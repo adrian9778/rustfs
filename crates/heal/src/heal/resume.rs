@@ -16,44 +16,56 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::collections::HashMap;
-use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::{BUCKET_META_PREFIX, DiskError, DiskStore, HealDiskExt as _, RUSTFS_META_BUCKET};
+use super::{
+    BUCKET_META_PREFIX, DiskError, DiskStore, HealDiskExt as _, RUSTFS_META_BUCKET, storage_api::owner::EcstoreDiskBytes,
+};
+
+mod checkpoint;
+mod gc;
+mod replacement;
+mod utils;
+
+pub use checkpoint::{CheckpointManager, CheckpointObjectOutcome, CheckpointObjectOutcomeRecord, ResumeCheckpoint};
+pub(crate) use gc::ResumeGc;
+pub(crate) use replacement::replacement_target_identities_match;
+use replacement::replacement_targets_match_identities;
+pub use replacement::{
+    ReplacementPhase, ReplacementRecoveryRecord, ReplacementRecoveryState, ReplacementTargetIdentity, compose_key,
+};
+pub use utils::ResumeUtils;
 
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_RESUME: &str = "resume";
 const EVENT_HEAL_RESUME_STATE: &str = "heal_resume_state";
-const EVENT_HEAL_CHECKPOINT_STATE: &str = "heal_checkpoint_state";
 
 /// resume state file constants
 const RESUME_STATE_FILE: &str = "ahm_resume_state.json";
+// Replacement intents must not use the ordinary resume-state suffix. Older
+// binaries enumerate that suffix and can otherwise resume a replacement as a
+// normal heal without its identity and format fences.
+const REPLACEMENT_INTENT_FILE: &str = "ahm_replacement_intent.json";
 const RESUME_PROGRESS_FILE: &str = "ahm_progress.json";
 pub(super) const RESUME_CHECKPOINT_FILE: &str = "ahm_checkpoint.json";
+pub(super) const RESUME_CHECKPOINT_BLOCKED_FILE: &str = "ahm_checkpoint.blocked";
+const REPLACEMENT_COMPLETION_PROOF_FILE: &str = "ahm_replacement_completion_proof.json";
+const REPLACEMENT_RECOVERY_DIR: &str = "ahm-replacement";
+const REPLACEMENT_INTENT_SEAL_FILE: &str = "ahm_replacement_intent_seal";
+const LEGACY_REPLACEMENT_RECOVERY_MARKER_FILE: &str = "ahm_replacement_recovery.json";
+const REPLACEMENT_RECOVERY_CONFLICT_PREFIX: &str = "replacement recovery conflict:";
+const REPLACEMENT_RECOVERY_CORRUPTION_PREFIX: &str = "replacement recovery corruption:";
 
 /// Current on-disk schema version for `ResumeState`. Snapshots written by an
 /// older schema (which tracked latest-only object names and a positional
 /// cursor) are incompatible with the per-version resume cursor, so they are
 /// discarded on load and the scan restarts from the beginning.
-const CURRENT_RESUME_SCHEMA: u32 = 2;
-/// Current on-disk schema version for `ResumeCheckpoint`. Same rationale as
-/// `CURRENT_RESUME_SCHEMA`: pre-per-version dedup identities are not comparable
-/// to the new `compose_key` identities, so a stale checkpoint is discarded.
-const CURRENT_CHECKPOINT_SCHEMA: u32 = 2;
-
-/// Build the canonical, provably-injective dedup identity for an object
-/// version. Length-prefixing the object key makes the encoding injective: no
-/// two distinct `(object, version_id)` pairs can collide, even for adversarial
-/// keys containing `:` or embedded null bytes. This is the single source of
-/// truth for per-version dedup across the heal loop and the checkpoint sets.
-pub fn compose_key(object: &str, version_id: Option<&str>) -> String {
-    format!("{}:{}{}", object.len(), object, version_id.unwrap_or(""))
-}
+const CURRENT_RESUME_SCHEMA: u32 = 5;
 
 /// Persistence throttle for per-object bookkeeping: flush after this many
 /// buffered mutations or once the interval elapses, whichever comes first.
@@ -92,6 +104,61 @@ impl PersistThrottle {
 fn path_to_str(path: &Path) -> Result<&str> {
     path.to_str()
         .ok_or_else(|| Error::other(format!("Invalid UTF-8 path: {path:?}")))
+}
+
+fn replacement_recovery_conflict(message: impl std::fmt::Display) -> Error {
+    Error::TaskExecutionFailed {
+        message: format!("{REPLACEMENT_RECOVERY_CONFLICT_PREFIX} {message}"),
+    }
+}
+
+fn replacement_recovery_corruption(message: impl std::fmt::Display) -> Error {
+    Error::TaskExecutionFailed {
+        message: format!("{REPLACEMENT_RECOVERY_CORRUPTION_PREFIX} {message}"),
+    }
+}
+
+pub(crate) fn replacement_recovery_error_requires_block(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::TaskExecutionFailed { message }
+            if message.starts_with(REPLACEMENT_RECOVERY_CONFLICT_PREFIX)
+                || message.starts_with(REPLACEMENT_RECOVERY_CORRUPTION_PREFIX)
+    )
+}
+
+fn replacement_recovery_corruption_for_state_load(message: impl std::fmt::Display, error: Error) -> Error {
+    if replacement_recovery_error_requires_block(&error) {
+        error
+    } else if matches!(
+        error,
+        Error::TaskExecutionFailed { .. } | Error::Serialization(_) | Error::InvalidCheckpoint(_)
+    ) {
+        replacement_recovery_corruption(format!("{message}: {error}"))
+    } else {
+        error
+    }
+}
+
+/// Resume task IDs become part of metadata file names. Persisted filenames are
+/// untrusted, so only accept a UUID encoded as one normal path component.
+fn validate_resume_task_id(task_id: &str) -> Result<()> {
+    let mut components = Path::new(task_id).components();
+    let is_single_normal_component = matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+
+    let Ok(uuid) = Uuid::parse_str(task_id) else {
+        return Err(Error::TaskExecutionFailed {
+            message: "Invalid resume task id".to_string(),
+        });
+    };
+
+    if is_single_normal_component && uuid.hyphenated().to_string() == task_id {
+        return Ok(());
+    }
+
+    Err(Error::TaskExecutionFailed {
+        message: "Invalid resume task id".to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -141,6 +208,53 @@ fn injected_resume_delete_error(_path: &str) -> Option<DiskError> {
     None
 }
 
+#[cfg(test)]
+struct ReplacementProofWriteFailure {
+    path: String,
+}
+
+#[cfg(test)]
+fn replacement_proof_write_failures() -> &'static Mutex<HashMap<String, DiskError>> {
+    static FAILURES: std::sync::OnceLock<Mutex<HashMap<String, DiskError>>> = std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+impl ReplacementProofWriteFailure {
+    fn install(path: String, error: DiskError) -> Self {
+        let previous = replacement_proof_write_failures()
+            .lock()
+            .expect("replacement proof write failure registry should not poison")
+            .insert(path.clone(), error);
+        assert!(previous.is_none(), "replacement proof write failure already installed");
+        Self { path }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ReplacementProofWriteFailure {
+    fn drop(&mut self) {
+        replacement_proof_write_failures()
+            .lock()
+            .expect("replacement proof write failure registry should not poison")
+            .remove(&self.path);
+    }
+}
+
+#[cfg(test)]
+fn injected_replacement_proof_write_error(path: &str) -> Option<DiskError> {
+    replacement_proof_write_failures()
+        .lock()
+        .expect("replacement proof write failure registry should not poison")
+        .get(path)
+        .cloned()
+}
+
+#[cfg(not(test))]
+fn injected_replacement_proof_write_error(_path: &str) -> Option<DiskError> {
+    None
+}
+
 async fn delete_resume_file(disk: &DiskStore, path: &Path) -> Result<()> {
     let path_str = path_to_str(path)?;
     if let Some(err) = injected_resume_delete_error(path_str) {
@@ -152,8 +266,36 @@ async fn delete_resume_file(disk: &DiskStore, path: &Path) -> Result<()> {
     }
 }
 
+fn replacement_completion_proof_path(task_id: &str) -> std::path::PathBuf {
+    replacement_recovery_dir().join(format!("{task_id}_{REPLACEMENT_COMPLETION_PROOF_FILE}"))
+}
+
+fn legacy_replacement_completion_proof_path(task_id: &str) -> std::path::PathBuf {
+    Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{REPLACEMENT_COMPLETION_PROOF_FILE}"))
+}
+
+fn replacement_recovery_dir() -> std::path::PathBuf {
+    Path::new(BUCKET_META_PREFIX).join(REPLACEMENT_RECOVERY_DIR)
+}
+
+async fn ensure_replacement_recovery_dir(disk: &DiskStore) -> std::result::Result<(), DiskError> {
+    let volume = format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}/{REPLACEMENT_RECOVERY_DIR}");
+    match super::storage_api::owner::EcstoreDiskAPI::make_volume(disk.as_ref(), &volume).await {
+        Ok(()) | Err(DiskError::VolumeExists) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn replacement_intent_seal_path(task_id: &str) -> std::path::PathBuf {
+    replacement_recovery_dir().join(format!("{task_id}_{REPLACEMENT_INTENT_SEAL_FILE}"))
+}
+
+fn legacy_replacement_recovery_marker_path(task_id: &str) -> std::path::PathBuf {
+    Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{LEGACY_REPLACEMENT_RECOVERY_MARKER_FILE}"))
+}
+
 /// resume state
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeState {
     /// on-disk schema version; absent in legacy snapshots (defaults to 0)
     #[serde(default)]
@@ -169,6 +311,22 @@ pub struct ResumeState {
     /// set disk identifier (for erasure set tasks)
     #[serde(default)]
     pub set_disk_id: String,
+    #[serde(default)]
+    pub replacement_targets: Vec<String>,
+    #[serde(default)]
+    pub replacement_target_identities: Vec<ReplacementTargetIdentity>,
+    /// Immutable bucket plan for a replacement generation. `pending_buckets`
+    /// shrinks during a pass and must never be reused as a positional resume
+    /// input after restart.
+    #[serde(default)]
+    pub replacement_buckets: Vec<String>,
+    /// A task-scoped generation assigned before formatting an automatic
+    /// replacement. A new unformatted replacement receives a new generation
+    /// and therefore cannot reuse an older disk's cursor or checkpoint.
+    #[serde(default)]
+    pub replacement_generation: Option<String>,
+    #[serde(default)]
+    pub replacement_phase: ReplacementPhase,
     /// start time
     pub start_time: u64,
     /// last update time
@@ -185,6 +343,12 @@ pub struct ResumeState {
     pub failed_objects: u64,
     /// skipped objects
     pub skipped_objects: u64,
+    /// Terminal versions skipped because they were newer than the heal start.
+    #[serde(default)]
+    pub skipped_new_versions: u64,
+    /// Terminal versions handed to lifecycle expiry.
+    #[serde(default)]
+    pub skipped_ilm_expired: u64,
     /// current bucket
     pub current_bucket: Option<String>,
     /// current object
@@ -199,6 +363,24 @@ pub struct ResumeState {
     pub retry_count: u32,
     /// max retries
     pub max_retries: u32,
+    /// Bytes accounted by the object ledger; additive for old snapshots.
+    #[serde(default)]
+    pub processed_bytes: u64,
+    /// Total bytes from a complete usage snapshot, when available.
+    #[serde(default)]
+    pub total_bytes: u64,
+    /// Generation of the usage snapshot used for the baseline.
+    #[serde(default)]
+    pub baseline_generation: Option<u64>,
+    /// Whether the usage baseline is known. Missing in old snapshots means
+    /// indeterminate rather than a measured zero baseline.
+    #[serde(default)]
+    pub baseline_known: bool,
+    /// Persistent telemetry fence for counter/byte overflow or corruption.
+    /// It must survive a restart so a saturated snapshot is never presented as
+    /// a measured percentage on the next resume.
+    #[serde(default)]
+    pub counter_unknown: bool,
 }
 
 impl ResumeState {
@@ -209,6 +391,11 @@ impl ResumeState {
             task_id,
             task_type,
             set_disk_id,
+            replacement_targets: Vec::new(),
+            replacement_target_identities: Vec::new(),
+            replacement_buckets: Vec::new(),
+            replacement_generation: None,
+            replacement_phase: ReplacementPhase::None,
             start_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             last_update: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             completed: false,
@@ -217,6 +404,8 @@ impl ResumeState {
             successful_objects: 0,
             failed_objects: 0,
             skipped_objects: 0,
+            skipped_new_versions: 0,
+            skipped_ilm_expired: 0,
             current_bucket: None,
             current_object: None,
             completed_buckets: Vec::new(),
@@ -224,7 +413,29 @@ impl ResumeState {
             error_message: None,
             retry_count: 0,
             max_retries: 3,
+            processed_bytes: 0,
+            total_bytes: 0,
+            baseline_generation: None,
+            baseline_known: false,
+            counter_unknown: false,
         }
+    }
+
+    fn replacement_intent(
+        task_id: String,
+        task_type: String,
+        set_disk_id: String,
+        buckets: Vec<String>,
+        replacement_targets: Vec<String>,
+        replacement_target_identities: Vec<ReplacementTargetIdentity>,
+    ) -> Self {
+        let mut state = Self::new(task_id.clone(), task_type, set_disk_id, buckets);
+        state.replacement_targets = replacement_targets;
+        state.replacement_target_identities = replacement_target_identities;
+        state.replacement_buckets = state.pending_buckets.clone();
+        state.replacement_generation = Some(task_id);
+        state.replacement_phase = ReplacementPhase::Intent;
+        state
     }
 
     pub fn update_progress(&mut self, processed: u64, successful: u64, failed: u64, skipped: u64) {
@@ -232,6 +443,39 @@ impl ResumeState {
         self.successful_objects = successful;
         self.failed_objects = failed;
         self.skipped_objects = skipped;
+        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    }
+
+    pub fn update_progress_with_bytes(
+        &mut self,
+        processed: u64,
+        successful: u64,
+        failed: u64,
+        skipped: u64,
+        processed_bytes: u64,
+    ) {
+        self.update_progress(processed, successful, failed, skipped);
+        self.processed_bytes = processed_bytes;
+    }
+
+    pub fn set_skipped_version_counts(&mut self, new_versions: u64, ilm_expired: u64) {
+        self.skipped_new_versions = new_versions;
+        self.skipped_ilm_expired = ilm_expired;
+        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    }
+
+    pub fn set_progress_baseline(&mut self, total_objects: u64, total_bytes: u64, generation: Option<u64>) {
+        self.total_objects = total_objects;
+        self.total_bytes = total_bytes;
+        self.baseline_generation = generation;
+        // This method is called only after a complete usage snapshot has been
+        // validated.  A complete but empty snapshot is still a known baseline.
+        self.baseline_known = true;
+        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    }
+
+    pub fn mark_counter_unknown(&mut self) {
+        self.counter_unknown = true;
         self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
@@ -260,6 +504,7 @@ impl ResumeState {
         if let Some(pos) = self.pending_buckets.iter().position(|b| b == bucket) {
             self.pending_buckets.remove(pos);
         }
+        self.resume_cursor = None;
         self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
@@ -277,6 +522,10 @@ impl ResumeState {
         self.successful_objects = 0;
         self.failed_objects = 0;
         self.skipped_objects = 0;
+        self.skipped_new_versions = 0;
+        self.skipped_ilm_expired = 0;
+        self.processed_bytes = 0;
+        self.counter_unknown = false;
         self.completed = false;
         // A retry re-scans every bucket from the beginning, so the version
         // cursor must be cleared too — otherwise the retry would resume mid-scan.
@@ -299,14 +548,28 @@ impl ResumeState {
     }
 
     pub fn get_progress_percentage(&self) -> f64 {
+        if self.completed {
+            return 100.0;
+        }
+        if self.counter_unknown {
+            return 0.0;
+        }
+        if !self.baseline_known {
+            return 0.0;
+        }
+        if self.total_bytes > 0 {
+            return ((self.processed_bytes as f64 / self.total_bytes as f64) * 100.0).min(99.999);
+        }
         if self.total_objects == 0 {
             return 0.0;
         }
-        (self.processed_objects as f64 / self.total_objects as f64) * 100.0
+        ((self.processed_objects as f64 / self.total_objects as f64) * 100.0).min(99.999)
     }
 
     pub fn get_success_rate(&self) -> f64 {
-        let total = self.successful_objects + self.failed_objects;
+        let Some(total) = self.successful_objects.checked_add(self.failed_objects) else {
+            return 0.0;
+        };
         if total == 0 {
             return 0.0;
         }
@@ -319,6 +582,38 @@ pub struct ResumeManager {
     disk: DiskStore,
     state: Arc<RwLock<ResumeState>>,
     throttle: Mutex<PersistThrottle>,
+    state_file: ResumeStateFile,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResumeStateFile {
+    Ordinary,
+    ReplacementIntent,
+    LegacyReplacementIntent,
+}
+
+impl ResumeStateFile {
+    fn path(self, task_id: &str) -> std::path::PathBuf {
+        match self {
+            Self::Ordinary => Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_STATE_FILE}")),
+            Self::ReplacementIntent => replacement_recovery_dir().join(format!("{task_id}_{REPLACEMENT_INTENT_FILE}")),
+            Self::LegacyReplacementIntent => Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{REPLACEMENT_INTENT_FILE}")),
+        }
+    }
+}
+
+fn is_replacement_intent(state: &ResumeState) -> bool {
+    state.replacement_generation.as_deref() == Some(state.task_id.as_str())
+        && !state.replacement_targets.is_empty()
+        && replacement_targets_match_identities(&state.replacement_targets, &state.replacement_target_identities)
+        && matches!(
+            state.replacement_phase,
+            ReplacementPhase::Intent
+                | ReplacementPhase::Rebuilding
+                | ReplacementPhase::Verified
+                | ReplacementPhase::CleanupPending
+                | ReplacementPhase::Abandoned
+        )
 }
 
 impl ResumeManager {
@@ -330,38 +625,204 @@ impl ResumeManager {
         set_disk_id: String,
         buckets: Vec<String>,
     ) -> Result<Self> {
+        validate_resume_task_id(&task_id)?;
         let state = ResumeState::new(task_id, task_type, set_disk_id, buckets);
         let manager = Self {
             disk,
             state: Arc::new(RwLock::new(state)),
             throttle: Mutex::new(PersistThrottle::new()),
+            state_file: ResumeStateFile::Ordinary,
         };
 
         // save initial state
-        if let Err(e) = manager.save_state().await {
-            warn!(
-                target: "rustfs::heal::resume",
-                event = EVENT_HEAL_RESUME_STATE,
-                component = LOG_COMPONENT_HEAL,
-                subsystem = LOG_SUBSYSTEM_RESUME,
-                state = "initial_save_failed",
-                error = %e,
-                "Heal resume state persistence failed"
-            );
-        }
+        manager.save_state().await?;
         Ok(manager)
     }
 
-    /// load resume state from disk
+    /// Persist the automatic replacement intent before the target is formatted.
+    /// Reusing the same task id is idempotent for scheduler retries, while a new
+    /// admission obtains a new task id and cannot inherit stale progress.
+    pub async fn new_replacement_intent(
+        disk: DiskStore,
+        task_id: String,
+        set_disk_id: String,
+        buckets: Vec<String>,
+        mut replacement_targets: Vec<String>,
+        mut replacement_target_identities: Vec<ReplacementTargetIdentity>,
+    ) -> Result<Self> {
+        validate_resume_task_id(&task_id)?;
+        replacement_targets.sort_unstable();
+        replacement_targets.dedup();
+        replacement_target_identities.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
+        replacement_target_identities.dedup_by(|left, right| left.endpoint == right.endpoint);
+        if replacement_target_identities
+            .iter()
+            .map(|identity| &identity.endpoint)
+            .collect::<Vec<_>>()
+            != replacement_targets.iter().collect::<Vec<_>>()
+        {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Replacement identities do not match targets for task {task_id}"),
+            });
+        }
+
+        let recovery_expected = if Self::has_replacement_intent(&disk, &task_id).await {
+            match Self::load_replacement_intent(disk.clone(), &task_id).await {
+                Ok(manager) => {
+                    let state = manager.get_state().await;
+                    if state.set_disk_id != set_disk_id
+                        || state.replacement_targets != replacement_targets
+                        || state.replacement_target_identities != replacement_target_identities
+                        || state.replacement_generation.as_deref() != Some(task_id.as_str())
+                        || !matches!(
+                            state.replacement_phase,
+                            ReplacementPhase::Intent
+                                | ReplacementPhase::Rebuilding
+                                | ReplacementPhase::Verified
+                                | ReplacementPhase::CleanupPending
+                        )
+                    {
+                        return Err(Error::TaskExecutionFailed {
+                            message: format!("Replacement intent does not match task {task_id}"),
+                        });
+                    }
+                    manager.ensure_replacement_intent_seal().await?;
+                    return Ok(manager);
+                }
+                Err(error) => match Self::torn_replacement_intent_bytes(&disk, &task_id).await? {
+                    Some(expected) => {
+                        warn!(
+                            target: "rustfs::heal::resume",
+                            event = EVENT_HEAL_RESUME_STATE,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_RESUME,
+                            task_id,
+                            error = %error,
+                            state = "torn_replacement_intent_recovered",
+                            "Replacing a torn replacement intent before formatting"
+                        );
+                        Some(expected)
+                    }
+                    None => return Err(error),
+                },
+            }
+        } else {
+            None
+        };
+
+        let state = ResumeState::replacement_intent(
+            task_id,
+            "erasure_set".to_string(),
+            set_disk_id,
+            buckets,
+            replacement_targets,
+            replacement_target_identities,
+        );
+        let manager = Self {
+            disk,
+            state: Arc::new(RwLock::new(state)),
+            throttle: Mutex::new(PersistThrottle::new()),
+            state_file: ResumeStateFile::ReplacementIntent,
+        };
+        manager.publish_new_replacement_intent(recovery_expected).await?;
+        manager.ensure_replacement_intent_seal().await?;
+        Ok(manager)
+    }
+
+    /// Load an ordinary resume state from disk. Replacement intents have a
+    /// separate namespace so they cannot be mistaken for ordinary work by an
+    /// older binary.
     pub async fn load_from_disk(disk: DiskStore, task_id: &str) -> Result<Self> {
-        let state_data = Self::read_state_file(&disk, task_id).await?;
+        Self::load_from_disk_at(disk, task_id, ResumeStateFile::Ordinary).await
+    }
+
+    /// Load a replacement intent, migrating a legacy flat record only after
+    /// the dedicated replacement record has been written.
+    pub async fn load_replacement_intent(disk: DiskStore, task_id: &str) -> Result<Self> {
+        if Self::has_state_file(&disk, task_id, ResumeStateFile::ReplacementIntent).await {
+            let isolated = Self::load_from_disk_at(disk.clone(), task_id, ResumeStateFile::ReplacementIntent).await?;
+            isolated.ensure_replacement_intent_seal().await?;
+            for legacy_file in [ResumeStateFile::LegacyReplacementIntent, ResumeStateFile::Ordinary] {
+                if !Self::has_state_file(&disk, task_id, legacy_file).await {
+                    continue;
+                }
+                let legacy = Self::load_from_disk_at(disk.clone(), task_id, legacy_file)
+                    .await
+                    .map_err(|error| {
+                        replacement_recovery_corruption_for_state_load(
+                            format!("Failed to load legacy replacement state {task_id}"),
+                            error,
+                        )
+                    })?;
+                let legacy_state = legacy.get_state().await;
+                if !is_replacement_intent(&legacy_state) || legacy_state != isolated.get_state().await {
+                    return Err(replacement_recovery_conflict(format!(
+                        "Replacement intent has conflicting legacy state for task {task_id}"
+                    )));
+                }
+                legacy.cleanup().await?;
+            }
+            delete_resume_file(&disk, &legacy_replacement_recovery_marker_path(task_id)).await?;
+            isolated.reconcile_replacement_completion_proof().await?;
+            return Ok(isolated);
+        }
+
+        let legacy_file = if Self::has_state_file(&disk, task_id, ResumeStateFile::LegacyReplacementIntent).await {
+            ResumeStateFile::LegacyReplacementIntent
+        } else {
+            ResumeStateFile::Ordinary
+        };
+        let legacy = Self::load_from_disk_at(disk.clone(), task_id, legacy_file)
+            .await
+            .map_err(|error| {
+                replacement_recovery_corruption_for_state_load(
+                    format!("Failed to load legacy replacement state {task_id}"),
+                    error,
+                )
+            })?;
+        if !is_replacement_intent(&legacy.get_state().await) {
+            return Err(replacement_recovery_corruption(format!(
+                "Resume state is not a replacement intent for task {task_id}"
+            )));
+        }
+
+        let migrated = Self {
+            disk,
+            state: legacy.state.clone(),
+            throttle: Mutex::new(PersistThrottle::new()),
+            state_file: ResumeStateFile::ReplacementIntent,
+        };
+        migrated.save_state_strict().await?;
+        migrated.ensure_replacement_intent_seal().await?;
+        legacy.cleanup().await?;
+        delete_resume_file(&migrated.disk, &legacy_replacement_recovery_marker_path(task_id)).await?;
+        migrated.reconcile_replacement_completion_proof().await?;
+        Ok(migrated)
+    }
+
+    async fn load_from_disk_at(disk: DiskStore, task_id: &str, state_file: ResumeStateFile) -> Result<Self> {
+        validate_resume_task_id(task_id)?;
+        let state_data = Self::read_state_file(&disk, task_id, state_file).await?;
         let mut state: ResumeState = serde_json::from_slice(&state_data).map_err(|e| Error::TaskExecutionFailed {
             message: format!("Failed to deserialize resume state: {e}"),
         })?;
+        if state.task_id != task_id {
+            return Err(Error::TaskExecutionFailed {
+                message: "Resume state task id does not match filename".to_string(),
+            });
+        }
 
         // A snapshot written by an older schema tracked a latest-only positional
         // cursor that is meaningless under per-version resume. Discard the stale
         // progress so the scan restarts cleanly, then stamp the current schema.
+        if state.schema_version > CURRENT_RESUME_SCHEMA {
+            return Err(Error::TaskExecutionFailed {
+                message: format!(
+                    "Resume state schema {} is newer than supported schema {CURRENT_RESUME_SCHEMA}",
+                    state.schema_version
+                ),
+            });
+        }
         if state.schema_version < CURRENT_RESUME_SCHEMA {
             warn!(
                 target: "rustfs::heal::resume",
@@ -379,7 +840,16 @@ impl ResumeManager {
             state.successful_objects = 0;
             state.failed_objects = 0;
             state.skipped_objects = 0;
+            state.skipped_new_versions = 0;
+            state.skipped_ilm_expired = 0;
+            state.processed_bytes = 0;
+            state.total_objects = 0;
+            state.total_bytes = 0;
+            state.baseline_generation = None;
+            state.baseline_known = false;
+            state.counter_unknown = false;
             state.completed = false;
+            state.completed_buckets.clear();
             state.schema_version = CURRENT_RESUME_SCHEMA;
         }
 
@@ -387,18 +857,65 @@ impl ResumeManager {
             disk,
             state: Arc::new(RwLock::new(state)),
             throttle: Mutex::new(PersistThrottle::new()),
+            state_file,
         })
     }
 
     /// check if resume state exists
     pub async fn has_resume_state(disk: &DiskStore, task_id: &str) -> bool {
-        let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_STATE_FILE}"));
+        Self::has_state_file(disk, task_id, ResumeStateFile::Ordinary).await
+    }
+
+    /// Check for a replacement intent in its dedicated namespace. Flat and
+    /// ordinary legacy records are recognized only for migration compatibility.
+    pub async fn has_replacement_intent(disk: &DiskStore, task_id: &str) -> bool {
+        if Self::has_state_file(disk, task_id, ResumeStateFile::ReplacementIntent).await {
+            return true;
+        }
+        if Self::has_state_file(disk, task_id, ResumeStateFile::LegacyReplacementIntent).await {
+            return true;
+        }
+        match Self::load_from_disk_at(disk.clone(), task_id, ResumeStateFile::Ordinary).await {
+            Ok(manager) => is_replacement_intent(&manager.get_state().await),
+            Err(_) => false,
+        }
+    }
+
+    async fn has_state_file(disk: &DiskStore, task_id: &str, state_file: ResumeStateFile) -> bool {
+        if validate_resume_task_id(task_id).is_err() {
+            return false;
+        }
+        let file_path = state_file.path(task_id);
         match path_to_str(&file_path) {
             Ok(path_str) => match disk.read_all(RUSTFS_META_BUCKET, path_str).await {
                 Ok(data) => !data.is_empty(),
                 Err(_) => false,
             },
             Err(_) => false,
+        }
+    }
+
+    async fn torn_replacement_intent_bytes(disk: &DiskStore, task_id: &str) -> Result<Option<EcstoreDiskBytes>> {
+        validate_resume_task_id(task_id)?;
+        let path = ResumeStateFile::ReplacementIntent.path(task_id);
+        let path = path_to_str(&path)?;
+        match disk.read_all(RUSTFS_META_BUCKET, path).await {
+            Ok(bytes) if serde_json::from_slice::<ResumeState>(&bytes).is_err() => {
+                let seal = replacement_intent_seal_path(task_id);
+                let seal = path_to_str(&seal)?;
+                match disk.read_all(RUSTFS_META_BUCKET, seal).await {
+                    Err(DiskError::FileNotFound) => Ok(Some(bytes)),
+                    Ok(_) => Ok(None),
+                    Err(error) => Err(Error::TaskExecutionFailed {
+                        message: format!("Failed to read replacement intent seal: {error}"),
+                    }),
+                }
+            }
+            Ok(_) => Ok(None),
+            Err(DiskError::FileNotFound) => Ok(None),
+            Err(error) => Err(Error::TaskExecutionFailed {
+                message: format!("Failed to read replacement intent: {error}"),
+            }),
         }
     }
 
@@ -411,6 +928,41 @@ impl ResumeManager {
     pub async fn update_progress(&self, processed: u64, successful: u64, failed: u64, skipped: u64) -> Result<()> {
         let mut state = self.state.write().await;
         state.update_progress(processed, successful, failed, skipped);
+        drop(state);
+        self.save_state_throttled().await
+    }
+
+    pub async fn update_progress_with_bytes(
+        &self,
+        processed: u64,
+        successful: u64,
+        failed: u64,
+        skipped: u64,
+        processed_bytes: u64,
+    ) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.update_progress_with_bytes(processed, successful, failed, skipped, processed_bytes);
+        drop(state);
+        self.save_state_throttled().await
+    }
+
+    pub async fn set_progress_baseline(&self, total_objects: u64, total_bytes: u64, generation: Option<u64>) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.set_progress_baseline(total_objects, total_bytes, generation);
+        drop(state);
+        self.save_state_throttled().await
+    }
+
+    pub async fn mark_counter_unknown(&self) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.mark_counter_unknown();
+        drop(state);
+        self.save_state().await
+    }
+
+    pub async fn set_skipped_version_counts(&self, new_versions: u64, ilm_expired: u64) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.set_skipped_version_counts(new_versions, ilm_expired);
         drop(state);
         self.save_state_throttled().await
     }
@@ -459,7 +1011,7 @@ impl ResumeManager {
         let mut state = self.state.write().await;
         state.complete_bucket(bucket);
         drop(state);
-        self.save_state_throttled().await
+        self.save_state().await
     }
 
     /// mark task completed
@@ -504,14 +1056,19 @@ impl ResumeManager {
 
     /// cleanup resume state
     pub async fn cleanup(&self) -> Result<()> {
-        let task_id = self.state.read().await.task_id.clone();
+        let state = self.state.read().await;
+        let task_id = state.task_id.clone();
+        drop(state);
+        validate_resume_task_id(&task_id)?;
 
-        let state_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_STATE_FILE}"));
+        let state_file = self.state_file.path(&task_id);
         let progress_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_PROGRESS_FILE}"));
 
         delete_resume_file(&self.disk, &progress_file).await?;
-        // Delete the state file last so a partial cleanup remains discoverable.
         delete_resume_file(&self.disk, &state_file).await?;
+        if matches!(self.state_file, ResumeStateFile::ReplacementIntent) {
+            delete_resume_file(&self.disk, &replacement_intent_seal_path(&task_id)).await?;
+        }
 
         debug!(
             target: "rustfs::heal::resume",
@@ -527,16 +1084,31 @@ impl ResumeManager {
 
     /// save state to disk
     async fn save_state(&self) -> Result<()> {
-        let state = self.state.read().await;
-        let state_data = serde_json::to_vec(&*state).map_err(|e| Error::TaskExecutionFailed {
-            message: format!("Failed to serialize resume state: {e}"),
-        })?;
+        self.save_state_with_unformatted_policy(true).await
+    }
 
-        let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{}_{}", state.task_id, RESUME_STATE_FILE));
+    async fn save_state_strict(&self) -> Result<()> {
+        self.save_state_with_unformatted_policy(false).await
+    }
+
+    async fn save_state_with_unformatted_policy(&self, allow_unformatted: bool) -> Result<()> {
+        let state = self.state.read().await.clone();
+        validate_resume_task_id(&state.task_id)?;
+        let state_data = EcstoreDiskBytes::from(serde_json::to_vec(&state).map_err(|e| Error::TaskExecutionFailed {
+            message: format!("Failed to serialize resume state: {e}"),
+        })?);
+
+        let file_path = self.state_file.path(&state.task_id);
 
         let path_str = path_to_str(&file_path)?;
-        if let Err(e) = self.disk.write_all(RUSTFS_META_BUCKET, path_str, state_data.into()).await {
-            if matches!(e, DiskError::UnformattedDisk) {
+        let write_result = match self.state_file {
+            ResumeStateFile::Ordinary | ResumeStateFile::LegacyReplacementIntent => {
+                self.disk.write_all(RUSTFS_META_BUCKET, path_str, state_data).await
+            }
+            ResumeStateFile::ReplacementIntent => self.write_replacement_intent_state(path_str, state_data).await,
+        };
+        if let Err(e) = write_result {
+            if allow_unformatted && matches!(e, DiskError::UnformattedDisk) {
                 warn!(
                     target: "rustfs::heal::resume",
                     event = EVENT_HEAL_RESUME_STATE,
@@ -566,861 +1138,17 @@ impl ResumeManager {
     }
 
     /// read state file from disk
-    async fn read_state_file(disk: &DiskStore, task_id: &str) -> Result<Vec<u8>> {
-        let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_STATE_FILE}"));
+    async fn read_state_file(disk: &DiskStore, task_id: &str, state_file: ResumeStateFile) -> Result<Vec<u8>> {
+        validate_resume_task_id(task_id)?;
+        let file_path = state_file.path(task_id);
 
         let path_str = path_to_str(&file_path)?;
         disk.read_all(RUSTFS_META_BUCKET, path_str)
             .await
             .map(|bytes| bytes.to_vec())
-            .map_err(|e| Error::TaskExecutionFailed {
-                message: format!("Failed to read resume state file: {e}"),
-            })
-    }
-}
-
-/// resume checkpoint
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResumeCheckpoint {
-    /// on-disk schema version; absent in legacy snapshots (defaults to 0)
-    #[serde(default)]
-    pub schema_version: u32,
-    /// task id
-    pub task_id: String,
-    /// checkpoint time
-    pub checkpoint_time: u64,
-    /// current bucket index
-    pub current_bucket_index: usize,
-    /// current object index
-    pub current_object_index: usize,
-    /// Objects healed since the last completed page. HashSet: with the
-    /// previous Vec the per-object `contains` was O(n) and made large-bucket
-    /// heals O(N²). Only spans the in-flight page — completed pages are
-    /// covered by `current_object_index`, so `complete_page` prunes the sets.
-    pub processed_objects: HashSet<String>,
-    /// failed objects
-    pub failed_objects: HashSet<String>,
-    /// skipped objects
-    pub skipped_objects: HashSet<String>,
-}
-
-impl ResumeCheckpoint {
-    pub fn new(task_id: String) -> Self {
-        Self {
-            schema_version: CURRENT_CHECKPOINT_SCHEMA,
-            task_id,
-            checkpoint_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-            current_bucket_index: 0,
-            current_object_index: 0,
-            processed_objects: HashSet::new(),
-            failed_objects: HashSet::new(),
-            skipped_objects: HashSet::new(),
-        }
-    }
-
-    pub fn update_position(&mut self, bucket_index: usize, object_index: usize) {
-        self.current_bucket_index = bucket_index;
-        self.current_object_index = object_index;
-        self.checkpoint_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    }
-
-    pub fn add_processed_object(&mut self, object: String) {
-        self.processed_objects.insert(object);
-    }
-
-    pub fn add_failed_object(&mut self, object: String) {
-        self.failed_objects.insert(object);
-    }
-
-    pub fn add_skipped_object(&mut self, object: String) {
-        self.skipped_objects.insert(object);
-    }
-
-    /// Advance past a fully-processed page: objects below `object_index` are
-    /// skipped by position on resume, so the per-object sets no longer need
-    /// their entries and would otherwise grow with the whole bucket.
-    pub fn complete_page(&mut self, bucket_index: usize, object_index: usize) {
-        self.update_position(bucket_index, object_index);
-        self.processed_objects.clear();
-        self.skipped_objects.clear();
-        self.failed_objects.clear();
-    }
-
-    /// Reset the scan to the start and clear the per-object sets so a retry
-    /// re-scans the whole set.
-    pub fn reset_for_retry(&mut self) {
-        self.update_position(0, 0);
-        self.processed_objects.clear();
-        self.skipped_objects.clear();
-        self.failed_objects.clear();
-    }
-}
-
-/// resume checkpoint manager
-pub struct CheckpointManager {
-    disk: DiskStore,
-    checkpoint: Arc<RwLock<ResumeCheckpoint>>,
-    throttle: Mutex<PersistThrottle>,
-}
-
-impl CheckpointManager {
-    /// create new checkpoint manager
-    pub async fn new(disk: DiskStore, task_id: String) -> Result<Self> {
-        let checkpoint = ResumeCheckpoint::new(task_id);
-        let manager = Self {
-            disk,
-            checkpoint: Arc::new(RwLock::new(checkpoint)),
-            throttle: Mutex::new(PersistThrottle::new()),
-        };
-
-        // save initial checkpoint
-        if let Err(e) = manager.save_checkpoint().await {
-            warn!(
-                target: "rustfs::heal::resume",
-                event = EVENT_HEAL_CHECKPOINT_STATE,
-                component = LOG_COMPONENT_HEAL,
-                subsystem = LOG_SUBSYSTEM_RESUME,
-                state = "initial_save_failed",
-                error = %e,
-                "Heal checkpoint persistence failed"
-            );
-        }
-        Ok(manager)
-    }
-
-    /// load checkpoint from disk
-    pub async fn load_from_disk(disk: DiskStore, task_id: &str) -> Result<Self> {
-        let checkpoint_data = Self::read_checkpoint_file(&disk, task_id).await?;
-        let mut checkpoint: ResumeCheckpoint =
-            serde_json::from_slice(&checkpoint_data).map_err(|e| Error::TaskExecutionFailed {
-                message: format!("Failed to deserialize checkpoint: {e}"),
-            })?;
-
-        // A checkpoint from an older schema stored latest-only dedup identities
-        // that are not comparable to the new per-version `compose_key`
-        // identities. Discard the stale sets and position, then stamp the
-        // current schema so the scan restarts cleanly.
-        if checkpoint.schema_version < CURRENT_CHECKPOINT_SCHEMA {
-            warn!(
-                target: "rustfs::heal::resume",
-                event = EVENT_HEAL_CHECKPOINT_STATE,
-                component = LOG_COMPONENT_HEAL,
-                subsystem = LOG_SUBSYSTEM_RESUME,
-                task_id,
-                found_schema = checkpoint.schema_version,
-                current_schema = CURRENT_CHECKPOINT_SCHEMA,
-                state = "schema_discarded",
-                "Heal checkpoint schema is stale; discarding dedup sets and position"
-            );
-            checkpoint.processed_objects.clear();
-            checkpoint.failed_objects.clear();
-            checkpoint.skipped_objects.clear();
-            checkpoint.current_object_index = 0;
-            checkpoint.schema_version = CURRENT_CHECKPOINT_SCHEMA;
-        }
-
-        Ok(Self {
-            disk,
-            checkpoint: Arc::new(RwLock::new(checkpoint)),
-            throttle: Mutex::new(PersistThrottle::new()),
-        })
-    }
-
-    /// check if checkpoint exists
-    pub async fn has_checkpoint(disk: &DiskStore, task_id: &str) -> bool {
-        let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
-        match path_to_str(&file_path) {
-            Ok(path_str) => match disk.read_all(RUSTFS_META_BUCKET, path_str).await {
-                Ok(data) => !data.is_empty(),
-                Err(_) => false,
-            },
-            Err(_) => false,
-        }
-    }
-
-    /// get current checkpoint
-    pub async fn get_checkpoint(&self) -> ResumeCheckpoint {
-        self.checkpoint.read().await.clone()
-    }
-
-    /// update position
-    pub async fn update_position(&self, bucket_index: usize, object_index: usize) -> Result<()> {
-        let mut checkpoint = self.checkpoint.write().await;
-        checkpoint.update_position(bucket_index, object_index);
-        drop(checkpoint);
-        self.save_checkpoint_throttled().await
-    }
-
-    /// Advance past a completed page and prune the per-object sets, then persist.
-    pub async fn complete_page(&self, bucket_index: usize, object_index: usize) -> Result<()> {
-        let mut checkpoint = self.checkpoint.write().await;
-        checkpoint.complete_page(bucket_index, object_index);
-        drop(checkpoint);
-        self.save_checkpoint_throttled().await
-    }
-
-    /// Reset the checkpoint to the start of the scan for a retry, then persist.
-    pub async fn reset_for_retry(&self) -> Result<()> {
-        let mut checkpoint = self.checkpoint.write().await;
-        checkpoint.reset_for_retry();
-        drop(checkpoint);
-        self.save_checkpoint_throttled().await
-    }
-
-    /// Add a processed object. Called once per healed object, so persistence
-    /// is batched (`PERSIST_EVERY_MUTATIONS` / `PERSIST_INTERVAL`); positions
-    /// and page boundaries still persist unconditionally.
-    pub async fn add_processed_object(&self, object: String) -> Result<()> {
-        let mut checkpoint = self.checkpoint.write().await;
-        checkpoint.add_processed_object(object);
-        drop(checkpoint);
-        self.save_checkpoint_if_due().await
-    }
-
-    /// add failed object (batched, see `add_processed_object`)
-    pub async fn add_failed_object(&self, object: String) -> Result<()> {
-        let mut checkpoint = self.checkpoint.write().await;
-        checkpoint.add_failed_object(object);
-        drop(checkpoint);
-        self.save_checkpoint_if_due().await
-    }
-
-    /// add skipped object (batched, see `add_processed_object`)
-    pub async fn add_skipped_object(&self, object: String) -> Result<()> {
-        let mut checkpoint = self.checkpoint.write().await;
-        checkpoint.add_skipped_object(object);
-        drop(checkpoint);
-        self.save_checkpoint_if_due().await
-    }
-
-    async fn save_checkpoint_if_due(&self) -> Result<()> {
-        let should_save = self.throttle.lock().map(|mut throttle| throttle.record()).unwrap_or(true);
-        if !should_save {
-            return Ok(());
-        }
-        self.save_checkpoint_throttled().await
-    }
-
-    async fn save_checkpoint_throttled(&self) -> Result<()> {
-        let result = self.save_checkpoint().await;
-        if result.is_ok()
-            && let Ok(mut throttle) = self.throttle.lock()
-        {
-            throttle.mark_saved();
-        }
-        result
-    }
-
-    /// cleanup checkpoint
-    pub async fn cleanup(&self) -> Result<()> {
-        let task_id = self.checkpoint.read().await.task_id.clone();
-
-        let checkpoint_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
-        delete_resume_file(&self.disk, &checkpoint_file).await?;
-
-        debug!(
-            target: "rustfs::heal::resume",
-            event = EVENT_HEAL_CHECKPOINT_STATE,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_RESUME,
-            task_id,
-            state = "cleaned",
-            "Heal checkpoint cleaned"
-        );
-        Ok(())
-    }
-
-    /// save checkpoint to disk
-    async fn save_checkpoint(&self) -> Result<()> {
-        let checkpoint = self.checkpoint.read().await;
-        let checkpoint_data = serde_json::to_vec(&*checkpoint).map_err(|e| Error::TaskExecutionFailed {
-            message: format!("Failed to serialize checkpoint: {e}"),
-        })?;
-
-        let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{}_{}", checkpoint.task_id, RESUME_CHECKPOINT_FILE));
-
-        let path_str = path_to_str(&file_path)?;
-        self.disk
-            .write_all(RUSTFS_META_BUCKET, path_str, checkpoint_data.into())
-            .await
-            .map_err(|e| Error::TaskExecutionFailed {
-                message: format!("Failed to save checkpoint: {e}"),
-            })?;
-
-        debug!(
-            target: "rustfs::heal::resume",
-            event = EVENT_HEAL_CHECKPOINT_STATE,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_RESUME,
-            task_id = %checkpoint.task_id,
-            state = "saved",
-            "Heal checkpoint persisted"
-        );
-        Ok(())
-    }
-
-    /// read checkpoint file from disk
-    async fn read_checkpoint_file(disk: &DiskStore, task_id: &str) -> Result<Vec<u8>> {
-        let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
-
-        let path_str = path_to_str(&file_path)?;
-        disk.read_all(RUSTFS_META_BUCKET, path_str)
-            .await
-            .map(|bytes| bytes.to_vec())
-            .map_err(|e| Error::TaskExecutionFailed {
-                message: format!("Failed to read checkpoint file: {e}"),
-            })
-    }
-}
-
-/// resume utils
-pub struct ResumeUtils;
-
-impl ResumeUtils {
-    /// generate unique task id
-    pub fn generate_task_id() -> String {
-        Uuid::new_v4().to_string()
-    }
-
-    /// check if task can be resumed
-    pub async fn can_resume_task(disk: &DiskStore, task_id: &str) -> bool {
-        ResumeManager::has_resume_state(disk, task_id).await
-    }
-
-    /// get all resumable task ids
-    pub async fn get_resumable_tasks(disk: &DiskStore) -> Result<Vec<String>> {
-        // List all files in the buckets metadata directory
-        let entries = match disk.list_dir("", RUSTFS_META_BUCKET, BUCKET_META_PREFIX, -1).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                debug!(
-                    target: "rustfs::heal::resume",
-                    event = EVENT_HEAL_RESUME_STATE,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_RESUME,
-                    state = "list_failed",
-                    error = %e,
-                    "Heal resume state listing failed"
-                );
-                return Ok(Vec::new());
-            }
-        };
-
-        let mut task_ids = Vec::new();
-
-        // Filter files that end with ahm_resume_state.json and extract task IDs
-        for entry in entries {
-            if entry.ends_with(&format!("_{RESUME_STATE_FILE}")) {
-                // Extract task ID from filename: {task_id}_ahm_resume_state.json
-                if let Some(task_id) = entry.strip_suffix(&format!("_{RESUME_STATE_FILE}"))
-                    && !task_id.is_empty()
-                {
-                    task_ids.push(task_id.to_string());
-                }
-            }
-        }
-
-        debug!(
-            target: "rustfs::heal::resume",
-            event = EVENT_HEAL_RESUME_STATE,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_RESUME,
-            task_count = task_ids.len(),
-            state = "listed",
-            "Heal resume states listed"
-        );
-        Ok(task_ids)
-    }
-
-    /// cleanup expired resume states
-    pub async fn cleanup_expired_states(disk: &DiskStore, max_age_hours: u64) -> Result<()> {
-        let task_ids = Self::get_resumable_tasks(disk).await?;
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-
-        for task_id in task_ids {
-            if let Ok(resume_manager) = ResumeManager::load_from_disk(disk.clone(), &task_id).await {
-                let state = resume_manager.get_state().await;
-                let age_hours = (current_time - state.last_update) / 3600;
-
-                if age_hours > max_age_hours {
-                    debug!(
-                        target: "rustfs::heal::resume",
-                        event = EVENT_HEAL_RESUME_STATE,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_RESUME,
-                        task_id,
-                        age_hours,
-                        state = "expired_cleanup_started",
-                        "Heal resume cleanup started"
-                    );
-                    if let Err(e) = resume_manager.cleanup().await {
-                        warn!(
-                            target: "rustfs::heal::resume",
-                            event = EVENT_HEAL_RESUME_STATE,
-                            component = LOG_COMPONENT_HEAL,
-                            subsystem = LOG_SUBSYSTEM_RESUME,
-                            task_id,
-                            age_hours,
-                            state = "expired_cleanup_failed",
-                            error = %e,
-                            "Heal resume state cleanup failed"
-                        );
-                    }
-                }
-            }
-        }
-
-        Ok(())
+            .map_err(Error::Disk)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_resume_state_creation() {
-        let task_id = ResumeUtils::generate_task_id();
-        let buckets = vec!["bucket1".to_string(), "bucket2".to_string()];
-        let state = ResumeState::new(task_id.clone(), "erasure_set".to_string(), "pool_0_set_0".to_string(), buckets);
-
-        assert_eq!(state.task_id, task_id);
-        assert_eq!(state.task_type, "erasure_set");
-        assert!(!state.completed);
-        assert_eq!(state.processed_objects, 0);
-        assert_eq!(state.pending_buckets.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_resume_state_progress() {
-        let task_id = ResumeUtils::generate_task_id();
-        let buckets = vec!["bucket1".to_string()];
-        let mut state = ResumeState::new(task_id, "erasure_set".to_string(), "pool_0_set_0".to_string(), buckets);
-
-        state.update_progress(10, 8, 1, 1);
-        assert_eq!(state.processed_objects, 10);
-        assert_eq!(state.successful_objects, 8);
-        assert_eq!(state.failed_objects, 1);
-        assert_eq!(state.skipped_objects, 1);
-
-        let progress = state.get_progress_percentage();
-        assert_eq!(progress, 0.0); // total_objects is 0
-
-        state.total_objects = 100;
-        let progress = state.get_progress_percentage();
-        assert_eq!(progress, 10.0);
-    }
-
-    #[test]
-    fn reset_for_retry_clears_progress_but_keeps_retry_budget() {
-        // backlog#855 / #799 B6: a retry must re-scan from the start without
-        // spending the retry budget's identity.
-        let buckets = vec!["bucket1".to_string(), "bucket2".to_string()];
-        let mut state = ResumeState::new("t".to_string(), "erasure_set".to_string(), "pool_0_set_0".to_string(), buckets);
-        state.update_progress(10, 8, 2, 0);
-        state.complete_bucket("bucket1");
-        state.increment_retry();
-        state.mark_completed();
-
-        state.reset_for_retry();
-
-        assert!(!state.completed, "retry must un-complete the task");
-        assert_eq!(state.completed_buckets.len(), 0, "all buckets must be re-scanned");
-        assert_eq!(state.processed_objects, 0);
-        assert_eq!(state.successful_objects, 0);
-        assert_eq!(state.failed_objects, 0);
-        assert_eq!(state.skipped_objects, 0);
-        assert_eq!(state.retry_count, 1, "retry budget must be preserved");
-    }
-
-    #[test]
-    fn can_retry_is_bounded_by_max_retries() {
-        let mut state = ResumeState::new("t".to_string(), "erasure_set".to_string(), "pool_0_set_0".to_string(), vec![]);
-        assert!(state.can_retry());
-        for _ in 0..state.max_retries {
-            assert!(state.can_retry());
-            state.increment_retry();
-        }
-        assert!(!state.can_retry(), "retries must stop after max_retries");
-    }
-
-    #[test]
-    fn checkpoint_reset_for_retry_rewinds_position_and_clears_sets() {
-        let mut checkpoint = ResumeCheckpoint::new("task".to_string());
-        checkpoint.update_position(3, 42);
-        checkpoint.add_processed_object("bucket/a".to_string());
-        checkpoint.add_failed_object("bucket/b".to_string());
-        checkpoint.add_skipped_object("bucket/c".to_string());
-
-        checkpoint.reset_for_retry();
-
-        assert_eq!(checkpoint.current_bucket_index, 0);
-        assert_eq!(checkpoint.current_object_index, 0);
-        assert!(checkpoint.processed_objects.is_empty());
-        assert!(checkpoint.failed_objects.is_empty());
-        assert!(checkpoint.skipped_objects.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_resume_state_bucket_completion() {
-        let task_id = ResumeUtils::generate_task_id();
-        let buckets = vec!["bucket1".to_string(), "bucket2".to_string()];
-        let mut state = ResumeState::new(task_id, "erasure_set".to_string(), "pool_0_set_0".to_string(), buckets);
-
-        assert_eq!(state.pending_buckets.len(), 2);
-        assert_eq!(state.completed_buckets.len(), 0);
-
-        state.complete_bucket("bucket1");
-        assert_eq!(state.pending_buckets.len(), 1);
-        assert_eq!(state.completed_buckets.len(), 1);
-        assert!(state.completed_buckets.contains(&"bucket1".to_string()));
-    }
-
-    #[test]
-    fn test_checkpoint_object_sets_dedupe_and_prune() {
-        let mut checkpoint = ResumeCheckpoint::new("task".to_string());
-        checkpoint.add_processed_object("bucket/a".to_string());
-        checkpoint.add_processed_object("bucket/a".to_string());
-        checkpoint.add_skipped_object("bucket/b".to_string());
-        checkpoint.add_failed_object("bucket/c".to_string());
-        assert_eq!(checkpoint.processed_objects.len(), 1);
-        assert!(checkpoint.processed_objects.contains("bucket/a"));
-
-        checkpoint.complete_page(2, 2000);
-        assert_eq!(checkpoint.current_bucket_index, 2);
-        assert_eq!(checkpoint.current_object_index, 2000);
-        assert!(checkpoint.processed_objects.is_empty());
-        assert!(checkpoint.skipped_objects.is_empty());
-        assert!(checkpoint.failed_objects.is_empty());
-    }
-
-    #[test]
-    fn test_checkpoint_loads_legacy_vec_format() {
-        // Checkpoints written before the HashSet migration stored the object
-        // lists as JSON arrays (possibly with duplicates); they must still load.
-        let legacy = r#"{
-            "task_id": "t1",
-            "checkpoint_time": 1700000000,
-            "current_bucket_index": 1,
-            "current_object_index": 42,
-            "processed_objects": ["a", "b", "a"],
-            "failed_objects": [],
-            "skipped_objects": ["c"]
-        }"#;
-        let checkpoint: ResumeCheckpoint = serde_json::from_str(legacy).unwrap();
-        assert_eq!(checkpoint.current_object_index, 42);
-        assert_eq!(checkpoint.processed_objects.len(), 2);
-        assert!(checkpoint.processed_objects.contains("a"));
-        assert!(checkpoint.skipped_objects.contains("c"));
-    }
-
-    #[test]
-    fn test_compose_key_injective_with_adversarial_keys() {
-        // Length-prefixing must keep the encoding injective even when keys
-        // contain the delimiter, embedded nulls, or look like a composed key.
-        assert_ne!(compose_key("a\0b", None), compose_key("a", Some("b")));
-        assert_ne!(compose_key("3:xy", None), compose_key("x", Some("y")));
-        assert_ne!(compose_key("a:b", None), compose_key("a", Some("b")));
-        assert_ne!(compose_key("", Some("x")), compose_key("x", None));
-        // Identical inputs must produce identical keys (stable identity).
-        assert_eq!(compose_key("obj", Some("v1")), compose_key("obj", Some("v1")));
-    }
-
-    #[test]
-    fn test_composite_key_dedup_distinguishes_versions() {
-        // Two versions of the same object must be distinct dedup identities, and
-        // the delete-marker/nil (None) version must not collide with a real one.
-        let mut checkpoint = ResumeCheckpoint::new("task".to_string());
-        checkpoint.add_processed_object(compose_key("obj", Some("v1")));
-        checkpoint.add_processed_object(compose_key("obj", Some("v2")));
-        checkpoint.add_processed_object(compose_key("obj", None));
-        assert_eq!(checkpoint.processed_objects.len(), 3);
-        assert!(checkpoint.processed_objects.contains(&compose_key("obj", Some("v1"))));
-        assert!(checkpoint.processed_objects.contains(&compose_key("obj", Some("v2"))));
-        assert!(checkpoint.processed_objects.contains(&compose_key("obj", None)));
-        // A different object with the same version id is still distinct.
-        assert!(!checkpoint.processed_objects.contains(&compose_key("other", Some("v1"))));
-    }
-
-    #[tokio::test]
-    async fn test_resumestate_schema_v0_discarded_on_load() {
-        use super::super::{DiskOption, Endpoint, new_disk};
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let disk_path = temp_dir.path().join("test_disk");
-        std::fs::create_dir_all(&disk_path).unwrap();
-        let endpoint = Endpoint::try_from(disk_path.to_string_lossy().as_ref()).unwrap();
-        let disk = new_disk(
-            &endpoint,
-            &DiskOption {
-                cleanup: false,
-                health_check: false,
-            },
-        )
-        .await
-        .unwrap();
-        let _ = disk.make_volume(RUSTFS_META_BUCKET).await;
-        let _ = disk.make_volume(&format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}")).await;
-
-        // Legacy snapshot: no schema_version, a stale positional cursor and progress.
-        let legacy = r#"{
-            "task_id": "old-task",
-            "task_type": "erasure_set",
-            "set_disk_id": "pool_0_set_0",
-            "start_time": 1700000000,
-            "last_update": 1700000000,
-            "completed": true,
-            "total_objects": 100,
-            "processed_objects": 50,
-            "successful_objects": 40,
-            "failed_objects": 10,
-            "skipped_objects": 0,
-            "current_bucket": null,
-            "current_object": null,
-            "completed_buckets": ["b1"],
-            "pending_buckets": [],
-            "error_message": null,
-            "retry_count": 1,
-            "max_retries": 3,
-            "resume_cursor": "v1:stale-token"
-        }"#;
-        let file_path = format!("{BUCKET_META_PREFIX}/old-task_{RESUME_STATE_FILE}");
-        disk.write_all(RUSTFS_META_BUCKET, &file_path, legacy.as_bytes().to_vec().into())
-            .await
-            .unwrap();
-
-        let manager = ResumeManager::load_from_disk(disk.clone(), "old-task").await.unwrap();
-        let state = manager.get_state().await;
-        assert_eq!(state.schema_version, CURRENT_RESUME_SCHEMA, "schema must be stamped current");
-        assert_eq!(state.resume_cursor, None, "stale cursor must be cleared");
-        assert_eq!(state.processed_objects, 0);
-        assert_eq!(state.successful_objects, 0);
-        assert_eq!(state.failed_objects, 0);
-        assert!(!state.completed);
-        temp_dir.close().unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_checkpoint_schema_v0_discarded_on_load() {
-        use super::super::{DiskOption, Endpoint, new_disk};
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let disk_path = temp_dir.path().join("test_disk");
-        std::fs::create_dir_all(&disk_path).unwrap();
-        let endpoint = Endpoint::try_from(disk_path.to_string_lossy().as_ref()).unwrap();
-        let disk = new_disk(
-            &endpoint,
-            &DiskOption {
-                cleanup: false,
-                health_check: false,
-            },
-        )
-        .await
-        .unwrap();
-        let _ = disk.make_volume(RUSTFS_META_BUCKET).await;
-        let _ = disk.make_volume(&format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}")).await;
-
-        // Legacy checkpoint: no schema_version, stale position and dedup sets.
-        let legacy = r#"{
-            "task_id": "old-task",
-            "checkpoint_time": 1700000000,
-            "current_bucket_index": 2,
-            "current_object_index": 500,
-            "processed_objects": ["a", "b"],
-            "failed_objects": ["c"],
-            "skipped_objects": ["d"]
-        }"#;
-        let file_path = format!("{BUCKET_META_PREFIX}/old-task_{RESUME_CHECKPOINT_FILE}");
-        disk.write_all(RUSTFS_META_BUCKET, &file_path, legacy.as_bytes().to_vec().into())
-            .await
-            .unwrap();
-
-        let manager = CheckpointManager::load_from_disk(disk.clone(), "old-task").await.unwrap();
-        let checkpoint = manager.get_checkpoint().await;
-        assert_eq!(checkpoint.schema_version, CURRENT_CHECKPOINT_SCHEMA, "schema must be stamped current");
-        assert_eq!(checkpoint.current_object_index, 0, "stale position must be reset");
-        assert!(checkpoint.processed_objects.is_empty());
-        assert!(checkpoint.failed_objects.is_empty());
-        assert!(checkpoint.skipped_objects.is_empty());
-        temp_dir.close().unwrap();
-    }
-
-    #[test]
-    fn test_persist_throttle_batches_until_threshold() {
-        let mut throttle = PersistThrottle::new();
-        for _ in 0..PERSIST_EVERY_MUTATIONS - 1 {
-            assert!(!throttle.record(), "must not flush below the mutation threshold");
-        }
-        assert!(throttle.record(), "must flush at the mutation threshold");
-        throttle.mark_saved();
-        assert!(!throttle.record(), "counter must reset after a save");
-    }
-
-    #[tokio::test]
-    async fn completion_persists_immediately_and_cleanup_propagates_delete_errors() {
-        use super::super::{DiskOption, Endpoint, new_disk};
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().expect("create resume persistence test directory");
-        let endpoint = Endpoint::try_from(temp_dir.path().to_string_lossy().as_ref()).expect("create test disk endpoint");
-        let disk = new_disk(
-            &endpoint,
-            &DiskOption {
-                cleanup: false,
-                health_check: false,
-            },
-        )
-        .await
-        .expect("create resume persistence test disk");
-        match disk.make_volume(RUSTFS_META_BUCKET).await {
-            Ok(()) | Err(DiskError::VolumeExists) => {}
-            Err(err) => panic!("create metadata volume for resume persistence test: {err}"),
-        }
-
-        let task_id = "completion-persistence".to_string();
-        let manager = ResumeManager::new(
-            disk.clone(),
-            task_id.clone(),
-            "erasure_set".to_string(),
-            "pool_0_set_0".to_string(),
-            vec!["bucket".to_string()],
-        )
-        .await
-        .expect("create resume manager");
-        manager
-            .update_progress(1, 1, 0, 0)
-            .await
-            .expect("buffer progress below the persistence threshold");
-        manager.mark_completed().await.expect("persist completed resume state");
-
-        let persisted = ResumeManager::load_from_disk(disk.clone(), &task_id)
-            .await
-            .expect("reload completed resume state")
-            .get_state()
-            .await;
-        assert!(persisted.completed, "completion must be persisted without waiting for the throttle");
-        assert_eq!(persisted.processed_objects, 1, "the completion write must include buffered progress");
-
-        let state_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_STATE_FILE}");
-        let failure = ResumeDeleteFailure::install(state_path, DiskError::DiskAccessDenied);
-        let error = manager
-            .cleanup()
-            .await
-            .expect_err("resume cleanup must propagate a real delete failure");
-        assert!(matches!(error, Error::Disk(DiskError::DiskAccessDenied)));
-        drop(failure);
-        manager.cleanup().await.expect("resume cleanup must be retryable");
-        manager
-            .cleanup()
-            .await
-            .expect("missing resume files must be idempotent success");
-
-        let checkpoint = CheckpointManager::new(disk.clone(), task_id.clone())
-            .await
-            .expect("create checkpoint manager");
-        let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
-        let failure = ResumeDeleteFailure::install(checkpoint_path, DiskError::DiskAccessDenied);
-        let error = checkpoint
-            .cleanup()
-            .await
-            .expect_err("checkpoint cleanup must propagate a real delete failure");
-        assert!(matches!(error, Error::Disk(DiskError::DiskAccessDenied)));
-        drop(failure);
-        checkpoint.cleanup().await.expect("checkpoint cleanup must be retryable");
-        checkpoint
-            .cleanup()
-            .await
-            .expect("missing checkpoint must be idempotent success");
-    }
-
-    #[tokio::test]
-    async fn test_resume_utils() {
-        let task_id1 = ResumeUtils::generate_task_id();
-        let task_id2 = ResumeUtils::generate_task_id();
-
-        assert_ne!(task_id1, task_id2);
-        assert_eq!(task_id1.len(), 36); // UUID length
-        assert_eq!(task_id2.len(), 36);
-    }
-
-    #[tokio::test]
-    async fn test_get_resumable_tasks_integration() {
-        use super::super::{DiskOption, Endpoint, new_disk};
-        use tempfile::TempDir;
-
-        // Create a temporary directory for testing
-        let temp_dir = TempDir::new().unwrap();
-        let disk_path = temp_dir.path().join("test_disk");
-        std::fs::create_dir_all(&disk_path).unwrap();
-
-        // Create a local disk for testing
-        let endpoint = Endpoint::try_from(disk_path.to_string_lossy().as_ref()).unwrap();
-        let disk_option = DiskOption {
-            cleanup: false,
-            health_check: false,
-        };
-        let disk = new_disk(&endpoint, &disk_option).await.unwrap();
-
-        // Create necessary directories first (ignore if already exist)
-        let _ = disk.make_volume(RUSTFS_META_BUCKET).await;
-        let _ = disk.make_volume(&format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}")).await;
-
-        // Create some test resume state files
-        let task_ids = vec![
-            "test-task-1".to_string(),
-            "test-task-2".to_string(),
-            "test-task-3".to_string(),
-        ];
-
-        // Save resume state files for each task
-        for task_id in &task_ids {
-            let state = ResumeState::new(
-                task_id.clone(),
-                "erasure_set".to_string(),
-                "pool_0_set_0".to_string(),
-                vec!["bucket1".to_string(), "bucket2".to_string()],
-            );
-
-            let state_data = serde_json::to_vec(&state).unwrap();
-            let file_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_STATE_FILE}");
-
-            disk.write_all(RUSTFS_META_BUCKET, &file_path, state_data.into())
-                .await
-                .unwrap();
-        }
-
-        // Also create some non-resume state files to test filtering
-        let non_resume_files = vec![
-            "other_file.txt",
-            "task4_ahm_checkpoint.json",
-            "task5_ahm_progress.json",
-            "_ahm_resume_state.json", // Invalid: empty task ID
-        ];
-
-        for file_name in non_resume_files {
-            let file_path = format!("{BUCKET_META_PREFIX}/{file_name}");
-            disk.write_all(RUSTFS_META_BUCKET, &file_path, b"test data".to_vec().into())
-                .await
-                .unwrap();
-        }
-
-        // Now call get_resumable_tasks to see if it finds the correct files
-        let found_task_ids = ResumeUtils::get_resumable_tasks(&disk).await.unwrap();
-
-        // Verify that only the valid resume state files are found
-        assert_eq!(found_task_ids.len(), 3);
-        for task_id in &task_ids {
-            assert!(found_task_ids.contains(task_id), "Task ID {task_id} not found");
-        }
-
-        // Verify that invalid files are not included
-        assert!(!found_task_ids.contains(&"".to_string()));
-        assert!(!found_task_ids.contains(&"task4".to_string()));
-        assert!(!found_task_ids.contains(&"task5".to_string()));
-
-        // Clean up
-        temp_dir.close().unwrap();
-    }
-}
+mod tests;

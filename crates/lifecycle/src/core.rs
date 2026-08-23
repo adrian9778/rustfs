@@ -50,7 +50,11 @@ const ERR_LIFECYCLE_INVALID_ABORT_INCOMPLETE_MPU_DAYS: &str =
 const ERR_LIFECYCLE_INVALID_EXPIRATION_DATE_NOT_MIDNIGHT: &str = "Expiration.Date must be at midnight UTC";
 const ERR_LIFECYCLE_INVALID_EXPIRED_OBJECT_DELETE_MARKER: &str =
     "ExpiredObjectDeleteMarker cannot be specified with Days or Date";
+const ERR_LIFECYCLE_INVALID_EXPIRED_OBJECT_ALL_VERSIONS: &str =
+    "Days must be a positive integer and Date must not be specified inside Expiration with ExpiredObjectAllVersions";
+const ERR_LIFECYCLE_INVALID_DEL_MARKER_EXPIRATION_DAYS: &str = "Days must be a positive integer with DelMarkerExpiration";
 const ERR_LIFECYCLE_INVALID_RULE_ID_TOO_LONG: &str = "Rule ID must be at most 255 characters";
+const ERR_LIFECYCLE_INVALID_RULE_ID_EMPTY: &str = "Rule ID must not be empty";
 const ERR_LIFECYCLE_INVALID_RULE_STATUS: &str = "Rule status must be either Enabled or Disabled";
 const ERR_LIFECYCLE_DEL_MARKER_WITH_TAGS: &str = "Rule with DelMarkerExpiration cannot have tags based filtering";
 const ERR_LIFECYCLE_EXPIRED_OBJECT_DELETE_MARKER_WITH_TAGS: &str =
@@ -154,6 +158,13 @@ impl RuleValidate for LifecycleRule {
             && (expiration.days.is_some() || expiration.date.is_some())
         {
             return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_EXPIRED_OBJECT_DELETE_MARKER));
+        }
+        if self
+            .del_marker_expiration
+            .as_ref()
+            .is_some_and(|expiration| expiration.days.is_none_or(|days| days < 1))
+        {
+            return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_DEL_MARKER_EXPIRATION_DAYS));
         }
         // Rule must have at least one action
         let has_expiration = self.expiration.is_some();
@@ -291,6 +302,14 @@ impl Lifecycle for BucketLifecycleConfiguration {
             {
                 return true;
             }
+            if rule
+                .del_marker_expiration
+                .as_ref()
+                .and_then(|expiration| expiration.days)
+                .is_some_and(|days| days > 0)
+            {
+                return true;
+            }
             if let Some(rule_expiration) = &rule.expiration {
                 if let Some(date1) = rule_expiration.date.clone()
                     && OffsetDateTime::from(date1).unix_timestamp() < OffsetDateTime::now_utc().unix_timestamp()
@@ -337,6 +356,11 @@ impl Lifecycle for BucketLifecycleConfiguration {
             }
 
             if let Some(expiration) = &r.expiration {
+                if expiration.expired_object_all_versions.is_some()
+                    && (expiration.days.is_none_or(|days| days < 1) || expiration.date.is_some())
+                {
+                    return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_EXPIRED_OBJECT_ALL_VERSIONS));
+                }
                 if let Some(expiration_date) = &expiration.date {
                     let date = OffsetDateTime::from(expiration_date.clone());
                     if date.hour() != 0 || date.minute() != 0 || date.second() != 0 || date.nanosecond() != 0 {
@@ -379,10 +403,13 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     NoncurrentVersionTransitionOps::validate(transition)?;
                 }
             }
-            if let Some(id) = &r.id
-                && id.len() > 255
-            {
-                return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_RULE_ID_TOO_LONG));
+            if let Some(id) = &r.id {
+                if id.is_empty() {
+                    return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_RULE_ID_EMPTY));
+                }
+                if id.len() > 255 {
+                    return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_RULE_ID_TOO_LONG));
+                }
             }
             r.validate()?;
             if let Some(object_lock_enabled) = lr.object_lock_enabled.as_ref()
@@ -563,25 +590,25 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             });
                         }
                     }
-                    // DelMarkerExpiration: expire delete marker after N days from mod_time
-                    if obj.delete_marker
-                        && let Some(ref dme) = rule.del_marker_expiration
-                        && let Some(days) = dme.days
-                        && days > 0
-                    {
-                        let due = expected_expiry_time(mod_time, days);
-                        if now.unix_timestamp() >= due.unix_timestamp() {
-                            events.push(Event {
-                                action: IlmAction::DelMarkerDeleteAllVersionsAction,
-                                rule_id: rule.id.clone().unwrap_or_default(),
-                                due: Some(due),
-                                noncurrent_days: 0,
-                                newer_noncurrent_versions: 0,
-                                storage_class: "".into(),
-                            });
-                        }
-                        continue;
+                }
+
+                if obj.is_latest
+                    && obj.delete_marker
+                    && let Some(days) = rule.del_marker_expiration.as_ref().and_then(|expiration| expiration.days)
+                    && days > 0
+                {
+                    let due = expected_expiry_time(mod_time, days);
+                    if now.unix_timestamp() >= due.unix_timestamp() {
+                        events.push(Event {
+                            action: IlmAction::DelMarkerDeleteAllVersionsAction,
+                            rule_id: rule.id.clone().unwrap_or_default(),
+                            due: Some(due),
+                            noncurrent_days: 0,
+                            newer_noncurrent_versions: 0,
+                            storage_class: "".into(),
+                        });
                     }
+                    continue;
                 }
 
                 if !obj.is_latest
@@ -1105,6 +1132,25 @@ mod tests {
         });
     }
 
+    fn enabled_rule(
+        expiration: Option<LifecycleExpiration>,
+        del_marker_expiration: Option<s3s::dto::DelMarkerExpiration>,
+        id: Option<&str>,
+    ) -> LifecycleRule {
+        LifecycleRule {
+            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            expiration,
+            abort_incomplete_multipart_upload: None,
+            del_marker_expiration,
+            filter: None,
+            id: id.map(str::to_string),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            prefix: None,
+            transitions: None,
+        }
+    }
+
     #[test]
     fn eval_inner_reports_invalid_mod_time_without_expiring_object() {
         let lifecycle = BucketLifecycleConfiguration {
@@ -1199,7 +1245,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_zero_expiration_days() {
         // S3 compatibility: Expiration.Days must be a positive integer (>= 1). AWS and
         // the ceph s3-tests `test_lifecycle_expiration_days0` case reject Days == 0 with
@@ -1233,7 +1278,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_negative_expiration_days() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1263,7 +1307,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_accepts_positive_expiration_days() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1290,7 +1333,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_accepts_one_day_boundary_values() {
         // Pin the exact >= 1 boundary: a value of 1 is the smallest legal positive
         // integer and must be accepted for every day-count field tightened for S3
@@ -1325,7 +1367,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn has_active_rules_accepts_zero_day_expiration() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1349,8 +1390,19 @@ mod tests {
         assert!(lc.has_active_rules("test/"));
     }
 
+    #[test]
+    fn has_active_rules_requires_valid_del_marker_expiration_days() {
+        let lifecycle = |days| BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![enabled_rule(None, Some(s3s::dto::DelMarkerExpiration { days }), None)],
+        };
+
+        assert!(lifecycle(Some(1)).has_active_rules(""));
+        assert!(!lifecycle(Some(0)).has_active_rules(""));
+        assert!(!lifecycle(None).has_active_rules(""));
+    }
+
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_zero_noncurrent_expiration_days() {
         // S3 compatibility: NoncurrentVersionExpiration.NoncurrentDays must be a positive
         // integer (>= 1); AWS rejects 0 with InvalidArgument.
@@ -1382,7 +1434,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_negative_noncurrent_expiration_days() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1412,7 +1463,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_accepts_abort_incomplete_multipart_upload_only_rule() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1438,7 +1488,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_zero_abort_incomplete_multipart_upload_days() {
         // S3 compatibility: AbortIncompleteMultipartUpload.DaysAfterInitiation must be a
         // positive integer (>= 1); AWS rejects 0 with InvalidArgument.
@@ -1469,7 +1518,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_missing_abort_incomplete_multipart_upload_days() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1495,7 +1543,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_negative_abort_incomplete_multipart_upload_days() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1521,7 +1568,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn abort_incomplete_multipart_upload_due_accepts_zero_days() {
         let initiated = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -1556,7 +1602,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_non_midnight_expiration_date() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1583,7 +1628,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn predict_expiration_selects_closest_expiry_for_put_object() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -1638,7 +1682,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_accepts_multiple_rules_without_ids() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1682,7 +1725,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_rule_id_too_long() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1709,7 +1751,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_duplicate_rule_ids() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1752,7 +1793,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_transition_without_storage_class() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1780,7 +1820,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_transition_without_date_or_days() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1808,7 +1847,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_noncurrent_transition_without_days() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1836,7 +1874,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn empty_transition_vectors_are_not_active_or_due() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1902,7 +1939,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn eval_inner_keeps_latest_object_before_days_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -1936,7 +1972,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn eval_inner_transitions_latest_object_after_days_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -1974,7 +2009,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn eval_inner_transitions_latest_object_after_date_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let transition_date = base_time - Duration::days(1);
@@ -2014,7 +2048,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn eval_inner_selects_earliest_due_among_multiple_past_due_events() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         // Two enabled rules both yield a past-due DeleteAction and a third yields a
@@ -2128,7 +2161,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn eval_inner_expires_noncurrent_version_after_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -2166,7 +2198,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn eval_inner_skips_noncurrent_expiration_without_successor() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).expect("valid fixed test timestamp");
         let lc = BucketLifecycleConfiguration {
@@ -2202,7 +2233,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn eval_inner_missing_successor_does_not_skip_noncurrent_transition() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).expect("valid fixed test timestamp");
         let lc = BucketLifecycleConfiguration {
@@ -2245,7 +2275,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn eval_inner_noncurrent_expiration_one_day_respects_due_boundary() {
         let successor_time = datetime!(2025-06-15 12:00:00 UTC);
         let due = expected_expiry_time(successor_time, 1);
@@ -2287,7 +2316,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn eval_inner_expires_noncurrent_version_immediately_when_zero_days() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -2325,7 +2353,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn eval_inner_transitions_noncurrent_version_after_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -2365,7 +2392,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn noncurrent_versions_expiration_limit_returns_configured_limits() {
         let lc = Arc::new(BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -2402,7 +2428,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn evaluator_honors_newer_noncurrent_versions_retention_count() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = Arc::new(BucketLifecycleConfiguration {
@@ -2456,7 +2481,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_invalid_status_case_sensitive() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -2483,7 +2507,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn filter_rules_respects_filter_prefix() {
         let filter = LifecycleRuleFilter {
             prefix: Some("prefix".to_string()),
@@ -2528,7 +2551,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn filter_rules_respects_filter_and_prefix() {
         let and = s3s::dto::LifecycleRuleAndOperator {
             prefix: Some("prefix".to_string()),
@@ -2578,7 +2600,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn filter_rules_respects_filter_tag() {
         let filter = LifecycleRuleFilter {
             tag: Some(s3s::dto::Tag {
@@ -2632,7 +2653,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn filter_rules_respects_filter_and_tags() {
         let filter = LifecycleRuleFilter {
             and: Some(s3s::dto::LifecycleRuleAndOperator {
@@ -2696,7 +2716,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn expired_object_delete_marker_ignores_marker_with_noncurrent_versions_present() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -2773,7 +2792,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn expired_object_delete_marker_deletes_only_delete_marker_immediately() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -2851,7 +2869,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn expiration_days_deletes_only_expired_delete_marker_when_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -2902,7 +2919,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn expiration_days_uses_earliest_due_rule_for_expired_delete_marker() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let make_rule = |id: &str, days| LifecycleRule {
@@ -3086,7 +3102,6 @@ mod tests {
     // --- TASK-002 tests: Object Lock + ExpiredObjectDeleteMarker compatibility ---
 
     #[tokio::test]
-    #[serial]
     async fn validate_allows_expired_object_delete_marker_on_locked_bucket() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3118,7 +3133,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_allows_expired_object_delete_marker_on_unlocked_bucket() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3146,7 +3160,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_allows_non_delete_marker_expiration_on_locked_bucket() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3179,7 +3192,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_del_marker_expiration_on_locked_bucket() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3210,40 +3222,72 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
-    async fn validate_rejects_zero_day_del_marker_expiration_on_locked_bucket() {
+    async fn validate_rejects_invalid_del_marker_expiration_days_even_with_another_action() {
+        for days in [None, Some(0), Some(-1)] {
+            let lc = BucketLifecycleConfiguration {
+                expiry_updated_at: None,
+                rules: vec![LifecycleRule {
+                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                    expiration: Some(LifecycleExpiration {
+                        days: Some(30),
+                        ..Default::default()
+                    }),
+                    abort_incomplete_multipart_upload: None,
+                    del_marker_expiration: Some(s3s::dto::DelMarkerExpiration { days }),
+                    filter: None,
+                    id: Some("test-rule".to_string()),
+                    noncurrent_version_expiration: None,
+                    noncurrent_version_transitions: None,
+                    prefix: None,
+                    transitions: None,
+                }],
+            };
+
+            let err = lc.validate(&ObjectLockConfiguration::default()).await.unwrap_err();
+            assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_DEL_MARKER_EXPIRATION_DAYS);
+        }
+    }
+
+    #[tokio::test]
+    async fn del_marker_expiration_deletes_marker_and_older_versions_when_due() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).expect("fixed timestamp should be valid");
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
-                    days: Some(30),
-                    ..Default::default()
-                }),
-                abort_incomplete_multipart_upload: None,
-                del_marker_expiration: Some(s3s::dto::DelMarkerExpiration { days: Some(0) }),
-                filter: None,
-                id: Some("test-rule".to_string()),
-                noncurrent_version_expiration: None,
-                noncurrent_version_transitions: None,
-                prefix: None,
-                transitions: None,
-            }],
+            rules: vec![enabled_rule(
+                None,
+                Some(s3s::dto::DelMarkerExpiration { days: Some(3) }),
+                Some("delete-marker-history"),
+            )],
         };
-
-        let locked_config = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+        let marker_with_history = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time),
+            is_latest: true,
+            delete_marker: true,
+            num_versions: 3,
+            version_id: Some(Uuid::new_v4()),
             ..Default::default()
         };
+        let due = expected_expiry_time(base_time, 3);
 
-        let err = lc.validate(&locked_config).await.unwrap_err();
-        assert_eq!(err.to_string(), ERR_LIFECYCLE_BUCKET_LOCKED);
+        let before_due = lc.eval_inner(&marker_with_history, due - Duration::seconds(1), 0).await;
+        assert_eq!(before_due.action, IlmAction::NoneAction);
+
+        let at_due = lc.eval_inner(&marker_with_history, due, 0).await;
+        assert_eq!(at_due.action, IlmAction::DelMarkerDeleteAllVersionsAction);
+        assert_eq!(at_due.rule_id, "delete-marker-history");
+        assert_eq!(at_due.due, Some(due));
+
+        let current_data = ObjectOpts {
+            delete_marker: false,
+            ..marker_with_history
+        };
+        assert_eq!(lc.eval_inner(&current_data, due, 0).await.action, IlmAction::NoneAction);
     }
 
     // --- TASK-003 tests: Round up to next UTC processing boundary ---
 
     #[test]
-    #[serial]
     fn expected_expiry_time_rounds_up_to_next_midnight_utc() {
         with_default_ilm_process_time(|| {
             // Object created at 2025-01-15T10:30:45Z, expire in 30 days
@@ -3259,7 +3303,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn expected_expiry_time_immediate_expiry_returns_epoch() {
         with_default_ilm_process_time(|| {
             let mod_time = datetime!(2025-06-01 12:00:00 UTC);
@@ -3269,7 +3312,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn expected_expiry_time_preserves_exact_midnight_boundary() {
         with_default_ilm_process_time(|| {
             let mod_time = datetime!(2025-03-01 00:00:00 UTC);
@@ -3279,7 +3321,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn expected_expiry_time_rounds_end_of_day_to_following_midnight() {
         with_default_ilm_process_time(|| {
             let mod_time = datetime!(2025-06-15 23:59:59 UTC);
@@ -3289,7 +3330,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn expected_expiry_time_uses_canonical_process_time_boundary() {
         let mod_time = datetime!(2025-01-15 10:30:45 UTC);
 
@@ -3302,7 +3342,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn expected_expiry_time_uses_deprecated_process_time_alias() {
         let mod_time = datetime!(2025-01-15 10:30:45 UTC);
 
@@ -3315,7 +3354,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn expected_expiry_time_uses_default_boundary_when_process_time_is_zero_or_invalid() {
         let mod_time = datetime!(2025-01-15 10:30:45 UTC);
 
@@ -3338,7 +3376,6 @@ mod tests {
 
     // (a) Default path (env unset) is byte-identical: one day == 86400s.
     #[test]
-    #[serial]
     fn ilm_day_secs_defaults_to_86400_when_unset() {
         temp_env::with_var_unset(ENV_ILM_DEBUG_DAY_SECS, || {
             assert_eq!(ilm_day_secs(), DEFAULT_ILM_DAY_SECS);
@@ -3367,7 +3404,6 @@ mod tests {
 
     // (b) End-to-end env read scales the day length.
     #[test]
-    #[serial]
     fn ilm_day_secs_scales_when_env_set() {
         temp_env::with_var(ENV_ILM_DEBUG_DAY_SECS, Some("2"), || {
             assert_eq!(ilm_day_secs(), 2);
@@ -3376,7 +3412,6 @@ mod tests {
 
     // (c) Invalid env value falls back to 86400.
     #[test]
-    #[serial]
     fn ilm_day_secs_falls_back_on_invalid_env() {
         temp_env::with_var(ENV_ILM_DEBUG_DAY_SECS, Some("bogus"), || {
             assert_eq!(ilm_day_secs(), DEFAULT_ILM_DAY_SECS);
@@ -3389,7 +3424,6 @@ mod tests {
     // Deadline math scales: with a 1s day and PROCESS_TIME unset, a Days=1 rule is
     // due 1s after mod_time (rounded up to the next 1s boundary => same instant).
     #[test]
-    #[serial]
     fn expected_expiry_time_scales_with_debug_day_secs() {
         let mod_time = datetime!(2025-01-15 10:30:45 UTC);
         temp_env::with_var(ENV_ILM_DEBUG_DAY_SECS, Some("1"), || {
@@ -3405,7 +3439,6 @@ mod tests {
 
     // days == 0 still yields the immediate-expiry sentinel regardless of the switch.
     #[test]
-    #[serial]
     fn expected_expiry_time_zero_days_ignores_debug_day_secs() {
         let mod_time = datetime!(2025-06-01 12:00:00 UTC);
         temp_env::with_var(ENV_ILM_DEBUG_DAY_SECS, Some("2"), || {
@@ -3416,7 +3449,6 @@ mod tests {
     // (③) Interaction with an explicit RUSTFS_ILM_PROCESS_TIME: the deadline offset
     // uses the accelerated day length, but the rounding boundary honors PROCESS_TIME.
     #[test]
-    #[serial]
     fn expected_expiry_time_debug_day_secs_respects_explicit_process_time() {
         let mod_time = datetime!(2025-01-15 10:30:00 UTC);
         // day == 10s, but round up to the next 60s (PROCESS_TIME) boundary.
@@ -3433,7 +3465,6 @@ mod tests {
 
     // (③) With the switch unset, an explicit PROCESS_TIME behaves exactly as before.
     #[test]
-    #[serial]
     fn expected_expiry_time_unset_debug_day_secs_matches_legacy_process_time() {
         let mod_time = datetime!(2025-01-15 10:30:45 UTC);
         temp_env::with_var_unset(ENV_ILM_DEBUG_DAY_SECS, || {
@@ -3461,7 +3492,6 @@ mod tests {
 
     // The abort-incomplete-multipart deadline path also scales through the switch.
     #[test]
-    #[serial]
     fn abort_incomplete_multipart_due_scales_with_debug_day_secs() {
         use s3s::dto::AbortIncompleteMultipartUpload;
         let initiated = datetime!(2025-01-15 10:30:45 UTC);
@@ -3506,7 +3536,6 @@ mod tests {
     // (⑤ evaluator seam) A Days=1 rule fires under RUSTFS_ILM_DEBUG_DAY_SECS=1 once
     // `now` advances a few seconds past a mod_time only ~seconds in the past.
     #[test]
-    #[serial]
     fn eval_inner_expires_days_one_rule_under_debug_day_secs() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3555,7 +3584,6 @@ mod tests {
 
     // Absolute Date-based rules must NOT scale with the switch (regression guard).
     #[test]
-    #[serial]
     fn eval_inner_date_rule_ignores_debug_day_secs() {
         let expiry_date = datetime!(2025-06-01 00:00:00 UTC);
         let lc = BucketLifecycleConfiguration {
@@ -3594,7 +3622,6 @@ mod tests {
     // --- TASK-007 tests: Legacy Prefix/Filter conflict ---
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_prefix_and_filter_both_present() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3623,7 +3650,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_allows_prefix_without_filter() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3650,7 +3676,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_allows_filter_without_prefix() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3680,7 +3705,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_allows_empty_prefix_with_filter() {
         // Empty prefix should be treated as "not set"
         let lc = BucketLifecycleConfiguration {
@@ -3710,10 +3734,34 @@ mod tests {
             .expect("empty prefix with filter should be valid");
     }
 
+    #[tokio::test]
+    async fn validate_rejects_empty_rule_id() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some(String::new()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let error = lc.validate(&ObjectLockConfiguration::default()).await.unwrap_err();
+        assert_eq!(error.to_string(), ERR_LIFECYCLE_INVALID_RULE_ID_EMPTY);
+    }
+
     // --- TASK-004 tests: ExpiredObjectAllVersions ---
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_expired_object_all_versions_on_locked_bucket() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3745,7 +3793,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_allows_expired_object_all_versions_on_unlocked_bucket() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3773,7 +3820,52 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    async fn validate_rejects_expired_object_all_versions_without_days_or_with_date() {
+        let expiration_date = datetime!(2025-01-01 00:00:00 UTC);
+        let invalid_expirations = [
+            LifecycleExpiration {
+                expired_object_all_versions: Some(true),
+                ..Default::default()
+            },
+            LifecycleExpiration {
+                date: Some(expiration_date.into()),
+                days: Some(1),
+                expired_object_all_versions: Some(true),
+                ..Default::default()
+            },
+        ];
+
+        for expiration in invalid_expirations {
+            let lc = BucketLifecycleConfiguration {
+                expiry_updated_at: None,
+                rules: vec![enabled_rule(Some(expiration), None, None)],
+            };
+
+            let err = lc.validate(&ObjectLockConfiguration::default()).await.unwrap_err();
+            assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_EXPIRED_OBJECT_ALL_VERSIONS);
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_false_expired_object_all_versions_with_date() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![enabled_rule(
+                Some(LifecycleExpiration {
+                    date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+                    expired_object_all_versions: Some(false),
+                    ..Default::default()
+                }),
+                None,
+                None,
+            )],
+        };
+
+        let err = lc.validate(&ObjectLockConfiguration::default()).await.unwrap_err();
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_EXPIRED_OBJECT_ALL_VERSIONS);
+    }
+
+    #[tokio::test]
     async fn eval_inner_triggers_delete_all_versions_when_expired_object_all_versions_set() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -3812,7 +3904,35 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    async fn expired_object_all_versions_does_not_apply_to_current_delete_marker() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).expect("fixed timestamp should be valid");
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![enabled_rule(
+                Some(LifecycleExpiration {
+                    days: Some(1),
+                    expired_object_all_versions: Some(true),
+                    ..Default::default()
+                }),
+                None,
+                Some("all-versions-rule"),
+            )],
+        };
+        let marker_with_history = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time),
+            is_latest: true,
+            delete_marker: true,
+            num_versions: 2,
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        let event = lc.eval_inner(&marker_with_history, base_time + Duration::days(2), 0).await;
+        assert_eq!(event.action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
     async fn eval_inner_uses_delete_action_when_all_versions_not_set() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -3931,7 +4051,6 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
         use s3s::dto::{NoncurrentVersionExpiration, Tag};
-        use serial_test::serial;
 
         const DAY_SECS: i64 = 86400;
 
@@ -4162,7 +4281,6 @@ mod tests {
             /// combination, and must be deterministic: the same input
             /// evaluated twice yields an identical event.
             #[test]
-            #[serial]
             fn eval_inner_never_panics_and_is_deterministic(
                 rules in prop::collection::vec(arb_rule(), 0..4),
                 obj in arb_object_opts(),
@@ -4302,7 +4420,6 @@ mod tests {
             /// candidate set — earliest due wins, ties prefer delete-class —
             /// and must be `NoneAction` exactly when that set is empty.
             #[test]
-            #[serial]
             fn eval_inner_winner_matches_selection_oracle(
                 rules in prop::collection::vec(arb_selection_rule(), 0..5),
                 mod_off in 0i64..(2 * DAY_SECS),
@@ -4356,7 +4473,6 @@ mod tests {
             /// non-decreasing in `days` (days == 0 maps to UNIX_EPOCH, below
             /// any post-1970 deadline).
             #[test]
-            #[serial]
             fn expected_expiry_time_is_monotonic_in_days(
                 mod_off in 0i64..(3650 * DAY_SECS),
                 d1 in 0i32..2000,
@@ -4378,7 +4494,6 @@ mod tests {
             /// to the next whole-day boundary: the result is day-aligned, not
             /// before `mod_time + days`, and less than one boundary beyond it.
             #[test]
-            #[serial]
             fn expected_expiry_time_lands_on_default_day_boundary(
                 mod_off in 0i64..(3650 * DAY_SECS),
                 days in 1i32..2000,
@@ -4396,7 +4511,6 @@ mod tests {
             /// to that boundary instead: aligned to it, never early, and less
             /// than one boundary late.
             #[test]
-            #[serial]
             fn expected_expiry_time_lands_on_explicit_process_boundary(
                 mod_off in 0i64..(365 * DAY_SECS),
                 days in 1i32..400,

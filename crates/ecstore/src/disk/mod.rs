@@ -13,7 +13,6 @@
 // limitations under the License.
 
 // #730: disk abstractions still carry staged health and direct-I/O migration paths.
-#![allow(dead_code)]
 
 pub mod disk_store;
 pub mod endpoint;
@@ -45,6 +44,8 @@ pub const PART_TRANSACTION_ROLLBACK: &str = "rollback";
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_DISK: &str = "disk";
 const EVENT_DISK_PART_ERR_UNCLASSIFIED: &str = "disk_part_err_unclassified";
+const ENV_BATCH_READ_VERSION_SERVER_PARALLELISM: &str = "RUSTFS_BATCH_READ_VERSION_SERVER_PARALLELISM";
+const BATCH_READ_VERSION_SERVER_PARALLELISM: usize = 4;
 
 pub fn part_transaction_path(part_path: &str) -> String {
     match part_path.rsplit_once('/') {
@@ -55,6 +56,7 @@ pub fn part_transaction_path(part_path: &str) -> String {
 
 use crate::cluster::rpc::RemoteDisk;
 use crate::cluster::rpc::build_internode_data_transport_from_env;
+use crate::disk::disk_store::DiskStoreRenameDataExt;
 use crate::disk::disk_store::LocalDiskWrapper;
 use crate::disk::health_state::RuntimeDriveHealthState;
 use crate::disk::local::ScanGuard;
@@ -62,14 +64,38 @@ use bytes::Bytes;
 use endpoint::Endpoint;
 use error::DiskError;
 use error::{Error, Result};
+use futures::stream::{self, StreamExt};
 use local::LocalDisk;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_madmin::info_commands::DiskMetrics;
+use rustfs_rio::ChunkReaderBox;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
+
+const QUOTA_MUTATION_FENCE_PREFIX: &str = "tmp/quota-mutation-fences/";
+pub(crate) const QUOTA_MUTATION_FENCE_METADATA_SUFFIX: &str = "quota-mutation-fence-token";
+
+pub(crate) fn quota_mutation_fence_path(bucket: &str, object: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut input = Vec::with_capacity(bucket.len() + object.len() + 1);
+    input.extend_from_slice(bucket.as_bytes());
+    input.push(0);
+    input.extend_from_slice(object.as_bytes());
+    let digest = Sha256::digest(input);
+    format!(
+        "{QUOTA_MUTATION_FENCE_PREFIX}{}",
+        hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower)
+    )
+}
+
+pub(crate) fn is_quota_mutation_fence_path(path: &str) -> bool {
+    path.strip_prefix(QUOTA_MUTATION_FENCE_PREFIX)
+        .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
 
 pub type DiskStore = Arc<Disk>;
 
@@ -95,6 +121,20 @@ impl SnapshotLeaseToken {
     pub fn as_bytes(&self) -> &[u8; 16] {
         self.0.as_bytes()
     }
+
+    pub(crate) fn as_uuid(self) -> Uuid {
+        self.0
+    }
+
+    #[doc(hidden)]
+    pub fn revoke_all() -> Self {
+        Self(Uuid::nil())
+    }
+
+    #[doc(hidden)]
+    pub fn is_revoke_all(self) -> bool {
+        self.0.is_nil()
+    }
 }
 
 impl Default for SnapshotLeaseToken {
@@ -113,6 +153,15 @@ pub enum DataDirDeleteStatus {
 pub enum PartTransactionAction {
     Commit,
     Rollback,
+}
+
+/// Result of an owner-aware file mutation. The disk applies the mutation only
+/// while the current contents match the supplied expected value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConditionalFileUpdate {
+    Updated,
+    Missing,
+    Mismatch,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -372,6 +421,14 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
+    async fn batch_read_version(&self, req: BatchReadVersionReq) -> Result<Vec<BatchReadVersionResp>> {
+        match self {
+            Disk::Local(local_disk) => local_disk.batch_read_version(req).await,
+            Disk::Remote(remote_disk) => remote_disk.batch_read_version(req).await,
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
         match self {
             Disk::Local(local_disk) => local_disk.read_xl(volume, path, read_data).await,
@@ -388,10 +445,8 @@ impl DiskAPI for Disk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        match self {
-            Disk::Local(local_disk) => local_disk.rename_data(src_volume, src_path, fi, dst_volume, dst_path).await,
-            Disk::Remote(remote_disk) => remote_disk.rename_data(src_volume, src_path, fi, dst_volume, dst_path).await,
-        }
+        self.rename_data_borrowed(src_volume, src_path, &fi, dst_volume, dst_path)
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -415,6 +470,19 @@ impl DiskAPI for Disk {
         match self {
             Disk::Local(local_disk) => local_disk.read_file_stream(volume, path, offset, length).await,
             Disk::Remote(remote_disk) => remote_disk.read_file_stream(volume, path, offset, length).await,
+        }
+    }
+
+    async fn read_file_stream_chunks(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<Option<ChunkReaderBox>> {
+        match self {
+            Disk::Local(_) => Ok(None),
+            Disk::Remote(remote_disk) => remote_disk.read_file_stream_chunks(volume, path, offset, length).await,
         }
     }
 
@@ -557,6 +625,26 @@ impl DiskAPI for Disk {
         }
     }
 
+    async fn compare_and_update_file(
+        &self,
+        volume: &str,
+        path: &str,
+        expected: Option<Bytes>,
+        replacement: Option<Bytes>,
+    ) -> Result<ConditionalFileUpdate> {
+        match self {
+            Disk::Local(local_disk) => local_disk.compare_and_update_file(volume, path, expected, replacement).await,
+            Disk::Remote(remote_disk) => remote_disk.compare_and_update_file(volume, path, expected, replacement).await,
+        }
+    }
+
+    fn has_replacement_mount_lease(&self) -> bool {
+        match self {
+            Disk::Local(local_disk) => local_disk.has_replacement_mount_lease(),
+            Disk::Remote(remote_disk) => remote_disk.has_replacement_mount_lease(),
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         match self {
@@ -584,6 +672,30 @@ impl DiskAPI for Disk {
         match self {
             Disk::Local(local_disk) => local_disk.read_metadata(volume, path).await,
             Disk::Remote(remote_disk) => remote_disk.read_metadata(volume, path).await,
+        }
+    }
+}
+
+impl Disk {
+    pub(crate) async fn rename_data_borrowed(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp> {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk
+                    .rename_data_borrowed(src_volume, src_path, fi, dst_volume, dst_path)
+                    .await
+            }
+            Disk::Remote(remote_disk) => {
+                remote_disk
+                    .rename_data_borrowed(src_volume, src_path, fi, dst_volume, dst_path)
+                    .await
+            }
         }
     }
 }
@@ -692,6 +804,34 @@ impl Disk {
     pub fn get_object_path_if_local(&self, volume: &str, path: &str) -> Option<crate::disk::error::Result<std::path::PathBuf>> {
         match self {
             Disk::Local(w) => Some(w.get_object_path_if_local(volume, path)),
+            Disk::Remote(_) => None,
+        }
+    }
+
+    pub(crate) fn get_object_path_for_io_if_local(
+        &self,
+        volume: &str,
+        path: &str,
+    ) -> Option<crate::disk::error::Result<std::path::PathBuf>> {
+        match self {
+            Disk::Local(w) => Some(w.get_object_path_for_io(volume, path)),
+            Disk::Remote(_) => None,
+        }
+    }
+
+    pub(crate) fn get_bucket_path_for_io_if_local(&self, volume: &str) -> Option<crate::disk::error::Result<std::path::PathBuf>> {
+        match self {
+            Disk::Local(w) => Some(w.get_bucket_path_for_io(volume)),
+            Disk::Remote(_) => None,
+        }
+    }
+
+    /// Return the descriptor-rooted mount path admitted for automatic
+    /// replacement, or `None` when the configured endpoint no longer names
+    /// that held mount instance.
+    pub fn replacement_mount_lease_root(&self) -> Option<PathBuf> {
+        match self {
+            Disk::Local(local_disk) => local_disk.replacement_mount_lease_root(),
             Disk::Remote(_) => None,
         }
     }
@@ -808,6 +948,18 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader>;
 
+    /// Returns an owned-chunk stream when the backing transport can preserve
+    /// receive-buffer ownership. `None` retains the ordinary reader path.
+    async fn read_file_stream_chunks(
+        &self,
+        _volume: &str,
+        _path: &str,
+        _offset: usize,
+        _length: usize,
+    ) -> Result<Option<ChunkReaderBox>> {
+        Ok(None)
+    }
+
     /// File read using mmap-then-copy on Unix or an efficient read on non-Unix.
     async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes>;
 
@@ -860,6 +1012,24 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // CleanAbandonedData
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
+    /// Atomically replace or remove a small control file only when its current
+    /// contents match `expected`. Implementations that cannot provide this
+    /// cross-process guarantee must fail closed instead of emulating it with a
+    /// read-then-write sequence.
+    async fn compare_and_update_file(
+        &self,
+        _volume: &str,
+        _path: &str,
+        _expected: Option<Bytes>,
+        _replacement: Option<Bytes>,
+    ) -> Result<ConditionalFileUpdate> {
+        Err(DiskError::MethodNotAllowed)
+    }
+    /// Whether local I/O is rooted at a held mount descriptor. Auto-replacement
+    /// refuses destructive work when this is false.
+    fn has_replacement_mount_lease(&self) -> bool {
+        false
+    }
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
     fn start_scan(&self) -> ScanGuard;
 }
@@ -869,34 +1039,45 @@ where
     D: DiskAPI + ?Sized,
 {
     validate_batch_read_version_item_count(req.items.len())?;
+    let parallelism = batch_read_version_server_parallelism();
 
-    let mut responses = Vec::with_capacity(req.items.len());
-    for (index, item) in req.items.iter().enumerate() {
-        let response = match disk
-            .read_version(&item.org_volume, &item.volume, &item.path, &item.version_id, &req.opts)
-            .await
-        {
-            Ok(file_info) => BatchReadVersionResp {
-                index,
-                path: item.path.clone(),
-                version_id: item.version_id.clone(),
-                success: true,
-                file_info,
-                error: String::new(),
-            },
-            Err(err) => BatchReadVersionResp {
-                index,
-                path: item.path.clone(),
-                version_id: item.version_id.clone(),
-                success: false,
-                file_info: FileInfo::default(),
-                error: err.to_string(),
-            },
-        };
-        responses.push(response);
-    }
+    let mut responses = stream::iter(req.items.into_iter().enumerate())
+        .map(|(index, item)| async move {
+            match disk
+                .read_version(&item.org_volume, &item.volume, &item.path, &item.version_id, &req.opts)
+                .await
+            {
+                Ok(file_info) => BatchReadVersionResp {
+                    index,
+                    path: item.path,
+                    version_id: item.version_id,
+                    success: true,
+                    file_info,
+                    error: String::new(),
+                    error_code: 0,
+                },
+                Err(err) => BatchReadVersionResp {
+                    index,
+                    path: item.path,
+                    version_id: item.version_id,
+                    success: false,
+                    file_info: FileInfo::default(),
+                    error: err.to_string(),
+                    error_code: err.to_u32(),
+                },
+            }
+        })
+        .buffer_unordered(parallelism)
+        .collect::<Vec<_>>()
+        .await;
+    responses.sort_unstable_by_key(|response| response.index);
 
     Ok(responses)
+}
+
+fn batch_read_version_server_parallelism() -> usize {
+    rustfs_utils::get_env_usize(ENV_BATCH_READ_VERSION_SERVER_PARALLELISM, BATCH_READ_VERSION_SERVER_PARALLELISM)
+        .clamp(1, BATCH_READ_VERSION_MAX_ITEMS)
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -954,6 +1135,10 @@ pub struct DiskInfo {
 }
 
 #[derive(Clone, Debug, Default)]
+#[allow(
+    dead_code,
+    reason = "MinIO-parity disk info shape with no constructor in this port (backlog#1823)"
+)]
 pub struct Info {
     pub total: u64,
     pub free: u64,
@@ -1159,6 +1344,8 @@ pub struct BatchReadVersionResp {
     pub success: bool,
     pub file_info: FileInfo,
     pub error: String,
+    #[serde(default)]
+    pub error_code: u32,
 }
 
 pub fn validate_batch_read_version_item_count(item_count: usize) -> Result<()> {
@@ -1176,7 +1363,7 @@ pub struct VolumeInfo {
     pub created: Option<OffsetDateTime>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Default, Clone)]
+#[derive(Deserialize, Serialize, Debug, Default, Clone, Copy)]
 pub struct ReadOptions {
     pub incl_free_versions: bool,
     pub read_data: bool,
@@ -1212,6 +1399,7 @@ pub fn conv_part_err_to_int(err: &Option<Error>) -> usize {
     }
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub fn has_part_err(part_errs: &[usize]) -> bool {
     part_errs.iter().any(|err| *err != CHECK_PART_SUCCESS)
 }
@@ -1251,6 +1439,26 @@ mod tests {
             disk_idx: Some(2),
         };
         assert!(!partial_valid_location.valid());
+    }
+
+    #[test]
+    fn batch_read_version_server_parallelism_defaults_to_conservative_four() {
+        temp_env::with_var(ENV_BATCH_READ_VERSION_SERVER_PARALLELISM, None::<&str>, || {
+            assert_eq!(batch_read_version_server_parallelism(), 4);
+        });
+    }
+
+    #[test]
+    fn batch_read_version_server_parallelism_honors_env_with_bounds() {
+        temp_env::with_var(ENV_BATCH_READ_VERSION_SERVER_PARALLELISM, Some("8"), || {
+            assert_eq!(batch_read_version_server_parallelism(), 8);
+        });
+        temp_env::with_var(ENV_BATCH_READ_VERSION_SERVER_PARALLELISM, Some("0"), || {
+            assert_eq!(batch_read_version_server_parallelism(), 1);
+        });
+        temp_env::with_var(ENV_BATCH_READ_VERSION_SERVER_PARALLELISM, Some("9999"), || {
+            assert_eq!(batch_read_version_server_parallelism(), BATCH_READ_VERSION_MAX_ITEMS);
+        });
     }
 
     /// Test FileInfoVersions find_version_index
@@ -1612,6 +1820,7 @@ mod tests {
 
         let endpoint = Endpoint::try_from(test_dir).unwrap();
         let local_disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let expected_object_path = local_disk.root.join("test-bucket/test-object");
         let disk = Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(local_disk), false)));
 
         // Test basic methods
@@ -1626,6 +1835,19 @@ mod tests {
         // Test path method
         let path = disk.path();
         assert!(path.exists());
+        let object_path = disk
+            .get_object_path_if_local("test-bucket", "test-object")
+            .expect("local disk should expose an object path")
+            .expect("object path should resolve");
+        assert_eq!(object_path, expected_object_path);
+        assert!(!object_path.starts_with("/proc/self/fd/"));
+        #[cfg(target_os = "linux")]
+        assert!(
+            disk.get_object_path_for_io_if_local("test-bucket", "test-object")
+                .expect("local disk should expose an I/O object path")
+                .expect("I/O object path should resolve")
+                .starts_with("/proc/self/fd/")
+        );
 
         // Test disk location
         let location = disk.get_disk_location();

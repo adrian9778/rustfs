@@ -40,9 +40,6 @@ mod kms_edge_cases_test;
 mod kms_fault_recovery_test;
 
 #[cfg(test)]
-mod test_runner;
-
-#[cfg(test)]
 mod bucket_default_encryption_test;
 
 #[cfg(test)]
@@ -59,3 +56,6 @@ mod configured_roundtrip_test;
 
 #[cfg(test)]
 mod kms_authorization_negative_matrix_test;
+
+#[cfg(test)]
+mod kms_ilm_sse_kms_test;

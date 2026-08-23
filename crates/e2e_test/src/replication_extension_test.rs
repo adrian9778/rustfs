@@ -13,10 +13,14 @@
 // limitations under the License.
 
 use crate::common::{
-    RustFSTestEnvironment, awscurl_available, awscurl_post_sts_form_urlencoded, init_logging, local_http_client,
-    replication_fast_env, rustfs_binary_path,
+    RustFSTestEnvironment, admin_create_user, awscurl_available, awscurl_post_sts_form_urlencoded, init_logging,
+    local_http_client, replication_fast_env, rustfs_binary_path, signed_request, signed_request_with_client,
+    signed_request_with_session_token,
 };
-use crate::fake_s3_target::{FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, Operation as FakeTargetOperation};
+use crate::fake_s3_target::{
+    FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FaultAction as FakeTargetFault, Operation as FakeTargetOperation,
+    RequestRecord,
+};
 use crate::kms::common::{create_key_with_specific_id, sse_customer_key_md5_base64};
 use crate::storage_api::replication_extension::BucketTargetSys;
 use aws_sdk_s3::config::{Credentials, Region};
@@ -32,7 +36,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use futures::{Stream, StreamExt};
-use http::header::{CONTENT_ENCODING, CONTENT_TYPE, HOST};
+use http::header::CONTENT_ENCODING;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -53,11 +57,7 @@ use rustfs_madmin::{
     AddServiceAccountReq, ListServiceAccountsResp, PeerInfo, PeerSite, ReplicateAddStatus, ReplicateEditStatus,
     ReplicateRemoveStatus, SRRemoveReq, SRResyncOpStatus, SRStatusInfo, SiteReplicationInfo, SyncStatus,
 };
-use rustfs_signer::constants::UNSIGNED_PAYLOAD;
-use rustfs_signer::sign_v4;
-use s3s::Body;
 use s3s::header::X_AMZ_REPLICATION_STATUS;
-use serial_test::serial;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -379,116 +379,10 @@ struct ReplicationResetStatusTarget {
     reset_id: String,
     #[serde(rename = "resyncStatus", default)]
     status: String,
-}
-
-async fn signed_request(
-    method: http::Method,
-    url: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: Option<Vec<u8>>,
-    content_type: Option<&str>,
-) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
-    let mut request = http::Request::builder().method(method.clone()).uri(uri);
-    request = request.header(HOST, authority);
-    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    if let Some(content_type) = content_type {
-        request = request.header(CONTENT_TYPE, content_type);
-    }
-
-    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
-    let signed = sign_v4(request.body(Body::empty())?, content_len, access_key, secret_key, "", "us-east-1");
-
-    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
-    let client = local_http_client();
-    let mut request_builder = client.request(reqwest_method, url);
-    for (name, value) in signed.headers() {
-        request_builder = request_builder.header(name, value);
-    }
-    if let Some(body) = body {
-        request_builder = request_builder.body(body);
-    }
-
-    Ok(request_builder.send().await?)
-}
-
-async fn signed_request_with_client(
-    client: &reqwest::Client,
-    method: http::Method,
-    url: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: Option<Vec<u8>>,
-    content_type: Option<&str>,
-) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
-    let mut request = http::Request::builder().method(method.clone()).uri(uri);
-    request = request.header(HOST, authority);
-    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    if let Some(content_type) = content_type {
-        request = request.header(CONTENT_TYPE, content_type);
-    }
-
-    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
-    let signed = sign_v4(request.body(Body::empty())?, content_len, access_key, secret_key, "", "us-east-1");
-
-    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
-    let mut request_builder = client.request(reqwest_method, url);
-    for (name, value) in signed.headers() {
-        request_builder = request_builder.header(name, value);
-    }
-    if let Some(body) = body {
-        request_builder = request_builder.body(body);
-    }
-
-    Ok(request_builder.send().await?)
-}
-
-async fn signed_request_with_session_token(
-    method: http::Method,
-    url: &str,
-    access_key: &str,
-    secret_key: &str,
-    session_token: &str,
-    body: Option<Vec<u8>>,
-    content_type: Option<&str>,
-) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
-    let mut request = http::Request::builder().method(method.clone()).uri(uri);
-    request = request.header(HOST, authority);
-    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    if !session_token.is_empty() {
-        request = request.header("x-amz-security-token", session_token);
-    }
-    if let Some(content_type) = content_type {
-        request = request.header(CONTENT_TYPE, content_type);
-    }
-
-    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
-    let signed = sign_v4(
-        request.body(Body::empty())?,
-        content_len,
-        access_key,
-        secret_key,
-        session_token,
-        "us-east-1",
-    );
-
-    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
-    let client = local_http_client();
-    let mut request_builder = client.request(reqwest_method, url);
-    for (name, value) in signed.headers() {
-        request_builder = request_builder.header(name, value);
-    }
-    if let Some(body) = body {
-        request_builder = request_builder.body(body);
-    }
-
-    Ok(request_builder.send().await?)
+    #[serde(rename = "replicationCount", default)]
+    replicated_count: i64,
+    #[serde(rename = "object", default)]
+    object: String,
 }
 
 fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
@@ -623,6 +517,17 @@ async fn put_bucket_replication_with_delete_statuses(
     delete_marker_status: &str,
     version_delete_status: Option<&str>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    put_bucket_replication_with_statuses(env, bucket, target_arn, delete_marker_status, version_delete_status, "Enabled").await
+}
+
+async fn put_bucket_replication_with_statuses(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+    target_arn: &str,
+    delete_marker_status: &str,
+    version_delete_status: Option<&str>,
+    existing_object_status: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let delete_replication = version_delete_status
         .map(|status| format!("<DeleteReplication><Status>{status}</Status></DeleteReplication>"))
         .unwrap_or_default();
@@ -638,7 +543,7 @@ async fn put_bucket_replication_with_delete_statuses(
     </DeleteMarkerReplication>
     {delete_replication}
     <ExistingObjectReplication>
-      <Status>Enabled</Status>
+      <Status>{existing_object_status}</Status>
     </ExistingObjectReplication>
     <Destination>
       <Bucket>{target_arn}</Bucket>
@@ -997,35 +902,6 @@ fn create_user_s3_client(env: &RustFSTestEnvironment, access_key: &str, secret_k
         .behavior_version_latest()
         .build();
     Client::from_conf(config)
-}
-
-async fn admin_create_user(
-    env: &RustFSTestEnvironment,
-    username: &str,
-    secret_key: &str,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", env.url, username);
-    let body = serde_json::json!({
-        "secretKey": secret_key,
-        "status": "enabled"
-    });
-    let response = signed_request(
-        http::Method::PUT,
-        &url,
-        &env.access_key,
-        &env.secret_key,
-        Some(body.to_string().into_bytes()),
-        Some("application/json"),
-    )
-    .await?;
-
-    if response.status() != StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("create user failed: {status} {body}").into());
-    }
-
-    Ok(())
 }
 
 async fn admin_add_canned_policy(
@@ -1447,10 +1323,6 @@ where
     }
 }
 
-async fn wait_for_replication_failure_event(response: reqwest::Response, expected_key: &str) -> TestResult {
-    wait_for_replication_failure_event_stream(response.bytes_stream(), expected_key, Duration::from_secs(30)).await
-}
-
 fn target_history_contains_key(output: &ListObjectVersionsOutput, key: &str) -> bool {
     output.versions().iter().any(|version| version.key() == Some(key))
         || output.delete_markers().iter().any(|marker| marker.key() == Some(key))
@@ -1507,41 +1379,24 @@ async fn assert_failed_replication_stays_absent_for(
     }
 }
 
-async fn subscribe_to_replication_failure(
-    env: &RustFSTestEnvironment,
-    bucket: &str,
-    key: &str,
-) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
-    let url = format!(
-        "{}/{bucket}?events={}&prefix={}&ping=1",
-        env.url,
-        urlencoding::encode(REPLICATION_FAILED_EVENT),
-        urlencoding::encode(key)
-    );
-    let response = timeout(
-        Duration::from_secs(30),
-        signed_request(http::Method::GET, &url, &env.access_key, &env.secret_key, None, None),
-    )
-    .await
-    .map_err(|_| "replication failure event subscription did not respond within 30 seconds")??;
-    if response.status() != StatusCode::OK {
-        return Err(format!("failed to subscribe to replication failure events: {}", response.status()).into());
-    }
-    Ok(response)
-}
-
 async fn build_sse_replication_pair(
     label: &str,
-    enable_kms: bool,
+    source_kms: bool,
+    target_kms: bool,
 ) -> Result<(RustFSTestEnvironment, RustFSTestEnvironment, String, String), Box<dyn Error + Send + Sync>> {
     let mut source_env = RustFSTestEnvironment::new().await?;
     let mut target_env = RustFSTestEnvironment::new().await?;
     let source_kms_key_dir = format!("{}/kms-keys", source_env.temp_dir);
     let target_kms_key_dir = format!("{}/kms-keys", target_env.temp_dir);
-    if enable_kms {
+    if source_kms {
         fs::create_dir_all(&source_kms_key_dir).await?;
-        fs::create_dir_all(&target_kms_key_dir).await?;
         create_key_with_specific_id(&source_kms_key_dir, REPL17_KMS_KEY_ID).await?;
+    }
+    // The two sites share a key id but never key material: each side generates
+    // its own key, which is exactly the independent-KMS topology managed-SSE
+    // replication must survive (target re-encrypts with its own envelope).
+    if target_kms {
+        fs::create_dir_all(&target_kms_key_dir).await?;
         create_key_with_specific_id(&target_kms_key_dir, REPL17_KMS_KEY_ID).await?;
     }
 
@@ -1549,7 +1404,7 @@ async fn build_sse_replication_pair(
     source_process_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
     source_process_env.extend_from_slice(FAST_SCANNER_ENV);
     source_process_env.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
-    if enable_kms {
+    if source_kms {
         source_process_env.extend_from_slice(&[
             ("RUSTFS_KMS_ENABLE", "true"),
             ("RUSTFS_KMS_BACKEND", "local"),
@@ -1557,15 +1412,15 @@ async fn build_sse_replication_pair(
             ("RUSTFS_KMS_DEFAULT_KEY_ID", REPL17_KMS_KEY_ID),
             ("RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS", "true"),
             // Per-key KMS authorization is on so this contract is pinned in the
-            // configuration replication will eventually ship with: the replication
-            // worker carries no request identity and must stay exempt.
+            // configuration replication ships with: the replication worker
+            // carries no request identity and must stay exempt.
             ("RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY", "true"),
         ]);
     }
     source_env.start_rustfs_server_with_env(vec![], &source_process_env).await?;
 
     let mut target_process_env = vec![("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")];
-    if enable_kms {
+    if target_kms {
         target_process_env.extend_from_slice(&[
             ("RUSTFS_KMS_ENABLE", "true"),
             ("RUSTFS_KMS_BACKEND", "local"),
@@ -1593,13 +1448,12 @@ async fn build_sse_replication_pair(
     Ok((source_env, target_env, source_bucket, target_bucket))
 }
 
-async fn assert_managed_sse_replication_fails_explicitly(label: &str, kms: bool) -> TestResult {
-    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair(label, true).await?;
+async fn assert_managed_sse_replicates_and_reencrypts(label: &str, kms: bool) -> TestResult {
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair(label, true, true).await?;
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
     let key = format!("{label}-contract.txt");
     let body = format!("repl-17 {label} payload").into_bytes();
-    let failure_events = subscribe_to_replication_failure(&source_env, &source_bucket, &key).await?;
 
     let encryption = if kms {
         ServerSideEncryption::AwsKms
@@ -1621,20 +1475,41 @@ async fn assert_managed_sse_replication_fails_explicitly(label: &str, kms: bool)
 
     let source = source_client.get_object().bucket(&source_bucket).key(&key).send().await?;
     assert_eq!(source.server_side_encryption(), Some(&encryption));
+    let source_etag = source.e_tag().map(str::to_string);
     assert_eq!(source.body.collect().await?.into_bytes().as_ref(), body.as_slice());
 
-    wait_for_replication_failure_event(failure_events, &key).await?;
-    wait_for_source_replication_status(&source_client, &source_bucket, &key, "FAILED", false).await?;
-    assert_failed_replication_stays_absent_for(
-        &source_client,
-        &source_bucket,
-        &target_client,
-        &target_bucket,
-        &key,
-        false,
-        Duration::from_secs(5),
-    )
-    .await?;
+    wait_for_source_replication_status(&source_client, &source_bucket, &key, "COMPLETED", false).await?;
+
+    // The target sits on an independent KMS (same key id, different material),
+    // so a successful plain GET proves the replica's envelope belongs to the
+    // target's KMS: a forwarded source envelope could never unwrap here.
+    let replica = target_client.get_object().bucket(&target_bucket).key(&key).send().await?;
+    assert_eq!(replica.server_side_encryption(), Some(&encryption));
+    let replica_version_id = replica.version_id().map(str::to_string);
+    let replica_etag = replica.e_tag().map(str::to_string);
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), body.as_slice());
+
+    // The replica must keep the source ETag; otherwise every replication HEAD
+    // comparison sees a mismatch and re-replicates the object forever.
+    assert_eq!(replica_etag, source_etag, "replica ETag must match the source ETag");
+
+    // Spanning several fast-scanner cycles, the replica must stay the same
+    // version: a second version appearing here means the ETag comparison did
+    // not converge and the scanner is re-driving the object.
+    sleep(Duration::from_secs(5)).await;
+    let versions = target_client
+        .list_object_versions()
+        .bucket(&target_bucket)
+        .prefix(&key)
+        .send()
+        .await?;
+    let replica_versions: Vec<_> = versions.versions().iter().filter(|v| v.key() == Some(key.as_str())).collect();
+    assert_eq!(replica_versions.len(), 1, "replica must not accumulate versions from re-replication");
+    assert_eq!(
+        replica_versions[0].version_id().map(str::to_string),
+        replica_version_id,
+        "replica version must stay stable across scanner cycles"
+    );
 
     Ok(())
 }
@@ -2384,15 +2259,20 @@ async fn wait_for_site_replication_info<F>(
 where
     F: Fn(&SiteReplicationInfo) -> bool,
 {
-    for _ in 0..40 {
+    // 30s to match wait_for_replication_state: the three-node site tests run
+    // several full rustfs processes on one runner, so peer-state propagation
+    // can take well over 10s under CI load.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
         let info = site_replication_info(env).await?;
         if predicate(&info) {
             return Ok(info);
         }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("site replication info did not reach expected state on {}", env.address).into());
+        }
         sleep(Duration::from_millis(250)).await;
     }
-
-    Err(format!("site replication info did not reach expected state on {}", env.address).into())
 }
 
 async fn wait_for_site_replication_status<F>(
@@ -2403,15 +2283,19 @@ async fn wait_for_site_replication_status<F>(
 where
     F: Fn(&SRStatusInfo) -> bool,
 {
-    for _ in 0..40 {
+    // Same 30s ceiling as wait_for_site_replication_info: the status probes
+    // fan out to every peer, so they see the same multi-process CI load.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
         let status = site_replication_status(env, query).await?;
         if predicate(&status) {
             return Ok(status);
         }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("site replication status did not reach expected state on {}", env.address).into());
+        }
         sleep(Duration::from_millis(250)).await;
     }
-
-    Err(format!("site replication status did not reach expected state on {}", env.address).into())
 }
 
 async fn wait_for_replication_reset_target<F>(
@@ -2480,7 +2364,6 @@ async fn build_replication_pair(
 /// metadata was inherited wholesale from the source, so the scanner heal pass
 /// skipped it too — no PENDING/FAILED marker meant nothing to re-drive).
 #[tokio::test]
-#[serial]
 async fn test_copy_object_replicates_to_target() -> TestResult {
     init_logging();
 
@@ -2529,7 +2412,6 @@ async fn test_copy_object_replicates_to_target() -> TestResult {
 /// independent object; every member must replicate to the remote target like a
 /// regular PUT (MinIO PutObjectExtract parity).
 #[tokio::test]
-#[serial]
 async fn test_snowball_extract_replicates_members_to_target() -> TestResult {
     init_logging();
 
@@ -2575,7 +2457,6 @@ async fn test_snowball_extract_replicates_members_to_target() -> TestResult {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_replication_check_succeeds_with_remote_target() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2584,14 +2465,20 @@ async fn test_replication_check_succeeds_with_remote_target() -> Result<(), Box<
 
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await?;
-    assert_eq!(payload["Status"], "OK");
+    assert_eq!(payload["Status"], "OK", "{payload}");
     assert_eq!(payload["ActiveMutation"], true);
     assert_eq!(payload["Targets"].as_array().map(Vec::len), Some(1));
-    assert_eq!(payload["Targets"][0]["Status"], "OK");
-    assert_eq!(payload["Targets"][0]["Phases"]["Put"]["Status"], "OK");
-    assert_eq!(payload["Targets"][0]["Phases"]["DeleteMarker"]["Status"], "OK");
-    assert_eq!(payload["Targets"][0]["Phases"]["VersionDelete"]["Status"], "OK");
-    assert_eq!(payload["Targets"][0]["Phases"]["Cleanup"]["Status"], "OK");
+    assert_eq!(payload["Targets"][0]["Status"], "OK", "{payload}");
+    assert_eq!(payload["Targets"][0]["Phases"]["Put"]["Status"], "OK", "{payload}");
+    // A RustFS target adopts the source version id, so the P1-19
+    // version-identity probe passes.
+    assert_eq!(payload["Targets"][0]["Phases"]["VersionFidelity"]["Status"], "OK", "{payload}");
+    // A RustFS target preserves the SSE-C passthrough transport headers and
+    // echoes the customer algorithm on the replication-check HEAD (N2).
+    assert_eq!(payload["Targets"][0]["Phases"]["SsecPassthrough"]["Status"], "OK", "{payload}");
+    assert_eq!(payload["Targets"][0]["Phases"]["DeleteMarker"]["Status"], "OK", "{payload}");
+    assert_eq!(payload["Targets"][0]["Phases"]["VersionDelete"]["Status"], "OK", "{payload}");
+    assert_eq!(payload["Targets"][0]["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
 
     let target_client = target_env.create_s3_client();
     let versions = target_client
@@ -2609,7 +2496,6 @@ async fn test_replication_check_succeeds_with_remote_target() -> Result<(), Box<
 }
 
 #[tokio::test]
-#[serial]
 async fn test_replication_check_rejects_target_without_object_lock() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2663,7 +2549,6 @@ async fn test_replication_check_rejects_target_without_object_lock() -> Result<(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_rejects_unversioned_source_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2702,7 +2587,6 @@ async fn test_set_remote_target_rejects_unversioned_source_bucket() -> Result<()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_replication_check_rejects_unversioned_source_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2726,7 +2610,6 @@ async fn test_replication_check_rejects_unversioned_source_bucket() -> Result<()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_replication_check_rejects_missing_replication_config() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2750,7 +2633,6 @@ async fn test_replication_check_rejects_missing_replication_config() -> Result<(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_replication_check_rejects_invalid_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2769,7 +2651,6 @@ async fn test_replication_check_rejects_invalid_bucket() -> Result<(), Box<dyn E
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_rejects_same_bucket_on_same_deployment() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2813,7 +2694,6 @@ async fn test_set_remote_target_rejects_same_bucket_on_same_deployment() -> Resu
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_rejects_unversioned_target_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2847,7 +2727,6 @@ async fn test_set_remote_target_rejects_unversioned_target_bucket() -> Result<()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_update_requires_arn() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2899,7 +2778,6 @@ async fn test_set_remote_target_update_requires_arn() -> Result<(), Box<dyn Erro
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_update_rejects_missing_target() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2988,7 +2866,6 @@ async fn fetch_single_target(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_partial_update_preserves_credentials() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3074,7 +2951,6 @@ async fn test_set_remote_target_partial_update_preserves_credentials() -> Result
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_rejects_invalid_target_url() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3116,7 +2992,6 @@ async fn test_set_remote_target_rejects_invalid_target_url() -> Result<(), Box<d
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_rejects_self_signed_https_target_without_skip_tls_verify()
 -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
@@ -3201,7 +3076,6 @@ async fn test_set_remote_target_rejects_self_signed_https_target_without_skip_tl
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_allows_self_signed_https_target_with_skip_tls_verify() -> Result<(), Box<dyn Error + Send + Sync>>
 {
     init_logging();
@@ -3313,7 +3187,6 @@ async fn test_set_remote_target_allows_self_signed_https_target_with_skip_tls_ve
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_pem() -> Result<(), Box<dyn Error + Send + Sync>>
 {
     init_logging();
@@ -3398,7 +3271,6 @@ async fn test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_allows_private_ca_https_target_with_ca_cert_pem() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3489,7 +3361,6 @@ async fn test_set_remote_target_allows_private_ca_https_target_with_ca_cert_pem(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_list_remote_targets_rejects_empty_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3509,7 +3380,6 @@ async fn test_list_remote_targets_rejects_empty_bucket() -> Result<(), Box<dyn E
 }
 
 #[tokio::test]
-#[serial]
 async fn test_list_remote_targets_rejects_invalid_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3528,7 +3398,6 @@ async fn test_list_remote_targets_rejects_invalid_bucket() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
-#[serial]
 async fn test_remove_remote_target_rejects_missing_target() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3569,7 +3438,6 @@ async fn test_remove_remote_target_rejects_missing_target() -> Result<(), Box<dy
 }
 
 #[tokio::test]
-#[serial]
 async fn test_remove_remote_target_rejects_missing_arn() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3594,7 +3462,6 @@ async fn test_remove_remote_target_rejects_missing_arn() -> Result<(), Box<dyn E
 }
 
 #[tokio::test]
-#[serial]
 async fn test_remove_remote_target_rejects_invalid_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3618,7 +3485,6 @@ async fn test_remove_remote_target_rejects_invalid_bucket() -> Result<(), Box<dy
 }
 
 #[tokio::test]
-#[serial]
 async fn test_remove_remote_target_rejects_target_used_by_replication() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3658,7 +3524,6 @@ async fn test_remove_remote_target_rejects_target_used_by_replication() -> Resul
 }
 
 #[tokio::test]
-#[serial]
 async fn test_delete_bucket_replication_removes_remote_target() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3708,7 +3573,6 @@ async fn test_delete_bucket_replication_removes_remote_target() -> Result<(), Bo
 }
 
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_replicates_put_object_issue_2539() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3750,7 +3614,6 @@ async fn test_bucket_replication_replicates_put_object_issue_2539() -> Result<()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_converges_delete_marker_and_version_purge() -> TestResult {
     init_logging();
 
@@ -3849,7 +3712,6 @@ async fn test_bucket_replication_converges_delete_marker_and_version_purge() -> 
 }
 
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_disabled_delete_marker_does_not_propagate() -> TestResult {
     init_logging();
 
@@ -3936,7 +3798,6 @@ async fn test_bucket_replication_disabled_delete_marker_does_not_propagate() -> 
 /// interoperability profile for a runner that provisions MinIO credentials
 /// and a reachable endpoint.
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestResult {
     init_logging();
 
@@ -4215,44 +4076,55 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
         "tag rule with disabled delete-marker replication created a marker: {tagged_state:?}"
     );
 
-    set_bucket_versioning(&source_env, source_bucket, BucketVersioningStatus::Suspended).await?;
-    set_bucket_versioning(&target_env_a, target_bucket_a, BucketVersioningStatus::Suspended).await?;
-    let null_put = source_client
+    // AWS S3 and MinIO both reject suspending versioning on a bucket that
+    // carries a replication configuration (InvalidBucketState): suspension
+    // would mint null versions that versioned replication can never converge.
+    let suspend_err = source_client
+        .put_bucket_versioning()
+        .bucket(source_bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Suspended)
+                .build(),
+        )
+        .send()
+        .await
+        .expect_err("suspending versioning on a replication source must be rejected");
+    assert_eq!(
+        suspend_err.as_service_error().and_then(|error| error.code()),
+        Some("InvalidBucketState"),
+        "suspension on a replication source must fail with InvalidBucketState: {suspend_err:?}"
+    );
+
+    // The rejected suspension must leave the versioning + replication state
+    // fully intact: a fresh matched PUT still replicates with a real version.
+    let post_reject_put = source_client
         .put_object()
         .bucket(source_bucket)
-        .key("prefix/null.txt")
-        .body(ByteStream::from_static(b"null version"))
+        .key("prefix/after-rejected-suspend.txt")
+        .body(ByteStream::from_static(b"still replicating"))
         .send()
         .await?;
-    assert!(null_put.version_id().is_none(), "suspended source PUT must create a null version");
-    wait_for_replication_state(&target_client_a, target_bucket_a, "null version did not replicate", |state| {
-        state
-            .iter()
-            .any(|entry| entry.key == "prefix/null.txt" && entry.version_id == "null" && !entry.delete_marker)
-    })
-    .await?;
-    let null_delete = source_client
-        .delete_object()
-        .bucket(source_bucket)
-        .key("prefix/null.txt")
-        .send()
-        .await?;
-    assert!(
-        null_delete.version_id().is_none(),
-        "suspended source DELETE must create a null delete marker"
-    );
-    wait_for_replication_state(&target_client_a, target_bucket_a, "null delete marker did not replicate", |state| {
-        state
-            .iter()
-            .any(|entry| entry.key == "prefix/null.txt" && entry.version_id == "null" && entry.delete_marker)
-    })
+    let post_reject_version_id = post_reject_put
+        .version_id()
+        .ok_or("PUT after rejected suspension omitted version ID")?
+        .to_string();
+    wait_for_replication_state(
+        &target_client_a,
+        target_bucket_a,
+        "replication stopped after rejected versioning suspension",
+        |state| {
+            state
+                .iter()
+                .any(|entry| entry.key == "prefix/after-rejected-suspend.txt" && entry.version_id == post_reject_version_id)
+        },
+    )
     .await?;
 
     Ok(())
 }
 
 #[tokio::test]
-#[serial]
 async fn test_single_bucket_multipart_replication_fans_out_to_multiple_targets() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -4294,6 +4166,8 @@ async fn test_single_bucket_multipart_replication_fans_out_to_multiple_targets()
         .create_multipart_upload()
         .bucket(source_bucket)
         .key(object_key)
+        .content_type("application/x-fanout")
+        .metadata("app", "fanout")
         .send()
         .await?;
     let upload_id = created.upload_id().ok_or("missing multipart upload id")?.to_string();
@@ -4341,15 +4215,17 @@ async fn test_single_bucket_multipart_replication_fans_out_to_multiple_targets()
         wait_for_replicated_sha256(&target_client_b, target_bucket_b, object_key, expected_sha256),
     )?;
 
-    let target_etag_a = target_client_a
+    let target_head_a = target_client_a
         .head_object()
         .bucket(target_bucket_a)
         .key(object_key)
         .send()
-        .await?
-        .e_tag()
-        .ok_or("first target omitted ETag")?
-        .to_string();
+        .await?;
+    // Multipart replicas carry their metadata through CreateMultipartUpload;
+    // this pins the plaintext side of the multipart header fix.
+    assert_eq!(target_head_a.content_type(), Some("application/x-fanout"));
+    assert_eq!(target_head_a.metadata().and_then(|m| m.get("app").map(String::as_str)), Some("fanout"));
+    let target_etag_a = target_head_a.e_tag().ok_or("first target omitted ETag")?.to_string();
     let target_etag_b = target_client_b
         .head_object()
         .bucket(target_bucket_b)
@@ -4411,22 +4287,22 @@ async fn test_repl17_failure_observation_helpers() -> TestResult {
     Ok(())
 }
 
-/// backlog#1147 repl-17: SSE-C currently fails replication explicitly. Pin the
-/// observed contract: the source remains decryptable with its customer key,
-/// reports FAILED, emits the standard failure event, and leaves no target data.
+/// backlog#1147 repl-17 / backlog#1783: SSE-C objects replicate as ciphertext
+/// passthrough — the source cannot decrypt them (no customer key server-side),
+/// so the stored ciphertext and its encryption metadata travel verbatim and
+/// the replica is decryptable only with the original customer key. The
+/// backlog#1291 property still holds: never a silent plaintext replica.
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_sse_c_contract() -> TestResult {
     init_logging();
 
-    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("ssec", false).await?;
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("ssec", false, false).await?;
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
     let key = "ssec-contract.txt";
     let body = b"repl-17 SSE-C payload";
     let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
     let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
-    let failure_events = subscribe_to_replication_failure(&source_env, &source_bucket, key).await?;
 
     source_client
         .put_object()
@@ -4448,73 +4324,624 @@ async fn test_bucket_replication_sse_c_contract() -> TestResult {
         .sse_customer_key_md5(&customer_key_md5)
         .send()
         .await?;
+    let source_etag = source.e_tag().map(str::to_string);
     assert_eq!(source.body.collect().await?.into_bytes().as_ref(), body);
 
-    wait_for_replication_failure_event(failure_events, key).await?;
-    wait_for_source_replication_status(&source_client, &source_bucket, key, "FAILED", true).await?;
+    wait_for_source_replication_status(&source_client, &source_bucket, key, "COMPLETED", true).await?;
+
+    // The replica is readable only with the original customer key.
+    let replica = target_client
+        .get_object()
+        .bucket(&target_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    assert_eq!(replica.sse_customer_algorithm(), Some("AES256"));
+    let replica_etag = replica.e_tag().map(str::to_string);
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), body);
+    assert_eq!(replica_etag, source_etag, "replica ETag must match the source ETag");
+
+    // Without the customer key the replica must not be readable — the direct
+    // detection point for a silent-plaintext replica (backlog#1291).
+    let plain_read = target_client.get_object().bucket(&target_bucket).key(key).send().await;
+    assert!(plain_read.is_err(), "SSE-C replica must not be readable without the customer key");
+
+    // A wrong customer key must fail too.
+    let wrong_key = BASE64_STANDARD.encode("99999999999999999999999999999999");
+    let wrong_key_md5 = sse_customer_key_md5_base64("99999999999999999999999999999999");
+    let wrong_read = target_client
+        .get_object()
+        .bucket(&target_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&wrong_key)
+        .sse_customer_key_md5(&wrong_key_md5)
+        .send()
+        .await;
+    assert!(wrong_read.is_err(), "SSE-C replica must reject a wrong customer key");
+
+    Ok(())
+}
+
+/// backlog#1783: SSE-C multipart objects pass through as ciphertext part by
+/// part — part boundaries and the encrypted-multipart marker survive so the
+/// replica decrypts each part with its part-derived nonce.
+#[tokio::test]
+async fn test_bucket_replication_sse_c_multipart_passthrough() -> TestResult {
+    init_logging();
+
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+    const PART_COUNT: usize = 3;
+
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("ssec-mp", false, false).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let key = "ssec-mp-contract.bin";
+    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+
+    let created = source_client
+        .create_multipart_upload()
+        .bucket(&source_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    let upload_id = created.upload_id().ok_or("missing multipart upload id")?.to_string();
+
+    let mut completed_parts = Vec::with_capacity(PART_COUNT);
+    let mut payload = Vec::with_capacity(PART_SIZE * PART_COUNT);
+    for part_number in 1..=PART_COUNT {
+        let part = vec![u8::try_from(part_number)?; PART_SIZE];
+        payload.extend_from_slice(&part);
+        let uploaded = source_client
+            .upload_part()
+            .bucket(&source_bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(i32::try_from(part_number)?)
+            .body(ByteStream::from(part))
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(&customer_key)
+            .sse_customer_key_md5(&customer_key_md5)
+            .send()
+            .await?;
+        completed_parts.push(
+            CompletedPart::builder()
+                .part_number(i32::try_from(part_number)?)
+                .set_e_tag(uploaded.e_tag().map(str::to_string))
+                .build(),
+        );
+    }
+    source_client
+        .complete_multipart_upload()
+        .bucket(&source_bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed_parts)).build())
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+
+    wait_for_source_replication_status(&source_client, &source_bucket, key, "COMPLETED", true).await?;
+
+    let source_head = source_client
+        .head_object()
+        .bucket(&source_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    let replica = target_client
+        .get_object()
+        .bucket(&target_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    // The replica must carry the SSE-C marker and the source's multipart ETag
+    // (its -N suffix also pins that the part structure survived).
+    assert_eq!(replica.sse_customer_algorithm(), Some("AES256"));
+    assert_eq!(replica.e_tag(), source_head.e_tag(), "replica must keep the source multipart ETag");
+    let replica_version_id = replica.version_id().map(str::to_string);
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), payload.as_slice());
+
+    let plain_read = target_client.get_object().bucket(&target_bucket).key(key).send().await;
+    assert!(
+        plain_read.is_err(),
+        "SSE-C multipart replica must not be readable without the customer key"
+    );
+
+    // Stability across scanner cycles: convergence must hold for passthrough.
+    sleep(Duration::from_secs(5)).await;
+    let versions = target_client
+        .list_object_versions()
+        .bucket(&target_bucket)
+        .prefix(key)
+        .send()
+        .await?;
+    let replica_versions: Vec<_> = versions.versions().iter().filter(|v| v.key() == Some(key)).collect();
+    assert_eq!(replica_versions.len(), 1, "SSE-C replica must not accumulate versions");
+    assert_eq!(replica_versions[0].version_id().map(str::to_string), replica_version_id);
+
+    Ok(())
+}
+
+/// N2 (backlog#1675 P1-22): SSE-C passthrough replication to a target that
+/// silently drops the `X-Rustfs-Replication-*` transport headers (MinIO-like
+/// behavior, modeled by the fake target's drop mode) used to report COMPLETED
+/// while the replica had irrecoverably lost its decryption material — the red
+/// light this test was born failing on. Fail-closed contract now under test:
+/// the first attempt PUTs, HEAD-backs the replica, finds no SSE-C evidence,
+/// records the target Unsupported and reports FAILED; a second SSE-C object
+/// fails without any PUT reaching the target (capability cache, proven from
+/// the target journal); plaintext objects still replicate COMPLETED.
+#[tokio::test]
+async fn test_ssec_replication_fails_closed_when_target_drops_passthrough_headers() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "ssec-drop-dst";
+    target.create_bucket(target_bucket);
+    target.drop_unlisted_replication_headers(true);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &env_vars).await?;
+
+    let source_bucket = "ssec-drop-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+    let put_ssec = |key: &'static str| {
+        source_client
+            .put_object()
+            .bucket(source_bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"ssec fail-closed payload"))
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(&customer_key)
+            .sse_customer_key_md5(&customer_key_md5)
+            .send()
+    };
+
+    // First SSE-C object: the audit must catch the dropped material.
+    put_ssec("ssec-first.txt").await?;
+    wait_for_source_replication_status(&source_client, source_bucket, "ssec-first.txt", "FAILED", true).await?;
+
+    let requests = target.take_requests();
+    let first_put = requests
+        .iter()
+        .find(|record| record.operation == FakeTargetOperation::PutObject && record.key.as_deref() == Some("ssec-first.txt"))
+        .ok_or("the first SSE-C object must have been PUT (capability was Unknown)")?;
+    assert!(
+        first_put.proxy_headers.ssec_transport_present,
+        "the replication PUT must have shipped the SSE-C transport headers the target then dropped"
+    );
+    assert!(
+        requests.iter().any(|record| {
+            record.operation == FakeTargetOperation::HeadObject
+                && record.key.as_deref() == Some("ssec-first.txt")
+                && record.sequence > first_put.sequence
+                && record.proxy_headers.replication_check.as_deref() == Some("true")
+        }),
+        "the post-PUT HEAD-back audit must have run through the replication-check channel; journal: {requests:?}"
+    );
+
+    // Second SSE-C object: the cached Unsupported verdict fails it closed
+    // before any PUT — including MRF retries of the first object.
+    put_ssec("ssec-second.txt").await?;
+    wait_for_source_replication_status(&source_client, source_bucket, "ssec-second.txt", "FAILED", true).await?;
+    assert!(
+        !target.requests().iter().any(|record| {
+            record.operation == FakeTargetOperation::PutObject
+                && record.key.as_deref() != Some("plain-control.txt")
+                && record.proxy_headers.ssec_transport_present
+        }),
+        "no further SSE-C ciphertext may reach a target recorded Unsupported; journal: {:?}",
+        target.requests()
+    );
+
+    // The gate is scoped to SSE-C: plaintext replication keeps working.
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("plain-control.txt")
+        .body(ByteStream::from_static(b"plaintext control payload"))
+        .send()
+        .await?;
+    wait_for_source_replication_status(&source_client, source_bucket, "plain-control.txt", "COMPLETED", false).await?;
+    assert!(target.has_object(target_bucket, "plain-control.txt"));
+
+    target.shutdown().await;
+    Ok(())
+}
+
+/// N2 (backlog#1675 P1-22): the admin replication-check must expose the same
+/// verdict operators would otherwise only learn from failing SSE-C objects —
+/// an SsecPassthrough probe phase that fails with the machine-readable
+/// `BucketRemoteSsecPassthroughUnsupported` code against a header-dropping
+/// target, with no probe residue left behind. The target's overall status
+/// stays OK: unlike version-identity drift, dropped passthrough headers are
+/// a capability limit, and a plaintext-only deployment against a MinIO-like
+/// target must not turn red.
+#[tokio::test]
+async fn test_replication_check_flags_ssec_passthrough_dropping_target() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "ssec-check-dst";
+    target.create_bucket(target_bucket);
+    target.drop_unlisted_replication_headers(true);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &env_vars).await?;
+
+    let source_bucket = "ssec-check-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+
+    assert_eq!(
+        payload["Status"], "OK",
+        "a capability-only SSE-C failure must not fail the check overall: {payload}"
+    );
+    let target_report = &payload["Targets"][0];
+    assert_eq!(target_report["Status"], "OK", "{payload}");
+    let ssec = &target_report["Phases"]["SsecPassthrough"];
+    assert_eq!(ssec["Status"], "FAILED", "SsecPassthrough phase must fail: {payload}");
+    assert_eq!(
+        ssec["Code"], "BucketRemoteSsecPassthroughUnsupported",
+        "the failure must carry the machine-readable code: {payload}"
+    );
+    // Basic replication of plaintext objects works on this target: every other
+    // phase passes, so the code is the discriminator operators branch on.
+    assert_eq!(target_report["Phases"]["Put"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionFidelity"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionDelete"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
+
+    // The SSE-C probe PUT must have shipped the real transport header names —
+    // a mangled or missing header set would fail the phase for the wrong
+    // reason and mask a working target.
+    let requests = target.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|record| record.operation == FakeTargetOperation::PutObject && record.proxy_headers.ssec_transport_present),
+        "the SSE-C probe PUT must carry the X-Rustfs-Replication-* transport headers; journal: {requests:?}"
+    );
+
+    // No probe residue, including the SSE-C probe version.
+    let probe_put = requests
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::PutObject)
+        .ok_or("the probe PUT never reached the fake target")?;
+    let probe_key = probe_put.key.ok_or("probe PUT journal record has no key")?;
+    assert!(
+        target.stored_versions(target_bucket, &probe_key).is_empty(),
+        "all probe versions must be cleaned up"
+    );
+
+    target.shutdown().await;
+    Ok(())
+}
+
+/// C1 (backlog#1675 P1-22): heal-path convergence for SSE-C. An SSE-C object
+/// whose live replication failed during a target outage must converge through
+/// the scanner/heal compensation once the target returns — passing the N2
+/// HEAD-back audit against the recovered RustFS target — and the replica must
+/// be readable with the customer key.
+#[tokio::test]
+async fn test_bucket_replication_sse_c_heals_after_target_outage() -> TestResult {
+    init_logging();
+
+    let (source_env, mut target_env, source_bucket, target_bucket) =
+        build_sse_replication_pair("ssec-heal", false, false).await?;
+    let source_client = source_env.create_s3_client();
+    let key = "ssec-heal-contract.txt";
+    let body = b"repl-22 ssec heal payload".to_vec();
+    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+
+    // Target outage: the SSE-C write cannot replicate.
+    target_env.stop_server();
+
+    source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key(key)
+        .body(ByteStream::from(body.clone()))
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+
+    // The failure is observable on the source (SSE-C HEAD needs the key).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let head = source_client
+            .head_object()
+            .bucket(&source_bucket)
+            .key(key)
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(&customer_key)
+            .sse_customer_key_md5(&customer_key_md5)
+            .send()
+            .await?;
+        match head.replication_status().map(|status| status.as_str()) {
+            Some("PENDING") | Some("FAILED") => break,
+            other => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("source SSE-C object never reported PENDING/FAILED; last status={other:?}").into());
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+
+    // Recover the target in place; the source scanner re-drives the failure.
+    target_env
+        .restart_server_preserving_data(vec![], &[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")])
+        .await?;
+
+    wait_for_source_replication_status(&source_client, &source_bucket, key, "COMPLETED", true).await?;
+
+    // The healed replica is a REPLICA (status surfaces on HEAD) readable with
+    // the customer key.
+    let target_client = target_env.create_s3_client();
+    let replica_head = target_client
+        .head_object()
+        .bucket(&target_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    assert_eq!(
+        replica_head.replication_status().map(|status| status.as_str()),
+        Some("REPLICA"),
+        "the healed copy must carry REPLICA status"
+    );
+    let replica = target_client
+        .get_object()
+        .bucket(&target_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    assert_eq!(replica.sse_customer_algorithm(), Some("AES256"));
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), body.as_slice());
+
+    Ok(())
+}
+
+/// C1 (backlog#1675 P1-22): existing-object resync for SSE-C. An SSE-C object
+/// written BEFORE any replication config must reach the RustFS target through
+/// the existing-object resync (`replicate_all` transport, N2-audited), land as
+/// a REPLICA, and read back with the customer key.
+#[tokio::test]
+async fn test_bucket_replication_sse_c_existing_object_resync() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_process_env = replication_fast_env();
+    source_process_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_process_env.extend_from_slice(FAST_SCANNER_ENV);
+    source_process_env.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &source_process_env).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(&[
+            ("NO_PROXY", "127.0.0.1,localhost"),
+            ("HTTP_PROXY", ""),
+            ("HTTPS_PROXY", ""),
+        ])
+        .await?;
+
+    let source_bucket = "ssec-existing-src";
+    let target_bucket = "ssec-existing-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    // The SSE-C object exists before any replication wiring.
+    let key = "ssec-existing-contract.txt";
+    let body = b"repl-22 ssec existing-object payload".to_vec();
+    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(key)
+        .body(ByteStream::from(body.clone()))
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+
+    // Wire replication (existing-object enabled) and drive a resync.
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+    let (reset_arn, reset_id) = start_bucket_replication_reset(&source_env, source_bucket).await?;
+    assert_eq!(reset_arn, target_arn);
+    let terminal = wait_for_replication_reset_target(&source_env, source_bucket, &target_arn, |status| {
+        status.reset_id == reset_id && matches!(status.status.as_str(), "Completed" | "Failed")
+    })
+    .await?;
+    assert_eq!(terminal.status, "Completed", "SSE-C existing-object resync must complete");
+    assert!(terminal.replicated_count >= 1, "the existing SSE-C object must have been resynced");
+
+    // The replica is a REPLICA (status surfaces on HEAD) readable with the
+    // customer key.
+    let replica_head = target_client
+        .head_object()
+        .bucket(target_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    assert_eq!(
+        replica_head.replication_status().map(|status| status.as_str()),
+        Some("REPLICA"),
+        "the resynced copy must carry REPLICA status"
+    );
+    let replica = target_client
+        .get_object()
+        .bucket(target_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    assert_eq!(replica.sse_customer_algorithm(), Some("AES256"));
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), body.as_slice());
+
+    // No plaintext leak: the replica stays unreadable without the key.
+    assert!(
+        target_client
+            .get_object()
+            .bucket(target_bucket)
+            .key(key)
+            .send()
+            .await
+            .is_err(),
+        "SSE-C replica must not be readable without the customer key"
+    );
+
+    Ok(())
+}
+
+/// backlog#1147 repl-17 / backlog#1783: SSE-S3 objects replicate by decrypting
+/// at the source and re-encrypting on the target with the target's own KMS.
+/// The property backlog#1291 pinned — never a silent plaintext replica — still
+/// holds, but the expectation flips from FAILED to a converged, decryptable
+/// replica: COMPLETED status, byte-identical plain GET on the target
+/// (independent KMS, so success proves target-owned envelopes), preserved
+/// source ETag, and a version that stays stable across scanner cycles.
+#[tokio::test]
+async fn test_bucket_replication_sse_s3_contract() -> TestResult {
+    init_logging();
+    assert_managed_sse_replicates_and_reencrypts("sse-s3", false).await
+}
+
+/// backlog#1783: when the target site has no KMS, managed-SSE replication must
+/// fail closed — replication FAILED, and no plaintext (or any) replica ever
+/// materializes on the target.
+#[tokio::test]
+async fn test_bucket_replication_sse_s3_fails_closed_without_target_kms() -> TestResult {
+    init_logging();
+
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("sse-nokms", true, false).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let key = "sse-nokms-contract.txt";
+    let body = b"repl-17 sse target-without-kms payload".to_vec();
+
+    source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key(key)
+        .body(ByteStream::from(body.clone()))
+        .server_side_encryption(ServerSideEncryption::Aes256)
+        .send()
+        .await?;
+
+    wait_for_source_replication_status(&source_client, &source_bucket, key, "FAILED", false).await?;
     assert_failed_replication_stays_absent_for(
         &source_client,
         &source_bucket,
         &target_client,
         &target_bucket,
         key,
-        true,
+        false,
         Duration::from_secs(5),
     )
     .await?;
 
-    target_client
-        .put_object()
-        .bucket(&target_bucket)
-        .key(key)
-        .body(ByteStream::from_static(b"observer negative-path fixture"))
-        .send()
-        .await?;
-    target_client.delete_object().bucket(&target_bucket).key(key).send().await?;
-    let history_error = assert_failed_replication_stays_absent_for(
-        &source_client,
-        &source_bucket,
-        &target_client,
-        &target_bucket,
-        key,
-        true,
-        Duration::ZERO,
-    )
-    .await
-    .expect_err("target history must violate the failed replication contract");
-    assert!(history_error.to_string().contains("created target history"));
+    let source = source_client.get_object().bucket(&source_bucket).key(key).send().await?;
+    assert_eq!(source.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    assert_eq!(source.body.collect().await?.into_bytes().as_ref(), body.as_slice());
 
     Ok(())
 }
 
-/// backlog#1147 repl-17 / backlog#1291: SSE-S3 must fail closed until managed
-/// encryption is supported on the target. The silent plaintext replication
-/// that originally kept this test ignored was fixed by the fail-closed gate in
-/// `crates/ecstore/src/bucket/replication/replication_target_boundary.rs`
-/// (all replication modes route through it), so this now pins the current
-/// fail-closed contract: FAILED status, failure event, readable source, and a
-/// stable absence of all target versions.
+/// P1-22 stage 0 → backlog#1783: the existing-object resync path re-drives
+/// managed-SSE objects through the same target boundary as live replication.
+/// After the live pass completes, a resync over the bucket must converge —
+/// the ETag comparison sees the preserved source ETag on the replica and does
+/// not rewrite it, so the replica's version stays stable through the resync.
 #[tokio::test]
-#[serial]
-async fn test_bucket_replication_sse_s3_contract() -> TestResult {
-    init_logging();
-    assert_managed_sse_replication_fails_explicitly("sse-s3", false).await
-}
-
-/// P1-22 stage 0: the existing-object resync path must fail closed for
-/// managed-SSE objects exactly like inline replication (which
-/// `test_bucket_replication_sse_s3_contract` pins, including the scanner heal
-/// re-drive). Resync re-drives every object version through the same
-/// fail-closed target boundary, so a resync over an encrypted bucket must
-/// terminate without ever materializing a plaintext (or unreadable) replica;
-/// the post-resync stays-absent window also spans further fast-scanner heal
-/// cycles.
-#[tokio::test]
-#[serial]
-async fn test_bucket_replication_sse_s3_resync_stays_fail_closed() -> TestResult {
+async fn test_bucket_replication_sse_s3_resync_converges() -> TestResult {
     init_logging();
 
-    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("sse-resync", true).await?;
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("sse-resync", true, true).await?;
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
     let key = "sse-resync-contract.txt";
@@ -4528,29 +4955,33 @@ async fn test_bucket_replication_sse_s3_resync_stays_fail_closed() -> TestResult
         .server_side_encryption(ServerSideEncryption::Aes256)
         .send()
         .await?;
-    wait_for_source_replication_status(&source_client, &source_bucket, key, "FAILED", false).await?;
+    wait_for_source_replication_status(&source_client, &source_bucket, key, "COMPLETED", false).await?;
 
-    // Resync: drive the existing-object resync path over the failed object.
+    let replica = target_client.get_object().bucket(&target_bucket).key(key).send().await?;
+    assert_eq!(replica.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    let replica_version_id = replica.version_id().map(str::to_string);
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), body.as_slice());
+
+    // Resync: drive the existing-object resync path over the replicated object.
     let (target_arn, reset_id) = start_bucket_replication_reset(&source_env, &source_bucket).await?;
     let terminal = wait_for_replication_reset_target(&source_env, &source_bucket, &target_arn, |target| {
         target.reset_id == reset_id && matches!(target.status.as_str(), "Completed" | "Failed")
     })
     .await?;
     assert_eq!(terminal.reset_id, reset_id);
+    assert_eq!(terminal.status, "Completed", "resync over a managed-SSE bucket must complete");
 
-    // The resync pass must have failed closed: still no target version (the
-    // window also spans further scanner heal cycles), and the source object
-    // stays readable and encrypted.
-    assert_failed_replication_stays_absent_for(
-        &source_client,
-        &source_bucket,
-        &target_client,
-        &target_bucket,
-        key,
-        false,
-        Duration::from_secs(5),
-    )
-    .await?;
+    // The resync pass must not have rewritten the converged replica.
+    let versions = target_client
+        .list_object_versions()
+        .bucket(&target_bucket)
+        .prefix(key)
+        .send()
+        .await?;
+    let replica_versions: Vec<_> = versions.versions().iter().filter(|v| v.key() == Some(key)).collect();
+    assert_eq!(replica_versions.len(), 1, "resync must not create additional replica versions");
+    assert_eq!(replica_versions[0].version_id().map(str::to_string), replica_version_id);
+
     let source = source_client.get_object().bucket(&source_bucket).key(key).send().await?;
     assert_eq!(source.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
     assert_eq!(source.body.collect().await?.into_bytes().as_ref(), body.as_slice());
@@ -4558,14 +4989,104 @@ async fn test_bucket_replication_sse_s3_resync_stays_fail_closed() -> TestResult
     Ok(())
 }
 
-/// backlog#1147 repl-17: SSE-KMS currently fails closed rather than creating an
-/// unreadable replica; the shared helper verifies FAILED, the failure event,
-/// source readability, and a stable absence of all target versions.
+/// backlog#1147 repl-17 / backlog#1783: SSE-KMS replicates like SSE-S3 — the
+/// source key id never crosses sites (only the aws:kms intent), and the target
+/// re-encrypts under its own default key. The independent-KMS pair proves the
+/// replica's envelope is target-owned.
 #[tokio::test]
-#[serial]
-async fn test_bucket_replication_sse_kms_failure_contract() -> TestResult {
+async fn test_bucket_replication_sse_kms_contract() -> TestResult {
     init_logging();
-    assert_managed_sse_replication_fails_explicitly("sse-kms", true).await
+    assert_managed_sse_replicates_and_reencrypts("sse-kms", true).await
+}
+
+/// backlog#1783: managed-SSE multipart objects keep their part structure and
+/// their metadata through replication. CreateMultipartUpload on the target
+/// carries the full header set (SSE intent, content-type, user metadata) and
+/// the completed replica preserves the source's multipart ETag.
+#[tokio::test]
+async fn test_bucket_replication_sse_s3_multipart_reencrypts() -> TestResult {
+    init_logging();
+
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+    const PART_COUNT: usize = 3;
+
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("sse-mp", true, true).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let key = "sse-mp-contract.bin";
+
+    let created = source_client
+        .create_multipart_upload()
+        .bucket(&source_bucket)
+        .key(key)
+        .content_type("application/x-repl17")
+        .metadata("app", "repl17")
+        .server_side_encryption(ServerSideEncryption::Aes256)
+        .send()
+        .await?;
+    let upload_id = created.upload_id().ok_or("missing multipart upload id")?.to_string();
+
+    let mut completed_parts = Vec::with_capacity(PART_COUNT);
+    let mut payload = Vec::with_capacity(PART_SIZE * PART_COUNT);
+    for part_number in 1..=PART_COUNT {
+        let part = vec![u8::try_from(part_number)?; PART_SIZE];
+        payload.extend_from_slice(&part);
+        let uploaded = source_client
+            .upload_part()
+            .bucket(&source_bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(i32::try_from(part_number)?)
+            .body(ByteStream::from(part))
+            .send()
+            .await?;
+        completed_parts.push(
+            CompletedPart::builder()
+                .part_number(i32::try_from(part_number)?)
+                .set_e_tag(uploaded.e_tag().map(str::to_string))
+                .build(),
+        );
+    }
+    source_client
+        .complete_multipart_upload()
+        .bucket(&source_bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed_parts)).build())
+        .send()
+        .await?;
+
+    wait_for_source_replication_status(&source_client, &source_bucket, key, "COMPLETED", false).await?;
+
+    let source_head = source_client.head_object().bucket(&source_bucket).key(key).send().await?;
+    let replica = target_client.get_object().bucket(&target_bucket).key(key).send().await?;
+    assert_eq!(replica.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    assert_eq!(replica.e_tag(), source_head.e_tag(), "replica must keep the source multipart ETag");
+    assert_eq!(
+        replica.last_modified(),
+        source_head.last_modified(),
+        "replica must keep the source mtime or the multipart HEAD comparison never converges"
+    );
+    assert_eq!(replica.content_type(), Some("application/x-repl17"));
+    assert_eq!(replica.metadata().and_then(|m| m.get("app").map(String::as_str)), Some("repl17"));
+    let replica_version_id = replica.version_id().map(str::to_string);
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), payload.as_slice());
+
+    // The multipart replica must also stay stable across scanner cycles: a
+    // rewritten or additional version means ETag/mtime convergence failed and
+    // the scanner keeps re-driving the object.
+    sleep(Duration::from_secs(5)).await;
+    let versions = target_client
+        .list_object_versions()
+        .bucket(&target_bucket)
+        .prefix(key)
+        .send()
+        .await?;
+    let replica_versions: Vec<_> = versions.versions().iter().filter(|v| v.key() == Some(key)).collect();
+    assert_eq!(replica_versions.len(), 1, "multipart replica must not accumulate versions");
+    assert_eq!(replica_versions[0].version_id().map(str::to_string), replica_version_id);
+
+    Ok(())
 }
 
 /// backlog#1147 repl-5, scenario (a) — target outage + recovery (rustfs#3421 / #2071).
@@ -4576,7 +5097,6 @@ async fn test_bucket_replication_sse_kms_failure_contract() -> TestResult {
 /// still-running source's data scanner (short cycle via [`FAST_SCANNER_ENV`])
 /// re-drives the failed objects once the target is reachable again.
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_recovers_after_target_outage() -> TestResult {
     init_logging();
 
@@ -4656,7 +5176,6 @@ async fn test_bucket_replication_recovers_after_target_outage() -> TestResult {
 /// must settle back to zero even though the historical failed counter remains
 /// non-zero.
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_backlog_metrics_observe_outage_and_recovery() -> TestResult {
     init_logging();
 
@@ -4790,7 +5309,6 @@ async fn test_bucket_replication_backlog_metrics_observe_outage_and_recovery() -
 /// must converge every persisted failure, including the replayed delete marker
 /// (whose replication decision is re-derived from the live config).
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_replays_failed_entries_after_source_restart() -> TestResult {
     init_logging();
 
@@ -4882,7 +5400,6 @@ async fn test_bucket_replication_replays_failed_entries_after_source_restart() -
 }
 
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_replayed_delete_marker_preserves_source_mtime_without_source_restart() -> TestResult {
     init_logging();
 
@@ -4952,7 +5469,6 @@ async fn test_bucket_replication_replayed_delete_marker_preserves_source_mtime_w
 }
 
 #[tokio::test]
-#[serial]
 async fn test_sequential_bucket_replication_succeeds_for_multiple_buckets() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -4996,7 +5512,6 @@ async fn test_sequential_bucket_replication_succeeds_for_multiple_buckets() -> R
 }
 
 #[tokio::test]
-#[serial]
 async fn test_replication_recovers_after_runtime_target_cache_is_cleared() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -5040,7 +5555,6 @@ async fn test_replication_recovers_after_runtime_target_cache_is_cleared() -> Re
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_allows_self_signed_https_with_skip_tls_verify_real_dual_node() -> TestResult {
     init_logging();
 
@@ -5119,7 +5633,6 @@ async fn test_site_replication_allows_self_signed_https_with_skip_tls_verify_rea
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_allows_private_ca_https_with_ca_cert_pem_real_dual_node() -> TestResult {
     init_logging();
 
@@ -5198,11 +5711,11 @@ async fn test_site_replication_allows_private_ca_https_with_ca_cert_pem_real_dua
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
     let resync_process_env = [
         ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true"),
+        ("RUSTFS_REPL_RESYNC_POLL_MAX_MS", "100"),
         // Verbose server logging can block startup when this focused test is run
         // through a captured test process rather than nextest.
         ("RUST_LOG", "error"),
@@ -5219,6 +5732,7 @@ async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -
         .await?;
 
     let source_bucket = "site-repl-resync-src";
+    const RESYNC_OBJECT_COUNT: usize = 128;
 
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
@@ -5263,12 +5777,13 @@ async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -
     wait_for_bucket_on_target(&source_client, source_bucket).await?;
     let target_arn = wait_for_remote_target_arn(&source_env, source_bucket).await?;
 
-    for idx in 0..96 {
+    for idx in 0..RESYNC_OBJECT_COUNT {
+        let size = if idx == 0 { 8 * 1024 * 1024 } else { 8 * 1024 };
         source_client
             .put_object()
             .bucket(source_bucket)
             .key(format!("resync-object-{idx:02}"))
-            .body(ByteStream::from(vec![b'x'; 512 * 1024]))
+            .body(ByteStream::from(vec![b'x'; size]))
             .send()
             .await?;
     }
@@ -5327,6 +5842,22 @@ async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -
     );
     let restarted_reset_id = restarted.resync_id.clone();
 
+    let partial_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = site_replication_resync_op(&source_env, "status", &remote_peer).await?;
+        let replicated = status.replicated_objects;
+        if status.resync_id == restarted_reset_id
+            && replicated > 0
+            && replicated < u64::try_from(RESYNC_OBJECT_COUNT).expect("test object count should fit u64")
+        {
+            break;
+        }
+        if status.state == "completed" || tokio::time::Instant::now() >= partial_deadline {
+            return Err(format!("resync did not expose a partial durable checkpoint before restart: {status:?}").into());
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+
     source_env.restart_server_preserving_data(vec![], &resync_process_env).await?;
     wait_for_site_replication_enabled(&source_env, 2).await?;
 
@@ -5360,11 +5891,45 @@ async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -
     })?;
     assert_eq!(restarted_target.reset_id, restarted_reset_id);
 
+    let completion_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let completed = loop {
+        let status = site_replication_resync_op(&source_env, "status", &remote_peer).await?;
+        match status.state.as_str() {
+            "completed" => break status,
+            "failed" => return Err(format!("recovered resync failed: {status:?}").into()),
+            _ if tokio::time::Instant::now() < completion_deadline => sleep(Duration::from_millis(500)).await,
+            _ => return Err(format!("recovered resync did not complete in time: {status:?}").into()),
+        }
+    };
+    assert_eq!(
+        completed.replicated_objects,
+        u64::try_from(RESYNC_OBJECT_COUNT).expect("test object count should fit u64")
+    );
+
+    let replicated = futures::stream::iter(0..RESYNC_OBJECT_COUNT)
+        .map(|idx| {
+            let target_client = target_client.clone();
+            async move {
+                let key = format!("resync-object-{idx:02}");
+                let body = wait_for_object_on_target(&target_client, source_bucket, &key).await?;
+                let expected_size = if idx == 0 { 8 * 1024 * 1024 } else { 8 * 1024 };
+                if body != vec![b'x'; expected_size] {
+                    return Err(format!("recovered resync object body mismatch for {key}").into());
+                }
+                Ok::<(), Box<dyn Error + Send + Sync>>(())
+            }
+        })
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+    for result in replicated {
+        result?;
+    }
+
     Ok(())
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_edit_and_status_peer_state_real_three_node() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -5613,7 +6178,6 @@ async fn test_site_replication_edit_and_status_peer_state_real_three_node() -> R
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -5733,7 +6297,6 @@ async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -5842,7 +6405,6 @@ async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Re
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_replicates_object_with_bucket_versioning_real_dual_node() -> TestResult {
     init_logging();
 
@@ -5933,7 +6495,6 @@ async fn test_site_replication_replicates_object_with_bucket_versioning_real_dua
 /// receiver was dropped with only a debug line, while `replicate status` still reported
 /// "1/1 Buckets in sync" because both configs were byte-identical.
 #[tokio::test]
-#[serial]
 async fn test_site_replication_config_broadcast_keeps_reverse_direction_real_dual_node() -> TestResult {
     init_logging();
 
@@ -6072,7 +6633,6 @@ async fn wait_for_site_replication_rule(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_active_active_converges_without_loops_real_dual_node() -> TestResult {
     init_logging();
 
@@ -6390,7 +6950,6 @@ async fn test_site_replication_active_active_converges_without_loops_real_dual_n
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_replicates_policy_backed_user_access_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -6478,7 +7037,6 @@ async fn test_site_replication_replicates_policy_backed_user_access_real_dual_no
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_replicates_group_policy_backed_access_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>>
 {
     init_logging();
@@ -6569,7 +7127,6 @@ async fn test_site_replication_replicates_group_policy_backed_access_real_dual_n
 }
 
 #[tokio::test]
-#[serial]
 async fn test_service_account_policy_from_accountinfo_round_trips_real_single_node() -> TestResult {
     init_logging();
 
@@ -6621,7 +7178,6 @@ async fn test_service_account_policy_from_accountinfo_round_trips_real_single_no
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_replicates_multiple_service_accounts_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -6722,7 +7278,6 @@ async fn test_site_replication_replicates_multiple_service_accounts_real_dual_no
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_replicates_service_accounts_created_from_sts_session_real_dual_node() -> TestResult {
     init_logging();
 
@@ -6862,6 +7417,118 @@ async fn wait_for_target_request_version_id(
     }
 }
 
+#[tokio::test]
+async fn test_bucket_resync_restart_revisits_objects_before_out_of_order_checkpoint() -> TestResult {
+    init_logging();
+
+    const OBJECT_COUNT: usize = 128;
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "resync-checkpoint-dst";
+    target.create_bucket(target_bucket);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut process_env = replication_fast_env();
+    process_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    process_env.extend_from_slice(&[
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("HTTP_PROXY", ""),
+        ("HTTPS_PROXY", ""),
+        ("RUST_LOG", "error"),
+    ]);
+    source_env.start_rustfs_server_with_env(vec![], &process_env).await?;
+
+    let source_bucket = "resync-checkpoint-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    for idx in 0..OBJECT_COUNT {
+        source_client
+            .put_object()
+            .bucket(source_bucket)
+            .key(format!("checkpoint-{idx:03}"))
+            .body(ByteStream::from(format!("checkpoint payload {idx}").into_bytes()))
+            .send()
+            .await?;
+    }
+    wait_for_source_replication_status(&source_client, source_bucket, "checkpoint-127", "COMPLETED", false).await?;
+    let initial_replication_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let replicated = target
+            .requests()
+            .into_iter()
+            .filter(|request| request.operation == FakeTargetOperation::PutObject)
+            .count();
+        if replicated >= OBJECT_COUNT {
+            break;
+        }
+        if tokio::time::Instant::now() >= initial_replication_deadline {
+            return Err(format!("initial replication only sent {replicated}/{OBJECT_COUNT} objects").into());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    target.clear_bucket_objects(target_bucket);
+    target.take_requests();
+    target.inject_for_key(
+        FakeTargetOperation::PutObject,
+        "checkpoint-000",
+        FakeTargetFault::Delay(Duration::from_secs(30)),
+        100,
+    );
+
+    let (reset_arn, reset_id) = start_bucket_replication_reset(&source_env, source_bucket).await?;
+    assert_eq!(reset_arn, target_arn);
+    let partial = wait_for_replication_reset_target(&source_env, source_bucket, &target_arn, |status| {
+        status.reset_id == reset_id
+            && status.replicated_count > 0
+            && status.replicated_count < i64::try_from(OBJECT_COUNT).expect("test object count should fit i64")
+            && status.object.as_str() > "checkpoint-000"
+    })
+    .await
+    .map_err(|err| format!("{err}; target journal: {:?}", target.requests()))?;
+    assert!(target.requests().iter().any(|request| {
+        request.operation == FakeTargetOperation::PutObject
+            && request.key.as_deref() == Some("checkpoint-000")
+            && request.fault == Some(FakeTargetFault::Delay(Duration::from_secs(30)))
+    }));
+    assert!(!target.has_object(target_bucket, "checkpoint-000"));
+    source_env.stop_server();
+    target.clear_faults();
+
+    source_env.start_rustfs_server_without_cleanup_with_env(&process_env).await?;
+    let completed = wait_for_replication_reset_target(&source_env, source_bucket, &target_arn, |status| {
+        status.reset_id == reset_id && status.status == "Completed"
+    })
+    .await?;
+    assert_eq!(
+        completed.replicated_count,
+        i64::try_from(OBJECT_COUNT).expect("test object count should fit i64")
+    );
+    assert!(
+        target.has_object(target_bucket, "checkpoint-000"),
+        "restart skipped failed object checkpoint-000 before persisted checkpoint {}",
+        partial.object
+    );
+
+    target.shutdown().await;
+    Ok(())
+}
+
 /// P0-5: MinIO derives the replicated version exclusively from the `versionId`
 /// query parameter (`putOptsFromReq`); the internal x-*-source-version-id
 /// headers do not exist there. Without the query, a MinIO target mints fresh
@@ -6869,7 +7536,6 @@ async fn wait_for_target_request_version_id(
 /// CreateMultipartUpload (the version is decided at initiate time) must both
 /// carry the source version as `?versionId=`.
 #[tokio::test]
-#[serial]
 async fn test_replication_put_and_create_multipart_carry_source_version_id_query() -> TestResult {
     init_logging();
 
@@ -6972,6 +7638,1274 @@ async fn test_replication_put_and_create_multipart_carry_source_version_id_query
         "replication CreateMultipartUpload must carry the source version in the versionId query"
     );
 
+    target.shutdown().await;
+    Ok(())
+}
+
+/// P1-20: inbound replicas never cascade. An object replicated A->B carries
+/// x-amz-replication-status=REPLICA on B; `must_replicate` returns an empty
+/// decision for replicas, so even an ExistingObjectReplication=Enabled rule
+/// configured on B AFTER the replica landed (making it an "existing object"
+/// for that rule) must never push it onward — while B's own native objects
+/// flow to the onward bucket, proving B's outbound replication and scanner
+/// are live.
+#[tokio::test]
+async fn test_scanner_never_cascades_inbound_replicas() -> TestResult {
+    init_logging();
+
+    let mut env_a = RustFSTestEnvironment::new().await?;
+    let mut env_a_vars = replication_fast_env();
+    env_a_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_a.start_rustfs_server_with_env(vec![], &env_a_vars).await?;
+
+    // B becomes a replication source itself, driven by its scanner.
+    let mut env_b = RustFSTestEnvironment::new().await?;
+    let mut env_b_vars = replication_fast_env();
+    env_b_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_b_vars.extend_from_slice(FAST_SCANNER_ENV);
+    env_b.start_rustfs_server_with_env(vec![], &env_b_vars).await?;
+
+    let bucket_a = "cascade-a-src";
+    let bucket_b = "cascade-b-mid";
+    let bucket_c = "cascade-a-third";
+    let client_a = env_a.create_s3_client();
+    let client_b = env_b.create_s3_client();
+    client_a.create_bucket().bucket(bucket_a).send().await?;
+    client_b.create_bucket().bucket(bucket_b).send().await?;
+    client_a.create_bucket().bucket(bucket_c).send().await?;
+    enable_bucket_versioning(&env_a, bucket_a).await?;
+    enable_bucket_versioning(&env_b, bucket_b).await?;
+    enable_bucket_versioning(&env_a, bucket_c).await?;
+
+    // A -> B first: the replica lands on B before B has any outbound rule.
+    let arn_ab = set_replication_target(&env_a, bucket_a, &env_b, bucket_b).await?;
+    put_bucket_replication(&env_a, bucket_a, &arn_ab).await?;
+
+    let replica_key = "replica-object.txt";
+    let replica_payload = "replica payload";
+    client_a
+        .put_object()
+        .bucket(bucket_a)
+        .key(replica_key)
+        .body(ByteStream::from_static(replica_payload.as_bytes()))
+        .send()
+        .await?;
+    wait_for_replicated_object(&client_b, bucket_b, replica_key, replica_payload).await?;
+
+    // Precondition for the anti-cascade contract: the inbound copy must carry
+    // REPLICA status on B. If this fails, the break is in inbound status
+    // stamping, not in the scanner guard.
+    let inbound = client_b.head_object().bucket(bucket_b).key(replica_key).send().await?;
+    assert_eq!(
+        inbound.replication_status().map(|status| status.as_str()),
+        Some("REPLICA"),
+        "inbound replica must be stamped REPLICA on the target"
+    );
+
+    // Now wire B's outbound rule; the replica is an "existing object" for it.
+    let arn_bc = set_replication_target(&env_b, bucket_b, &env_a, bucket_c).await?;
+    put_bucket_replication(&env_b, bucket_b, &arn_bc).await?;
+
+    // B's own native object flows onward through the live path.
+    let native_key = "native-control.txt";
+    let native_payload = "native control payload";
+    client_b
+        .put_object()
+        .bucket(bucket_b)
+        .key(native_key)
+        .body(ByteStream::from_static(native_payload.as_bytes()))
+        .send()
+        .await?;
+    wait_for_replicated_object(&client_a, bucket_c, native_key, native_payload).await?;
+
+    // With B's outbound proven, the inbound replica must stay put across
+    // multiple fast-scanner cycles.
+    assert_replication_key_absent(&client_a, bucket_c, replica_key, Duration::from_secs(6)).await?;
+
+    Ok(())
+}
+
+/// P1-19 review follow-up: multipart fixes the target version at initiate
+/// and only reports it on completion, so a target can adopt PutObject
+/// version ids and still mint its own there — the check must not report OK
+/// while multipart deletes and heals would silently miss.
+#[tokio::test]
+async fn test_replication_check_flags_multipart_only_version_minting_target() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "multipart-fidelity-dst";
+    target.create_bucket(target_bucket);
+    // PutObject mirrors the source version id; CreateMultipartUpload does not.
+    target.assign_own_multipart_version_ids(true);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &env_vars).await?;
+
+    let source_bucket = "multipart-fidelity-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+
+    assert_eq!(payload["Status"], "FAILED", "multipart drift must fail the check: {payload}");
+    let target_report = &payload["Targets"][0];
+    let fidelity = &target_report["Phases"]["VersionFidelity"];
+    assert_eq!(fidelity["Status"], "FAILED", "{payload}");
+    assert_eq!(fidelity["Code"], "BucketRemoteTargetVersionMismatch", "{payload}");
+    assert!(
+        fidelity["Error"]
+            .as_str()
+            .is_some_and(|error| error.contains("CreateMultipartUpload")),
+        "the failure must name the multipart path: {payload}"
+    );
+    // The PutObject leg mirrored, so it is the multipart probe that failed.
+    assert_eq!(target_report["Phases"]["Put"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "SKIPPED", "{payload}");
+    assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
+
+    let probe_key = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::PutObject)
+        .and_then(|record| record.key)
+        .ok_or("the probe PUT never reached the fake target")?;
+    assert!(
+        target.stored_versions(target_bucket, &probe_key).is_empty(),
+        "both probe versions must be cleaned up on the mismatching target"
+    );
+
+    target.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_replication_check_aborts_failed_multipart_probes() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "multipart-cleanup-dst";
+    target.create_bucket(target_bucket);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &env_vars).await?;
+
+    let source_bucket = "multipart-cleanup-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    for failed_operation in [FakeTargetOperation::UploadPart, FakeTargetOperation::CompleteMultipartUpload] {
+        target.clear_faults();
+        target.take_requests();
+        target.inject(failed_operation, FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE), 16);
+
+        let response = run_replication_check(&source_env, source_bucket).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = response.json().await?;
+        assert_eq!(
+            payload["Status"], "FAILED",
+            "the injected multipart failure must fail the check: {payload}"
+        );
+
+        let requests = target.requests();
+        assert!(
+            requests.iter().any(|request| {
+                request.operation == failed_operation
+                    && request.fault == Some(FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE))
+            }),
+            "the check must reach the injected {failed_operation:?} failure: {requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.operation == FakeTargetOperation::AbortMultipartUpload),
+            "the failed {failed_operation:?} probe must be aborted: {requests:?}"
+        );
+        assert_eq!(
+            target.active_multipart_upload_count(),
+            0,
+            "the failed {failed_operation:?} probe must not leave multipart state"
+        );
+        assert_eq!(payload["Targets"][0]["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
+    }
+
+    target.clear_faults();
+    target.take_requests();
+    target.inject(FakeTargetOperation::CompleteMultipartUpload, FakeTargetFault::DisconnectAfterResponse, 16);
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+    let target_report = &payload["Targets"][0];
+    assert_eq!(target_report["Status"], "FAILED", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionFidelity"]["Status"], "FAILED", "{payload}");
+    assert_eq!(
+        target_report["Phases"]["Cleanup"]["Status"], "OK",
+        "NoSuchUpload after an ambiguous complete means the multipart artifact is gone: {payload}"
+    );
+    let requests = target.requests();
+    let completed_key = requests
+        .iter()
+        .find(|request| {
+            request.operation == FakeTargetOperation::CompleteMultipartUpload
+                && request.fault == Some(FakeTargetFault::DisconnectAfterResponse)
+        })
+        .and_then(|request| request.key.as_deref())
+        .expect("the scripted complete response disconnect must be observed");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.operation == FakeTargetOperation::AbortMultipartUpload),
+        "the ambiguous complete must still attempt abort: {requests:?}"
+    );
+    assert_eq!(target.active_multipart_upload_count(), 0);
+    assert!(
+        target.stored_versions(target_bucket, completed_key).is_empty(),
+        "outer cleanup must remove the object committed before the response disconnect"
+    );
+
+    target.clear_faults();
+    target.take_requests();
+    target.inject(FakeTargetOperation::UploadPart, FakeTargetFault::Status(StatusCode::FORBIDDEN), 16);
+    target.inject(
+        FakeTargetOperation::AbortMultipartUpload,
+        FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE),
+        16,
+    );
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+    let target_report = &payload["Targets"][0];
+    assert_eq!(target_report["Status"], "FAILED", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionFidelity"]["Status"], "FAILED", "{payload}");
+    assert_eq!(
+        target_report["Phases"]["Cleanup"]["Status"], "FAILED",
+        "an unremoved multipart probe must be reported as a cleanup failure: {payload}"
+    );
+    assert_eq!(
+        target_report["Error"], "s3:ReplicateObject permissions missing for replication user",
+        "the primary multipart error must remain the target error: {payload}"
+    );
+    assert_eq!(
+        target_report["Phases"]["VersionFidelity"]["Error"], "s3:ReplicateObject permissions missing for replication user",
+        "{payload}"
+    );
+    assert_eq!(
+        target_report["Phases"]["Cleanup"]["Error"], "failed to abort multipart replication probe",
+        "{payload}"
+    );
+    assert!(
+        target.requests().iter().any(|request| {
+            request.operation == FakeTargetOperation::AbortMultipartUpload
+                && request.fault == Some(FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE))
+        }),
+        "the abort failure must be observed"
+    );
+    assert_eq!(
+        target.active_multipart_upload_count(),
+        1,
+        "the report must match the retained multipart state"
+    );
+
+    target.shutdown().await;
+    Ok(())
+}
+
+/// P1-19 (backlog#1675): the supported replication contract is targets that
+/// adopt the source version id (RustFS/MinIO semantics). A target that mints
+/// its own version ids silently breaks every version-addressed operation that
+/// follows — version deletes and heal re-drives never match, diverging the
+/// two sides. replication-check must surface this explicitly: a
+/// VersionFidelity phase that compares the probe PUT's response version id
+/// against the sent source version id and fails with
+/// BucketRemoteTargetVersionMismatch — while still cleaning up the probe
+/// object via the version id the target actually assigned.
+#[tokio::test]
+async fn test_replication_check_flags_version_minting_target() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "version-fidelity-dst";
+    target.create_bucket(target_bucket);
+    target.assign_own_version_ids(true);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &env_vars).await?;
+
+    let source_bucket = "version-fidelity-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+
+    assert_eq!(
+        payload["Status"], "FAILED",
+        "a version-minting target must fail the replication check: {payload}"
+    );
+    let target_report = &payload["Targets"][0];
+    assert_eq!(target_report["Status"], "FAILED", "target must be FAILED: {payload}");
+    let fidelity = &target_report["Phases"]["VersionFidelity"];
+    assert_eq!(fidelity["Status"], "FAILED", "VersionFidelity phase must fail: {payload}");
+    assert_eq!(
+        fidelity["Code"], "BucketRemoteTargetVersionMismatch",
+        "the failure must carry a machine-readable code: {payload}"
+    );
+    // The probe PUT itself succeeded (fidelity is judged from its response);
+    // the later mutation phases are pointless against a drifting target and
+    // must be skipped, but cleanup still runs.
+    assert_eq!(target_report["Phases"]["Put"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "SKIPPED", "{payload}");
+    assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
+
+    // The probe PUT must carry the source version as `?versionId=` — the
+    // exact shape live replication uses (P0-5), and the only shape MinIO
+    // consumes. The journal records the query value.
+    let probe_put = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::PutObject)
+        .ok_or("the probe PUT never reached the fake target")?;
+    let probe_query_version = probe_put
+        .version_id
+        .as_deref()
+        .ok_or("the probe PUT must carry a versionId query")?;
+    assert!(
+        uuid::Uuid::parse_str(probe_query_version).is_ok(),
+        "the probe versionId query must be the source uuid, got {probe_query_version}"
+    );
+
+    // No probe residue: cleanup must address the version id the target
+    // actually assigned, not the source id (which never matched anything).
+    let probe_key = probe_put.key.ok_or("probe PUT journal record has no key")?;
+    assert!(
+        target.stored_versions(target_bucket, &probe_key).is_empty(),
+        "the probe object must be cleaned up on the mismatching target"
+    );
+
+    Ok(())
+}
+
+// --- P1-21 (backlog#1675): delayed delete-marker purge failure handling ---
+//
+// The fixtures below wire a versioned source bucket to a FakeS3Target with the
+// default replication shape: DeleteMarkerReplication=Enabled and
+// DeleteReplication omitted. With version-delete replication unconfigured,
+// purging the source marker version emits no replication event, and the data
+// scanner cannot see a source version that is gone — the delayed purge watcher
+// spawned by the marker replication is the ONLY channel that can remove the
+// replicated marker from the target.
+
+const DELAYED_PURGE_KEY: &str = "doc.txt";
+
+fn delayed_purge_process_env() -> Vec<(&'static str, &'static str)> {
+    let mut env = replication_fast_env();
+    env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    env
+}
+
+async fn start_delayed_purge_fixture(
+    source_bucket: &str,
+    target_bucket: &str,
+) -> Result<(FakeS3Target, RustFSTestEnvironment, Client), Box<dyn Error + Send + Sync>> {
+    let target = FakeS3Target::start().await?;
+    target.create_bucket(target_bucket);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], &delayed_purge_process_env())
+        .await?;
+
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    Ok((target, source_env, source_client))
+}
+
+/// PUT an object, stack a delete marker on it, and wait until the fake target
+/// stores the marker replica. Returns the source marker version id — the fake
+/// target mirrors it because delete replication forwards
+/// `x-*-source-version-id`.
+///
+/// Timing budget for callers: the delayed purge watcher only observes the
+/// source for ~4s after the marker replication completes, so the source-side
+/// marker-version DELETE must be issued promptly after this returns (the
+/// 100ms journal poll below keeps the detection latency small).
+async fn replicate_delete_marker(
+    target: &FakeS3Target,
+    target_bucket: &str,
+    source_client: &Client,
+    source_bucket: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(DELAYED_PURGE_KEY)
+        .body(ByteStream::from_static(b"delayed purge payload"))
+        .send()
+        .await?;
+
+    let delete = source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(DELAYED_PURGE_KEY)
+        .send()
+        .await?;
+    assert_eq!(delete.delete_marker(), Some(true), "unversioned DELETE must create a marker");
+    let marker_version = delete
+        .version_id()
+        .ok_or("source DELETE omitted the marker version ID")?
+        .to_string();
+
+    // Wait for ANY delete marker: a target that mints its own version ids
+    // does not mirror the source one.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let replicated = target
+            .stored_versions(target_bucket, DELAYED_PURGE_KEY)
+            .iter()
+            .any(|(_, delete_marker)| *delete_marker);
+        if replicated {
+            return Ok(marker_version);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(
+                format!("fake target never stored the replicated delete marker; journal: {:?}", target.requests()).into(),
+            );
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Journal records of purge attempts: target DELETE calls addressing the marker
+/// version explicitly. The marker-creation replica DELETE carries no
+/// `versionId` query, so the version id is an exact discriminator.
+fn delayed_purge_attempts(target: &FakeS3Target, marker_version: &str) -> Vec<RequestRecord> {
+    target
+        .requests()
+        .into_iter()
+        .filter(|record| {
+            record.operation == FakeTargetOperation::DeleteObject
+                && record.key.as_deref() == Some(DELAYED_PURGE_KEY)
+                && record.version_id.as_deref() == Some(marker_version)
+        })
+        .collect()
+}
+
+async fn wait_for_target_marker_purged(
+    target: &FakeS3Target,
+    target_bucket: &str,
+    max_wait: Duration,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        let marker_present = target
+            .stored_versions(target_bucket, DELAYED_PURGE_KEY)
+            .iter()
+            .any(|(_, delete_marker)| *delete_marker);
+        if !marker_present {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "target delete marker was never purged; target state: {:?}",
+                target.stored_versions(target_bucket, DELAYED_PURGE_KEY)
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// P1-21: the delayed purge's single target DELETE currently swallows failures
+/// (`let _ =`), so one transient target error strands the replicated marker on
+/// the target forever. Contract under test: a failed purge attempt is retried
+/// within the watch window and converges once the fault clears.
+#[tokio::test]
+async fn test_delayed_delete_marker_purge_retries_after_transient_target_failure() -> TestResult {
+    init_logging();
+    let source_bucket = "delayed-purge-retry-src";
+    let target_bucket = "delayed-purge-retry-dst";
+    let (target, _source_env, source_client) = start_delayed_purge_fixture(source_bucket, target_bucket).await?;
+
+    let marker_version = replicate_delete_marker(&target, target_bucket, &source_client, source_bucket).await?;
+
+    // Four scripted failures. Fault budget accounting (each journal record
+    // consumes one fault, including the SDK's own per-request retries):
+    // deleting the marker version fans out over the version-purge replication
+    // channel (initial attempt + its fast in-memory MRF retries) plus the
+    // delayed purge watcher's single pre-fix attempt — three target DELETE calls
+    // in total today, empirically (see the exhaustion test's journal). Four
+    // faults outlast all of them, so only a delayed-purge retry in a later
+    // watch round can converge. If the SDK retry configuration ever changes,
+    // re-derive this budget from a fresh journal capture.
+    target.inject(
+        FakeTargetOperation::DeleteObject,
+        FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE),
+        4,
+    );
+
+    // Purge the marker at the source. The watcher spawned when the marker
+    // replication completed moments ago observes the source marker vanish
+    // within its watch window and drives the target purge.
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(DELAYED_PURGE_KEY)
+        .version_id(&marker_version)
+        .send()
+        .await?;
+
+    // Tight window on purpose: a fixed delayed purge retries on 1s rounds and
+    // converges within ~5s, while any straggling backoff retry from the other
+    // channels would land later and must not be what turns this test green.
+    wait_for_target_marker_purged(&target, target_bucket, Duration::from_secs(15)).await?;
+
+    let attempts = delayed_purge_attempts(&target, &marker_version);
+    assert!(
+        attempts.len() >= 2,
+        "expected the faulted purge attempt plus at least one retry, got: {attempts:?}"
+    );
+    assert!(
+        attempts.iter().any(|record| record.fault.is_none()),
+        "expected a clean purge attempt after the fault script drained, got: {attempts:?}"
+    );
+
+    target.shutdown().await;
+    Ok(())
+}
+
+/// P1-21 review follow-up: the watcher must purge the version the TARGET
+/// assigned to the replicated marker, not one derived from the source uuid.
+/// A target that mints its own version ids answers a source-derived purge
+/// with an idempotent 204, which used to look like success and strand the
+/// real marker on the target forever.
+#[tokio::test]
+async fn test_delayed_delete_marker_purge_uses_target_assigned_version() -> TestResult {
+    init_logging();
+    let source_bucket = "delayed-purge-mint-src";
+    let target_bucket = "delayed-purge-mint-dst";
+    let (target, _source_env, source_client) = start_delayed_purge_fixture(source_bucket, target_bucket).await?;
+    // The target ignores the forwarded source-version-id header and mints its
+    // own ids for both the object and the replicated delete marker.
+    target.assign_own_version_ids(true);
+
+    let marker_version = replicate_delete_marker(&target, target_bucket, &source_client, source_bucket).await?;
+
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(DELAYED_PURGE_KEY)
+        .version_id(&marker_version)
+        .send()
+        .await?;
+
+    // The replicated marker carries a target-minted version id, so nothing
+    // but the recorded mapping can address it.
+    wait_for_target_marker_purged(&target, target_bucket, Duration::from_secs(25)).await?;
+
+    target.shutdown().await;
+    Ok(())
+}
+
+/// P1-21: when every watch-window purge attempt fails, the purge intent must
+/// survive as a durable MRF entry and replay on the next startup; once the
+/// replayed purge succeeds, the entry must be acknowledged instead of being
+/// retained as Missed forever.
+#[tokio::test]
+async fn test_delayed_delete_marker_purge_exhaustion_persists_to_mrf_and_replays_on_restart() -> TestResult {
+    init_logging();
+    let source_bucket = "delayed-purge-mrf-src";
+    let target_bucket = "delayed-purge-mrf-dst";
+    let (target, mut source_env, source_client) = start_delayed_purge_fixture(source_bucket, target_bucket).await?;
+
+    let marker_version = replicate_delete_marker(&target, target_bucket, &source_client, source_bucket).await?;
+
+    // Outlast the whole watch window: every in-process purge attempt fails.
+    target.inject(
+        FakeTargetOperation::DeleteObject,
+        FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE),
+        64,
+    );
+
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(DELAYED_PURGE_KEY)
+        .version_id(&marker_version)
+        .send()
+        .await?;
+
+    // Let the watch window drain before restarting. The wall-clock length is
+    // not 5x1s: every faulted attempt embeds the SDK's own per-request 503
+    // retries (a few seconds each), so instead of a fixed sleep, wait until
+    // the faulted attempts stop arriving (the watcher exhausted its rounds and
+    // persisted the purge intent), then give the MRF persister its 100ms
+    // flush interval.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut last_seen = delayed_purge_attempts(&target, &marker_version).len();
+    let mut quiet_since = tokio::time::Instant::now();
+    loop {
+        sleep(Duration::from_millis(500)).await;
+        let seen = delayed_purge_attempts(&target, &marker_version).len();
+        if seen != last_seen {
+            last_seen = seen;
+            quiet_since = tokio::time::Instant::now();
+        }
+        if last_seen > 0 && quiet_since.elapsed() >= Duration::from_secs(5) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("purge attempts never quiesced (saw {last_seen}); journal: {:?}", target.requests()).into());
+        }
+    }
+    sleep(Duration::from_secs(1)).await;
+
+    let marker_survives_faults = target
+        .stored_versions(target_bucket, DELAYED_PURGE_KEY)
+        .iter()
+        .any(|(_, delete_marker)| *delete_marker);
+    assert!(marker_survives_faults, "scripted faults must have blocked every in-process purge attempt");
+
+    target.clear_faults();
+    let attempts_before_restart = delayed_purge_attempts(&target, &marker_version).len();
+
+    // Startup MRF replay must re-drive the purge and clean the target.
+    source_env
+        .restart_server_preserving_data(vec![], &delayed_purge_process_env())
+        .await?;
+    wait_for_target_marker_purged(&target, target_bucket, Duration::from_secs(30)).await?;
+    let attempts_after_replay = delayed_purge_attempts(&target, &marker_version).len();
+    assert!(
+        attempts_after_replay > attempts_before_restart,
+        "the restart replay must have issued the purge DELETE"
+    );
+
+    // The successful replay must acknowledge the MRF entry: another restart may
+    // not re-drive the purge again.
+    source_env
+        .restart_server_preserving_data(vec![], &delayed_purge_process_env())
+        .await?;
+    sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        delayed_purge_attempts(&target, &marker_version).len(),
+        attempts_after_replay,
+        "acknowledged purge-intent MRF entries must not replay again"
+    );
+
+    target.shutdown().await;
+
+    Ok(())
+}
+
+// --- P1-20 (backlog#1675): scanner existing-object compensation matrix ---
+//
+// Every case below inverts the order used by the rest of this file: objects
+// are written FIRST and the replication rule arrives afterwards, so the only
+// channel that can move the pre-existing objects is the data scanner's
+// existing-object resync pass. Negative cells ("never compensated") are
+// contracts and are asserted over multiple scanner cycles, always next to a
+// replicated control key that proves the scanner and the live path are
+// running — an absent key on a dead scanner proves nothing.
+
+/// Envs + buckets only: versioning, the remote target, and the rule variant
+/// are wired by each test (the null-version case must PUT before the source
+/// bucket becomes versioned). The source runs with FAST_SCANNER_ENV so
+/// existing keys are rescanned within seconds instead of 16 dir cycles.
+async fn build_scanner_compensation_pair(
+    source_bucket: &str,
+    target_bucket: &str,
+) -> Result<(RustFSTestEnvironment, RustFSTestEnvironment), Box<dyn Error + Send + Sync>> {
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_process_env = replication_fast_env();
+    source_process_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_process_env.extend_from_slice(FAST_SCANNER_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_process_env).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    source_env
+        .create_s3_client()
+        .create_bucket()
+        .bucket(source_bucket)
+        .send()
+        .await?;
+    target_env
+        .create_s3_client()
+        .create_bucket()
+        .bucket(target_bucket)
+        .send()
+        .await?;
+
+    Ok((source_env, target_env))
+}
+
+/// P1-20: objects that already exist when a rule with
+/// ExistingObjectReplication=Enabled arrives are compensated by the scanner's
+/// existing-object resync pass, whatever wrote them — plain PUT, CopyObject,
+/// or Snowball auto-extract. The pinned exception is a null-version object
+/// (written before the bucket became versioned): the scanner heal gate skips
+/// nil-version objects entirely (`scanner_folder.rs` heal_replication), so it
+/// must NEVER be compensated.
+#[tokio::test]
+async fn test_scanner_compensates_existing_objects_across_write_paths() -> TestResult {
+    init_logging();
+    let source_bucket = "scanner-comp-src";
+    let target_bucket = "scanner-comp-dst";
+    let (source_env, target_env) = build_scanner_compensation_pair(source_bucket, target_bucket).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    // Null-version cell: PUT before versioning; the object keeps the nil
+    // version id forever.
+    let null_key = "pre-versioning-null.txt";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(null_key)
+        .body(ByteStream::from_static(b"null version payload"))
+        .send()
+        .await?;
+
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    // Pre-existing objects from three write paths, all before any replication
+    // config exists (their replication status stays Empty).
+    let plain_key = "existing-plain.txt";
+    let plain_payload = "existing plain payload";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(plain_key)
+        .body(ByteStream::from_static(plain_payload.as_bytes()))
+        .send()
+        .await?;
+
+    let copy_key = "existing-copy.txt";
+    source_client
+        .copy_object()
+        .bucket(source_bucket)
+        .key(copy_key)
+        .copy_source(format!("{source_bucket}/{plain_key}"))
+        .send()
+        .await?;
+
+    let member_key = "snowball/existing-member.txt";
+    let member_payload: &[u8] = b"existing snowball member payload";
+    let mut builder = tokio_tar::Builder::new(std::io::Cursor::new(Vec::new()));
+    let mut header = tokio_tar::Header::new_gnu();
+    header.set_size(member_payload.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, member_key, std::io::Cursor::new(member_payload))
+        .await?;
+    let archive = builder.into_inner().await?.into_inner();
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("existing-members.tar")
+        .metadata("Snowball-Auto-Extract", "true")
+        .body(ByteStream::from(archive))
+        .send()
+        .await?;
+    // The extracted member must exist locally before the rule arrives, or it
+    // would replicate through the live path instead of the scanner.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if source_client
+            .head_object()
+            .bucket(source_bucket)
+            .key(member_key)
+            .send()
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("snowball member was never extracted on the source".into());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    // Only now wire the remote target and the Enabled rule.
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    // Control key written after the rule replicates through the live path.
+    let control_key = "control-live.txt";
+    let control_payload = "control live payload";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(control_key)
+        .body(ByteStream::from_static(control_payload.as_bytes()))
+        .send()
+        .await?;
+    wait_for_replicated_object(&target_client, target_bucket, control_key, control_payload).await?;
+
+    // Scanner compensation for each pre-existing write path.
+    wait_for_replicated_object(&target_client, target_bucket, plain_key, plain_payload).await?;
+    wait_for_replicated_object(&target_client, target_bucket, copy_key, plain_payload).await?;
+    wait_for_replicated_object(&target_client, target_bucket, member_key, std::str::from_utf8(member_payload)?).await?;
+
+    // Null-version contract: with every sibling compensated (scanner proven
+    // live), the nil-version object must stay absent across further cycles.
+    assert_replication_key_absent(&target_client, target_bucket, null_key, Duration::from_secs(6)).await?;
+
+    Ok(())
+}
+
+/// P1-20: ExistingObjectReplication=Disabled is a contract, not a delay — the
+/// scanner must NEVER compensate objects that predate the rule, while objects
+/// written after the rule replicate normally (the setting only gates the
+/// existing-object resync path).
+#[tokio::test]
+async fn test_scanner_never_compensates_when_existing_object_replication_disabled() -> TestResult {
+    init_logging();
+    let source_bucket = "scanner-disabled-src";
+    let target_bucket = "scanner-disabled-dst";
+    let (source_env, mut target_env) = build_scanner_compensation_pair(source_bucket, target_bucket).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let existing_key = "existing-disabled.txt";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(existing_key)
+        .body(ByteStream::from_static(b"existing disabled payload"))
+        .send()
+        .await?;
+
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication_with_statuses(&source_env, source_bucket, &target_arn, "Enabled", None, "Disabled").await?;
+
+    // The live path is unaffected by the Disabled existing-object setting.
+    let control_key = "control-live.txt";
+    let control_payload = "control live payload";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(control_key)
+        .body(ByteStream::from_static(control_payload.as_bytes()))
+        .send()
+        .await?;
+    wait_for_replicated_object(&target_client, target_bucket, control_key, control_payload).await?;
+
+    // Scanner-only witness. A live-path control key alone would let this test
+    // pass while the existing-object scanner is disabled or wedged, so make
+    // the scanner itself observable: an object whose replication FAILED while
+    // the target was down can only be re-driven by the data scanner's
+    // replication heal pass (see FAST_SCANNER_ENV), and that pass is NOT
+    // gated by ExistingObjectReplication. The witness lives in the same
+    // bucket and prefix as the pre-existing key, so a heal pass that reached
+    // it necessarily walked the pre-existing key in the same scan.
+    let witness_key = "scanner-witness.txt";
+    let witness_payload = "scanner witness payload";
+    target_env.stop_server();
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(witness_key)
+        .body(ByteStream::from_static(witness_payload.as_bytes()))
+        .send()
+        .await?;
+    wait_for_source_replication_status(&source_client, source_bucket, witness_key, "FAILED", false).await?;
+    target_env.restart_server_preserving_data(vec![], &[]).await?;
+    let target_client = target_env.create_s3_client();
+    wait_for_replicated_object(&target_client, target_bucket, witness_key, witness_payload).await?;
+
+    // The scanner demonstrably swept this bucket; the pre-existing key must
+    // still be absent, and stay absent over further cycles.
+    assert_replication_key_absent(&target_client, target_bucket, existing_key, Duration::from_secs(6)).await?;
+
+    Ok(())
+}
+
+/// Shared setup for the P1-5 read-proxy scenarios (backlog#1675): a RustFS
+/// source with an enabled replication rule pointing at the fake target, and
+/// an object seeded DIRECTLY on the target — it exists remotely but not
+/// locally, exactly the active-active replication-lag window the read proxy
+/// serves.
+async fn start_read_proxy_lab(
+    source_bucket: &str,
+    target_bucket: &str,
+) -> Result<(FakeS3Target, RustFSTestEnvironment, Client, Client), Box<dyn Error + Send + Sync>> {
+    let target = FakeS3Target::start().await?;
+    target.create_bucket(target_bucket);
+    target.assign_own_version_ids(true);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut process_env = replication_fast_env();
+    process_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    process_env.extend_from_slice(&[
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("HTTP_PROXY", ""),
+        ("HTTPS_PROXY", ""),
+        ("RUST_LOG", "error"),
+    ]);
+    source_env.start_rustfs_server_with_env(vec![], &process_env).await?;
+
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let target_client = Client::from_conf(crate::common::build_test_s3_config(
+        target.endpoint(),
+        FAKE_ACCESS_KEY,
+        FAKE_SECRET_KEY,
+        None,
+        "read-proxy-e2e",
+    ));
+
+    Ok((target, source_env, source_client, target_client))
+}
+
+/// P1-5 (backlog#1675): during the active-active replication lag window a
+/// GET/HEAD for an object the local site does not have yet is proxied to the
+/// replication target. Pins the wire contract: the anti-loop
+/// `source-proxy-request` marker is sent, the replication worker's
+/// `source-replication-check` SSE-C exemption is NEVER sent, client SSE-C
+/// headers are forwarded verbatim, and an inbound request that was itself
+/// proxied is answered locally (404) without touching the target.
+#[tokio::test]
+async fn test_get_and_head_proxy_unreplicated_object_to_replication_target() -> TestResult {
+    init_logging();
+
+    let source_bucket = "proxy-read-src";
+    let target_bucket = "proxy-read-dst";
+    let (target, source_env, source_client, target_client) = start_read_proxy_lab(source_bucket, target_bucket).await?;
+
+    let payload = b"proxy payload".to_vec();
+    target_client
+        .put_object()
+        .bucket(target_bucket)
+        .key("proxy-only")
+        .body(ByteStream::from(payload.clone()))
+        .send()
+        .await?;
+    target.take_requests();
+
+    // a. GET of the locally-missing object is served through the proxy.
+    let got = source_client
+        .get_object()
+        .bucket(source_bucket)
+        .key("proxy-only")
+        .send()
+        .await
+        .map_err(|err| format!("proxied GET failed: {}", err.into_service_error()))?;
+    assert_eq!(got.content_length, Some(payload.len() as i64));
+    let body = got.body.collect().await?.into_bytes();
+    assert_eq!(body.as_ref(), payload.as_slice(), "proxied GET must stream the target's body");
+
+    let get_record = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::GetObject && record.key.as_deref() == Some("proxy-only"))
+        .ok_or("fake target never received the proxied GET")?;
+    assert_eq!(
+        get_record.proxy_headers.source_proxy_request.as_deref(),
+        Some("true"),
+        "proxied GET must carry the anti-loop source-proxy-request marker"
+    );
+    assert!(
+        get_record.proxy_headers.replication_check.is_none(),
+        "proxied GET must never carry the replication worker's source-replication-check exemption"
+    );
+    assert!(
+        get_record.proxy_headers.ssec_algorithm.is_none() && !get_record.proxy_headers.ssec_key_present,
+        "no client SSE-C headers were sent, so none may be forwarded"
+    );
+
+    // a2. Client SSE-C headers travel verbatim to the target (the target owns
+    // the real SSE-C decryption; the plaintext fake simply ignores them).
+    target.take_requests();
+    let ssec_key = "01234567890123456789012345678901";
+    let ssec_key_b64 = BASE64_STANDARD.encode(ssec_key);
+    let ssec_key_md5 = sse_customer_key_md5_base64(ssec_key);
+    let _ = source_client
+        .get_object()
+        .bucket(source_bucket)
+        .key("proxy-only")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&ssec_key_b64)
+        .sse_customer_key_md5(&ssec_key_md5)
+        .send()
+        .await
+        .map_err(|err| format!("proxied SSE-C GET failed: {}", err.into_service_error()))?;
+    let ssec_record = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::GetObject && record.key.as_deref() == Some("proxy-only"))
+        .ok_or("fake target never received the proxied SSE-C GET")?;
+    assert_eq!(ssec_record.proxy_headers.ssec_algorithm.as_deref(), Some("AES256"));
+    assert!(ssec_record.proxy_headers.ssec_key_present, "SSE-C key header must be forwarded verbatim");
+    assert_eq!(ssec_record.proxy_headers.ssec_key_md5.as_deref(), Some(ssec_key_md5.as_str()));
+    assert!(ssec_record.proxy_headers.replication_check.is_none());
+
+    // b. HEAD of the locally-missing object is served through the proxy.
+    target.take_requests();
+    let head = source_client
+        .head_object()
+        .bucket(source_bucket)
+        .key("proxy-only")
+        .send()
+        .await
+        .map_err(|err| format!("proxied HEAD failed: {}", err.into_service_error()))?;
+    assert_eq!(head.content_length, Some(payload.len() as i64));
+    let head_record = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::HeadObject && record.key.as_deref() == Some("proxy-only"))
+        .ok_or("fake target never received the proxied HEAD")?;
+    assert_eq!(head_record.proxy_headers.source_proxy_request.as_deref(), Some("true"));
+    assert!(head_record.proxy_headers.replication_check.is_none());
+
+    // c. Anti-loop: an inbound request that already carries the proxy marker
+    // is answered locally with 404 and never forwarded to the target.
+    target.take_requests();
+    let err = source_client
+        .get_object()
+        .bucket(source_bucket)
+        .key("proxy-only")
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-minio-source-proxy-request", "true");
+        })
+        .send()
+        .await
+        .expect_err("anti-loop GET must fail locally instead of proxying");
+    let service_err = err.into_service_error();
+    assert!(service_err.is_no_such_key(), "anti-loop GET must 404, got: {service_err}");
+    assert!(
+        !target
+            .requests()
+            .iter()
+            .any(|record| record.operation == FakeTargetOperation::GetObject),
+        "anti-loop GET must not reach the replication target; journal: {:?}",
+        target.requests()
+    );
+
+    // c2. MinIO ProxyHeaderSet parity: the header's mere PRESENCE disables
+    // proxying — "false" is exactly what a peer's replication worker sends on
+    // its convergence HEADs, and proxying that miss back would fake
+    // convergence.
+    target.take_requests();
+    let err = source_client
+        .get_object()
+        .bucket(source_bucket)
+        .key("proxy-only")
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-minio-source-proxy-request", "false");
+        })
+        .send()
+        .await
+        .expect_err("proxy-header-set GET must fail locally instead of proxying");
+    let service_err = err.into_service_error();
+    assert!(service_err.is_no_such_key(), "proxy-header-set GET must 404, got: {service_err}");
+    assert!(
+        !target
+            .requests()
+            .iter()
+            .any(|record| record.operation == FakeTargetOperation::GetObject),
+        "proxy-header-set GET must not reach the replication target; journal: {:?}",
+        target.requests()
+    );
+
+    // d. The replication worker's own convergence HEAD against the target
+    // must carry `source-proxy-request: false` (never proxied back) and the
+    // replication-check exemption. Trigger real replication and inspect the
+    // fake journal.
+    target.take_requests();
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("worker-replicated")
+        .body(ByteStream::from_static(b"worker payload"))
+        .send()
+        .await?;
+    wait_for_target_request_version_id(&target, FakeTargetOperation::PutObject, "worker-replicated").await?;
+    let worker_head = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::HeadObject && record.key.as_deref() == Some("worker-replicated"))
+        .ok_or_else(|| format!("replication worker never HEAD-ed the target; journal: {:?}", target.requests()))?;
+    assert_eq!(
+        worker_head.proxy_headers.source_proxy_request.as_deref(),
+        Some("false"),
+        "worker convergence HEAD must send source-proxy-request: false so the target answers locally"
+    );
+    assert_eq!(
+        worker_head.proxy_headers.replication_check.as_deref(),
+        Some("true"),
+        "worker convergence HEAD keeps the replication-check exemption"
+    );
+
+    drop(source_env);
+    target.shutdown().await;
+    Ok(())
+}
+
+/// P1-5 (backlog#1675): GetObjectTagging for an object missing locally is
+/// proxied to the replication target with the anti-loop marker, mirroring
+/// MinIO `proxyGetTaggingToRepTarget`.
+#[tokio::test]
+async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_target() -> TestResult {
+    init_logging();
+
+    let source_bucket = "proxy-tag-src";
+    let target_bucket = "proxy-tag-dst";
+    let (target, source_env, source_client, target_client) = start_read_proxy_lab(source_bucket, target_bucket).await?;
+
+    target_client
+        .put_object()
+        .bucket(target_bucket)
+        .key("proxy-tagged")
+        .body(ByteStream::from_static(b"tagged payload"))
+        .send()
+        .await?;
+    target_client
+        .put_object_tagging()
+        .bucket(target_bucket)
+        .key("proxy-tagged")
+        .tagging(
+            aws_sdk_s3::types::Tagging::builder()
+                .tag_set(aws_sdk_s3::types::Tag::builder().key("team").value("storage").build()?)
+                .build()?,
+        )
+        .send()
+        .await?;
+    target.take_requests();
+
+    let tags = source_client
+        .get_object_tagging()
+        .bucket(source_bucket)
+        .key("proxy-tagged")
+        .send()
+        .await
+        .map_err(|err| format!("proxied GetObjectTagging failed: {}", err.into_service_error()))?;
+    assert_eq!(tags.tag_set.len(), 1, "proxied tagging read must return the target's tags");
+    assert_eq!(tags.tag_set[0].key.as_str(), "team");
+    assert_eq!(tags.tag_set[0].value.as_str(), "storage");
+
+    let record = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::GetObjectTagging && record.key.as_deref() == Some("proxy-tagged"))
+        .ok_or("fake target never received the proxied GetObjectTagging")?;
+    assert_eq!(
+        record.proxy_headers.source_proxy_request.as_deref(),
+        Some("true"),
+        "proxied tagging read must carry the anti-loop marker"
+    );
+    assert!(record.proxy_headers.replication_check.is_none());
+
+    drop(source_env);
     target.shutdown().await;
     Ok(())
 }

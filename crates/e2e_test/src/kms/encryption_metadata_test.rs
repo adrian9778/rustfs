@@ -22,7 +22,6 @@ use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, ServerSideEncryption, ServerSideEncryptionByDefault,
     ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
 };
-use serial_test::serial;
 use std::collections::{HashMap, VecDeque};
 use tracing::info;
 
@@ -82,14 +81,13 @@ pub(super) fn assert_storage_encrypted(storage_root: &std::path::Path, bucket: &
 }
 
 #[tokio::test]
-#[serial]
 async fn test_head_reports_managed_metadata_for_sse_s3() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Validating SSE-S3 managed encryption metadata exposure");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -143,14 +141,13 @@ async fn test_head_reports_managed_metadata_for_sse_s3() -> Result<(), Box<dyn s
 }
 
 #[tokio::test]
-#[serial]
 async fn test_head_reports_managed_metadata_for_sse_kms_and_copy() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Validating SSE-KMS managed encryption metadata (including copy)");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -247,14 +244,13 @@ async fn test_head_reports_managed_metadata_for_sse_kms_and_copy() -> Result<(),
 }
 
 #[tokio::test]
-#[serial]
 async fn test_multipart_upload_writes_encrypted_data() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Validating ciphertext persistence for multipart SSE-KMS uploads");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;

@@ -427,7 +427,6 @@ pub enum DataSource {
     /// Write triggered
     WriteTriggered,
     /// Fallback value
-    #[allow(dead_code)]
     Fallback,
 }
 
@@ -603,7 +602,6 @@ impl WriteRecord {
 
 /// Hybrid strategy configuration
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct HybridStrategyConfig {
     /// Scheduled update interval
     pub scheduled_update_interval: Duration,
@@ -998,14 +996,12 @@ impl HybridCapacityManager {
     }
 
     /// Get cache age
-    #[allow(dead_code)]
     pub async fn get_cache_age(&self) -> Option<Duration> {
         let cache = self.cache.read().await;
         cache.as_ref().map(|c| c.last_update.elapsed())
     }
 
     /// Get write frequency (writes/minute)
-    #[allow(dead_code)]
     pub async fn get_write_frequency(&self) -> usize {
         let record = &self.write_record;
         record.recent_write_count(record.monotonic_second())
@@ -1300,7 +1296,6 @@ pub fn get_capacity_manager() -> Arc<HybridCapacityManager> {
 ///     .update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime)
 ///     .await;
 /// ```
-#[allow(dead_code)]
 pub fn create_isolated_manager(config: HybridStrategyConfig) -> Arc<HybridCapacityManager> {
     Arc::new(HybridCapacityManager::new(config))
 }
@@ -1489,7 +1484,6 @@ mod tests {
         ENV_CAPACITY_SAMPLE_RATE, ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD,
         ENV_CAPACITY_WRITE_TRIGGER_DELAY,
     };
-    use serial_test::serial;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1674,7 +1668,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_config_getter_defaults() {
         for (env_var, getter, default, _, _) in config_getter_cases() {
             temp_env::with_var(env_var, None::<&str>, || {
@@ -1684,7 +1677,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_config_getter_env_overrides() {
         for (env_var, getter, _, override_value, expected) in config_getter_cases() {
             temp_env::with_var(env_var, Some(override_value), || {
@@ -1694,7 +1686,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_zero_env_values_clamp_to_defaults() {
         // A zero threshold makes small disks report 0 bytes; a zero timeout
         // (with dynamic timeout off) makes every scan fail. Both must fall
@@ -1714,7 +1705,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_update_capacity_preserves_retrieval_metadata() {
         let manager = HybridCapacityManager::from_env();
 
@@ -1730,7 +1720,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_record_write_operation() {
         let manager = HybridCapacityManager::from_env();
 
@@ -1741,7 +1730,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_write_frequency_window() {
         let manager = HybridCapacityManager::from_env();
 
@@ -1829,7 +1817,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_recent_write_count_ignores_future_buckets() {
         let record = WriteRecord::new();
         record.write_buckets[0].store(120, 3);
@@ -1843,7 +1830,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_needs_fast_update() {
         let manager = HybridCapacityManager::from_env();
 
@@ -1860,7 +1846,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_cache_age_tracking() {
         let manager = HybridCapacityManager::from_env();
 
@@ -1880,7 +1865,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_data_source_tracking() {
         let manager = HybridCapacityManager::from_env();
 
@@ -1896,7 +1880,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_needs_fast_update_waits_for_write_trigger_delay() {
         let manager = create_isolated_manager(HybridStrategyConfig {
             scheduled_update_interval: Duration::from_secs(60),
@@ -1927,7 +1910,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_needs_fast_update_respects_enable_write_trigger() {
         let manager = create_isolated_manager(HybridStrategyConfig {
             scheduled_update_interval: Duration::from_secs(60),
@@ -1954,7 +1936,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_concurrent_access() {
         let manager = Arc::new(HybridCapacityManager::from_env());
         let mut handles = Vec::new();
@@ -1981,7 +1962,6 @@ mod tests {
     // exact under heavy same-second contention or the frequency window (and the
     // write-trigger decision) would undercount.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    #[serial]
     async fn test_record_write_operation_lock_free_is_exact_under_contention() {
         let manager = Arc::new(HybridCapacityManager::from_env());
         let mut handles = Vec::new();
@@ -2006,7 +1986,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_performance_overhead() {
         let manager = Arc::new(HybridCapacityManager::from_env());
         let start = Instant::now();
@@ -2023,7 +2002,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_refresh_or_join_singleflight() {
         let manager = Arc::new(HybridCapacityManager::from_env());
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2063,7 +2041,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_refresh_or_join_recovers_after_leader_cancellation() {
         let manager = Arc::new(HybridCapacityManager::from_env());
 
@@ -2092,7 +2069,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_refresh_or_join_cancelled_leader_unblocks_joiner() {
         let manager = Arc::new(HybridCapacityManager::from_env());
 
@@ -2120,7 +2096,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_spawn_refresh_if_needed_deduplicates_background_refresh() {
         let manager = Arc::new(HybridCapacityManager::from_env());
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2158,7 +2133,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_record_write_operation_with_scope_token_marks_dirty_disks() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
         let token = uuid::Uuid::new_v4();
@@ -2182,7 +2156,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_get_dirty_disks_drains_global_dirty_scope_registry() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
         record_global_dirty_scope(CapacityScope {
@@ -2202,7 +2175,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_update_capacity_recomputes_total_from_disk_cache_for_subset_refresh() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
 
@@ -2313,7 +2285,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_update_capacity_degraded_full_refresh_merges_cache_and_does_not_oscillate() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
 
@@ -2359,7 +2330,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_update_capacity_degraded_with_empty_per_disk_serves_merged_cache() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
         manager.update_capacity(full_two_disk_update(), DataSource::RealTime).await;
@@ -2389,7 +2359,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_update_capacity_degraded_without_complete_cache_keeps_partial_sum() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
 
@@ -2430,7 +2399,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_commit_keeps_dirty_marks_recorded_after_scan_start() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
         let disk = scope_disk("node-a", "/tmp/disk-a");
@@ -2461,7 +2429,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_commit_clears_dirty_marks_recorded_before_scan_start() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
         let disk = scope_disk("node-a", "/tmp/disk-a");
@@ -2482,7 +2449,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_retain_dirty_disks_within_drops_ghost_entries() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
         let local = scope_disk("node-a", "/tmp/disk-a");
@@ -2501,7 +2467,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_spawn_refresh_recovers_from_construction_panic() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
 
@@ -2568,7 +2533,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[serial]
     async fn test_refresh_or_join_joiner_times_out_when_leader_wedges() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
 
@@ -2596,7 +2560,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_refresh_or_join_returns_cluster_total_for_dirty_subset() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
 
@@ -2678,7 +2641,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_config_from_env() {
         let config = HybridStrategyConfig::from_env();
 
@@ -2692,7 +2654,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_config_from_env_with_override() {
         temp_env::with_var(ENV_CAPACITY_SCHEDULED_INTERVAL, Some("600"), || {
             let config = HybridStrategyConfig::from_env();

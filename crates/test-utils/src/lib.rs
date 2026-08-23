@@ -30,13 +30,37 @@ mod ecstore_test_compat;
 use std::path::PathBuf;
 use std::sync::{Arc, Once};
 
+#[cfg(feature = "put-object-commit-barrier")]
+use ecstore_test_compat::fixture::ecstore_set_disk;
 use ecstore_test_compat::fixture::{
-    BucketOperations as _, BucketOptions, ECStore, Endpoint, EndpointServerPools, Endpoints, MakeBucketOptions, PoolEndpoints,
-    init_bucket_metadata_sys, init_local_disks,
+    BucketOperations as _, BucketOptions, ECStore, Endpoint, EndpointServerPools, Endpoints, MakeBucketOptions, ObjectIO as _,
+    PoolEndpoints, PutObjReader, SelectObjectSnapshot, init_bucket_metadata_sys, init_local_disks,
 };
 use tokio_util::sync::CancellationToken;
 
 static INIT_TRACING: Once = Once::new();
+
+#[cfg(feature = "put-object-commit-barrier")]
+pub struct PutObjectCommitBarrier(ecstore_set_disk::test_util::PutObjectCommitBarrier);
+
+#[cfg(feature = "put-object-commit-barrier")]
+impl PutObjectCommitBarrier {
+    pub fn before_namespace(bucket: &str, object: &str) -> Self {
+        Self(ecstore_set_disk::test_util::PutObjectCommitBarrier::install(
+            bucket,
+            object,
+            ecstore_set_disk::test_util::PutObjectCommitPause::BeforeNamespace,
+        ))
+    }
+
+    pub async fn wait_until_paused(&self) {
+        self.0.wait_until_paused().await;
+    }
+
+    pub async fn release_and_wait_until_namespace_pending(&self) {
+        self.0.release_and_wait_until_namespace_pending().await;
+    }
+}
 
 /// Install the standard test tracing subscriber once per process
 /// (`RUST_LOG`-driven). Safe to call from every test; later calls are no-ops.
@@ -68,6 +92,13 @@ pub struct TestECStoreEnv {
     /// `init_local_disks` + `ECStore::new` on `127.0.0.1:0` (random port keeps
     /// nextest's process-per-test parallelism safe).
     pub ecstore: Arc<ECStore>,
+    /// The single-pool, single-set topology the store was built from.
+    ///
+    /// The bootstrap does **not** publish it on the instance context (server
+    /// startup is what calls `set_endpoints`, and that write is once-only), so
+    /// a test that needs `get_global_endpoints` to resolve — admin server-info
+    /// and other topology readers — publishes this value itself.
+    pub endpoint_pools: EndpointServerPools,
 }
 
 impl TestECStoreEnv {
@@ -89,6 +120,29 @@ impl TestECStoreEnv {
             )
             .await
             .unwrap_or_else(|e| panic!("failed to create test bucket {bucket}: {e:?}"));
+    }
+
+    /// Write one complete object body through the real ECStore test backend.
+    pub async fn put_object_bytes(&self, bucket: &str, object: &str, bytes: Vec<u8>) {
+        let mut reader = PutObjReader::from_vec(bytes);
+        self.ecstore
+            .put_object(bucket, object, &mut reader, &Default::default())
+            .await
+            .unwrap_or_else(|e| panic!("failed to write test object {bucket}/{object}: {e:?}"));
+    }
+
+    /// Prepare the lock-backed object snapshot used by SelectObjectContent tests.
+    ///
+    /// The concrete ECStore snapshot type stays behind this crate's test
+    /// compatibility boundary; consumers can pass the inferred value directly
+    /// to the S3 Select API without importing ECStore facade paths.
+    pub async fn prepare_select_object_snapshot(&self, bucket: &str, object: &str) -> Arc<SelectObjectSnapshot> {
+        Arc::new(
+            self.ecstore
+                .prepare_select_object_snapshot(bucket, object, &Default::default(), &Default::default())
+                .await
+                .unwrap_or_else(|e| panic!("failed to prepare test object snapshot {bucket}/{object}: {e:?}")),
+        )
     }
 }
 
@@ -187,9 +241,21 @@ impl TestECStoreEnvBuilder {
         // Port 0 keeps ECStore-backed integration binaries parallel-safe under
         // nextest: no fixed peer port is ever shared between test processes.
         let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("parse test addr");
-        let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
+        let ecstore = ECStore::new(server_addr, endpoint_pools.clone(), CancellationToken::new())
             .await
             .expect("build test ECStore");
+
+        // The production bootstrap only persists pool.bin from the elected
+        // first cluster node.  Test stores intentionally have no cluster
+        // election, but heal-format still requires that durable fence before
+        // it can write any disk format.  Materialize the validated topology
+        // here so the shared fixture models a ready single-node store.
+        let mut pool_meta = ecstore.pool_meta.read().await.clone();
+        pool_meta.dont_save = false;
+        pool_meta
+            .save(ecstore.pools.clone())
+            .await
+            .expect("persist test pool metadata");
 
         if self.init_bucket_metadata {
             let buckets_list = ecstore
@@ -207,6 +273,7 @@ impl TestECStoreEnvBuilder {
             temp_root,
             disk_paths,
             ecstore,
+            endpoint_pools,
         }
     }
 }

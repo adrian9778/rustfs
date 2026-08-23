@@ -28,6 +28,7 @@ their issue closes.
 | `check_architecture_migration_rules.sh` | ci-gate | Architecture-boundary anti-regression guard | ci.yml Quick Checks; `make pre-commit` |
 | `check_body_cache_whitelist.sh` | ci-gate | Keeps the app-layer body-cache eligibility gate fail-closed | ci.yml Quick Checks |
 | `check_doc_paths.sh` | ci-gate | Fails when instruction/architecture docs reference repo paths that no longer exist | `make pre-commit` / `pre-pr` |
+| `check_embedded_secrets.sh` | ci-gate | Repo-wide scan blocking committed private key material and provider credential literals | ci.yml Quick Checks; `make pre-commit` / `pre-pr` |
 | `check_extension_schema_boundaries.sh` | ci-gate | Extension-schema crate boundary guard | ci.yml Quick Checks; `make pre-commit` |
 | `check_layer_dependencies.sh` | ci-gate | Crate-layering DAG guard (reads `layer-dependency-baseline.txt`) | ci.yml Quick Checks |
 | `check_logging_guardrails.sh` | ci-gate | Blocks legacy logging patterns from returning | `make pre-commit` / `pre-pr` |
@@ -74,6 +75,8 @@ their issue closes.
 | `run_get_1mib_abba_stage_metrics.sh` | dev-tool | Exact-1MiB isolated-host GET ABBA/stage-metrics harness for backlog#1434 | `test_get_1mib_abba_stage_metrics.sh` |
 | `run_gt1g_get_http_matrix.sh` | dev-tool | >1 GiB GET HTTP matrix | `docs/testing/ecstore-validation-suite-design.md` |
 | `run_gt1g_multipart_put_matrix.sh` | dev-tool | >1 GiB multipart PUT matrix | `docs/testing/ecstore-validation-suite-design.md` |
+| `sample_remote_rustfs_rss.sh` | dev-tool | Remote RustFS PID CPU/RSS TSV sampler for hotpath profiling runs | `test_sample_remote_rustfs_rss.sh`; backlog#1647 |
+| `summarize_samply_profile_symbols.py` | dev-tool | Offline samply `profile.json.gz` + `.syms.json` function-level hotpath summarizer | `test_summarize_samply_profile_symbols.py`; backlog#1647 |
 | `run_scanner_benchmarks.sh` | dev-tool (disposition pending) | Scanner performance benchmark runner. Contains a hardcoded stale path; **disposition owned by backlog perf-10 — do not fix, move, or delete it here** | — |
 
 ## Local development & operations

@@ -26,7 +26,6 @@ use crate::common::{TEST_BUCKET, init_logging};
 use aws_sdk_s3::types::ServerSideEncryption;
 use base64::Engine;
 use md5::{Digest as Md5Digest, Md5};
-use serial_test::serial;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
@@ -39,14 +38,13 @@ fn md5_hex(input: impl AsRef<[u8]>) -> String {
 
 /// Test encryption of zero-byte files (empty files)
 #[tokio::test]
-#[serial]
 async fn test_kms_zero_byte_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS encryption with zero-byte files");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -113,14 +111,13 @@ async fn test_kms_zero_byte_file_encryption() -> Result<(), Box<dyn std::error::
 
 /// Test encryption of single-byte files
 #[tokio::test]
-#[serial]
 async fn test_kms_single_byte_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS encryption with single-byte files");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -206,14 +203,13 @@ async fn test_kms_single_byte_file_encryption() -> Result<(), Box<dyn std::error
 
 /// Test multipart upload boundary conditions (minimum 5MB part size)
 #[tokio::test]
-#[serial]
 async fn test_kms_multipart_boundary_conditions() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS multipart upload boundary conditions");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -282,14 +278,13 @@ async fn test_kms_multipart_boundary_conditions() -> Result<(), Box<dyn std::err
 
 /// Test invalid key scenarios and error handling
 #[tokio::test]
-#[serial]
 async fn test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS invalid key scenarios and error handling");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -370,14 +365,13 @@ async fn test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Erro
 
 /// Test concurrent encryption operations
 #[tokio::test]
-#[serial]
 async fn test_kms_concurrent_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS concurrent encryption operations");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = Arc::new(kms_env.base_env.create_s3_client());
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -478,14 +472,13 @@ async fn test_kms_concurrent_encryption() -> Result<(), Box<dyn std::error::Erro
 
 /// Test key validation and security properties
 #[tokio::test]
-#[serial]
 async fn test_kms_key_validation_security() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS key validation and security properties");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;

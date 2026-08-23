@@ -170,6 +170,7 @@ pub fn internode_rpc_max_message_size() -> usize {
 pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = heal_control::RESULT_MAX_SIZE + 1024;
 pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 3;
 pub const DYNAMIC_CONFIG_PROTOCOL_VERSION: u32 = 1;
+pub const BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION: u32 = 2;
 pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v3\0";
 pub const REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-tier-remote-version-state-capability-v1\0";
 pub const CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-cross-pool-fence-capability-v1\0";
@@ -2106,6 +2107,9 @@ pub enum ChannelClass {
     Bulk,
 }
 
+// Keep multiplexed unary RPCs below h2's per-connection small-frame budget.
+const INTERNODE_RPC_CONCURRENCY_LIMIT: usize = 64;
+
 /// Whether control/bulk channel isolation is enabled (env-gated, default off for safe rollout).
 fn channel_isolation_enabled() -> bool {
     rustfs_utils::get_env_bool(
@@ -2188,6 +2192,7 @@ async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<Channel, Box<
     let mut connector = Endpoint::from_shared(dial_addr.to_string())?
         // Fast connection timeout for dead peer detection
         .connect_timeout(connect_timeout)
+        .concurrency_limit(INTERNODE_RPC_CONCURRENCY_LIMIT)
         // TCP-level keepalive - OS will probe connection
         .tcp_keepalive(Some(tcp_keepalive))
         // Disable Nagle so latency-sensitive control-plane RPCs (locks/health) are not batched
@@ -2342,9 +2347,27 @@ pub async fn evict_failed_connection_with_log_level(addr: &str, log_level: Conne
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message as _;
     use std::sync::Mutex;
 
     static INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct BackgroundHealStatusRequestV1 {}
+
+    #[test]
+    fn background_heal_status_request_remains_rolling_upgrade_compatible() {
+        let current = proto_gen::node_service::BackgroundHealStatusRequest {
+            protocol_version: BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION,
+        };
+        let encoded = current.encode_to_vec();
+        BackgroundHealStatusRequestV1::decode(encoded.as_slice()).expect("v1 server should ignore the version field");
+
+        let encoded = BackgroundHealStatusRequestV1 {}.encode_to_vec();
+        let decoded = proto_gen::node_service::BackgroundHealStatusRequest::decode(encoded.as_slice())
+            .expect("v2 server should accept a v1 request");
+        assert_eq!(decoded.protocol_version, 0);
+    }
 
     #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
     struct CompatPayloadField {
@@ -2433,7 +2456,7 @@ mod tests {
                 json_field: "opts",
                 bin_field: "opts_bin",
             },
-            json_encoder: "let opts_str = compat_json(opts)?;",
+            json_encoder: "let encoded_opts = compat_json(opts).and_then(|opts_str| encode_msgpack(opts).map(|opts_bin| (opts_str, opts_bin)));",
             policy: RequestJsonPolicy::MsgpackOnlyEligible,
         },
         RequestCompatSendSite {
@@ -2513,7 +2536,7 @@ mod tests {
                 json_field: "rename_data_resp",
                 bin_field: "rename_data_resp_bin",
             },
-            json_encoder: "let rename_data_resp_json = compat_response_json(&rename_data_resp, false);",
+            json_encoder: "let rename_data_resp_json = compat_response_json(rename_data_resp, request_decoded_from_msgpack)",
         },
     ];
 
@@ -2557,7 +2580,7 @@ mod tests {
 
     fn production_source(source: &'static str, file_name: &str) -> &'static str {
         source
-            .split("\n#[cfg(test)]")
+            .split("\n#[cfg(test)]\nmod tests")
             .next()
             .unwrap_or_else(|| panic!("{file_name} should contain production source before tests"))
     }

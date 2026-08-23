@@ -34,6 +34,7 @@ use super::interfaces::{
     ScannerMetricsInterface, ServerConfigInterface, StorageClassInterface, TierConfigInterface, TransitionStateInterface,
 };
 use crate::app::object_data_cache::ObjectDataCacheAdapter;
+use crate::app::object_traffic_health::ObjectTrafficHealth;
 use rustfs_iam::{federation::FederatedIdentityService, store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use std::sync::{Arc, OnceLock};
@@ -44,7 +45,6 @@ pub struct AppContext {
     object_store: Arc<ECStore>,
     iam: Arc<dyn IamInterface>,
     federated_identity: Arc<dyn FederatedIdentityInterface>,
-    #[allow(dead_code)]
     kms: Arc<dyn KmsInterface>,
     kms_runtime: Arc<dyn KmsRuntimeInterface>,
     outbound_tls_runtime: Arc<dyn OutboundTlsRuntimeInterface>,
@@ -74,6 +74,8 @@ pub struct AppContext {
     storage_class: Arc<dyn StorageClassInterface>,
     buffer_config: Arc<dyn BufferConfigInterface>,
     object_data_cache: Arc<ObjectDataCacheAdapter>,
+    object_traffic_health: Arc<ObjectTrafficHealth>,
+    table_catalog_strong_runtime: crate::table_catalog::StrongTableCatalogRuntime,
 }
 
 impl AppContext {
@@ -122,6 +124,8 @@ impl AppContext {
             storage_class: default_storage_class_interface(),
             buffer_config: default_buffer_config_interface(),
             object_data_cache,
+            object_traffic_health: Arc::new(ObjectTrafficHealth::from_env()),
+            table_catalog_strong_runtime: crate::table_catalog::StrongTableCatalogRuntime::default(),
         }
     }
 
@@ -137,6 +141,14 @@ impl AppContext {
         self.object_store.clone()
     }
 
+    pub(crate) fn object_traffic_health(&self) -> Arc<ObjectTrafficHealth> {
+        Arc::clone(&self.object_traffic_health)
+    }
+
+    pub(crate) fn table_catalog_strong_runtime(&self) -> crate::table_catalog::StrongTableCatalogRuntime {
+        self.table_catalog_strong_runtime.clone()
+    }
+
     pub fn iam(&self) -> Arc<dyn IamInterface> {
         self.iam.clone()
     }
@@ -149,7 +161,6 @@ impl AppContext {
         self.federated_identity.publish_handle(service)
     }
 
-    #[allow(dead_code)]
     pub fn kms(&self) -> Arc<dyn KmsInterface> {
         self.kms.clone()
     }
@@ -342,7 +353,14 @@ impl AppContext {
             storage_class: interfaces.storage_class,
             buffer_config: interfaces.buffer_config,
             object_data_cache: ObjectDataCacheAdapter::disabled_arc(),
+            object_traffic_health: Arc::new(ObjectTrafficHealth::from_env()),
+            table_catalog_strong_runtime: crate::table_catalog::StrongTableCatalogRuntime::default(),
         }
+    }
+
+    pub(crate) fn with_test_object_traffic_health(mut self, object_traffic_health: Arc<ObjectTrafficHealth>) -> Self {
+        self.object_traffic_health = object_traffic_health;
+        self
     }
 
     pub(crate) fn with_test_runtime_config_interfaces(

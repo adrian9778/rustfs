@@ -88,10 +88,11 @@ use tonic::{Request, Status};
 use tower::{Service, ServiceBuilder};
 use tower_http::add_extension::AddExtensionLayer;
 use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::compression::CompressionLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{Span, debug, error, info, instrument, trace, warn};
+use tracing::{Level, Span, debug, error, info, instrument, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 const LABEL_HTTP_METHOD: &str = "method";
@@ -104,7 +105,29 @@ const METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL: &str = "rustfs_http_server_re
 const METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES: &str = "rustfs_http_server_request_body_size_bytes";
 const METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL: &str = "rustfs_http_server_response_body_bytes_total";
 const METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES: &str = "rustfs_http_server_response_body_size_bytes";
+const METRIC_HTTP_SERVER_RESPONSE_BODY_CHUNK_SIZE_BYTES: &str = "rustfs_http_server_response_body_chunk_size_bytes";
+const METRIC_HTTP_SERVER_RESPONSE_BODY_CHUNK_LATENCY_SECONDS: &str = "rustfs_http_server_response_body_chunk_latency_seconds";
+const METRIC_HTTP_SERVER_RESPONSE_BODY_STREAM_DURATION_SECONDS: &str = "rustfs_http_server_response_body_stream_duration_seconds";
 const METRIC_HTTP_SERVER_CONNECTION_CAP_SATURATED_TOTAL: &str = "rustfs_http_server_connection_cap_saturated_total";
+const HTTP_STREAMING_BODY_FAILURE_STAGE_TRANSPORT: &str = "http_transport";
+const HTTP_STREAMING_BODY_FAILURE_REASON_TRANSPORT: &str = "transport_failure";
+const HTTP_STREAMING_BODY_FAILURE_CLASS_TRANSPORT: &str = "transport";
+const HTTP_STREAMING_BODY_FAILURE_UNKNOWN: &str = "unknown";
+const HTTP_METHOD_GET_INDEX: usize = 0;
+const HTTP_METHOD_PUT_INDEX: usize = 1;
+const HTTP_METHOD_POST_INDEX: usize = 2;
+const HTTP_METHOD_DELETE_INDEX: usize = 3;
+const HTTP_METHOD_HEAD_INDEX: usize = 4;
+const HTTP_METHOD_OPTIONS_INDEX: usize = 5;
+const HTTP_METHOD_PATCH_INDEX: usize = 6;
+const HTTP_METHOD_CONNECT_INDEX: usize = 7;
+const HTTP_METHOD_TRACE_INDEX: usize = 8;
+const HTTP_METHOD_OTHER_INDEX: usize = 9;
+const HTTP_METHOD_LABELS: [&str; 10] = [
+    "GET", "PUT", "POST", "DELETE", "HEAD", "OPTIONS", "PATCH", "CONNECT", "TRACE", "OTHER",
+];
+const HTTP_STATUS_UNKNOWN_INDEX: usize = 5;
+const HTTP_STATUS_CLASS_LABELS: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "unknown"];
 
 /// Cached handle for the per-response-body-chunk byte counter. A streamed GET
 /// emits many chunks, so resolving the `counter!` registry entry once — the
@@ -112,6 +135,22 @@ const METRIC_HTTP_SERVER_CONNECTION_CAP_SATURATED_TOTAL: &str = "rustfs_http_ser
 /// a registry lookup on every chunk.
 static RESP_BODY_BYTES_COUNTER: std::sync::LazyLock<metrics::Counter> =
     std::sync::LazyLock::new(|| counter!(METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL));
+static RESP_BODY_CHUNK_SIZE_HISTOGRAM: std::sync::LazyLock<metrics::Histogram> =
+    std::sync::LazyLock::new(|| histogram!(METRIC_HTTP_SERVER_RESPONSE_BODY_CHUNK_SIZE_BYTES));
+static RESP_BODY_CHUNK_LATENCY_HISTOGRAM: std::sync::LazyLock<metrics::Histogram> =
+    std::sync::LazyLock::new(|| histogram!(METRIC_HTTP_SERVER_RESPONSE_BODY_CHUNK_LATENCY_SECONDS));
+static RESP_BODY_STREAM_DURATION_HISTOGRAM: std::sync::LazyLock<metrics::Histogram> =
+    std::sync::LazyLock::new(|| histogram!(METRIC_HTTP_SERVER_RESPONSE_BODY_STREAM_DURATION_SECONDS));
+static ACTIVE_HTTP_REQUESTS_GAUGE: std::sync::LazyLock<metrics::Gauge> =
+    std::sync::LazyLock::new(|| gauge!(METRIC_HTTP_SERVER_ACTIVE_REQUESTS));
+static REQUEST_BODY_BYTES_COUNTER: std::sync::LazyLock<metrics::Counter> =
+    std::sync::LazyLock::new(|| counter!(METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL));
+static HTTP_METHOD_METRICS: std::sync::LazyLock<[HttpMethodMetrics; 10]> =
+    std::sync::LazyLock::new(|| HTTP_METHOD_LABELS.map(HttpMethodMetrics::new));
+static HTTP_STATUS_CLASS_METRICS: std::sync::LazyLock<[HttpStatusClassMetrics; 6]> =
+    std::sync::LazyLock::new(|| HTTP_STATUS_CLASS_LABELS.map(HttpStatusClassMetrics::new));
+static HTTP_TRANSPORT_FAILURES_COUNTER: std::sync::LazyLock<metrics::Counter> =
+    std::sync::LazyLock::new(|| counter!(METRIC_HTTP_SERVER_FAILURES_TOTAL, LABEL_HTTP_STATUS_CLASS => "transport"));
 const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_HTTP: &str = "http";
 const LOG_SUBSYSTEM_TRANSPORT: &str = "transport";
@@ -139,6 +178,36 @@ const TIER_MUTATION_COMMIT_TONIC_RPC_PATH: &str = "/node_service.TierMutationCon
 const TIER_MUTATION_ABORT_TONIC_RPC_PATH: &str = "/node_service.TierMutationControlService/AbortTierMutation";
 
 static ACTIVE_HTTP_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+struct HttpMethodMetrics {
+    requests: metrics::Counter,
+    request_body_size: metrics::Histogram,
+}
+
+impl HttpMethodMetrics {
+    fn new(method: &'static str) -> Self {
+        Self {
+            requests: counter!(METRIC_HTTP_SERVER_REQUESTS_TOTAL, LABEL_HTTP_METHOD => method),
+            request_body_size: histogram!(METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES, LABEL_HTTP_METHOD => method),
+        }
+    }
+}
+
+struct HttpStatusClassMetrics {
+    request_duration: metrics::Histogram,
+    failures: metrics::Counter,
+    response_body_size: metrics::Histogram,
+}
+
+impl HttpStatusClassMetrics {
+    fn new(status_class: &'static str) -> Self {
+        Self {
+            request_duration: histogram!(METRIC_HTTP_SERVER_REQUEST_DURATION_SECONDS, LABEL_HTTP_STATUS_CLASS => status_class),
+            failures: counter!(METRIC_HTTP_SERVER_FAILURES_TOTAL, LABEL_HTTP_STATUS_CLASS => status_class),
+            response_body_size: histogram!(METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES, LABEL_HTTP_STATUS_CLASS => status_class),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct RpcRequestTarget {
@@ -199,36 +268,66 @@ where
 }
 
 #[inline]
-fn request_method_label(method: &Method) -> &'static str {
+fn http_method_index(method: &Method) -> usize {
     match method.as_str() {
-        "GET" => "GET",
-        "PUT" => "PUT",
-        "POST" => "POST",
-        "DELETE" => "DELETE",
-        "HEAD" => "HEAD",
-        "OPTIONS" => "OPTIONS",
-        "PATCH" => "PATCH",
-        "CONNECT" => "CONNECT",
-        "TRACE" => "TRACE",
-        _ => "OTHER",
+        "GET" => HTTP_METHOD_GET_INDEX,
+        "PUT" => HTTP_METHOD_PUT_INDEX,
+        "POST" => HTTP_METHOD_POST_INDEX,
+        "DELETE" => HTTP_METHOD_DELETE_INDEX,
+        "HEAD" => HTTP_METHOD_HEAD_INDEX,
+        "OPTIONS" => HTTP_METHOD_OPTIONS_INDEX,
+        "PATCH" => HTTP_METHOD_PATCH_INDEX,
+        "CONNECT" => HTTP_METHOD_CONNECT_INDEX,
+        "TRACE" => HTTP_METHOD_TRACE_INDEX,
+        _ => HTTP_METHOD_OTHER_INDEX,
     }
 }
 
 #[inline]
-fn status_class_label(status: http::StatusCode) -> &'static str {
+fn http_method_metrics(method: &Method) -> &'static HttpMethodMetrics {
+    &HTTP_METHOD_METRICS[http_method_index(method)]
+}
+
+#[inline]
+fn status_class_index(status: http::StatusCode) -> usize {
     match status.as_u16() / 100 {
-        1 => "1xx",
-        2 => "2xx",
-        3 => "3xx",
-        4 => "4xx",
-        5 => "5xx",
-        _ => "unknown",
+        1..=5 => usize::from(status.as_u16() / 100 - 1),
+        _ => HTTP_STATUS_UNKNOWN_INDEX,
     }
+}
+
+#[inline]
+fn http_status_class_metrics(status: http::StatusCode) -> &'static HttpStatusClassMetrics {
+    &HTTP_STATUS_CLASS_METRICS[status_class_index(status)]
+}
+
+#[inline]
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[inline]
 fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[inline]
+fn record_response_body_chunk_observation(chunk_len: usize, latency: Duration) {
+    if !rustfs_io_metrics::metrics_enabled() {
+        return;
+    }
+
+    RESP_BODY_CHUNK_SIZE_HISTOGRAM.record(chunk_len as f64);
+    RESP_BODY_CHUNK_LATENCY_HISTOGRAM.record(latency.as_secs_f64());
+}
+
+#[inline]
+fn record_response_body_stream_duration(stream_duration: Duration) {
+    if !rustfs_io_metrics::metrics_enabled() {
+        return;
+    }
+
+    RESP_BODY_STREAM_DURATION_HISTOGRAM.record(stream_duration.as_secs_f64());
 }
 
 fn log_tls_handshake_failure(peer_addr: &str, kind: TlsHandshakeFailureKind, err: &dyn std::fmt::Display) {
@@ -321,7 +420,28 @@ fn record_active_http_requests(delta: i64) {
             .unwrap_or_else(|current| current)
             .saturating_sub(decrement)
     };
-    gauge!(METRIC_HTTP_SERVER_ACTIVE_REQUESTS).set(next as f64);
+    ACTIVE_HTTP_REQUESTS_GAUGE.set(next as f64);
+}
+
+#[inline]
+fn record_http_transport_streaming_body_failure() {
+    rustfs_io_metrics::record_get_object_streaming_body_failure(rustfs_io_metrics::GetObjectStreamingBodyFailure {
+        stage: HTTP_STREAMING_BODY_FAILURE_STAGE_TRANSPORT,
+        reason: HTTP_STREAMING_BODY_FAILURE_REASON_TRANSPORT,
+        error_class: HTTP_STREAMING_BODY_FAILURE_CLASS_TRANSPORT,
+        strategy: HTTP_STREAMING_BODY_FAILURE_UNKNOWN,
+        buffer_source: HTTP_STREAMING_BODY_FAILURE_UNKNOWN,
+        size_bucket: rustfs_io_metrics::GET_OBJECT_SIZE_BUCKET_UNKNOWN,
+        emitted_bytes: 0,
+        remaining_bytes: 0,
+    });
+}
+
+#[inline]
+fn record_http_transport_failure_if_body_error(error: &ServerErrorsFailureClass) {
+    if matches!(error, ServerErrorsFailureClass::Error(_)) {
+        record_http_transport_streaming_body_failure();
+    }
 }
 
 pub(crate) fn active_http_requests() -> u64 {
@@ -405,28 +525,82 @@ where
 fn trace_on_response<ResBody>(response: &Response<ResBody>, latency: Duration, span: &Span) {
     span.record("status_code", tracing::field::display(response.status()));
     let _enter = span.enter();
-    let status_class = status_class_label(response.status());
-    histogram!(
-        METRIC_HTTP_SERVER_REQUEST_DURATION_SECONDS,
-        LABEL_HTTP_STATUS_CLASS => status_class
-    )
-    .record(latency.as_secs_f64());
+    let status_metrics = http_status_class_metrics(response.status());
+    status_metrics.request_duration.record(latency.as_secs_f64());
     if response.status().is_client_error() || response.status().is_server_error() {
-        counter!(
-            METRIC_HTTP_SERVER_FAILURES_TOTAL,
-            LABEL_HTTP_STATUS_CLASS => status_class
-        )
-        .increment(1);
+        status_metrics.failures.increment(1);
     }
     if let Some(cl) = response.headers().get("content-length")
         && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
     {
-        histogram!(
-            METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES,
-            LABEL_HTTP_STATUS_CLASS => status_class
-        )
-        .record(len as f64);
+        status_metrics.response_body_size.record(len as f64);
     }
+}
+
+fn make_http_trace_span<ReqBody>(request: &HttpRequest<ReqBody>) -> Span {
+    if !tracing::enabled!(Level::INFO) {
+        return Span::none();
+    }
+
+    let request_context = request
+        .extensions()
+        .get::<crate::storage_api::server::http::request_context::RequestContext>();
+    let request_id = request_context.map(|ctx| ctx.request_id.as_str()).unwrap_or("unknown");
+    let trace_id = request_context.and_then(|ctx| ctx.trace_id.as_deref()).unwrap_or("unknown");
+    let span_id = request_context.and_then(|ctx| ctx.span_id.as_deref()).unwrap_or("unknown");
+
+    let parent_context =
+        global::get_text_map_propagator(|propagator| propagator.extract(&HeaderMapCarrier::new(request.headers())));
+
+    if parent_context.has_active_span() {
+        let span_ref = parent_context.span();
+        trace!(
+            otel_trace_id = %span_ref.span_context().trace_id(),
+            otel_parent_span_id = %span_ref.span_context().span_id(),
+            sampled = span_ref.span_context().is_sampled(),
+            "Extracted trace context from incoming request headers"
+        );
+    } else {
+        trace!("No trace context found in request headers, will create root span");
+    }
+
+    let client_info = request.extensions().get::<ClientInfo>();
+    let peer_addr = client_info
+        .map(|info| info.real_ip.to_string())
+        .or_else(|| request.extensions().get::<RemoteAddr>().map(|addr| addr.0.to_string()))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let span = tracing::info_span!("http-request",
+        request_id = %request_id,
+        trace_id = %trace_id,
+        span_id = %span_id,
+        status_code = tracing::field::Empty,
+        method = %request.method(),
+        peer_addr = %peer_addr,
+        uri = %redact_sensitive_uri_query(request.uri()),
+        version = ?request.version(),
+        user_agent = tracing::field::Empty,
+        content_type = tracing::field::Empty,
+        content_length = tracing::field::Empty,
+    );
+    if span.is_disabled() {
+        return span;
+    }
+    if let Err(e) = span.set_parent(parent_context) {
+        debug!(component = LOG_COMPONENT_SERVER, subsystem = LOG_SUBSYSTEM_HTTP, error = ?e, "Failed to propagate tracing context");
+    }
+    for (header_name, header_value) in request.headers() {
+        let value = header_value.to_str().unwrap_or("invalid");
+        if header_name == "user-agent" {
+            span.record("user_agent", value);
+        } else if header_name == "content-type" {
+            span.record("content_type", value);
+        } else if header_name == "content-length" {
+            span.record("content_length", value);
+        }
+    }
+
+    span
 }
 
 pub async fn start_http_server(
@@ -1363,7 +1537,7 @@ fn process_connection(
                 None
             }
         };
-        // ── Canonical Middleware Stack Order (outermost → innermost) ──
+        // ── Canonical External Middleware Stack Order (outermost → innermost) ──
         // This order MUST be preserved across refactorings.
         // Only AddExtensionLayer (layers 1-2) are per-connection; most remaining layers are stateless.
         //
@@ -1379,8 +1553,8 @@ fn process_connection(
         // 10. KeystoneAuthLayer                      — X-Auth-Token validation
         // 11. TraceLayer                             — request span creation + metrics
         // 12. RequestLoggingLayer                    — single completion event per request
-        // 13. CompressionLayer                       — response compression (whitelist, path-aware)
-        // 14. PathCategoryInjectionLayer             — injects path category for compression predicate
+        // 13. CompressionLayer                       — response compression predicate (whitelist, path-aware)
+        // 14. PathCategoryInjectionLayer             — injects path category when compression is enabled
         // 15. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
         // 16. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
         // 17. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
@@ -1391,6 +1565,8 @@ fn process_connection(
         // 22. PublicHealthEndpointLayer              — handles public health before s3s host parsing
         // 23. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
         // 24. DoubleSlashListBucketsCompatLayer      — rewrites `GET //` to `GET /` for ListBuckets (MinIO browser compat)
+        // The internode lane below intentionally keeps only the shared
+        // transport/auth/observability subset needed by `/rustfs/rpc/...`.
         // ─────────────────────────────────────────────────────────────
         let build_external_stack = |service| {
             ServiceBuilder::new()
@@ -1431,98 +1607,26 @@ fn process_connection(
                 .layer(InFlightLayer)
                 .layer(
                     TraceLayer::new_for_http()
-                        .make_span_with(|request: &HttpRequest<_>| {
-                            let request_context =
-                                request.extensions().get::<crate::storage_api::server::http::request_context::RequestContext>();
-                            let request_id = request_context
-                                .map(|ctx| ctx.request_id.as_str())
-                                .unwrap_or("unknown");
-                            let trace_id = request_context
-                                .and_then(|ctx| ctx.trace_id.as_deref())
-                                .unwrap_or("unknown");
-                            let span_id = request_context
-                                .and_then(|ctx| ctx.span_id.as_deref())
-                                .unwrap_or("unknown");
-
-                            let parent_context = global::get_text_map_propagator(|propagator| {
-                                propagator.extract(&HeaderMapCarrier::new(request.headers()))
-                            });
-
-                            if parent_context.has_active_span() {
-                                let span_ref = parent_context.span();
-                                trace!(
-                                    otel_trace_id = %span_ref.span_context().trace_id(),
-                                    otel_parent_span_id = %span_ref.span_context().span_id(),
-                                    sampled = span_ref.span_context().is_sampled(),
-                                    "Extracted trace context from incoming request headers"
-                                );
-                            } else {
-                                trace!("No trace context found in request headers, will create root span");
-                            }
-                            let client_info = request.extensions().get::<ClientInfo>();
-                            let peer_addr = client_info
-                                .map(|info| info.real_ip.to_string())
-                                .or_else(|| request.extensions().get::<RemoteAddr>().map(|addr| addr.0.to_string()))
-                                .unwrap_or_else(|| "unknown".to_string());
-
-                            let span = tracing::info_span!("http-request",
-                                request_id = %request_id,
-                                trace_id = %trace_id,
-                                span_id = %span_id,
-                                status_code = tracing::field::Empty,
-                                method = %request.method(),
-                                peer_addr = %peer_addr,
-                                uri = %redact_sensitive_uri_query(request.uri()),
-                                version = ?request.version(),
-                                user_agent = tracing::field::Empty,
-                                content_type = tracing::field::Empty,
-                                content_length = tracing::field::Empty,
-                            );
-                            if span.is_disabled() {
-                                return span;
-                            }
-                            if let Err(e) = span.set_parent(parent_context) {
-                                debug!(component = LOG_COMPONENT_SERVER, subsystem = LOG_SUBSYSTEM_HTTP, error = ?e, "Failed to propagate tracing context");
-                            }
-                            for (header_name, header_value) in request.headers() {
-                                let value = header_value.to_str().unwrap_or("invalid");
-                                if header_name == "user-agent" {
-                                    span.record("user_agent", value);
-                                } else if header_name == "content-type" {
-                                    span.record("content_type", value);
-                                } else if header_name == "content-length" {
-                                    span.record("content_length", value);
-                                }
-                            }
-
-                            span
-                        })
+                        .make_span_with(make_http_trace_span)
                         .on_request(|request: &HttpRequest<_>, span: &Span| {
                             let _enter = span.enter();
                             trace!("HTTP request started");
-                            let method = request_method_label(request.method());
+                            let method_metrics = http_method_metrics(request.method());
                             // In-flight counting is handled by InFlightLayer's RAII guard
                             // (backlog#806-35); do not adjust the active-requests gauge here.
-                            counter!(
-                                METRIC_HTTP_SERVER_REQUESTS_TOTAL,
-                                LABEL_HTTP_METHOD => method
-                            )
-                            .increment(1);
+                            method_metrics.requests.increment(1);
 
                             if let Some(cl) = request.headers().get("content-length")
                                 && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
                             {
-                                counter!(METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL).increment(len);
-                                histogram!(
-                                    METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES,
-                                    LABEL_HTTP_METHOD => method
-                                )
-                                .record(len as f64);
+                                REQUEST_BODY_BYTES_COUNTER.increment(len);
+                                method_metrics.request_body_size.record(len as f64);
                             }
                         })
                         .on_response(trace_on_response)
                         .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
-                            RESP_BODY_BYTES_COUNTER.increment(chunk.len() as u64);
+                            RESP_BODY_BYTES_COUNTER.increment(usize_to_u64_saturating(chunk.len()));
+                            record_response_body_chunk_observation(chunk.len(), latency);
                             #[cfg(feature = "tracing-chunk-debug")]
                             {
                                 let _enter = span.enter();
@@ -1534,6 +1638,7 @@ fn process_connection(
                             }
                         })
                         .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
+                            record_response_body_stream_duration(stream_duration);
                             #[cfg(feature = "tracing-chunk-debug")]
                             {
                                 let _enter = span.enter();
@@ -1550,17 +1655,14 @@ fn process_connection(
                             // (backlog#806-35). This hook previously also fired for 5xx
                             // responses (which ALSO hit on_response), double-decrementing
                             // the gauge; only the failure metric is recorded here now.
-                            counter!(
-                                METRIC_HTTP_SERVER_FAILURES_TOTAL,
-                                LABEL_HTTP_STATUS_CLASS => "transport"
-                            )
-                            .increment(1);
+                            HTTP_TRANSPORT_FAILURES_COUNTER.increment(1);
+                            record_http_transport_failure_if_body_error(&error);
                             trace!(error = ?error, duration_ms = duration_ms(latency), "HTTP request failure captured by trace layer");
                         }),
                 )
                 .layer(RequestLoggingLayer)
                 .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
-                .layer(PathCategoryInjectionLayer)
+                .option_layer(compression_config.enabled.then_some(PathCategoryInjectionLayer))
                 .layer(S3ErrorMessageCompatLayer)
                 .layer(IcebergRestErrorCompatLayer)
                 .layer(ObjectAttributesEtagFixLayer)
@@ -1568,7 +1670,7 @@ fn process_connection(
                 .option_layer(if is_console { Some(RedirectLayer) } else { None })
                 .layer(BodylessStatusFixLayer)
                 .layer(HeadRequestBodyFixLayer)
-                .layer(PublicHealthEndpointLayer)
+                .layer(PublicHealthEndpointLayer::new(Arc::clone(&server_ctx)))
                 .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
                 .layer(DoubleSlashListBucketsCompatLayer)
                 .service(service)
@@ -1591,98 +1693,26 @@ fn process_connection(
                 .layer(InFlightLayer)
                 .layer(
                     TraceLayer::new_for_http()
-                        .make_span_with(|request: &HttpRequest<_>| {
-                            let request_context =
-                                request.extensions().get::<crate::storage_api::server::http::request_context::RequestContext>();
-                            let request_id = request_context
-                                .map(|ctx| ctx.request_id.as_str())
-                                .unwrap_or("unknown");
-                            let trace_id = request_context
-                                .and_then(|ctx| ctx.trace_id.as_deref())
-                                .unwrap_or("unknown");
-                            let span_id = request_context
-                                .and_then(|ctx| ctx.span_id.as_deref())
-                                .unwrap_or("unknown");
-
-                            let parent_context = global::get_text_map_propagator(|propagator| {
-                                propagator.extract(&HeaderMapCarrier::new(request.headers()))
-                            });
-
-                            if parent_context.has_active_span() {
-                                let span_ref = parent_context.span();
-                                trace!(
-                                    otel_trace_id = %span_ref.span_context().trace_id(),
-                                    otel_parent_span_id = %span_ref.span_context().span_id(),
-                                    sampled = span_ref.span_context().is_sampled(),
-                                    "Extracted trace context from incoming request headers"
-                                );
-                            } else {
-                                trace!("No trace context found in request headers, will create root span");
-                            }
-                            let client_info = request.extensions().get::<ClientInfo>();
-                            let peer_addr = client_info
-                                .map(|info| info.real_ip.to_string())
-                                .or_else(|| request.extensions().get::<RemoteAddr>().map(|addr| addr.0.to_string()))
-                                .unwrap_or_else(|| "unknown".to_string());
-
-                            let span = tracing::info_span!("http-request",
-                                request_id = %request_id,
-                                trace_id = %trace_id,
-                                span_id = %span_id,
-                                status_code = tracing::field::Empty,
-                                method = %request.method(),
-                                peer_addr = %peer_addr,
-                                uri = %redact_sensitive_uri_query(request.uri()),
-                                version = ?request.version(),
-                                user_agent = tracing::field::Empty,
-                                content_type = tracing::field::Empty,
-                                content_length = tracing::field::Empty,
-                            );
-                            if span.is_disabled() {
-                                return span;
-                            }
-                            if let Err(e) = span.set_parent(parent_context) {
-                                debug!(component = LOG_COMPONENT_SERVER, subsystem = LOG_SUBSYSTEM_HTTP, error = ?e, "Failed to propagate tracing context");
-                            }
-                            for (header_name, header_value) in request.headers() {
-                                let value = header_value.to_str().unwrap_or("invalid");
-                                if header_name == "user-agent" {
-                                    span.record("user_agent", value);
-                                } else if header_name == "content-type" {
-                                    span.record("content_type", value);
-                                } else if header_name == "content-length" {
-                                    span.record("content_length", value);
-                                }
-                            }
-
-                            span
-                        })
+                        .make_span_with(make_http_trace_span)
                         .on_request(|request: &HttpRequest<_>, span: &Span| {
                             let _enter = span.enter();
                             trace!("HTTP request started");
-                            let method = request_method_label(request.method());
+                            let method_metrics = http_method_metrics(request.method());
                             // In-flight counting is handled by InFlightLayer's RAII guard
                             // (backlog#806-35); do not adjust the active-requests gauge here.
-                            counter!(
-                                METRIC_HTTP_SERVER_REQUESTS_TOTAL,
-                                LABEL_HTTP_METHOD => method
-                            )
-                            .increment(1);
+                            method_metrics.requests.increment(1);
 
                             if let Some(cl) = request.headers().get("content-length")
                                 && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
                             {
-                                counter!(METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL).increment(len);
-                                histogram!(
-                                    METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES,
-                                    LABEL_HTTP_METHOD => method
-                                )
-                                .record(len as f64);
+                                REQUEST_BODY_BYTES_COUNTER.increment(len);
+                                method_metrics.request_body_size.record(len as f64);
                             }
                         })
                         .on_response(trace_on_response)
                         .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
-                            RESP_BODY_BYTES_COUNTER.increment(chunk.len() as u64);
+                            RESP_BODY_BYTES_COUNTER.increment(usize_to_u64_saturating(chunk.len()));
+                            record_response_body_chunk_observation(chunk.len(), latency);
                             #[cfg(feature = "tracing-chunk-debug")]
                             {
                                 let _enter = span.enter();
@@ -1694,6 +1724,7 @@ fn process_connection(
                             }
                         })
                         .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
+                            record_response_body_stream_duration(stream_duration);
                             #[cfg(feature = "tracing-chunk-debug")]
                             {
                                 let _enter = span.enter();
@@ -1710,27 +1741,17 @@ fn process_connection(
                             // (backlog#806-35). This hook previously also fired for 5xx
                             // responses (which ALSO hit on_response), double-decrementing
                             // the gauge; only the failure metric is recorded here now.
-                            counter!(
-                                METRIC_HTTP_SERVER_FAILURES_TOTAL,
-                                LABEL_HTTP_STATUS_CLASS => "transport"
-                            )
-                            .increment(1);
+                            HTTP_TRANSPORT_FAILURES_COUNTER.increment(1);
+                            record_http_transport_failure_if_body_error(&error);
                             trace!(error = ?error, duration_ms = duration_ms(latency), "HTTP request failure captured by trace layer");
                         }),
                 )
                 .layer(PropagateRequestIdLayer::x_request_id())
                 .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
-                .layer(PathCategoryInjectionLayer)
-                .layer(S3ErrorMessageCompatLayer)
-                .layer(IcebergRestErrorCompatLayer)
-                .layer(ObjectAttributesEtagFixLayer)
-                .layer(ConditionalCorsLayer::new())
-                .option_layer(if is_console { Some(RedirectLayer) } else { None })
-                .layer(BodylessStatusFixLayer)
-                .layer(HeadRequestBodyFixLayer)
-                .layer(PublicHealthEndpointLayer)
-                .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
-                .layer(DoubleSlashListBucketsCompatLayer)
+                .option_layer(compression_config.enabled.then_some(PathCategoryInjectionLayer))
+                // The internode lane only serves `/rustfs/rpc/...` gRPC requests.
+                // Keep safety/observability layers above, but leave S3/REST
+                // compatibility rewrites on the external lane.
                 .service(service)
         };
         let external_stack_service = build_external_stack(external_service);
@@ -1810,6 +1831,13 @@ fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error
         } else if hyper_err.is_parse() {
             log_transport_failed(peer_addr, "parse_failure", &hyper_err.to_string());
         } else if hyper_err.is_user() {
+            // is_user() = "error from user's Body stream": the application
+            // returned a streaming body that failed mid-flight. Log the full
+            // error source chain so the underlying cause (disk read failure,
+            // upstream RPC error, deleted object, etc.) is visible.
+            let cause = std::error::Error::source(hyper_err)
+                .map(|e| e.to_string())
+                .unwrap_or_default();
             error!(
                 event = EVENT_HTTP_TRANSPORT_FAILED,
                 component = LOG_COMPONENT_SERVER,
@@ -1817,6 +1845,7 @@ fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error
                 peer_addr = %peer_addr,
                 error_kind = "service_error",
                 error = %hyper_err,
+                cause = %cause,
                 result = "transport_error",
                 "HTTP transport failed"
             );
@@ -2041,7 +2070,7 @@ mod tests {
     use http::{HeaderMap, StatusCode};
     use http_body_util::{Empty, Full};
     use metrics::with_local_recorder;
-    use metrics_util::debugging::DebuggingRecorder;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use opentelemetry::propagation::Extractor;
     use std::collections::HashMap;
     use std::convert::Infallible;
@@ -2051,6 +2080,13 @@ mod tests {
     use storage::tonic_service::{heal_topology_fingerprint, make_heal_control_server_for_source};
     use storage::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
     use tower::{Layer, Service, ServiceBuilder};
+
+    type MetricRow = (
+        metrics_util::CompositeKey,
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        DebugValue,
+    );
 
     /// Baseline constants — reference the authoritative config defaults.
     /// If a config default changes, tests automatically follow.
@@ -2100,6 +2136,21 @@ mod tests {
         use rustfs_config::{DEFAULT_HTTP1_HEADER_READ_TIMEOUT, DEFAULT_HTTP1_MAX_BUF_SIZE};
         assert_eq!(baseline::HTTP1_HEADER_READ_TIMEOUT_SECS, DEFAULT_HTTP1_HEADER_READ_TIMEOUT);
         assert_eq!(baseline::HTTP1_MAX_BUF_SIZE, DEFAULT_HTTP1_MAX_BUF_SIZE);
+    }
+
+    #[test]
+    fn http_trace_span_is_empty_when_info_is_disabled() {
+        let subscriber = tracing_subscriber::fmt().with_max_level(Level::ERROR).finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("/bucket/object.txt")
+            .body(())
+            .expect("request");
+
+        let span = make_http_trace_span(&request);
+
+        assert!(span.is_disabled());
     }
 
     #[test]
@@ -2169,6 +2220,128 @@ mod tests {
 
         assert_eq!(LABEL_HTTP_METHOD, "method");
         assert_eq!(LABEL_HTTP_STATUS_CLASS, "status_class");
+    }
+
+    #[test]
+    fn cached_http_metric_indexes_match_public_labels() {
+        for (method, expected_index) in [
+            (Method::GET, HTTP_METHOD_GET_INDEX),
+            (Method::PUT, HTTP_METHOD_PUT_INDEX),
+            (Method::POST, HTTP_METHOD_POST_INDEX),
+            (Method::DELETE, HTTP_METHOD_DELETE_INDEX),
+            (Method::HEAD, HTTP_METHOD_HEAD_INDEX),
+            (Method::OPTIONS, HTTP_METHOD_OPTIONS_INDEX),
+            (Method::PATCH, HTTP_METHOD_PATCH_INDEX),
+            (Method::CONNECT, HTTP_METHOD_CONNECT_INDEX),
+            (Method::TRACE, HTTP_METHOD_TRACE_INDEX),
+        ] {
+            assert_eq!(http_method_index(&method), expected_index);
+            assert_eq!(HTTP_METHOD_LABELS[expected_index], method.as_str());
+        }
+        let custom_method = Method::from_bytes(b"PURGE").expect("custom method should parse");
+        assert_eq!(http_method_index(&custom_method), HTTP_METHOD_OTHER_INDEX);
+        assert_eq!(HTTP_METHOD_LABELS[HTTP_METHOD_OTHER_INDEX], "OTHER");
+
+        for (status, expected_index, expected_label) in [
+            (StatusCode::CONTINUE, 0, "1xx"),
+            (StatusCode::OK, 1, "2xx"),
+            (StatusCode::FOUND, 2, "3xx"),
+            (StatusCode::NOT_FOUND, 3, "4xx"),
+            (StatusCode::INTERNAL_SERVER_ERROR, 4, "5xx"),
+        ] {
+            assert_eq!(status_class_index(status), expected_index);
+            assert_eq!(HTTP_STATUS_CLASS_LABELS[expected_index], expected_label);
+        }
+        let unknown_status = StatusCode::from_u16(700).expect("extension status should parse");
+        assert_eq!(status_class_index(unknown_status), HTTP_STATUS_UNKNOWN_INDEX);
+        assert_eq!(HTTP_STATUS_CLASS_LABELS[HTTP_STATUS_UNKNOWN_INDEX], "unknown");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cached_http_metric_handles_preserve_metric_labels() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let active_before = active_http_requests();
+
+        with_local_recorder(&recorder, || {
+            record_active_http_requests(1);
+            record_active_http_requests(-1);
+
+            let request = HttpRequest::builder()
+                .method(Method::GET)
+                .header("content-length", "7")
+                .body(Empty::<Bytes>::new())
+                .expect("request");
+            let method_metrics = http_method_metrics(request.method());
+            method_metrics.requests.increment(1);
+            REQUEST_BODY_BYTES_COUNTER.increment(7);
+            method_metrics.request_body_size.record(7.0);
+
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header("content-length", "1024")
+                .body(Empty::<Bytes>::new())
+                .expect("response");
+            trace_on_response(&response, Duration::from_millis(5), &Span::none());
+
+            HTTP_TRANSPORT_FAILURES_COUNTER.increment(1);
+        });
+
+        assert_eq!(active_http_requests(), active_before, "active request counter must be restored");
+        let rows = snapshotter.snapshot().into_vec();
+        assert_metric_counter(&rows, METRIC_HTTP_SERVER_REQUESTS_TOTAL, &[(LABEL_HTTP_METHOD, "GET")], 1);
+        assert_metric_counter(&rows, METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL, &[], 7);
+        assert_metric_histogram(&rows, METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES, &[(LABEL_HTTP_METHOD, "GET")], &[7.0]);
+        assert_metric_histogram(
+            &rows,
+            METRIC_HTTP_SERVER_REQUEST_DURATION_SECONDS,
+            &[(LABEL_HTTP_STATUS_CLASS, "2xx")],
+            &[0.005],
+        );
+        assert_metric_histogram(
+            &rows,
+            METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES,
+            &[(LABEL_HTTP_STATUS_CLASS, "2xx")],
+            &[1024.0],
+        );
+        assert_metric_counter(&rows, METRIC_HTTP_SERVER_FAILURES_TOTAL, &[(LABEL_HTTP_STATUS_CLASS, "transport")], 1);
+    }
+
+    fn assert_metric_counter(rows: &[MetricRow], name: &str, labels: &[(&str, &str)], expected: u64) {
+        let value = metric_debug_value(rows, name, labels);
+        match value {
+            DebugValue::Counter(value) => assert_eq!(*value, expected),
+            other => panic!("{name} should be a counter, got {other:?}"),
+        }
+    }
+
+    fn assert_metric_histogram(rows: &[MetricRow], name: &str, labels: &[(&str, &str)], expected: &[f64]) {
+        let value = metric_debug_value(rows, name, labels);
+        match value {
+            DebugValue::Histogram(samples) => {
+                let actual: Vec<_> = samples.iter().map(|sample| sample.0).collect();
+                assert_eq!(actual, expected);
+            }
+            other => panic!("{name} should be a histogram, got {other:?}"),
+        }
+    }
+
+    fn metric_debug_value<'a>(rows: &'a [MetricRow], name: &str, labels: &[(&str, &str)]) -> &'a DebugValue {
+        let mut matching = rows.iter().filter(|(composite, _, _, _)| {
+            composite.key().name() == name
+                && labels.iter().all(|(key, value)| {
+                    composite
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == *key && label.value() == *value)
+                })
+        });
+        let (_, _, _, value) = matching
+            .next()
+            .unwrap_or_else(|| panic!("{name} with labels {labels:?} was not recorded"));
+        assert!(matching.next().is_none(), "{name} with labels {labels:?} was recorded more than once");
+        value
     }
 
     #[test]

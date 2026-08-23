@@ -12,19 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use rustfs_ecstore::api::data_usage::DATA_USAGE_CACHE_NAME as ECSTORE_DATA_USAGE_CACHE_NAME;
+pub(crate) use rustfs_ecstore::api::data_usage::{
+    DATA_USAGE_CACHE_NAME as ECSTORE_DATA_USAGE_CACHE_NAME,
+    load_admin_data_usage_from_backend_cached as ecstore_load_admin_data_usage_from_backend_cached,
+};
 pub(crate) use rustfs_ecstore::api::disk::endpoint::Endpoint as EcstoreEndpoint;
 pub(crate) use rustfs_ecstore::api::disk::error::{DiskError as EcstoreDiskError, Result as EcstoreDiskResult};
 pub(crate) use rustfs_ecstore::api::disk::{
-    BUCKET_META_PREFIX as ECSTORE_BUCKET_META_PREFIX, Bytes as EcstoreDiskBytes, DeleteOptions as EcstoreDeleteOptions,
-    DiskAPI as EcstoreDiskAPI, DiskStore as EcstoreDiskStore, HEALING_MARKER_PATH as ECSTORE_HEALING_MARKER_PATH,
+    BUCKET_META_PREFIX as ECSTORE_BUCKET_META_PREFIX, Bytes as EcstoreDiskBytes,
+    ConditionalFileUpdate as EcstoreConditionalFileUpdate, DeleteOptions as EcstoreDeleteOptions, DiskAPI as EcstoreDiskAPI,
+    DiskStore as EcstoreDiskStore, HEALING_MARKER_PATH as ECSTORE_HEALING_MARKER_PATH,
     RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET,
 };
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::disk::{DiskOption as EcstoreDiskOption, new_disk as ecstore_new_disk};
 pub(crate) use rustfs_ecstore::api::error::{Error as EcstoreErrorType, StorageError as EcstoreStorageError};
 pub(crate) use rustfs_ecstore::api::runtime::local_disk_map_read as ecstore_local_disk_map_read;
-pub(crate) use rustfs_ecstore::api::storage::ECStore as EcstoreStore;
+pub(crate) use rustfs_ecstore::api::storage::{
+    ECStore as EcstoreStore, HealLifecycleExpiryContext as EcstoreHealLifecycleExpiryContext,
+};
 use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod owner {
@@ -32,8 +38,9 @@ pub(crate) mod owner {
 
     pub(crate) use super::{
         ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_HEALING_MARKER_PATH, ECSTORE_RUSTFS_META_BUCKET,
-        EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskResult, EcstoreDiskStore,
-        EcstoreEndpoint, EcstoreErrorType, EcstoreStorageError, EcstoreStore, ecstore_local_disk_map_read,
+        EcstoreConditionalFileUpdate, EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError,
+        EcstoreDiskResult, EcstoreDiskStore, EcstoreEndpoint, EcstoreErrorType, EcstoreHealLifecycleExpiryContext,
+        EcstoreStorageError, EcstoreStore, ecstore_load_admin_data_usage_from_backend_cached, ecstore_local_disk_map_read,
     };
 
     #[cfg(test)]

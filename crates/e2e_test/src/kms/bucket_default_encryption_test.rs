@@ -27,19 +27,17 @@ use aws_sdk_s3::types::{
     ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
 };
 use rustfs_rio::{Checksum, ChecksumType};
-use serial_test::serial;
 use tracing::{debug, info, warn};
 
 /// Test 1: When bucket is configured with default SSE-S3 encryption, put_object should automatically apply encryption
 #[tokio::test]
-#[serial]
 async fn test_bucket_default_sse_s3_put_object() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Testing bucket default SSE-S3 encryption impact on put_object");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -155,14 +153,13 @@ async fn test_bucket_default_sse_s3_put_object() -> Result<(), Box<dyn std::erro
 
 /// Test 2: When bucket is configured with default SSE-KMS encryption, put_object should automatically apply encryption and use the specified KMS key
 #[tokio::test]
-#[serial]
 async fn test_bucket_default_sse_kms_put_object() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Testing bucket default SSE-KMS encryption impact on put_object");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -275,14 +272,13 @@ async fn test_bucket_default_sse_kms_put_object() -> Result<(), Box<dyn std::err
 
 /// Test 3: When bucket is configured with default encryption, create_multipart_upload should inherit the configuration
 #[tokio::test]
-#[serial]
 async fn test_bucket_default_sse_kms_multipart_crc32() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Testing bucket default encryption impact on create_multipart_upload");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -473,14 +469,13 @@ async fn test_bucket_default_sse_kms_multipart_crc32() -> Result<(), Box<dyn std
 
 /// Test 4: Explicitly specified encryption parameters in requests should override bucket default configuration
 #[tokio::test]
-#[serial]
 async fn test_explicit_encryption_overrides_bucket_default() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Testing explicitly specified encryption parameters override bucket default configuration");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -569,14 +564,13 @@ async fn test_explicit_encryption_overrides_bucket_default() -> Result<(), Box<d
 /// Test 5: Setting SSE-KMS without a specific key ID should auto-populate the
 /// default KMS key ID so that GetBucketEncryption returns it (issue #3039).
 #[tokio::test]
-#[serial]
 async fn test_sse_kms_without_key_id_populates_default() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Testing SSE-KMS without explicit key ID populates default key");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;

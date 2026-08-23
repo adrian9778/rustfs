@@ -22,11 +22,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const INTERNODE_OPERATION_READ_FILE_STREAM: &str = "read_file_stream";
 pub const INTERNODE_OPERATION_PUT_FILE_STREAM: &str = "put_file_stream";
+pub const INTERNODE_OPERATION_PUT_FILE_CAPABILITY: &str = "put_file_capability";
 pub const INTERNODE_OPERATION_WALK_DIR: &str = "walk_dir";
 pub const INTERNODE_OPERATION_NS_SCANNER: &str = "ns_scanner";
 pub const INTERNODE_OPERATION_GRPC_READ_ALL: &str = "grpc_read_all";
 pub const INTERNODE_OPERATION_GRPC_WRITE_ALL: &str = "grpc_write_all";
 pub const INTERNODE_OPERATION_GRPC_READ_MULTIPLE: &str = "grpc_read_multiple";
+pub const INTERNODE_OPERATION_GRPC_READ_VERSION: &str = "grpc_read_version";
+pub const INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION: &str = "grpc_batch_read_version";
+pub const INTERNODE_OPERATION_GRPC_LOCK: &str = "grpc_lock";
+pub const INTERNODE_OPERATION_GRPC_UNLOCK: &str = "grpc_unlock";
+pub const INTERNODE_OPERATION_GRPC_LOCK_BATCH: &str = "grpc_lock_batch";
+pub const INTERNODE_OPERATION_GRPC_UNLOCK_BATCH: &str = "grpc_unlock_batch";
+pub const INTERNODE_OPERATION_GRPC_REFRESH: &str = "grpc_refresh";
+pub const INTERNODE_OPERATION_GRPC_FORCE_UNLOCK: &str = "grpc_force_unlock";
 pub const INTERNODE_OPERATION_GRPC_OTHER: &str = "grpc_other";
 pub const INTERNODE_TRANSPORT_BACKEND_TCP_HTTP: &str = "tcp-http";
 pub const INTERNODE_TRANSPORT_BACKEND_GRPC: &str = "grpc";
@@ -38,6 +47,20 @@ pub const INTERNODE_MSGPACK_DIRECTION_REQUEST: &str = "request";
 pub const INTERNODE_MSGPACK_DIRECTION_RESPONSE: &str = "response";
 pub const INTERNODE_MSGPACK_CODEC_MSGPACK: &str = "msgpack";
 pub const INTERNODE_MSGPACK_CODEC_JSON: &str = "json";
+pub const INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE: &str = "read_version_request_encode";
+pub const INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE: &str = "read_version_request_decode";
+pub const INTERNODE_STAGE_READ_VERSION_DISK_READ: &str = "read_version_disk_read";
+pub const INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE: &str = "read_version_response_json_encode";
+pub const INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE: &str = "read_version_response_msgpack_encode";
+pub const INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP: &str = "read_version_rpc_roundtrip";
+pub const INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE: &str = "read_version_response_decode";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_ENCODE: &str = "batch_read_version_request_encode";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_DECODE: &str = "batch_read_version_request_decode";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_DISK_READ: &str = "batch_read_version_disk_read";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_JSON_ENCODE: &str = "batch_read_version_response_json_encode";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MSGPACK_ENCODE: &str = "batch_read_version_response_msgpack_encode";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP: &str = "batch_read_version_rpc_roundtrip";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_DECODE: &str = "batch_read_version_response_decode";
 
 const OPERATION_LABEL: &str = "operation";
 const BACKEND_LABEL: &str = "backend";
@@ -58,6 +81,7 @@ const INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL: &str = "rustfs_system_network
 const INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_incoming_total";
 const INTERNODE_OPERATION_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_errors_total";
 const INTERNODE_OPERATION_DURATION_MS: &str = "rustfs_system_network_internode_operation_duration_ms";
+const INTERNODE_OPERATION_STAGE_DURATION_MS: &str = "rustfs_system_network_internode_operation_stage_duration_ms";
 const INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_classified_errors_total";
 const INTERNODE_OPERATION_RETRIES_TOTAL: &str = "rustfs_system_network_internode_operation_retries_total";
 const INTERNODE_OPERATION_RETRY_SUCCESSES_TOTAL: &str = "rustfs_system_network_internode_operation_retry_successes_total";
@@ -77,6 +101,7 @@ const INTERNODE_REPLAY_SCOPE_FALLBACK_TOTAL: &str = "rustfs_system_network_inter
 const INTERNODE_REPLAY_CACHE_OVERFLOW_TOTAL: &str = "rustfs_system_network_internode_replay_cache_overflow_total";
 const INTERNODE_REPLAY_CACHE_OVERFLOW_BY_OPERATION_TOTAL: &str =
     "rustfs_system_network_internode_replay_cache_overflow_by_operation_total";
+const INTERNODE_REPLAY_CACHE_RECORDS_TOTAL: &str = "rustfs_system_network_internode_replay_cache_records_total";
 const INTERNODE_REPLAY_CACHE_ENTRIES: &str = "rustfs_system_network_internode_replay_cache_entries";
 const INTERNODE_REPLAY_CACHE_CAPACITY: &str = "rustfs_system_network_internode_replay_cache_capacity";
 const INTERNODE_REPLAY_CACHE_EVICTIONS_TOTAL: &str = "rustfs_system_network_internode_replay_cache_evictions_total";
@@ -95,6 +120,7 @@ const SERVER_OPERATION_BACKEND_HTTP_VERSION_LABELS: &[&str] = &[SERVER_LABEL, OP
 const SERVER_OPERATION_BACKEND_FAILURE_REASON_LABELS: &[&str] =
     &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, FAILURE_REASON_LABEL];
 const SERVER_OPERATION_BACKEND_RPC_PATH_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, RPC_PATH_LABEL];
+const SERVER_OPERATION_BACKEND_STAGE_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, STAGE_LABEL];
 const SERVER_LABELS: &[&str] = &[SERVER_LABEL];
 const SERVER_REASON_LABELS: &[&str] = &[SERVER_LABEL, REASON_LABEL];
 const SERVER_QUORUM_FAILURE_LABELS: &[&str] = &[SERVER_LABEL, STAGE_LABEL, DOMINANT_ERROR_LABEL];
@@ -123,6 +149,10 @@ pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_DURATION_MS,
         labels: SERVER_OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_STAGE_DURATION_MS,
+        labels: SERVER_OPERATION_BACKEND_STAGE_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL,
@@ -157,6 +187,10 @@ pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &
         labels: SERVER_OPERATION_BACKEND_RPC_PATH_LABELS,
     },
     InternodeOperationMetricDescriptor {
+        name: INTERNODE_REPLAY_CACHE_RECORDS_TOTAL,
+        labels: SERVER_OPERATION_BACKEND_RPC_PATH_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
         name: INTERNODE_REPLAY_CACHE_ENTRIES,
         labels: SERVER_LABELS,
     },
@@ -182,22 +216,159 @@ pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &
     },
 ];
 
-fn current_server_label() -> &'static str {
-    static STABLE_SERVER_LABEL: OnceLock<String> = OnceLock::new();
-    static FALLBACK_SERVER_LABEL: LazyLock<String> = LazyLock::new(rustfs_utils::get_local_ip_with_default);
+static STABLE_SERVER_LABEL: OnceLock<String> = OnceLock::new();
 
-    if let Some(server) = STABLE_SERVER_LABEL.get() {
-        return server.as_str();
+#[cfg(not(test))]
+struct InternodeServerMetricHandles {
+    sent_bytes: metrics::Counter,
+    recv_bytes: metrics::Counter,
+    outgoing_requests: metrics::Counter,
+    incoming_requests: metrics::Counter,
+    errors: metrics::Counter,
+}
+
+#[cfg(not(test))]
+impl InternodeServerMetricHandles {
+    fn new(server: &'static str) -> Self {
+        Self {
+            sent_bytes: counter!("rustfs_system_network_internode_sent_bytes_total", SERVER_LABEL => server),
+            recv_bytes: counter!("rustfs_system_network_internode_recv_bytes_total", SERVER_LABEL => server),
+            outgoing_requests: counter!("rustfs_system_network_internode_requests_outgoing_total", SERVER_LABEL => server),
+            incoming_requests: counter!("rustfs_system_network_internode_requests_incoming_total", SERVER_LABEL => server),
+            errors: counter!("rustfs_system_network_internode_errors_total", SERVER_LABEL => server),
+        }
     }
+}
 
-    if let Some(server) = rustfs_common::try_get_global_local_node_name() {
-        let _ = STABLE_SERVER_LABEL.set(server);
-        if let Some(server) = STABLE_SERVER_LABEL.get() {
-            return server.as_str();
+#[cfg(not(test))]
+static INTERNODE_SERVER_METRIC_HANDLES: LazyLock<InternodeServerMetricHandles> =
+    LazyLock::new(|| InternodeServerMetricHandles::new(current_server_label()));
+
+#[cfg(not(test))]
+struct GrpcReadVersionMetricHandles {
+    sent_bytes: metrics::Counter,
+    recv_bytes: metrics::Counter,
+    outgoing_requests: metrics::Counter,
+    incoming_requests: metrics::Counter,
+    errors: metrics::Counter,
+    duration: metrics::Histogram,
+    request_encode: metrics::Histogram,
+    request_decode: metrics::Histogram,
+    disk_read: metrics::Histogram,
+    response_json_encode: metrics::Histogram,
+    response_msgpack_encode: metrics::Histogram,
+    rpc_roundtrip: metrics::Histogram,
+    response_decode: metrics::Histogram,
+}
+
+#[cfg(not(test))]
+impl GrpcReadVersionMetricHandles {
+    fn new(server: &'static str) -> Self {
+        Self {
+            sent_bytes: counter!(
+                INTERNODE_OPERATION_SENT_BYTES_TOTAL,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            recv_bytes: counter!(
+                INTERNODE_OPERATION_RECV_BYTES_TOTAL,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            outgoing_requests: counter!(
+                INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            incoming_requests: counter!(
+                INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            errors: counter!(
+                INTERNODE_OPERATION_ERRORS_TOTAL,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            duration: metrics::histogram!(
+                INTERNODE_OPERATION_DURATION_MS,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            request_encode: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE),
+            request_decode: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE),
+            disk_read: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_DISK_READ),
+            response_json_encode: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE),
+            response_msgpack_encode: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE),
+            rpc_roundtrip: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP),
+            response_decode: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE),
         }
     }
 
-    FALLBACK_SERVER_LABEL.as_str()
+    fn stage_duration(server: &'static str, stage: &'static str) -> metrics::Histogram {
+        metrics::histogram!(
+            INTERNODE_OPERATION_STAGE_DURATION_MS,
+            SERVER_LABEL => server,
+            OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+            BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC,
+            STAGE_LABEL => stage
+        )
+    }
+
+    fn stage_duration_for(&self, stage: &'static str) -> Option<&metrics::Histogram> {
+        match stage {
+            INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE => Some(&self.request_encode),
+            INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE => Some(&self.request_decode),
+            INTERNODE_STAGE_READ_VERSION_DISK_READ => Some(&self.disk_read),
+            INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE => Some(&self.response_json_encode),
+            INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE => Some(&self.response_msgpack_encode),
+            INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP => Some(&self.rpc_roundtrip),
+            INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE => Some(&self.response_decode),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(not(test))]
+static GRPC_READ_VERSION_METRIC_HANDLES: LazyLock<GrpcReadVersionMetricHandles> =
+    LazyLock::new(|| GrpcReadVersionMetricHandles::new(current_server_label()));
+
+#[cfg(not(test))]
+fn server_metric_handles_if_ready() -> Option<&'static InternodeServerMetricHandles> {
+    STABLE_SERVER_LABEL.get()?;
+    Some(&INTERNODE_SERVER_METRIC_HANDLES)
+}
+
+#[cfg(not(test))]
+fn grpc_read_version_metric_handles_if_ready(
+    operation: &'static str,
+    backend: &'static str,
+) -> Option<&'static GrpcReadVersionMetricHandles> {
+    STABLE_SERVER_LABEL.get()?;
+    if operation == INTERNODE_OPERATION_GRPC_READ_VERSION && backend == INTERNODE_TRANSPORT_BACKEND_GRPC {
+        Some(&GRPC_READ_VERSION_METRIC_HANDLES)
+    } else {
+        None
+    }
+}
+
+/// Injects the stable server label (node name or address) stamped on
+/// internode metrics. The runtime calls this when the local node name is
+/// published (see ecstore's `set_local_node_name`); the first write wins.
+/// io-metrics is a leaf crate and no longer resolves node identity itself
+/// (backlog#1834) — before injection the label reads "unset".
+pub fn set_internode_server_label(label: impl Into<String>) {
+    let _ = STABLE_SERVER_LABEL.set(label.into());
+}
+
+fn current_server_label() -> &'static str {
+    STABLE_SERVER_LABEL.get().map(String::as_str).unwrap_or("unset")
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -260,6 +431,11 @@ impl InternodeMetrics {
             return;
         }
         self.sent_bytes_total.fetch_add(bytes, Ordering::Relaxed);
+        #[cfg(not(test))]
+        if let Some(handles) = server_metric_handles_if_ready() {
+            handles.sent_bytes.increment(bytes);
+            return;
+        }
         counter!("rustfs_system_network_internode_sent_bytes_total", SERVER_LABEL => current_server_label()).increment(bytes);
     }
 
@@ -272,6 +448,11 @@ impl InternodeMetrics {
 
         let bytes = bytes as u64;
         if bytes == 0 {
+            return;
+        }
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
+            handles.sent_bytes.increment(bytes);
             return;
         }
         counter!(
@@ -289,6 +470,11 @@ impl InternodeMetrics {
             return;
         }
         self.recv_bytes_total.fetch_add(bytes, Ordering::Relaxed);
+        #[cfg(not(test))]
+        if let Some(handles) = server_metric_handles_if_ready() {
+            handles.recv_bytes.increment(bytes);
+            return;
+        }
         counter!("rustfs_system_network_internode_recv_bytes_total", SERVER_LABEL => current_server_label()).increment(bytes);
     }
 
@@ -303,6 +489,11 @@ impl InternodeMetrics {
         if bytes == 0 {
             return;
         }
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
+            handles.recv_bytes.increment(bytes);
+            return;
+        }
         counter!(
             INTERNODE_OPERATION_RECV_BYTES_TOTAL,
             SERVER_LABEL => current_server_label(),
@@ -314,6 +505,11 @@ impl InternodeMetrics {
 
     pub fn record_outgoing_request(&self) {
         self.outgoing_requests_total.fetch_add(1, Ordering::Relaxed);
+        #[cfg(not(test))]
+        if let Some(handles) = server_metric_handles_if_ready() {
+            handles.outgoing_requests.increment(1);
+            return;
+        }
         counter!("rustfs_system_network_internode_requests_outgoing_total", SERVER_LABEL => current_server_label()).increment(1);
     }
 
@@ -323,6 +519,11 @@ impl InternodeMetrics {
 
     pub fn record_outgoing_request_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.record_outgoing_request();
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
+            handles.outgoing_requests.increment(1);
+            return;
+        }
         counter!(
             INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL,
             SERVER_LABEL => current_server_label(),
@@ -334,6 +535,11 @@ impl InternodeMetrics {
 
     pub fn record_incoming_request(&self) {
         self.incoming_requests_total.fetch_add(1, Ordering::Relaxed);
+        #[cfg(not(test))]
+        if let Some(handles) = server_metric_handles_if_ready() {
+            handles.incoming_requests.increment(1);
+            return;
+        }
         counter!("rustfs_system_network_internode_requests_incoming_total", SERVER_LABEL => current_server_label()).increment(1);
     }
 
@@ -343,6 +549,11 @@ impl InternodeMetrics {
 
     pub fn record_incoming_request_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.record_incoming_request();
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
+            handles.incoming_requests.increment(1);
+            return;
+        }
         counter!(
             INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL,
             SERVER_LABEL => current_server_label(),
@@ -354,6 +565,11 @@ impl InternodeMetrics {
 
     pub fn record_error(&self) {
         self.errors_total.fetch_add(1, Ordering::Relaxed);
+        #[cfg(not(test))]
+        if let Some(handles) = server_metric_handles_if_ready() {
+            handles.errors.increment(1);
+            return;
+        }
         counter!("rustfs_system_network_internode_errors_total", SERVER_LABEL => current_server_label()).increment(1);
     }
 
@@ -363,6 +579,11 @@ impl InternodeMetrics {
 
     pub fn record_error_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.record_error();
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
+            handles.errors.increment(1);
+            return;
+        }
         counter!(
             INTERNODE_OPERATION_ERRORS_TOTAL,
             SERVER_LABEL => current_server_label(),
@@ -374,11 +595,41 @@ impl InternodeMetrics {
 
     pub fn record_duration_for_operation_and_backend(&self, operation: &'static str, backend: &'static str, duration: Duration) {
         let duration_ms = duration.as_secs_f64() * 1000.0;
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
+            handles.duration.record(duration_ms);
+            return;
+        }
         metrics::histogram!(
             INTERNODE_OPERATION_DURATION_MS,
             SERVER_LABEL => current_server_label(),
             OPERATION_LABEL => operation,
             BACKEND_LABEL => backend
+        )
+        .record(duration_ms);
+    }
+
+    pub fn record_stage_duration_for_operation_and_backend(
+        &self,
+        operation: &'static str,
+        backend: &'static str,
+        stage: &'static str,
+        duration: Duration,
+    ) {
+        let duration_ms = duration.as_secs_f64() * 1000.0;
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend)
+            && let Some(histogram) = handles.stage_duration_for(stage)
+        {
+            histogram.record(duration_ms);
+            return;
+        }
+        metrics::histogram!(
+            INTERNODE_OPERATION_STAGE_DURATION_MS,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend,
+            STAGE_LABEL => stage
         )
         .record(duration_ms);
     }
@@ -610,6 +861,22 @@ impl InternodeMetrics {
         self.record_replay_cache_overflow();
         counter!(
             INTERNODE_REPLAY_CACHE_OVERFLOW_BY_OPERATION_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend,
+            RPC_PATH_LABEL => rpc_path.to_owned()
+        )
+        .increment(1);
+    }
+
+    pub fn record_replay_cache_record_for_operation_and_backend_path(
+        &self,
+        operation: &'static str,
+        backend: &'static str,
+        rpc_path: &str,
+    ) {
+        counter!(
+            INTERNODE_REPLAY_CACHE_RECORDS_TOTAL,
             SERVER_LABEL => current_server_label(),
             OPERATION_LABEL => operation,
             BACKEND_LABEL => backend,
@@ -889,7 +1156,7 @@ fn cluster_peer_health_keys() -> Vec<String> {
 mod tests {
     use super::*;
     use metrics::with_local_recorder;
-    use metrics_util::debugging::DebuggingRecorder;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::collections::{HashMap, HashSet};
 
     #[test]
@@ -962,46 +1229,107 @@ mod tests {
     }
 
     #[test]
+    fn operation_stage_duration_records_low_cardinality_stage_labels() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let metrics = InternodeMetrics::default();
+
+        with_local_recorder(&recorder, || {
+            metrics.record_stage_duration_for_operation_and_backend(
+                INTERNODE_OPERATION_GRPC_READ_VERSION,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+                INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP,
+                Duration::from_micros(125),
+            );
+        });
+
+        let entries: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == INTERNODE_OPERATION_STAGE_DURATION_MS)
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let labels: HashMap<_, _> = entries[0]
+            .0
+            .key()
+            .labels()
+            .map(|label| (label.key().to_string(), label.value().to_string()))
+            .collect();
+        assert_eq!(
+            labels.get(OPERATION_LABEL).map(String::as_str),
+            Some(INTERNODE_OPERATION_GRPC_READ_VERSION)
+        );
+        assert_eq!(labels.get(BACKEND_LABEL).map(String::as_str), Some(INTERNODE_TRANSPORT_BACKEND_GRPC));
+        assert_eq!(
+            labels.get(STAGE_LABEL).map(String::as_str),
+            Some(INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP)
+        );
+        assert!(labels.get(SERVER_LABEL).is_some_and(|value| !value.is_empty()));
+        match &entries[0].3 {
+            DebugValue::Histogram(samples) => assert_eq!(samples.iter().map(|sample| sample.0).collect::<Vec<_>>(), vec![0.125]),
+            other => panic!("{INTERNODE_OPERATION_STAGE_DURATION_MS} must be a histogram, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn operation_metric_descriptors_include_backend_and_operation_labels() {
-        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 20);
+        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 22);
         for metric in &INTERNODE_OPERATION_METRICS[..6] {
             assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
         }
-        for metric in &INTERNODE_OPERATION_METRICS[6..9] {
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[6].labels,
+            &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, STAGE_LABEL]
+        );
+        for metric in &INTERNODE_OPERATION_METRICS[7..10] {
             assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, CLASSIFICATION_LABEL]);
         }
         assert_eq!(
-            INTERNODE_OPERATION_METRICS[9].labels,
+            INTERNODE_OPERATION_METRICS[10].labels,
             &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, HTTP_VERSION_LABEL]
         );
-        for metric in &INTERNODE_OPERATION_METRICS[10..12] {
+        for metric in &INTERNODE_OPERATION_METRICS[11..13] {
             assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
         }
         assert_eq!(
-            INTERNODE_OPERATION_METRICS[12].labels,
+            INTERNODE_OPERATION_METRICS[13].labels,
             &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, FAILURE_REASON_LABEL]
         );
         assert_eq!(
-            INTERNODE_OPERATION_METRICS[13].labels,
+            INTERNODE_OPERATION_METRICS[14].labels,
             &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, RPC_PATH_LABEL]
         );
-        for metric in &INTERNODE_OPERATION_METRICS[14..16] {
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[15].labels,
+            &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, RPC_PATH_LABEL]
+        );
+        for metric in &INTERNODE_OPERATION_METRICS[16..18] {
             assert_eq!(metric.labels, &[SERVER_LABEL]);
         }
-        assert_eq!(INTERNODE_OPERATION_METRICS[16].labels, &[SERVER_LABEL, REASON_LABEL]);
-        assert_eq!(INTERNODE_OPERATION_METRICS[17].labels, &[SERVER_LABEL, STAGE_LABEL, DOMINANT_ERROR_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[18].labels, &[SERVER_LABEL, REASON_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[19].labels, &[SERVER_LABEL, STAGE_LABEL, DOMINANT_ERROR_LABEL]);
         // Payload histogram + large-payload counter carry operation+backend labels.
-        assert_eq!(INTERNODE_OPERATION_METRICS[18].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
-        assert_eq!(INTERNODE_OPERATION_METRICS[19].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[20].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[21].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
     }
 
     #[test]
     fn operation_metric_names_and_low_cardinality_values_are_stable() {
         assert_eq!(INTERNODE_OPERATION_READ_FILE_STREAM, "read_file_stream");
         assert_eq!(INTERNODE_OPERATION_PUT_FILE_STREAM, "put_file_stream");
+        assert_eq!(INTERNODE_OPERATION_PUT_FILE_CAPABILITY, "put_file_capability");
         assert_eq!(INTERNODE_OPERATION_WALK_DIR, "walk_dir");
         assert_eq!(INTERNODE_OPERATION_GRPC_READ_ALL, "grpc_read_all");
         assert_eq!(INTERNODE_OPERATION_GRPC_WRITE_ALL, "grpc_write_all");
+        assert_eq!(INTERNODE_OPERATION_GRPC_READ_VERSION, "grpc_read_version");
+        assert_eq!(INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, "grpc_batch_read_version");
+        assert_eq!(INTERNODE_OPERATION_GRPC_LOCK, "grpc_lock");
+        assert_eq!(INTERNODE_OPERATION_GRPC_UNLOCK, "grpc_unlock");
+        assert_eq!(INTERNODE_OPERATION_GRPC_LOCK_BATCH, "grpc_lock_batch");
+        assert_eq!(INTERNODE_OPERATION_GRPC_UNLOCK_BATCH, "grpc_unlock_batch");
+        assert_eq!(INTERNODE_OPERATION_GRPC_REFRESH, "grpc_refresh");
+        assert_eq!(INTERNODE_OPERATION_GRPC_FORCE_UNLOCK, "grpc_force_unlock");
         assert_eq!(INTERNODE_OPERATION_GRPC_OTHER, "grpc_other");
 
         assert_eq!(INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, "tcp-http");
@@ -1014,58 +1342,66 @@ mod tests {
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[6].name,
-            "rustfs_system_network_internode_operation_classified_errors_total"
+            "rustfs_system_network_internode_operation_stage_duration_ms"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[7].name,
-            "rustfs_system_network_internode_operation_retries_total"
+            "rustfs_system_network_internode_operation_classified_errors_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[8].name,
-            "rustfs_system_network_internode_operation_retry_successes_total"
+            "rustfs_system_network_internode_operation_retries_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[9].name,
-            "rustfs_system_network_internode_operation_http_versions_total"
+            "rustfs_system_network_internode_operation_retry_successes_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[10].name,
-            "rustfs_system_network_internode_operation_stall_timeouts_total"
+            "rustfs_system_network_internode_operation_http_versions_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[11].name,
-            "rustfs_system_network_internode_operation_write_shutdown_errors_total"
+            "rustfs_system_network_internode_operation_stall_timeouts_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[12].name,
-            "rustfs_system_network_internode_rpc_auth_failures_total"
+            "rustfs_system_network_internode_operation_write_shutdown_errors_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[13].name,
-            "rustfs_system_network_internode_replay_cache_overflow_by_operation_total"
+            "rustfs_system_network_internode_rpc_auth_failures_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[14].name,
-            "rustfs_system_network_internode_replay_cache_entries"
+            "rustfs_system_network_internode_replay_cache_overflow_by_operation_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[15].name,
-            "rustfs_system_network_internode_replay_cache_capacity"
+            "rustfs_system_network_internode_replay_cache_records_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[16].name,
-            "rustfs_system_network_internode_replay_cache_evictions_total"
+            "rustfs_system_network_internode_replay_cache_entries"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[17].name,
-            "rustfs_system_storage_erasure_write_quorum_failures_total"
+            "rustfs_system_network_internode_replay_cache_capacity"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[18].name,
-            "rustfs_system_network_internode_operation_payload_bytes"
+            "rustfs_system_network_internode_replay_cache_evictions_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[19].name,
+            "rustfs_system_storage_erasure_write_quorum_failures_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[20].name,
+            "rustfs_system_network_internode_operation_payload_bytes"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[21].name,
             "rustfs_system_network_internode_operation_large_payloads_total"
         );
         assert_eq!(INTERNODE_OPERATION_GRPC_READ_MULTIPLE, "grpc_read_multiple");
@@ -1085,9 +1421,23 @@ mod tests {
         assert_eq!(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "response");
         assert_eq!(INTERNODE_MSGPACK_CODEC_MSGPACK, "msgpack");
         assert_eq!(INTERNODE_MSGPACK_CODEC_JSON, "json");
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE, "read_version_request_encode");
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE, "read_version_request_decode");
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_DISK_READ, "read_version_disk_read");
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE, "read_version_response_json_encode");
+        assert_eq!(
+            INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE,
+            "read_version_response_msgpack_encode"
+        );
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP, "read_version_rpc_roundtrip");
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE, "read_version_response_decode");
         assert_eq!(
             INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL,
             "rustfs_system_network_internode_signature_v1_fallback_total"
+        );
+        assert_eq!(
+            INTERNODE_REPLAY_CACHE_RECORDS_TOTAL,
+            "rustfs_system_network_internode_replay_cache_records_total"
         );
         assert_eq!(FAILURE_REASON_LABEL, "failure_reason");
         assert_eq!(RPC_PATH_LABEL, "rpc_path");
@@ -1142,6 +1492,11 @@ mod tests {
                 INTERNODE_TRANSPORT_BACKEND_GRPC,
                 "/node_service.NodeService/ReadAll",
             );
+            metrics.record_replay_cache_record_for_operation_and_backend_path(
+                INTERNODE_OPERATION_GRPC_READ_VERSION,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+                "/node_service.NodeService/ReadVersion",
+            );
         });
 
         let snapshot = metrics.snapshot();
@@ -1176,6 +1531,28 @@ mod tests {
         assert_eq!(labels.get(OPERATION_LABEL).map(String::as_str), Some(INTERNODE_OPERATION_GRPC_READ_ALL));
         assert_eq!(labels.get(BACKEND_LABEL).map(String::as_str), Some(INTERNODE_TRANSPORT_BACKEND_GRPC));
         assert_eq!(labels.get(RPC_PATH_LABEL).map(String::as_str), Some("/node_service.NodeService/ReadAll"));
+        assert!(labels.get(SERVER_LABEL).is_some_and(|value| !value.is_empty()));
+
+        let records: Vec<_> = entries
+            .iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == INTERNODE_REPLAY_CACHE_RECORDS_TOTAL)
+            .collect();
+        assert_eq!(records.len(), 1);
+        let labels: HashMap<_, _> = records[0]
+            .0
+            .key()
+            .labels()
+            .map(|label| (label.key().to_string(), label.value().to_string()))
+            .collect();
+        assert_eq!(
+            labels.get(OPERATION_LABEL).map(String::as_str),
+            Some(INTERNODE_OPERATION_GRPC_READ_VERSION)
+        );
+        assert_eq!(labels.get(BACKEND_LABEL).map(String::as_str), Some(INTERNODE_TRANSPORT_BACKEND_GRPC));
+        assert_eq!(
+            labels.get(RPC_PATH_LABEL).map(String::as_str),
+            Some("/node_service.NodeService/ReadVersion")
+        );
         assert!(labels.get(SERVER_LABEL).is_some_and(|value| !value.is_empty()));
     }
 
@@ -1233,11 +1610,47 @@ mod tests {
     }
 
     #[test]
-    fn msgpack_json_fallback_counter_records_without_panicking() {
-        // Smoke test: the counter accepts both directions and a static message label.
+    fn msgpack_json_fallback_counter_separates_the_two_directions() {
+        // Previously a smoke test that asserted nothing; the counter carries no
+        // in-struct total, so the emission itself is what has to be checked
+        // (rustfs/backlog#1836).
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
         let metrics = InternodeMetrics::default();
-        metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, "FileInfo");
-        metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "RawFileInfo");
+
+        metrics::with_local_recorder(&recorder, || {
+            metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, "FileInfo");
+            metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "RawFileInfo");
+        });
+
+        let observed: Vec<(String, String, u64)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL)
+            .map(|(composite, _, _, value)| {
+                let labels: HashMap<String, String> = composite
+                    .key()
+                    .labels()
+                    .map(|label| (label.key().to_string(), label.value().to_string()))
+                    .collect();
+                let count = match value {
+                    DebugValue::Counter(count) => count,
+                    other => panic!("fallback total must be a counter, got {other:?}"),
+                };
+                (
+                    labels.get(DIRECTION_LABEL).cloned().unwrap_or_default(),
+                    labels.get(MESSAGE_LABEL).cloned().unwrap_or_default(),
+                    count,
+                )
+            })
+            .collect();
+
+        // Each direction/message pair is its own series, so a regression that
+        // dropped a label would collapse these into one row.
+        assert_eq!(observed.len(), 2, "each direction must land in its own series: {observed:?}");
+        assert!(observed.contains(&(INTERNODE_MSGPACK_DIRECTION_REQUEST.to_string(), "FileInfo".to_string(), 1)));
+        assert!(observed.contains(&(INTERNODE_MSGPACK_DIRECTION_RESPONSE.to_string(), "RawFileInfo".to_string(), 1)));
     }
 
     #[test]

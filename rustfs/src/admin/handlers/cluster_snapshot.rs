@@ -14,7 +14,7 @@
 
 use crate::admin::storage_api::cluster::{CapabilityState, CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
 use crate::admin::{
-    auth::validate_admin_request,
+    auth::authorize_admin_request,
     router::{AdminOperation, Operation, S3Router},
     runtime_sources::default_admin_usecase,
     storage_api::cluster::{
@@ -24,11 +24,10 @@ use crate::admin::{
     },
     system,
 };
-use crate::auth::{check_key_valid, get_session_token};
 use crate::cluster_snapshot::{
     ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot, cluster_has_actionable_pressure,
 };
-use crate::server::{ADMIN_PREFIX, ReadinessDegradedReason, RemoteAddr};
+use crate::server::{ADMIN_PREFIX, ReadinessDegradedReason};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
@@ -66,23 +65,15 @@ pub(crate) struct ClusterSnapshotDiscoveryResponse {
     pub components: Option<ClusterComponentStatusView>,
 }
 
+/// The pre-check keeps this endpoint's historical missing-credentials message;
+/// the shared gate reports "get cred failed".
 async fn authorize_cluster_snapshot_request(req: &S3Request<Body>) -> S3Result<()> {
-    let Some(input_cred) = &req.credentials else {
+    if req.credentials.is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
-    };
+    }
 
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-    validate_admin_request(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
-        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-    )
-    .await
+    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await?;
+    Ok(())
 }
 
 fn build_json_response(
@@ -105,10 +96,9 @@ pub struct GetClusterSnapshotHandler {}
 impl Operation for GetClusterSnapshotHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_cluster_snapshot_request(&req).await?;
-        let snapshot = default_admin_usecase()
-            .execute_collect_cluster_read_only_snapshot()
-            .await
-            .map(ClusterSnapshotView::from);
+        let snapshot = default_admin_usecase().execute_collect_cluster_read_only_snapshot().await;
+        let server_info_endpoint = crate::runtime_sources::current_local_node_name().await;
+        let snapshot = snapshot.map(|snapshot| ClusterSnapshotView::from_snapshot(snapshot, server_info_endpoint));
         build_json_response(StatusCode::OK, &ClusterSnapshotResponse { snapshot }, req.headers.get("x-request-id"))
     }
 }
@@ -166,6 +156,12 @@ pub(crate) struct ClusterSnapshotView {
 
 impl From<ClusterReadOnlySnapshot> for ClusterSnapshotView {
     fn from(snapshot: ClusterReadOnlySnapshot) -> Self {
+        Self::from_snapshot(snapshot, None)
+    }
+}
+
+impl ClusterSnapshotView {
+    fn from_snapshot(snapshot: ClusterReadOnlySnapshot, server_info_endpoint: Option<String>) -> Self {
         let components = ClusterComponentStatusView::from_snapshot(&snapshot);
         let summary = ClusterSnapshotSummary::from_snapshot_and_components(&snapshot, &components);
         let actionable_pressure = cluster_has_actionable_pressure(&snapshot);
@@ -175,7 +171,7 @@ impl From<ClusterReadOnlySnapshot> for ClusterSnapshotView {
             extensions_catalog_path: format!("{}{}", ADMIN_PREFIX, "/v4/extensions/catalog"),
             components,
             topology: snapshot.topology,
-            membership: ClusterMembershipView::from(snapshot.membership),
+            membership: ClusterMembershipView::from_snapshot(snapshot.membership, server_info_endpoint),
             pool_state: ClusterPoolStateView::from(snapshot.pool_state),
             local_storage: ClusterLocalStorageView::from(snapshot.local_storage),
             peer_health: ClusterPeerHealthView::from(snapshot.peer_health),
@@ -324,8 +320,25 @@ pub(crate) struct ClusterMembershipView {
 
 impl From<ClusterMembershipSnapshot> for ClusterMembershipView {
     fn from(snapshot: ClusterMembershipSnapshot) -> Self {
+        Self::from_snapshot(snapshot, None)
+    }
+}
+
+impl ClusterMembershipView {
+    fn from_snapshot(snapshot: ClusterMembershipSnapshot, server_info_endpoint: Option<String>) -> Self {
         Self {
-            nodes: snapshot.nodes.into_iter().map(ClusterNodeMembershipView::from).collect(),
+            nodes: snapshot
+                .nodes
+                .into_iter()
+                .map(|node| {
+                    let endpoint = if node.is_local && node.node_id == "local" {
+                        server_info_endpoint.clone()
+                    } else {
+                        None
+                    };
+                    ClusterNodeMembershipView::from_node(node, endpoint)
+                })
+                .collect(),
             drives: snapshot.drives.into_iter().map(ClusterDriveMembershipView::from).collect(),
         }
     }
@@ -335,15 +348,18 @@ impl From<ClusterMembershipSnapshot> for ClusterMembershipView {
 pub(crate) struct ClusterNodeMembershipView {
     pub node_id: String,
     pub grid_host: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_info_endpoint: Option<String>,
     pub is_local: bool,
     pub pools: Vec<usize>,
 }
 
-impl From<ClusterNodeMembership> for ClusterNodeMembershipView {
-    fn from(node: ClusterNodeMembership) -> Self {
+impl ClusterNodeMembershipView {
+    fn from_node(node: ClusterNodeMembership, server_info_endpoint: Option<String>) -> Self {
         Self {
             node_id: node.node_id,
             grid_host: node.grid_host,
+            server_info_endpoint,
             is_local: node.is_local,
             pools: node.pools,
         }
@@ -891,7 +907,7 @@ fn summarize_named_capability_statuses<const N: usize>(
 
 #[cfg(test)]
 mod tests {
-    use super::{ClusterSnapshotResponse, ClusterSnapshotSummary, ClusterSnapshotView};
+    use super::{ClusterMembershipView, ClusterSnapshotResponse, ClusterSnapshotSummary, ClusterSnapshotView};
     use crate::admin::storage_api::cluster::CapabilityState;
     use crate::admin::storage_api::cluster::{CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
     use crate::admin::storage_api::cluster::{
@@ -903,7 +919,7 @@ mod tests {
         ClusterListingDiagnosticsSnapshot, ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot,
         ClusterUsageFreshnessSnapshot,
     };
-    use crate::server::{DependencyReadiness, ReadinessDegradedReason};
+    use crate::shared_types::{DependencyReadiness, ReadinessDegradedReason};
     use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadClass};
 
     #[test]
@@ -918,9 +934,38 @@ mod tests {
             "cluster snapshot handler should require admin authorization"
         );
         assert!(
+            handler_block.contains("current_local_node_name().await")
+                && handler_block.contains("ClusterSnapshotView::from_snapshot"),
+            "cluster snapshot handler should attach the v3 server-info identity"
+        );
+        assert!(
             auth_block.contains("AdminAction::ServerInfoAdminAction"),
             "cluster snapshot should require server info admin permission"
         );
+    }
+
+    /// This endpoint authorizes through the shared admin gate, which reports
+    /// "get cred failed" for a credential-less request. The pre-check keeps the
+    /// message it has always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn cluster_snapshot_gate_keeps_its_missing_credentials_message() {
+        let req = s3s::S3Request {
+            input: s3s::Body::from(String::new()),
+            method: http::Method::GET,
+            uri: http::Uri::from_static("/rustfs/admin/v4/cluster/snapshot"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = super::authorize_cluster_snapshot_request(&req)
+            .await
+            .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("authentication required"));
     }
 
     #[test]
@@ -949,8 +994,8 @@ mod tests {
             topology: TopologySnapshot::default(),
             membership: ClusterMembershipSnapshot {
                 nodes: vec![ClusterNodeMembership {
-                    node_id: "node-a".to_string(),
-                    grid_host: "node-a:9000".to_string(),
+                    node_id: "local".to_string(),
+                    grid_host: String::new(),
                     is_local: true,
                     pools: vec![0],
                 }],
@@ -1020,7 +1065,8 @@ mod tests {
             },
         };
 
-        let value = serde_json::to_value(ClusterSnapshotView::from(snapshot)).expect("serialize view");
+        let value = serde_json::to_value(ClusterSnapshotView::from_snapshot(snapshot, Some(":::9000".to_string())))
+            .expect("serialize view");
         assert_eq!(value["runtime_capabilities_path"], "/rustfs/admin/v4/runtime/capabilities");
         assert_eq!(value["extensions_catalog_path"], "/rustfs/admin/v4/extensions/catalog");
         assert_eq!(value["components"]["storage"]["source"], "runtime_readiness");
@@ -1031,6 +1077,7 @@ mod tests {
         assert_eq!(value["components"]["listing"]["internode_stall_timeouts_total"], 2);
         assert_eq!(value["components"]["usage"]["source"], "scanner_metrics");
         assert_eq!(value["components"]["usage"]["condition"], "stale");
+        assert_eq!(value["membership"]["nodes"][0]["server_info_endpoint"], ":::9000");
         assert_eq!(value["membership"]["drives"][0]["endpoint_type"], "url");
         assert_eq!(value["workload_admission"][0]["class"], "repair");
         assert_eq!(value["workload_admission"][0]["state"], "unknown");
@@ -1042,6 +1089,21 @@ mod tests {
         assert_eq!(value["summary"]["rpc_boundary"]["state"], "supported");
         assert_eq!(value["runtime_status"]["degraded_reasons"][0], "storage_and_lock_unavailable");
         assert_eq!(value["actionable_pressure"], true);
+
+        let remote_membership = ClusterMembershipView::from_snapshot(
+            ClusterMembershipSnapshot {
+                nodes: vec![ClusterNodeMembership {
+                    node_id: "node-b:9000".to_string(),
+                    grid_host: "http://node-b:9000".to_string(),
+                    is_local: false,
+                    pools: vec![0],
+                }],
+                drives: Vec::new(),
+            },
+            Some(":::9000".to_string()),
+        );
+        let remote_value = serde_json::to_value(remote_membership).expect("serialize remote membership");
+        assert!(remote_value["nodes"][0].get("server_info_endpoint").is_none());
     }
 
     #[test]

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![warn(
     // missing_docs,
@@ -25,6 +26,8 @@ use http::HeaderMap;
 use rustfs_config::server_config::{Config as ServerConfig, get_global_server_config as config_get_global_server_config};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
 use storage_api::owner::{
     ECSTORE_BUCKET_META_PREFIX, ECSTORE_RUSTFS_META_BUCKET, ECSTORE_STORAGE_FORMAT_FILE, ECSTORE_STORAGECLASS_RRS,
     ECSTORE_STORAGECLASS_STANDARD, ECSTORE_TRANSITION_COMPLETE, EcstoreBucketTargetSys, EcstoreBucketVersioningSys, EcstoreDisk,
@@ -32,7 +35,7 @@ use storage_api::owner::{
     EcstoreDiskResult, EcstoreErrorType, EcstoreEvaluator, EcstoreEvent, EcstoreLcEventSrc, EcstoreLifecycle,
     EcstoreListPathRawOptions, EcstoreNsScannerOpenRequest, EcstoreObjectOpts, EcstoreReplicationConfigurationExt,
     EcstoreReplicationScannerBridge, EcstoreResultType, EcstoreScanGuard, EcstoreSetDisks, EcstoreStorageError, EcstoreStore,
-    EcstoreTierConfig, EcstoreVersioningApi, HTTPPreconditions, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete,
+    EcstoreVersioningApi, HTTPPreconditions, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete,
     ScannerReplicationHealObject, ScannerReplicationHealResult, ScannerReplicationQueueAdmission, ecstore_apply_expiry_rule,
     ecstore_apply_transition_rule, ecstore_expiry_state_handle, ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config,
     ecstore_get_object_lock_config, ecstore_get_replication_config, ecstore_invalidate_admin_data_usage_snapshot_cache,
@@ -52,17 +55,21 @@ use tokio_util::sync::CancellationToken;
 
 pub mod data_usage_define;
 pub mod error;
+pub mod prefix_usage;
 mod remote_scanner;
 pub mod runtime_config;
 pub mod scanner;
 pub mod scanner_budget;
 pub mod scanner_folder;
+#[cfg(test)]
+mod scanner_heal_admission_baseline;
 pub mod scanner_io;
 pub mod sleeper;
 pub(crate) mod storage_api;
 
 pub use data_usage_define::*;
 pub use error::ScannerError;
+pub use prefix_usage::{BucketPrefixUsageResponse, bucket_prefix_usage, invalidate_prefix_usage_cache};
 pub use remote_scanner::{
     NS_SCANNER_MAX_REQUEST_BODY_SIZE, RemoteScannerAdmission, RemoteScannerRequest, admit_remote_scanner_request,
     claim_remote_scanner_request, decode_remote_scanner_request, preflight_remote_scanner_request,
@@ -70,7 +77,10 @@ pub use remote_scanner::{
 };
 pub use runtime_config::{apply_scanner_runtime_config, scanner_runtime_config_status, validate_scanner_runtime_config};
 pub use rustfs_common::last_minute;
-pub use scanner::{ScannerCycleScheduleStatus, init_data_scanner, scanner_cycle_schedule_status, scanner_topology_digest};
+pub use scanner::{
+    ScannerCycleRecoveryMarker, ScannerCycleRecoveryStatus, ScannerCycleScheduleStatus, init_data_scanner,
+    reset_scanner_cycle_recovery, scanner_cycle_recovery_status, scanner_cycle_schedule_status, scanner_topology_digest,
+};
 pub use scanner_io::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageState, acknowledge_dirty_usage_generation, clear_dirty_usage_bucket,
     record_dirty_usage_bucket, record_scanner_maintenance_change, scanner_activity_epoch, scanner_dirty_usage_state,
@@ -82,11 +92,16 @@ pub use storage_api::ScannerReplicationConfig as ReplicationConfig;
 pub use storage_api::scan::SCANNER_ACTIVITY_PROTOCOL_VERSION;
 
 static SCANNER_ACTIVE_WORK_UNITS: AtomicU64 = AtomicU64::new(0);
+static SCANNER_RUNTIME_INSTANCES: AtomicU64 = AtomicU64::new(0);
 static SCANNER_FOREGROUND_READ_ACTIVITY: AtomicU64 = AtomicU64::new(0);
 static SCANNER_FOREGROUND_STREAM_READS: AtomicU64 = AtomicU64::new(0);
 
 pub fn current_scanner_activity() -> u64 {
     SCANNER_ACTIVE_WORK_UNITS.load(Ordering::Relaxed)
+}
+
+pub fn scanner_runtime_initialized() -> bool {
+    SCANNER_RUNTIME_INSTANCES.load(Ordering::Relaxed) > 0
 }
 
 pub fn set_foreground_read_activity(active: usize) {
@@ -136,6 +151,26 @@ impl ScannerActivityGuard {
         SCANNER_ACTIVE_WORK_UNITS.fetch_add(1, Ordering::Relaxed);
         Self
     }
+}
+
+pub(crate) struct ScannerRuntimeGuard;
+
+impl ScannerRuntimeGuard {
+    pub(crate) fn new() -> Self {
+        SCANNER_RUNTIME_INSTANCES.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ScannerRuntimeGuard {
+    fn drop(&mut self) {
+        let _ = SCANNER_RUNTIME_INSTANCES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1));
+    }
+}
+
+#[cfg(test)]
+fn reset_scanner_runtime_instances_for_test() {
+    SCANNER_RUNTIME_INSTANCES.store(0, Ordering::Relaxed);
 }
 
 impl Drop for ScannerActivityGuard {
@@ -335,8 +370,46 @@ pub(crate) fn resolve_scanner_server_config() -> Option<ServerConfig> {
     config_get_global_server_config()
 }
 
-pub(crate) async fn list_runtime_tiers() -> Vec<EcstoreTierConfig> {
-    ecstore_get_global_tier_config_mgr().read().await.list_tiers()
+/// How long the scanner caches the runtime tier-name list before re-reading
+/// the tier configuration manager.
+const TIER_NAME_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Process-wide TTL cache of runtime tier names.
+///
+/// The scan hot path only needs tier *names* to seed `SizeSummary::tier_stats`
+/// per object, but every `list_tiers()` call clones each full `TierConfig`
+/// (endpoints, credentials, prefixes) from the global manager. Caching just
+/// the names keeps the per-object cost at an `Arc` clone.
+///
+/// Staleness bounds: a newly added tier starts showing up in scans at most
+/// `TIER_NAME_CACHE_TTL` later; a removed tier can leave an all-zero
+/// `TierStats` seed behind for one cache generation, which merges harmlessly
+/// by key in per-object accounting and disappears on the next refresh.
+static TIER_NAME_CACHE: RwLock<Option<(Instant, Arc<[String]>)>> = RwLock::new(None);
+
+/// Tier names currently registered in the tier configuration, cached for
+/// `TIER_NAME_CACHE_TTL`.
+pub(crate) async fn runtime_tier_names() -> Arc<[String]> {
+    {
+        let cached = TIER_NAME_CACHE.read().unwrap_or_else(|err| err.into_inner()).clone();
+        if let Some((refreshed_at, names)) = cached
+            && refreshed_at.elapsed() < TIER_NAME_CACHE_TTL
+        {
+            return names;
+        }
+    }
+
+    let tiers = ecstore_get_global_tier_config_mgr().read().await.list_tiers();
+    let names: Arc<[String]> = tiers.iter().map(|tier| tier.name.clone()).collect::<Vec<_>>().into();
+    *TIER_NAME_CACHE.write().unwrap_or_else(|err| err.into_inner()) = Some((Instant::now(), Arc::clone(&names)));
+    names
+}
+
+/// Test-only cache reset; the production cache has no invalidation hook
+/// because the TTL is its only refresh path.
+#[cfg(test)]
+fn reset_tier_name_cache_for_test() {
+    *TIER_NAME_CACHE.write().unwrap_or_else(|err| err.into_inner()) = None;
 }
 
 pub(crate) async fn enqueue_runtime_free_version(oi: ScannerObjectInfo) {
@@ -440,6 +513,75 @@ where
     .await
 }
 
+pub(crate) async fn save_config_with_publication_admission_for_epoch<S>(
+    api: Arc<S>,
+    file: &str,
+    data: Vec<u8>,
+    preconditions: HTTPPreconditions,
+    expected_epoch: u64,
+) -> EcstoreResult<ScannerObjectInfo>
+where
+    S: ScannerObjectIO + ScannerConfigObjectDelete,
+{
+    let Some(_admission) = scanner_publication_admission_for_epoch(api.clone(), expected_epoch).await else {
+        return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
+    };
+    save_config_with_preconditions(api, file, data, preconditions).await
+}
+
+pub(crate) const SCANNER_PUBLICATION_EPOCH_CHANGED: &str = "scanner publication epoch changed before commit";
+
+pub(crate) fn scanner_publication_epoch_changed(error: &EcstoreError) -> bool {
+    matches!(
+        error,
+        EcstoreError::Io(io_error) if io_error.to_string() == SCANNER_PUBLICATION_EPOCH_CHANGED
+    )
+}
+
+pub(crate) async fn delete_config_with_publication_admission_for_epoch<S>(
+    api: Arc<S>,
+    bucket: &str,
+    object: &str,
+    opts: ScannerObjectOptions,
+    expected_epoch: u64,
+) -> EcstoreResult<ScannerObjectInfo>
+where
+    S: ScannerObjectIO + ScannerConfigObjectDelete,
+{
+    let Some(_admission) = scanner_publication_admission_for_epoch(api.clone(), expected_epoch).await else {
+        return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
+    };
+    api.delete_config_object(bucket, object, opts).await
+}
+
+/// Capture the storage-owned publication epoch without retaining the read
+/// guard across a potentially slow metadata read. Callers must compare this
+/// token with a fresh admission immediately before their conditional write.
+pub(crate) async fn scanner_publication_epoch<S>(api: Arc<S>) -> Option<u64>
+where
+    S: ScannerConfigObjectDelete,
+{
+    let admission = api.scanner_data_usage_publication_admission().await?;
+    Some(admission.epoch())
+}
+
+/// Re-admit a publication only when the storage-owned movement epoch is still
+/// the one observed before the caller's metadata read. The returned guard
+/// remains held through the caller's short conditional commit.
+pub(crate) async fn scanner_publication_admission_for_epoch<S>(
+    api: Arc<S>,
+    expected_epoch: u64,
+) -> Option<ScannerDataUsagePublicationAdmission>
+where
+    S: ScannerConfigObjectDelete,
+{
+    let admission = api.scanner_data_usage_publication_admission().await?;
+    if admission.epoch() != expected_epoch {
+        return None;
+    }
+    Some(admission)
+}
+
 pub(crate) async fn save_config_shared_with_preconditions<S>(
     api: Arc<S>,
     file: &str,
@@ -514,6 +656,39 @@ pub trait ScannerConfigObjectDelete: Send + Sync + std::fmt::Debug + 'static {
         object: &str,
         opts: ScannerObjectOptions,
     ) -> EcstoreResult<ScannerObjectInfo>;
+
+    /// Acquire storage-owned admission for one short data-usage publication
+    /// commit. Implementations without a storage-owned movement owner fail
+    /// closed; test fixtures opt into the explicit unfenced helper.
+    async fn scanner_data_usage_publication_admission(&self) -> Option<ScannerDataUsagePublicationAdmission> {
+        None
+    }
+}
+
+pub struct ScannerDataUsagePublicationAdmission {
+    epoch: u64,
+    _read_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
+impl ScannerDataUsagePublicationAdmission {
+    #[cfg(test)]
+    pub(crate) fn unfenced() -> Self {
+        Self {
+            epoch: 0,
+            _read_guard: None,
+        }
+    }
+
+    fn fenced(read_guard: tokio::sync::OwnedRwLockReadGuard<()>, epoch: u64) -> Self {
+        Self {
+            epoch,
+            _read_guard: Some(read_guard),
+        }
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
 }
 
 #[async_trait::async_trait]
@@ -526,15 +701,48 @@ impl ScannerConfigObjectDelete for ECStore {
     ) -> EcstoreResult<ScannerObjectInfo> {
         ObjectOperations::delete_object(self, bucket, object, opts).await
     }
+
+    async fn scanner_data_usage_publication_admission(&self) -> Option<ScannerDataUsagePublicationAdmission> {
+        let (read_guard, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        Some(ScannerDataUsagePublicationAdmission::fenced(read_guard, epoch))
+    }
+}
+
+#[async_trait::async_trait]
+impl ScannerConfigObjectDelete for SetDisks {
+    async fn delete_config_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: ScannerObjectOptions,
+    ) -> EcstoreResult<ScannerObjectInfo> {
+        ObjectOperations::delete_object(self, bucket, object, opts).await
+    }
+
+    async fn scanner_data_usage_publication_admission(&self) -> Option<ScannerDataUsagePublicationAdmission> {
+        let (read_guard, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        Some(ScannerDataUsagePublicationAdmission::fenced(read_guard, epoch))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
+
+    #[tokio::test]
+    async fn runtime_tier_names_serves_cached_arc_within_ttl() {
+        reset_tier_name_cache_for_test();
+        // The tier config manager is unconfigured in unit tests, so the
+        // first call populates the cache from an empty tier list...
+        let first = runtime_tier_names().await;
+        assert!(first.is_empty());
+        // ...and a second call within the TTL must return the cached Arc
+        // (pointer-equal) without re-reading the manager.
+        let second = runtime_tier_names().await;
+        assert!(Arc::ptr_eq(&first, &second));
+    }
 
     #[test]
-    #[serial]
     fn foreground_read_guard_tracks_stream_lifetime() {
         reset_foreground_read_activity_for_test();
         assert_eq!(current_foreground_read_activity(), 0);
@@ -548,7 +756,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn foreground_read_activity_keeps_larger_signal() {
         reset_foreground_read_activity_for_test();
         let _guard = ForegroundReadGuard::new();
@@ -558,5 +765,18 @@ mod tests {
 
         set_foreground_read_activity(0);
         assert_eq!(current_foreground_read_activity(), 1);
+    }
+
+    #[test]
+    fn scanner_runtime_guard_tracks_runtime_lifetime() {
+        reset_scanner_runtime_instances_for_test();
+        assert!(!scanner_runtime_initialized());
+
+        {
+            let _guard = ScannerRuntimeGuard::new();
+            assert!(scanner_runtime_initialized());
+        }
+
+        assert!(!scanner_runtime_initialized());
     }
 }

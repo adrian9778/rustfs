@@ -23,6 +23,16 @@ pub(crate) mod capacity {
     }
 }
 
+/// Offline bucket-metadata inspection (`rustfs inspect bucket-meta`,
+/// backlog#1733): read-only shard verification and reconstruction without a
+/// running store.
+pub(crate) mod inspect {
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata as bucket_metadata;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::utils::check_valid_bucket_name_strict;
+    pub(crate) use crate::storage::storage_api::ecstore_erasure::{BitrotReader, Erasure};
+    pub(crate) use crate::storage::storage_api::ecstore_set_disk::file_info_quorum_hash;
+}
+
 pub(crate) mod cluster {
     pub(crate) mod contract {
         pub(crate) mod capability {
@@ -204,7 +214,9 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod background {
-        pub(crate) use crate::storage::storage_api::{ECStore, set_workload_admission_snapshot_provider};
+        pub(crate) use crate::storage::storage_api::{
+            BitrotSelfTestError, ECStore, bitrot_self_test, set_workload_admission_snapshot_provider,
+        };
     }
 
     pub(crate) mod bucket_metadata {
@@ -215,8 +227,8 @@ pub(crate) mod startup {
         }
 
         pub(crate) use crate::storage::storage_api::{
-            ECStore, init_bucket_metadata_sys, reconcile_bucket_resync_target_intents, try_migrate_bucket_metadata,
-            try_migrate_iam_config,
+            ECStore, get_global_replication_pool, init_bucket_metadata_sys, reconcile_bucket_resync_target_intents,
+            try_migrate_bucket_metadata, try_migrate_iam_config,
         };
     }
 
@@ -263,7 +275,7 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod runtime_sources {
-        pub(crate) use crate::storage::storage_api::{DynReplicationPool, InstanceContext, set_global_rustfs_port};
+        pub(crate) use crate::storage::storage_api::{InstanceContext, set_global_rustfs_port};
     }
 
     pub(crate) mod services {
@@ -272,7 +284,8 @@ pub(crate) mod startup {
 
     pub(crate) mod shutdown {
         pub(crate) use crate::storage::storage_api::{
-            shutdown_background_monitors, shutdown_background_services, store_compression_total_in_backend,
+            mark_get_metadata_read_version_coalescing_service_ready, shutdown_background_monitors, shutdown_background_services,
+            store_compression_total_in_backend,
         };
     }
 

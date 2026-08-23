@@ -23,19 +23,17 @@
 
 use super::common::{LocalKMSTestEnvironment, sse_customer_key_md5_base64};
 use crate::common::{TEST_BUCKET, init_logging};
-use serial_test::serial;
 use tracing::{debug, info};
 
 /// Step 1: Test the basic single-file encryption function (ensure that SSE-S3 works properly in non-sharded scenarios)
 #[tokio::test]
-#[serial]
 async fn test_step1_basic_single_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Step 1: Test the basic single-file encryption function");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -85,14 +83,13 @@ async fn test_step1_basic_single_file_encryption() -> Result<(), Box<dyn std::er
 
 /// Step 2: Test the unencrypted shard upload (make sure the shard upload base is working properly)
 #[tokio::test]
-#[serial]
 async fn test_step2_basic_multipart_upload_without_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Step 2: Test unencrypted shard uploads");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -184,14 +181,13 @@ async fn test_step2_basic_multipart_upload_without_encryption() -> Result<(), Bo
 
 /// Step 3: Test Shard Upload + SSE-S3 Encryption (Focus Test)
 #[tokio::test]
-#[serial]
 async fn test_step3_multipart_upload_with_sse_s3() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Step 3: Test Shard Upload + SSE-S3 Encryption");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -308,14 +304,13 @@ async fn test_step3_multipart_upload_with_sse_s3() -> Result<(), Box<dyn std::er
 
 /// Step 4: test larger multipart uploads (streaming encryption)
 #[tokio::test]
-#[serial]
 async fn test_step4_large_multipart_upload_with_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Step 4: test large-file multipart encryption");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -434,14 +429,13 @@ async fn test_step4_large_multipart_upload_with_encryption() -> Result<(), Box<d
 
 /// Step 5: test multipart uploads for every encryption mode
 #[tokio::test]
-#[serial]
 async fn test_step5_all_encryption_types_multipart() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Step 5: test multipart uploads for every encryption mode");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;

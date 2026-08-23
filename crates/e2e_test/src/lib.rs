@@ -39,10 +39,19 @@ pub mod fault_proxy;
 #[cfg(test)]
 mod reliability_disk_fault_test;
 
+// Privileged Linux-only 3x4 replacement rebuild proof for rustfs#5869/#1791.
+#[cfg(all(test, target_os = "linux"))]
+mod replacement_privileged_e2e_test;
+
 // dist-13 (backlog#1150/#1155): e2e regression net proving a large-object
 // degraded EC read never returns a silently truncated body (rustfs#4594/#4560/#4585).
 #[cfg(test)]
 mod degraded_read_eof_regression_test;
+
+// rustfs#4784: a mid-stream GET failure must be reportable from the source
+// server's log alone — naming the object, at the default log level.
+#[cfg(test)]
+mod get_stream_failure_observability_test;
 
 // backlog#1183: GET codec-streaming fast path must be byte/header identical to
 // the legacy duplex path before its rollout gates can be flipped on by default.

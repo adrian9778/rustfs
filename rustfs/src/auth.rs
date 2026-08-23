@@ -451,7 +451,7 @@ pub async fn check_key_valid_with_context(
         cred = u.credentials;
     }
 
-    let claims = check_claims_from_token(session_token, &cred)
+    let claims = check_claims_from_token_with_context(session_token, &cred, ctx)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed {e}")))?;
 
     cred.claims = if !claims.is_empty() { Some(claims) } else { None };
@@ -461,6 +461,14 @@ pub async fn check_key_valid_with_context(
 }
 
 pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<HashMap<String, Value>> {
+    check_claims_from_token_with_context(token, cred, None)
+}
+
+fn check_claims_from_token_with_context(
+    token: &str,
+    cred: &Credentials,
+    ctx: Option<&AppContext>,
+) -> S3Result<HashMap<String, Value>> {
     if !token.is_empty() && cred.access_key.is_empty() {
         return Err(s3_error!(InvalidRequest, "no access key"));
     }
@@ -481,7 +489,11 @@ pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<Hash
         return Err(s3_error!(InvalidRequest, "invalid access key is temp and expired"));
     }
 
-    let Some(sys_cred) = current_action_credentials() else {
+    let sys_cred = match ctx {
+        Some(context) => context.action_credentials().get(),
+        None => current_action_credentials(),
+    };
+    let Some(sys_cred) = sys_cred else {
         return Err(s3_error!(InternalError, "action cred not init"));
     };
 
@@ -502,39 +514,6 @@ pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<Hash
     }
 
     Ok(HashMap::new())
-}
-
-/// Check for Keystone authentication headers and authenticate if present
-/// Returns Some((Credentials, is_owner)) if Keystone authentication succeeds
-/// Returns None if no Keystone headers present (fall back to standard auth)
-///
-/// Reserved for future use (alternative Keystone auth path)
-#[allow(dead_code)]
-pub async fn try_keystone_auth(headers: &HeaderMap) -> S3Result<Option<(Credentials, bool)>> {
-    use crate::auth_keystone;
-
-    if !auth_keystone::is_keystone_enabled() {
-        return Ok(None);
-    }
-
-    match auth_keystone::authenticate_keystone(headers).await? {
-        Some(cred) => {
-            // Keystone credentials are never "owner" in the traditional sense
-            // unless they have admin role
-            let is_owner = cred
-                .groups
-                .as_ref()
-                .map(|groups| {
-                    groups
-                        .iter()
-                        .any(|g| g.eq_ignore_ascii_case("admin") || g.eq_ignore_ascii_case("reseller_admin"))
-                })
-                .unwrap_or(false);
-
-            Ok(Some((cred, is_owner)))
-        }
-        None => Ok(None),
-    }
 }
 
 pub fn get_session_token<'a>(uri: &'a Uri, hds: &'a HeaderMap) -> Option<&'a str> {
@@ -833,12 +812,10 @@ fn is_reserved_condition_key(key: &str, server_derived: &HashMap<String, Vec<Str
 /// # Returns
 /// * `AuthType` - The determined authentication type
 ///
-#[allow(dead_code)]
 pub fn get_request_auth_type(header: &HeaderMap) -> AuthType {
     get_request_auth_type_with_query(header, None)
 }
 
-#[allow(dead_code)]
 pub(crate) fn get_request_auth_type_with_query(header: &HeaderMap, query: Option<&str>) -> AuthType {
     if is_request_signature_v2(header) {
         AuthType::SignedV2
@@ -867,20 +844,6 @@ pub(crate) fn get_request_auth_type_with_query(header: &HeaderMap, query: Option
     }
 }
 
-/// Helper function to determine auth type and signature version
-///
-/// # Arguments
-/// * `header` - HTTP headers of the request
-///
-/// # Returns
-/// * `(String, String)` - Tuple of auth type and signature version
-///
-#[allow(dead_code)]
-fn determine_auth_type_and_version(header: &HeaderMap) -> (String, String) {
-    determine_auth_type_and_version_with_query(header, None)
-}
-
-#[allow(dead_code)]
 fn determine_auth_type_and_version_with_query(header: &HeaderMap, query: Option<&str>) -> (String, String) {
     match get_request_auth_type_with_query(header, query) {
         AuthType::JWT => ("JWT".to_string(), String::new()),
@@ -944,18 +907,6 @@ fn is_request_signature_v2(header: &HeaderMap) -> bool {
         return !auth_str.starts_with(SIGN_V4_ALGORITHM) && auth_str.starts_with(SIGN_V2_ALGORITHM);
     }
     false
-}
-
-/// Verify if request has AWS PreSign Version '4'
-///
-/// # Arguments
-/// * `header` - HTTP headers of the request
-///
-/// # Returns
-/// * `bool` - True if request has AWS PreSign Version '4', false otherwise
-#[allow(dead_code)]
-pub(crate) fn is_request_presigned_signature_v4(header: &HeaderMap) -> bool {
-    is_request_presigned_signature_v4_with_query(header, None)
 }
 
 pub(crate) fn is_request_presigned_signature_v4_with_query(header: &HeaderMap, query: Option<&str>) -> bool {
@@ -1059,13 +1010,46 @@ pub fn get_query_param<'a>(query: &'a str, param_name: &str) -> Option<&'a str> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_sources::{IamInterface, KmsInterface};
     use http::{HeaderMap, HeaderValue, Uri};
     use rustfs_credentials::Credentials;
+    use rustfs_iam::{
+        store::{
+            Store as _,
+            object::{IAM_CONFIG_PREFIX, ObjectStore},
+        },
+        sys::IamSys,
+    };
+    use rustfs_kms::KmsServiceManager;
+    use rustfs_policy::auth::get_new_credentials_with_metadata;
     use rustfs_trusted_proxies::ValidationMode;
     use s3s::auth::SecretKey;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use time::OffsetDateTime;
+
+    struct ContextIam {
+        handle: Arc<IamSys<ObjectStore>>,
+    }
+
+    impl IamInterface for ContextIam {
+        fn handle(&self) -> Arc<IamSys<ObjectStore>> {
+            self.handle.clone()
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+    }
+
+    struct TestKms;
+
+    impl KmsInterface for TestKms {
+        fn handle(&self) -> Arc<KmsServiceManager> {
+            Arc::new(KmsServiceManager::new())
+        }
+    }
 
     fn create_test_credentials() -> Credentials {
         Credentials {
@@ -1266,6 +1250,59 @@ mod tests {
             assert_eq!(error.code(), &S3ErrorCode::InternalError);
             assert!(error.message().unwrap_or("").contains("action cred not init"));
         }
+    }
+
+    #[tokio::test]
+    async fn check_claims_uses_the_explicit_context_signing_secret() {
+        let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        ObjectStore::new(store.clone())
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("seed request IAM format");
+        let iam = rustfs_iam::build_iam_sys(store.clone())
+            .await
+            .expect("request IAM should initialize");
+        let matching = AppContext::new(store.clone(), Arc::new(ContextIam { handle: iam.clone() }), Arc::new(TestKms));
+        let mismatching = AppContext::new(store, Arc::new(ContextIam { handle: iam.clone() }), Arc::new(TestKms));
+        assert!(matching.publish_action_credentials(Credentials {
+            access_key: "matching-root".to_string(),
+            secret_key: "matching-signing-secret".to_string(),
+            status: "on".to_string(),
+            ..Default::default()
+        }));
+        assert!(mismatching.publish_action_credentials(Credentials {
+            access_key: "mismatching-root".to_string(),
+            secret_key: "mismatching-signing-secret".to_string(),
+            status: "on".to_string(),
+            ..Default::default()
+        }));
+        let claims = HashMap::from([
+            (
+                "exp".to_string(),
+                json!((OffsetDateTime::now_utc() + time::Duration::minutes(5)).unix_timestamp()),
+            ),
+            ("context".to_string(), json!("matching")),
+        ]);
+        let mut credential = get_new_credentials_with_metadata(&claims, "matching-signing-secret")
+            .expect("temporary credentials should be generated");
+        credential.parent_user = "matching-root".to_string();
+        iam.set_temp_user(&credential.access_key, &credential, None)
+            .await
+            .expect("temporary credentials should be stored in request IAM");
+
+        let (verified, _) = check_key_valid_with_context(&credential.session_token, &credential.access_key, Some(&matching))
+            .await
+            .expect("the matching request context should verify the token");
+        assert_eq!(
+            verified.claims.as_ref().and_then(|claims| claims.get("context")),
+            Some(&json!("matching"))
+        );
+        assert!(
+            check_key_valid_with_context(&credential.session_token, &credential.access_key, Some(&mismatching))
+                .await
+                .is_err(),
+            "a different server context must not validate the token"
+        );
     }
 
     #[test]
@@ -2171,6 +2208,89 @@ mod tests_policy {
         };
 
         assert!(!policy.is_allowed(&args_fail).await, "IAM Policy should deny non-matching IP");
+    }
+
+    /// The failure this issue is about: when `remote_addr` is dropped the
+    /// `aws:SourceIp` key never reaches the condition map, and `AddrFunc::evaluate`
+    /// returns `false` for an absent key. That flips two policy shapes in
+    /// opposite directions, and only one of them looks like a failure
+    /// (rustfs/backlog#1885).
+    #[tokio::test]
+    async fn source_ip_policies_break_in_both_directions_when_the_key_is_missing() {
+        let allow_from_office = |effect: &str| {
+            format!(
+                r#"{{
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {{"Effect": "Allow", "Action": ["admin:ConfigUpdate"], "Resource": ["arn:aws:s3:::*"]}},
+                        {{
+                            "Effect": "{effect}",
+                            "Action": ["admin:ConfigUpdate"],
+                            "Resource": ["arn:aws:s3:::*"],
+                            "Condition": {{"IpAddress": {{"aws:SourceIp": "192.168.1.0/24"}}}}
+                        }}
+                    ]
+                }}"#
+            )
+        };
+
+        let claims = HashMap::new();
+        let groups = None;
+        let mut with_ip = HashMap::new();
+        with_ip.insert("SourceIp".to_string(), vec!["192.168.1.10".to_string()]);
+        let without_ip: HashMap<String, Vec<String>> = HashMap::new();
+
+        let args_with_ip = Args {
+            account: "test-account",
+            groups: &groups,
+            action: Action::AdminAction(rustfs_policy::policy::action::AdminAction::ConfigUpdateAdminAction),
+            bucket: "",
+            conditions: &with_ip,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+        let args_without_ip = Args {
+            conditions: &without_ip,
+            ..args_with_ip
+        };
+
+        // Deny + blacklist: the bypass shape. With the key present the deny
+        // matches and the request is refused; drop the key and the deny stops
+        // matching, so a source that policy means to block gets through.
+        let deny_policy: Policy = serde_json::from_str(&allow_from_office("Deny")).expect("deny policy parses");
+        assert!(
+            !deny_policy.is_allowed(&args_with_ip).await,
+            "a blacklisted source must be refused while aws:SourceIp is present"
+        );
+        assert!(
+            deny_policy.is_allowed(&args_without_ip).await,
+            "dropping remote_addr makes the Deny statement unreachable — this is the bypass"
+        );
+
+        // Allow + whitelist: the availability shape, and the only one an
+        // operator would notice, which is why the bypass above went unseen.
+        let allow_policy: Policy = serde_json::from_str(
+            r#"{
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": ["admin:ConfigUpdate"],
+                    "Resource": ["arn:aws:s3:::*"],
+                    "Condition": {"IpAddress": {"aws:SourceIp": "192.168.1.0/24"}}
+                }]
+            }"#,
+        )
+        .expect("allow policy parses");
+        assert!(
+            allow_policy.is_allowed(&args_with_ip).await,
+            "a whitelisted source must be allowed while aws:SourceIp is present"
+        );
+        assert!(
+            !allow_policy.is_allowed(&args_without_ip).await,
+            "dropping remote_addr locks out a legitimate admin"
+        );
     }
 
     #[tokio::test]

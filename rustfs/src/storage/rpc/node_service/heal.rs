@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::startup_background::{heal_enabled_from_env, scanner_enabled_from_env};
+use crate::module_switches::{heal_enabled_from_env, scanner_enabled_from_env};
 use crate::storage::storage_api::runtime_sources_consumer::EndpointServerPools;
 use jiff::Timestamp;
 use rmp_serde::Deserializer;
@@ -25,8 +25,11 @@ use std::io::Cursor;
 
 use super::super::encode_msgpack_map;
 
-const NODE_HEAL_STATUS_VERSION: u8 = 1;
+const NODE_HEAL_STATUS_PREVIOUS_VERSION: u8 = 1;
+const NODE_HEAL_STATUS_VERSION: u8 = 2;
 const NODE_HEAL_STATUS_MAX_SIZE: usize = 64 * 1024;
+const NODE_REPLACEMENT_RECOVERY_STATUS_VERSION: u8 = 1;
+const NODE_REPLACEMENT_RECOVERY_STATUS_MAX_SIZE: usize = 64 * 1024;
 const HEAL_TOPOLOGY_FINGERPRINT_DOMAIN: &[u8] = b"rustfs-heal-topology-v1\0";
 
 fn chrono_to_jiff_timestamp(timestamp: chrono::DateTime<chrono::Utc>) -> Timestamp {
@@ -170,13 +173,38 @@ pub(crate) fn heal_topology_fingerprint(endpoint_pools: &EndpointServerPools) ->
     Ok(hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower))
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) type NodeHealProgress = rustfs_heal::HealProgress;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct NodeHealProgress {
-    pub objects_scanned: u64,
-    pub objects_healed: u64,
-    pub objects_failed: u64,
-    pub bytes_processed: u64,
+struct NodeHealProgressV1 {
+    objects_scanned: u64,
+    objects_healed: u64,
+    objects_failed: u64,
+    bytes_processed: u64,
+}
+
+impl From<&NodeHealProgress> for NodeHealProgressV1 {
+    fn from(progress: &NodeHealProgress) -> Self {
+        Self {
+            objects_scanned: progress.objects_scanned,
+            objects_healed: progress.objects_healed,
+            objects_failed: progress.objects_failed,
+            bytes_processed: progress.bytes_processed,
+        }
+    }
+}
+
+impl From<NodeHealProgressV1> for NodeHealProgress {
+    fn from(progress: NodeHealProgressV1) -> Self {
+        Self {
+            objects_scanned: progress.objects_scanned,
+            objects_healed: progress.objects_healed,
+            objects_failed: progress.objects_failed,
+            bytes_processed: progress.bytes_processed,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,6 +246,48 @@ pub(crate) struct NodeHealStatusSnapshot {
     pub progress: Option<NodeHealProgress>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NodeHealStatusSnapshotV1 {
+    version: u8,
+    services_enabled: bool,
+    initialized: bool,
+    info: NodeHealInfo,
+    operations: HealOperationsSnapshot,
+    progress: Option<NodeHealProgressV1>,
+}
+
+impl From<&NodeHealStatusSnapshot> for NodeHealStatusSnapshotV1 {
+    fn from(snapshot: &NodeHealStatusSnapshot) -> Self {
+        Self {
+            version: NODE_HEAL_STATUS_PREVIOUS_VERSION,
+            services_enabled: snapshot.services_enabled,
+            initialized: snapshot.initialized,
+            info: snapshot.info.clone(),
+            operations: snapshot.operations,
+            progress: snapshot.progress.as_ref().map(NodeHealProgressV1::from),
+        }
+    }
+}
+
+impl From<NodeHealStatusSnapshotV1> for NodeHealStatusSnapshot {
+    fn from(snapshot: NodeHealStatusSnapshotV1) -> Self {
+        Self {
+            version: snapshot.version,
+            services_enabled: snapshot.services_enabled,
+            initialized: snapshot.initialized,
+            info: snapshot.info,
+            operations: snapshot.operations,
+            progress: snapshot.progress.map(NodeHealProgress::from),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct NodeHealStatusVersion {
+    version: u8,
+}
+
 impl NodeHealStatusSnapshot {
     #[cfg(test)]
     pub(crate) fn for_test(
@@ -247,14 +317,7 @@ impl NodeHealStatusSnapshot {
 }
 
 pub(crate) async fn capture_node_heal_status(info: BackgroundHealInfo) -> NodeHealStatusSnapshot {
-    let progress = rustfs_heal::current_heal_progress_snapshot()
-        .await
-        .map(|progress| NodeHealProgress {
-            objects_scanned: progress.objects_scanned,
-            objects_healed: progress.objects_healed,
-            objects_failed: progress.objects_failed,
-            bytes_processed: progress.bytes_processed,
-        });
+    let progress = rustfs_heal::current_heal_progress_snapshot().await;
 
     NodeHealStatusSnapshot {
         version: NODE_HEAL_STATUS_VERSION,
@@ -266,38 +329,157 @@ pub(crate) async fn capture_node_heal_status(info: BackgroundHealInfo) -> NodeHe
     }
 }
 
-pub(crate) fn encode_node_heal_status(snapshot: &NodeHealStatusSnapshot) -> Result<Vec<u8>, String> {
-    encode_msgpack_map(snapshot).map_err(|err| format!("failed to encode node heal status: {err}"))
+pub(crate) fn encode_node_heal_status(snapshot: &NodeHealStatusSnapshot, protocol_version: u32) -> Result<Vec<u8>, String> {
+    let encoded = if protocol_version < rustfs_protos::BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION {
+        encode_msgpack_map(&NodeHealStatusSnapshotV1::from(snapshot))
+    } else {
+        let mut snapshot = snapshot.clone();
+        snapshot.version = NODE_HEAL_STATUS_VERSION;
+        encode_msgpack_map(&snapshot)
+    };
+    encoded.map_err(|err| format!("failed to encode node heal status: {err}"))
 }
 
 pub(crate) fn decode_node_heal_status(data: &[u8]) -> Result<NodeHealStatusSnapshot, String> {
     if data.len() > NODE_HEAL_STATUS_MAX_SIZE {
         return Err("node heal status exceeds size limit".to_string());
     }
-    let mut deserializer = Deserializer::new(Cursor::new(data));
-    let snapshot = NodeHealStatusSnapshot::deserialize(&mut deserializer)
-        .map_err(|err| format!("failed to decode node heal status: {err}"))?;
+    let decode_version = || {
+        let mut deserializer = Deserializer::new(Cursor::new(data));
+        NodeHealStatusVersion::deserialize(&mut deserializer)
+            .map(|version| (version, deserializer))
+            .map_err(|err| format!("failed to decode node heal status: {err}"))
+    };
+    let (version, deserializer) = decode_version()?;
     if usize::try_from(deserializer.get_ref().position()).ok() != Some(data.len()) {
         return Err("node heal status contains trailing data".to_string());
     }
-    if snapshot.version != NODE_HEAL_STATUS_VERSION {
-        return Err(format!("unsupported node heal status version: {}", snapshot.version));
+
+    let mut deserializer = Deserializer::new(Cursor::new(data));
+    let snapshot = match version.version {
+        NODE_HEAL_STATUS_PREVIOUS_VERSION => {
+            NodeHealStatusSnapshotV1::deserialize(&mut deserializer).map(NodeHealStatusSnapshot::from)
+        }
+        NODE_HEAL_STATUS_VERSION => NodeHealStatusSnapshot::deserialize(&mut deserializer),
+        version => return Err(format!("unsupported node heal status version: {version}")),
+    }
+    .map_err(|err| format!("failed to decode node heal status: {err}"))?;
+    if usize::try_from(deserializer.get_ref().position()).ok() != Some(data.len()) {
+        return Err("node heal status contains trailing data".to_string());
     }
     Ok(snapshot)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NodeReplacementRecoveryStatusSnapshot {
+    version: u8,
+    pub snapshot: rustfs_heal::ReplacementRecoverySnapshot,
+}
+
+impl NodeReplacementRecoveryStatusSnapshot {
+    pub(crate) fn new(snapshot: rustfs_heal::ReplacementRecoverySnapshot) -> Self {
+        Self {
+            version: NODE_REPLACEMENT_RECOVERY_STATUS_VERSION,
+            snapshot,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NodeReplacementRecoveryStatusSnapshotWire {
+    version: u8,
+    snapshot: ReplacementRecoverySnapshotWire,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReplacementRecoverySnapshotWire {
+    records: Vec<ReplacementRecoveryRecordWire>,
+    definitive: bool,
+    reason: Option<String>,
+}
+
+impl From<ReplacementRecoverySnapshotWire> for rustfs_heal::ReplacementRecoverySnapshot {
+    fn from(snapshot: ReplacementRecoverySnapshotWire) -> Self {
+        Self {
+            records: snapshot.records.into_iter().map(Into::into).collect(),
+            definitive: snapshot.definitive,
+            reason: snapshot.reason,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReplacementRecoveryRecordWire {
+    task_id: String,
+    state: rustfs_heal::ReplacementRecoveryState,
+    generation: Option<String>,
+    set_disk_id: Option<String>,
+    target_slots: Vec<String>,
+    reason: Option<String>,
+    verified_at: Option<u64>,
+}
+
+impl From<ReplacementRecoveryRecordWire> for rustfs_heal::ReplacementRecoveryRecord {
+    fn from(record: ReplacementRecoveryRecordWire) -> Self {
+        Self {
+            task_id: record.task_id,
+            state: record.state,
+            generation: record.generation,
+            set_disk_id: record.set_disk_id,
+            target_slots: record.target_slots,
+            reason: record.reason,
+            verified_at: record.verified_at,
+        }
+    }
+}
+
+pub(crate) async fn capture_node_replacement_recovery_status() -> NodeReplacementRecoveryStatusSnapshot {
+    NodeReplacementRecoveryStatusSnapshot::new(rustfs_heal::current_replacement_recovery_snapshot().await)
+}
+
+pub(crate) fn encode_node_replacement_recovery_status(
+    snapshot: &NodeReplacementRecoveryStatusSnapshot,
+) -> Result<Vec<u8>, String> {
+    encode_msgpack_map(snapshot).map_err(|err| format!("failed to encode replacement recovery status: {err}"))
+}
+
+pub(crate) fn decode_node_replacement_recovery_status(data: &[u8]) -> Result<NodeReplacementRecoveryStatusSnapshot, String> {
+    if data.len() > NODE_REPLACEMENT_RECOVERY_STATUS_MAX_SIZE {
+        return Err("replacement recovery status exceeds size limit".to_string());
+    }
+    let mut deserializer = Deserializer::new(Cursor::new(data));
+    let wire = NodeReplacementRecoveryStatusSnapshotWire::deserialize(&mut deserializer)
+        .map_err(|err| format!("failed to decode replacement recovery status: {err}"))?;
+    if usize::try_from(deserializer.get_ref().position()).ok() != Some(data.len()) {
+        return Err("replacement recovery status contains trailing data".to_string());
+    }
+    if wire.version != NODE_REPLACEMENT_RECOVERY_STATUS_VERSION {
+        return Err(format!("unsupported replacement recovery status version: {}", wire.version));
+    }
+    Ok(NodeReplacementRecoveryStatusSnapshot {
+        version: wire.version,
+        snapshot: wire.snapshot.into(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        NODE_HEAL_STATUS_MAX_SIZE, NODE_HEAL_STATUS_VERSION, NodeHealProgress, NodeHealStatusSnapshot, decode_node_heal_status,
-        encode_node_heal_status, heal_control_coordinator, heal_topology_fingerprint,
+        NODE_HEAL_STATUS_MAX_SIZE, NODE_HEAL_STATUS_PREVIOUS_VERSION, NODE_HEAL_STATUS_VERSION, NodeHealProgress,
+        NodeHealStatusSnapshot, NodeReplacementRecoveryStatusSnapshot, decode_node_heal_status,
+        decode_node_replacement_recovery_status, encode_node_heal_status, encode_node_replacement_recovery_status,
+        heal_control_coordinator, heal_topology_fingerprint,
     };
     use crate::storage::storage_api::{
         Endpoint,
         ecstore_layout::{EndpointServerPools, Endpoints, PoolEndpoints},
     };
     use chrono::SecondsFormat;
-    use rustfs_heal::HealOperationsSnapshot;
+    use rustfs_heal::{HealOperationsSnapshot, ReplacementRecoveryRecord, ReplacementRecoverySnapshot, ReplacementRecoveryState};
     use rustfs_scanner::scanner::BackgroundHealInfo;
 
     fn topology_endpoints(last_host: &str) -> EndpointServerPools {
@@ -434,18 +616,70 @@ mod tests {
                 ..Default::default()
             },
             Some(NodeHealProgress {
+                kind: rustfs_heal::heal::progress::HealProgressKind::ObjectSweep,
                 objects_scanned: 7,
                 objects_healed: 5,
                 objects_failed: 1,
+                skipped_objects: 1,
+                objects_total_count: 10,
+                objects_total_size: 2048,
                 bytes_processed: 1024,
+                progress_percentage: 50.0,
+                progress_state: rustfs_heal::heal::progress::HealProgressState::Running,
+                baseline_generation: Some(42),
+                baseline_known: true,
+                ..Default::default()
             }),
         );
 
-        let encoded = encode_node_heal_status(&snapshot).expect("snapshot should encode");
+        let encoded = encode_node_heal_status(&snapshot, rustfs_protos::BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION)
+            .expect("snapshot should encode");
         let decoded = decode_node_heal_status(&encoded).expect("snapshot should decode");
         assert_eq!(decoded.version, NODE_HEAL_STATUS_VERSION);
         assert_eq!(decoded.operations.queue_length, 2);
         assert_eq!(decoded.progress, snapshot.progress);
+    }
+
+    #[test]
+    fn node_heal_status_v1_encoding_preserves_rolling_compatibility() {
+        let snapshot = NodeHealStatusSnapshot::for_test(
+            true,
+            true,
+            BackgroundHealInfo::default(),
+            HealOperationsSnapshot::default(),
+            Some(NodeHealProgress {
+                objects_scanned: 7,
+                objects_healed: 5,
+                objects_failed: 1,
+                skipped_objects: 3,
+                bytes_processed: 1024,
+                progress_state: rustfs_heal::heal::progress::HealProgressState::Running,
+                baseline_known: true,
+                ..Default::default()
+            }),
+        );
+
+        let encoded =
+            encode_node_heal_status(&snapshot, u32::from(NODE_HEAL_STATUS_PREVIOUS_VERSION)).expect("v1 snapshot should encode");
+        let wire: serde_json::Value = rmp_serde::from_slice(&encoded).expect("v1 snapshot should decode as JSON");
+        let progress = wire["progress"].as_object().expect("v1 progress should be a map");
+        assert_eq!(wire["version"], NODE_HEAL_STATUS_PREVIOUS_VERSION);
+        assert_eq!(progress.len(), 4);
+        assert_eq!(progress["objectsScanned"], 7);
+        assert!(!progress.contains_key("skippedObjects"));
+
+        let decoded = decode_node_heal_status(&encoded).expect("v1 snapshot should decode");
+        let progress = decoded.progress.as_ref().expect("v1 progress should be present");
+        assert_eq!(decoded.version, NODE_HEAL_STATUS_PREVIOUS_VERSION);
+        assert_eq!(progress.objects_scanned, 7);
+        assert_eq!(progress.progress_state, rustfs_heal::heal::progress::HealProgressState::Unknown);
+        assert!(!progress.baseline_known);
+
+        let upgraded = encode_node_heal_status(&decoded, rustfs_protos::BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION)
+            .expect("decoded v1 snapshot should upgrade to v2");
+        let upgraded = decode_node_heal_status(&upgraded).expect("upgraded snapshot should decode");
+        assert_eq!(upgraded.version, NODE_HEAL_STATUS_VERSION);
+        assert_eq!(upgraded.progress.as_ref(), Some(progress));
     }
 
     #[test]
@@ -459,7 +693,7 @@ mod tests {
         );
         snapshot.version += 1;
 
-        let encoded = encode_node_heal_status(&snapshot).expect("snapshot should encode");
+        let encoded = rmp_serde::to_vec_named(&snapshot).expect("snapshot should encode");
         let err = decode_node_heal_status(&encoded).expect_err("unknown version should fail closed");
         assert!(err.contains("unsupported node heal status version"));
     }
@@ -480,12 +714,22 @@ mod tests {
                 "activeBySource": {"scanner": 0, "admin": 1, "autoHeal": 0, "internal": 0, "readRepair": 0},
                 "retryingBySource": {"scanner": 0, "admin": 0, "autoHeal": 0, "internal": 0, "readRepair": 0}
             },
-            "progress": null
+            "progress": {
+                "objectsScanned": 7,
+                "objectsHealed": 5,
+                "objectsFailed": 1,
+                "bytesProcessed": 1024
+            }
         });
         let encoded = rmp_serde::to_vec_named(&fixture).expect("fixture should encode");
         let decoded = decode_node_heal_status(&encoded).expect("fixed v1 fixture should decode");
         assert_eq!(decoded.info().bitrot_start_cycle, 9);
         assert_eq!(decoded.operations.queue_length, 2);
+        assert_eq!(decoded.operations.queued_by_source.mrf, 0);
+        let progress = decoded.progress.expect("legacy progress should decode");
+        assert_eq!(progress.objects_scanned, 7);
+        assert!(!progress.baseline_known);
+        assert_eq!(progress.progress_state, rustfs_heal::heal::progress::HealProgressState::Unknown);
     }
 
     #[test]
@@ -531,7 +775,8 @@ mod tests {
             HealOperationsSnapshot::default(),
             None,
         );
-        let encoded = encode_node_heal_status(&snapshot).expect("snapshot should encode");
+        let encoded = encode_node_heal_status(&snapshot, rustfs_protos::BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION)
+            .expect("snapshot should encode");
         let encoded_json: serde_json::Value = rmp_serde::from_slice(&encoded).expect("encoded snapshot should decode as JSON");
         assert_eq!(encoded_json["info"]["bitrotStartTime"], serde_json::json!("2023-11-14T22:13:20.123456Z"));
     }
@@ -564,6 +809,74 @@ mod tests {
             decode_node_heal_status(&vec![0; NODE_HEAL_STATUS_MAX_SIZE + 1])
                 .expect_err("oversized status must fail")
                 .contains("size limit")
+        );
+    }
+
+    #[test]
+    fn node_replacement_recovery_status_round_trip_is_versioned() {
+        let snapshot = NodeReplacementRecoveryStatusSnapshot::new(ReplacementRecoverySnapshot {
+            records: vec![ReplacementRecoveryRecord {
+                task_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                state: ReplacementRecoveryState::Completed,
+                generation: Some("11111111-1111-4111-8111-111111111111".to_string()),
+                set_disk_id: Some("pool_0_set_0".to_string()),
+                target_slots: vec!["http://node-a:9000/mnt/disk1".to_string()],
+                reason: None,
+                verified_at: Some(42),
+            }],
+            definitive: true,
+            reason: None,
+        });
+
+        let encoded = encode_node_replacement_recovery_status(&snapshot).expect("snapshot should encode");
+        let decoded = decode_node_replacement_recovery_status(&encoded).expect("snapshot should decode");
+
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn node_replacement_recovery_status_rejects_unknown_trailing_and_oversized_data() {
+        let mut snapshot = NodeReplacementRecoveryStatusSnapshot::new(ReplacementRecoverySnapshot {
+            records: Vec::new(),
+            definitive: true,
+            reason: None,
+        });
+        snapshot.version += 1;
+        let encoded = encode_node_replacement_recovery_status(&snapshot).expect("snapshot should encode");
+        assert!(
+            decode_node_replacement_recovery_status(&encoded)
+                .expect_err("unknown version should fail closed")
+                .contains("unsupported replacement recovery status version")
+        );
+
+        snapshot.version = super::NODE_REPLACEMENT_RECOVERY_STATUS_VERSION;
+        let mut encoded = encode_node_replacement_recovery_status(&snapshot).expect("snapshot should encode");
+        encoded.push(0);
+        assert!(
+            decode_node_replacement_recovery_status(&encoded)
+                .expect_err("trailing data must fail")
+                .contains("trailing")
+        );
+        assert!(
+            decode_node_replacement_recovery_status(&vec![0; super::NODE_REPLACEMENT_RECOVERY_STATUS_MAX_SIZE + 1])
+                .expect_err("oversized status must fail")
+                .contains("size limit")
+        );
+
+        let fixture = serde_json::json!({
+            "version": super::NODE_REPLACEMENT_RECOVERY_STATUS_VERSION,
+            "snapshot": {
+                "records": [],
+                "definitive": true,
+                "reason": null,
+                "futureField": true,
+            }
+        });
+        let encoded = rmp_serde::to_vec_named(&fixture).expect("fixture should encode");
+        assert!(
+            decode_node_replacement_recovery_status(&encoded)
+                .expect_err("nested unknown field must fail")
+                .contains("futureField")
         );
     }
 }

@@ -84,6 +84,12 @@ Current guidance:
 - `RUSTFS_SCANNER_CYCLE_MAX_OBJECTS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` (canonical)
 
+Scanner cycle budget controls:
+
+- When `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` is unset, the finite default is 1800 seconds (30 minutes), matching the scanner benchmark guidance.
+- An explicit `0` preserves the compatibility behavior of an unbounded runtime budget. Object and directory budgets likewise remain unbounded when explicitly set to `0`.
+- A timed-out cycle cancels cooperative scanner work, then fences its leader epoch before releasing the lease. An uncooperative I/O operation is dropped after the bounded shutdown window; its cursor is not claimed to be durable and the scanner reports `recovery-required` when the worker cannot stop cooperatively, the cycle state was not confirmed durable, or epoch fencing cannot be persisted.
+
 ## Mmap read environment aliases
 
 - `RUSTFS_OBJECT_MMAP_READ_ENABLE` (canonical)
@@ -97,6 +103,14 @@ Current guidance:
   - enables minimal payload mode for GET health responses (`status`, `ready` only).
 - `RUSTFS_HEALTH_READINESS_CACHE_TTL_MS`
   - TTL for readiness cache evaluation.
+- `RUSTFS_HEALTH_OBJECT_PROGRESS_ENABLE`
+  - withdraws readiness when bounded object read/write stages stop completing while requests remain active.
+  - default is `true`.
+- `RUSTFS_HEALTH_OBJECT_PROGRESS_TIMEOUT_MS`
+  - maximum time without completion in a bounded object stage before readiness is withdrawn.
+  - default is `30000`; `0` uses the default.
+  - the effective value is at least 5 seconds longer than `RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT`.
+  - this readiness SLO is independent of disk read/write failure deadlines and may withdraw traffic before those deadlines expire.
 - `RUSTFS_HEALTH_COMPAT_BUSY_CHECK_ENABLE`
   - enables busy protection behavior for health probes.
   - default is `false`.
@@ -106,6 +120,15 @@ Current guidance:
 - `RUSTFS_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE`
   - enables KMS readiness enforcement for `/health/ready`.
   - default is `false`.
+
+## Object lock admission environment variables
+
+- `RUSTFS_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS`
+  - experimental same-object PUT commit namespace-lock admission budget.
+  - default is `0`, which disables this override and keeps `RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT` behavior.
+  - when set, only `put_object_commit` write-lock acquisition is bounded by this millisecond budget; other namespace lock users keep the global object-lock timeout.
+  - timeout returns S3 `SlowDown`, so clients should use normal SDK retry handling.
+  - this is not a fdatasync or group-commit switch. Track fdatasync batching separately with `rustfs_s3_put_object_rename_fdatasync_batch_files`.
 
 ## Drive timeout environment variables
 

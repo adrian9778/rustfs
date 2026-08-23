@@ -14,6 +14,8 @@
 
 use super::*;
 use crate::bucket::lifecycle::{
+    bucket_lifecycle_ops::eval_action_from_lifecycle,
+    get_expiry_configs,
     tier_delete_journal::{
         abort_prepared_tier_delete_journal_entry as abort_prepared_journal_entry_if_current, commit_tier_delete_journal_entry,
         enqueue_committed_tier_delete_journal_entry, persist_tier_delete_journal_entry,
@@ -30,14 +32,19 @@ use crate::bucket::metadata_sys::{
 use crate::bucket::object_lock::objectlock_sys::{
     check_object_lock_for_deletion_with_state, ensure_recursive_force_delete_allowed_for_state,
 };
-use crate::bucket::replication::ReplicationObjectBridge;
+use crate::bucket::replication::{DeleteReplicationConfigSnapshot, ReplicationObjectBridge};
+use crate::bucket::versioning::VersioningApi;
 use crate::disk::OldCurrentSize;
 use crate::object_api::{NamespaceLockFence, ObjectLockConfigSnapshot};
 use crate::set_disk::{
-    get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
-    is_lock_optimization_enabled, is_object_lock_diag_enabled,
+    SetDisks, get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
+    is_lock_optimization_enabled, is_object_lock_diag_enabled, same_distributed_lock_domain,
 };
-use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+use crate::storage_api_contracts::{
+    namespace::NamespaceLocking as _,
+    object::{DeleteAccounting, ObjectIO as _, ObjectOperations as _},
+};
+use parking_lot::Mutex as ParkingMutex;
 use rustfs_io_metrics::{
     record_object_lock_diag_acquire_duration, record_object_lock_diag_hold_duration, record_object_lock_diag_slow_acquire,
     record_object_lock_diag_slow_hold,
@@ -45,6 +52,7 @@ use rustfs_io_metrics::{
 use std::{
     fmt,
     pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -206,7 +214,8 @@ async fn delete_prefix_with_tier_delete_journal(
     opts: &ObjectOptions,
     tier_journal_api: Option<&Arc<ECStore>>,
 ) -> Result<()> {
-    let journal_entry = if let Some(api) = tier_journal_api {
+    let lifecycle_delete_all = opts.lifecycle_delete_all.is_some();
+    let journal_entry = if !lifecycle_delete_all && let Some(api) = tier_journal_api {
         Some(prepare_prefix_tier_delete_journal_entries(api, bucket, object, opts).await?)
     } else {
         None
@@ -215,14 +224,34 @@ async fn delete_prefix_with_tier_delete_journal(
     let result = store.delete_prefix(bucket, object, opts).await;
     match result {
         Ok(()) => {
-            if let (Some(api), Some(entries)) = (tier_journal_api, journal_entry.as_ref()) {
+            let lifecycle_entries = if lifecycle_delete_all {
+                opts.lifecycle_delete_all_journal()
+                    .ok_or(StorageError::PreconditionFailed)?
+                    .lock()
+                    .prepared_entries()
+            } else {
+                Vec::new()
+            };
+            let entries = journal_entry.as_deref().unwrap_or(&lifecycle_entries);
+            if let Some(api) = tier_journal_api {
                 commit_prepared_tier_delete_journal_entries(api, entries).await;
             }
             Ok(())
         }
         Err(err) => {
-            if let (Some(api), Some(entries)) = (tier_journal_api, journal_entry.as_ref()) {
-                abort_prepared_tier_delete_journal_entries(api, entries).await;
+            if let Some(api) = tier_journal_api {
+                if lifecycle_delete_all {
+                    let (abort, entries) = {
+                        let journal = opts.lifecycle_delete_all_journal().ok_or(StorageError::PreconditionFailed)?;
+                        let state = journal.lock();
+                        (!state.mutation_started(), state.prepared_entries())
+                    };
+                    if abort {
+                        abort_prepared_tier_delete_journal_entries(api, &entries).await;
+                    }
+                } else if let Some(entries) = journal_entry.as_ref() {
+                    abort_prepared_tier_delete_journal_entries(api, entries).await;
+                }
             }
             Err(err)
         }
@@ -322,8 +351,10 @@ impl fmt::Display for ObjectLockDiagMode {
     }
 }
 
-struct ObjectLockDiagGuard {
+pub(crate) struct ObjectLockDiagGuard {
     guard: rustfs_lock::NamespaceLockGuard,
+    #[cfg(test)]
+    test_namespace_lock_fence: Option<NamespaceLockFence>,
     enabled: bool,
     op: &'static str,
     bucket: Option<String>,
@@ -345,6 +376,8 @@ impl ObjectLockDiagGuard {
     ) -> Self {
         Self {
             guard,
+            #[cfg(test)]
+            test_namespace_lock_fence: None,
             enabled,
             op,
             bucket,
@@ -355,11 +388,124 @@ impl ObjectLockDiagGuard {
         }
     }
 
-    fn lock_lost_signal(&self) -> Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>> {
+    pub(crate) fn lock_lost_signal(&self) -> Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>> {
         match &self.guard {
             rustfs_lock::NamespaceLockGuard::Standard(guard) => Some(guard.lock_lost()),
             rustfs_lock::NamespaceLockGuard::Fast(_) => None,
         }
+    }
+
+    pub(crate) fn is_lock_lost(&self) -> bool {
+        self.guard.is_lock_lost()
+    }
+
+    pub(crate) fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
+        opts.ensure_namespace_lock_fence();
+        if let Some(signal) = self.lock_lost_signal() {
+            opts.add_namespace_lock_lost_signal(signal);
+        }
+        #[cfg(test)]
+        if let Some(fence) = self.test_namespace_lock_fence.as_ref() {
+            opts.add_namespace_lock_fence_for_test(fence);
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecommissionMutationFenceTestPhase {
+    Migration,
+    SourceCleanup,
+}
+
+#[cfg(test)]
+struct DecommissionMutationFenceLossState {
+    bucket: String,
+    object: String,
+    phase: DecommissionMutationFenceTestPhase,
+    fence: NamespaceLockFence,
+    loss_handle: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+pub(crate) struct DecommissionMutationFenceLossHook {
+    state: Arc<DecommissionMutationFenceLossState>,
+}
+
+#[cfg(test)]
+static DECOMMISSION_MUTATION_FENCE_LOSS_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<DecommissionMutationFenceLossState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl DecommissionMutationFenceLossHook {
+    pub(crate) fn install(bucket: &str, object: &str, phase: DecommissionMutationFenceTestPhase) -> Self {
+        let (fence, loss_handle) = NamespaceLockFence::loss_handle_for_test();
+        let state = Arc::new(DecommissionMutationFenceLossState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            phase,
+            fence,
+            loss_handle,
+        });
+        let mut slot = DECOMMISSION_MUTATION_FENCE_LOSS_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission mutation fence loss hooks should not poison");
+        assert!(slot.is_none(), "decommission mutation fence loss hook must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) fn mark_lost(&self) {
+        self.state.loss_handle.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+impl Drop for DecommissionMutationFenceLossHook {
+    fn drop(&mut self) {
+        let mut slot = DECOMMISSION_MUTATION_FENCE_LOSS_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission mutation fence loss hooks should not poison");
+        if slot.as_ref().is_some_and(|hook| Arc::ptr_eq(hook, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn decommission_mutation_fence_for_test(
+    bucket: &str,
+    object: &str,
+    phase: DecommissionMutationFenceTestPhase,
+) -> Option<NamespaceLockFence> {
+    DECOMMISSION_MUTATION_FENCE_LOSS_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("decommission mutation fence loss hooks should not poison")
+        .as_ref()
+        .filter(|hook| hook.bucket == bucket && hook.object == object && hook.phase == phase)
+        .map(|hook| hook.fence.clone())
+}
+
+pub(crate) struct SourceCleanupMutationFence {
+    guard: ObjectLockDiagGuard,
+    source_lock_covered: bool,
+}
+
+impl SourceCleanupMutationFence {
+    pub(crate) fn source_lock_covered(&self) -> bool {
+        self.source_lock_covered
+    }
+
+    pub(crate) fn is_lock_lost(&self) -> bool {
+        self.guard.is_lock_lost()
+    }
+
+    pub(crate) fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
+        self.guard.add_namespace_lock_fence(opts);
     }
 }
 
@@ -378,10 +524,7 @@ impl RestoreAcceptGuard {
     }
 
     pub fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
-        opts.ensure_namespace_lock_fence();
-        if let Some(signal) = self.0.lock_lost_signal() {
-            opts.add_namespace_lock_lost_signal(signal);
-        }
+        self.0.add_namespace_lock_fence(opts);
     }
 }
 
@@ -408,6 +551,269 @@ impl Drop for ObjectLockDiagGuard {
                 "object namespace lock held longer than threshold"
             );
         }
+    }
+}
+
+/// A failure to preserve one object generation for a SelectObjectContent read.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SnapshotConsistencyError {
+    #[error("namespace locking is disabled for SelectObjectContent")]
+    LockingDisabled,
+    #[error("SelectObjectContent namespace lock was lost")]
+    LockLost,
+    #[error("object read semantics changed while SelectObjectContent was running")]
+    ObjectChanged,
+}
+
+/// Failure while creating a SelectObjectContent snapshot.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PrepareSelectObjectSnapshotError {
+    #[error("storage failed while preparing SelectObjectContent snapshot: {0}")]
+    Storage(#[source] StorageError),
+    #[error("SelectObjectContent snapshot consistency failure: {0}")]
+    Consistency(#[source] SnapshotConsistencyError),
+    #[error("SelectObjectContent object has invalid logical size {size}")]
+    InvalidLogicalSize { size: i64 },
+}
+
+impl From<StorageError> for PrepareSelectObjectSnapshotError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl From<SnapshotConsistencyError> for PrepareSelectObjectSnapshotError {
+    fn from(error: SnapshotConsistencyError) -> Self {
+        Self::Consistency(error)
+    }
+}
+
+/// Failure while opening a reader from a SelectObjectContent snapshot.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SelectObjectSnapshotReadError {
+    #[error("storage failed while opening SelectObjectContent snapshot reader: {0}")]
+    Storage(#[source] StorageError),
+    #[error("SelectObjectContent snapshot consistency failure: {0}")]
+    Consistency(#[source] SnapshotConsistencyError),
+}
+
+impl From<StorageError> for SelectObjectSnapshotReadError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl From<SnapshotConsistencyError> for SelectObjectSnapshotReadError {
+    fn from(error: SnapshotConsistencyError) -> Self {
+        Self::Consistency(error)
+    }
+}
+
+struct SelectObjectSnapshotLease {
+    guards: Vec<ObjectLockDiagGuard>,
+    lost: Arc<AtomicBool>,
+    lock_loss: tokio::sync::watch::Sender<bool>,
+    _monitor_shutdown: tokio::sync::watch::Sender<()>,
+}
+
+impl SelectObjectSnapshotLease {
+    fn new(guards: Vec<ObjectLockDiagGuard>) -> Self {
+        let signals = guards.iter().filter_map(ObjectLockDiagGuard::lock_lost_signal);
+        let mut waits = signals
+            .map(|signal| async move { signal.notified().await })
+            .collect::<futures::stream::FuturesUnordered<_>>();
+        let lost = Arc::new(AtomicBool::new(false));
+        let (lock_loss, _) = tokio::sync::watch::channel(false);
+        let (monitor_shutdown, mut shutdown_rx) = tokio::sync::watch::channel(());
+        if !waits.is_empty() {
+            let task_lost = Arc::clone(&lost);
+            let task_lock_loss = lock_loss.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    lost = futures::StreamExt::next(&mut waits) => {
+                        if lost.is_some() {
+                            task_lost.store(true, Ordering::Release);
+                            task_lock_loss.send_replace(true);
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {}
+                }
+            });
+        }
+        Self {
+            guards,
+            lost,
+            lock_loss,
+            _monitor_shutdown: monitor_shutdown,
+        }
+    }
+
+    fn check(&self) -> std::result::Result<(), SnapshotConsistencyError> {
+        if self.is_lost() || self.guards.iter().any(ObjectLockDiagGuard::is_lock_lost) {
+            self.lost.store(true, Ordering::Release);
+            self.lock_loss.send_replace(true);
+            return Err(SnapshotConsistencyError::LockLost);
+        }
+        Ok(())
+    }
+
+    fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
+    }
+
+    fn subscribe_lock_loss(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.lock_loss.subscribe()
+    }
+}
+
+/// Opaque, lock-backed object generation used by SelectObjectContent.
+pub struct SelectObjectSnapshot {
+    pool: Arc<Sets>,
+    bucket: String,
+    object: String,
+    headers: HeaderMap,
+    opts: ObjectOptions,
+    object_info: ObjectInfo,
+    logical_size: u64,
+    read_semantics_identity: [u8; 32],
+    first_metadata: ParkingMutex<Option<crate::set_disk::PreparedGetObjectMetadata>>,
+    lease: Arc<SelectObjectSnapshotLease>,
+}
+
+impl fmt::Debug for SelectObjectSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SelectObjectSnapshot")
+            .field("bucket", &self.bucket)
+            .field("object", &self.object)
+            .field("logical_size", &self.logical_size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SelectObjectSnapshot {
+    pub fn is_for(&self, bucket: &str, object: &str) -> bool {
+        self.bucket == bucket && self.object == encode_dir_object(object)
+    }
+
+    pub fn object_info(&self) -> &ObjectInfo {
+        &self.object_info
+    }
+
+    pub fn logical_size(&self) -> u64 {
+        self.logical_size
+    }
+
+    pub fn matches_version(&self, requested: &str) -> bool {
+        select_snapshot_version_matches(self.object_info.version_id, requested)
+    }
+
+    pub fn ensure_valid(&self) -> std::result::Result<(), SnapshotConsistencyError> {
+        self.lease.check()
+    }
+
+    #[cfg(feature = "test-util")]
+    pub fn mark_lost_for_test(&self) {
+        self.lease.lost.store(true, Ordering::Release);
+        self.lease.lock_loss.send_replace(true);
+    }
+
+    pub async fn open_reader(
+        &self,
+        range: Option<HTTPRangeSpec>,
+    ) -> std::result::Result<GetObjectReader, SelectObjectSnapshotReadError> {
+        self.lease.check()?;
+        let first_metadata = self.first_metadata.lock().take();
+        let metadata = match first_metadata {
+            Some(metadata) => metadata,
+            None => {
+                self.pool
+                    .prepare_get_object_reader_metadata(&self.bucket, &self.object, &self.opts)
+                    .await?
+            }
+        };
+        self.lease.check()?;
+        if metadata.read_semantics_identity() != self.read_semantics_identity {
+            return Err(SnapshotConsistencyError::ObjectChanged.into());
+        }
+
+        let mut reader =
+            crate::object_api::without_get_object_body_cache_hook(self.pool.get_object_reader_with_prepared_metadata(
+                &self.bucket,
+                &self.object,
+                range,
+                self.headers.clone(),
+                &self.opts,
+                metadata,
+            ))
+            .await?;
+        self.lease.check()?;
+        reader.body_source = crate::object_api::GetObjectBodySource::HookMissed;
+        reader.stream = Box::new(SelectObjectSnapshotReader {
+            inner: reader.stream,
+            lock_loss_wake: SelectObjectSnapshotLockLossWake::new(self.lease.subscribe_lock_loss()),
+            lease: Arc::clone(&self.lease),
+        });
+        Ok(reader)
+    }
+}
+
+fn select_snapshot_version_matches(actual: Option<Uuid>, requested: &str) -> bool {
+    let requested = requested.trim();
+    let requested = if requested.eq_ignore_ascii_case("null") {
+        Uuid::nil()
+    } else if let Ok(requested) = Uuid::parse_str(requested) {
+        requested
+    } else {
+        return false;
+    };
+    actual.unwrap_or_else(Uuid::nil) == requested
+}
+
+struct SelectObjectSnapshotReader {
+    inner: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    lock_loss_wake: SelectObjectSnapshotLockLossWake,
+    lease: Arc<SelectObjectSnapshotLease>,
+}
+
+struct SelectObjectSnapshotLockLossWake {
+    stream: tokio_stream::wrappers::WatchStream<bool>,
+}
+
+impl SelectObjectSnapshotLockLossWake {
+    fn new(receiver: tokio::sync::watch::Receiver<bool>) -> Self {
+        Self {
+            stream: tokio_stream::wrappers::WatchStream::new(receiver),
+        }
+    }
+
+    fn poll_lost(&mut self, cx: &mut Context<'_>) -> bool {
+        loop {
+            match futures::Stream::poll_next(Pin::new(&mut self.stream), cx) {
+                Poll::Ready(Some(true)) => return true,
+                Poll::Ready(Some(false)) => {}
+                Poll::Ready(None) | Poll::Pending => return false,
+            }
+        }
+    }
+}
+
+impl AsyncRead for SelectObjectSnapshotReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if self.lock_loss_wake.poll_lost(cx) || self.lease.is_lost() {
+            return Poll::Ready(Err(std::io::Error::other(SnapshotConsistencyError::LockLost)));
+        }
+        let filled_before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        let reached_eof = matches!(&poll, Poll::Ready(Ok(()))) && buf.filled().len() == filled_before;
+        if self.lease.is_lost() || (reached_eof && self.lease.check().is_err()) {
+            buf.set_filled(filled_before);
+            return Poll::Ready(Err(std::io::Error::other(SnapshotConsistencyError::LockLost)));
+        }
+        poll
     }
 }
 
@@ -500,7 +906,7 @@ fn resolve_latest_object_access(
 }
 
 fn should_create_delete_marker_for_missing_object(opts: &ObjectOptions) -> bool {
-    opts.versioned && opts.version_id.is_none() && !opts.delete_marker && !opts.data_movement
+    (opts.versioned || opts.version_suspended) && opts.version_id.is_none() && !opts.delete_marker && !opts.data_movement
 }
 
 #[cfg(test)]
@@ -508,6 +914,8 @@ struct DeleteAfterObjectLockSnapshotBarrierState {
     bucket: String,
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    namespace_pending: tokio::sync::Notify,
+    namespace_acquired: AtomicBool,
 }
 
 #[cfg(test)]
@@ -527,6 +935,8 @@ impl DeleteAfterObjectLockSnapshotBarrier {
             bucket: bucket.to_string(),
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            namespace_pending: tokio::sync::Notify::new(),
+            namespace_acquired: AtomicBool::new(false),
         });
         let mut slot = DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
@@ -543,6 +953,18 @@ impl DeleteAfterObjectLockSnapshotBarrier {
 
     pub(crate) fn release(&self) {
         self.state.release.notify_one();
+    }
+
+    pub(crate) async fn release_and_wait_until_namespace_pending(&self) {
+        let namespace_pending = self.state.namespace_pending.notified();
+        self.release();
+        tokio::time::timeout(Duration::from_secs(5), namespace_pending)
+            .await
+            .expect("delete should proceed to its namespace lock after leaving the snapshot barrier");
+    }
+
+    pub(crate) fn namespace_acquired(&self) -> bool {
+        self.state.namespace_acquired.load(Ordering::Acquire)
     }
 }
 
@@ -567,6 +989,97 @@ async fn pause_delete_after_object_lock_snapshot(bucket: &str) {
         .expect("delete snapshot barrier mutex should not poison")
         .as_ref()
         .filter(|state| state.bucket == bucket)
+        .cloned();
+    if let Some(state) = state {
+        state.arrived.notify_one();
+        state.release.notified().await;
+        state.namespace_pending.notify_one();
+    }
+}
+
+#[cfg(test)]
+fn notify_delete_namespace_acquired(bucket: &str) {
+    let state = DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("delete snapshot barrier mutex should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == bucket)
+        .cloned();
+    if let Some(state) = state {
+        state.namespace_acquired.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+struct VersionedDeleteMarkerCommitBarrierState {
+    bucket: String,
+    object: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct VersionedDeleteMarkerCommitBarrier {
+    state: Arc<VersionedDeleteMarkerCommitBarrierState>,
+}
+
+#[cfg(test)]
+static VERSIONED_DELETE_MARKER_COMMIT_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<VersionedDeleteMarkerCommitBarrierState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl VersionedDeleteMarkerCommitBarrier {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(VersionedDeleteMarkerCommitBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = VERSIONED_DELETE_MARKER_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("versioned delete-marker commit barrier mutex should not poison");
+        assert!(slot.is_none(), "versioned delete-marker commit barrier must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("versioned DELETE should reach the post-marker-commit barrier");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for VersionedDeleteMarkerCommitBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = VERSIONED_DELETE_MARKER_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("versioned delete-marker commit barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_versioned_delete_marker_after_commit(bucket: &str, object: &str) {
+    let state = VERSIONED_DELETE_MARKER_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("versioned delete-marker commit barrier mutex should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == bucket && state.object == object)
         .cloned();
     if let Some(state) = state {
         state.arrived.notify_one();
@@ -597,6 +1110,10 @@ fn version_aware_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptio
 }
 
 fn data_movement_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions {
+    writer_pool_lookup_opts(opts, no_lock)
+}
+
+fn writer_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions {
     let mut lookup_opts = version_aware_lookup_opts(opts, no_lock);
     lookup_opts.skip_decommissioned = true;
     lookup_opts.skip_rebalancing = true;
@@ -604,9 +1121,165 @@ fn data_movement_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> Object
     lookup_opts
 }
 
+fn delete_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions {
+    let mut lookup_opts = writer_pool_lookup_opts(opts, no_lock);
+    lookup_opts.skip_decommissioned = opts.data_movement;
+    lookup_opts
+}
+
+fn should_delete_from_all_pools(opts: &ObjectOptions, pool_count: usize) -> bool {
+    pool_count > 0 && (!opts.versioned && !opts.version_suspended || opts.version_id.is_some())
+}
+
+fn batch_delete_creates_latest_marker(object: &ObjectToDelete, delete_config_snapshot: &DeleteReplicationConfigSnapshot) -> bool {
+    if object.version_id.is_some() {
+        return false;
+    }
+
+    let object_name = decode_dir_object(&object.object_name);
+    let (versioned, version_suspended) = delete_config_snapshot.versioning_config().delete_state(&object_name);
+    versioned || version_suspended
+}
+
+fn batch_delete_targets_pool(creates_latest_marker: bool, marker_target_pool_idx: Option<usize>, pool_idx: usize) -> bool {
+    !creates_latest_marker || marker_target_pool_idx == Some(pool_idx)
+}
+
+#[cfg(test)]
+struct BatchDeletePoolErrorInjectionState {
+    bucket: String,
+    pool_idx: usize,
+    errors: std::collections::HashMap<String, Error>,
+    observed: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+pub(crate) struct BatchDeletePoolErrorInjection {
+    state: Arc<BatchDeletePoolErrorInjectionState>,
+}
+
+#[cfg(test)]
+static BATCH_DELETE_POOL_ERROR_INJECTION: std::sync::OnceLock<std::sync::Mutex<Option<Arc<BatchDeletePoolErrorInjectionState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl BatchDeletePoolErrorInjection {
+    pub(crate) fn install(bucket: &str, pool_idx: usize, errors: Vec<(String, Error)>) -> Self {
+        let state = Arc::new(BatchDeletePoolErrorInjectionState {
+            bucket: bucket.to_string(),
+            pool_idx,
+            errors: errors.into_iter().collect(),
+            observed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut slot = BATCH_DELETE_POOL_ERROR_INJECTION
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("batch delete pool error injection mutex should not poison");
+        assert!(slot.is_none(), "batch delete pool error injection must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) fn observed(&self) -> usize {
+        self.state.observed.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+impl Drop for BatchDeletePoolErrorInjection {
+    fn drop(&mut self) {
+        let mut slot = BATCH_DELETE_POOL_ERROR_INJECTION
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("batch delete pool error injection mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn inject_batch_delete_pool_errors(
+    bucket: &str,
+    pool_idx: usize,
+    object_names: &[String],
+    deleted: &[DeletedObject],
+    errors: &mut [Option<Error>],
+) {
+    let state = BATCH_DELETE_POOL_ERROR_INJECTION
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("batch delete pool error injection mutex should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == bucket && state.pool_idx == pool_idx)
+        .cloned();
+    let Some(state) = state else {
+        return;
+    };
+
+    for (idx, object_name) in object_names.iter().enumerate() {
+        let Some(error) = state.errors.get(object_name) else {
+            continue;
+        };
+        if errors[idx].is_none() && deleted[idx].found {
+            errors[idx] = Some(error.clone());
+            state.observed.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+fn resolve_batch_delete_pool_results<'a>(
+    initial_error: Option<Error>,
+    pool_results: impl IntoIterator<Item = (&'a DeletedObject, &'a Option<Error>)>,
+) -> (Option<DeletedObject>, Option<Error>, bool) {
+    let mut failure = initial_error.map(|err| (None, err));
+    let mut deleted = None;
+    let mut fallback: Option<(DeletedObject, Option<Error>)> = None;
+    let mut attempted = false;
+
+    for (pool_delete, pool_error) in pool_results {
+        attempted = true;
+        match pool_error {
+            Some(err) if is_err_object_not_found(err) || is_err_version_not_found(err) => {
+                if fallback.as_ref().is_none_or(|(_, error)| error.is_none()) {
+                    fallback = Some(((*pool_delete).clone(), Some(err.clone())));
+                }
+            }
+            Some(err) => {
+                if failure.is_none() {
+                    failure = Some((Some((*pool_delete).clone()), err.clone()));
+                }
+            }
+            None if pool_delete.found => {
+                if deleted.is_none() {
+                    deleted = Some((*pool_delete).clone());
+                }
+            }
+            None => {
+                if fallback.is_none() {
+                    fallback = Some(((*pool_delete).clone(), None));
+                }
+            }
+        }
+    }
+
+    if let Some((failed_delete, err)) = failure {
+        return (failed_delete, Some(err), attempted);
+    }
+    if let Some(deleted) = deleted {
+        return (Some(deleted), None, attempted);
+    }
+    if let Some((deleted, err)) = fallback {
+        return (Some(deleted), err, attempted);
+    }
+
+    (None, None, attempted)
+}
+
 fn transition_restore_pool_opts(opts: &ObjectOptions) -> ObjectOptions {
     let mut lookup_opts = opts.clone();
     lookup_opts.skip_decommissioned = true;
+    lookup_opts.skip_rebalancing = true;
     lookup_opts
 }
 
@@ -619,7 +1292,7 @@ fn is_equivalent_data_movement_delete_marker(source: &ObjectInfo, target: &Objec
         && is_data_movement_delete_marker(target)
         && source.version_id == target.version_id
         && source.mod_time == target.mod_time
-        && source.user_defined == target.user_defined
+        && is_equivalent_data_movement_delete_marker_metadata(&source.user_defined, &target.user_defined)
         && source.user_tags == target.user_tags
         && source.replication_status_internal == target.replication_status_internal
         && source.replication_status == target.replication_status
@@ -627,8 +1300,162 @@ fn is_equivalent_data_movement_delete_marker(source: &ObjectInfo, target: &Objec
         && source.version_purge_status == target.version_purge_status
 }
 
+fn is_equivalent_data_movement_delete_marker_metadata(
+    source: &HashMap<String, String>,
+    target: &HashMap<String, String>,
+) -> bool {
+    matches!(
+        (
+            data_movement_delete_marker_metadata_identity(source),
+            data_movement_delete_marker_metadata_identity(target)
+        ),
+        (Some(source), Some(target)) if source == target
+    )
+}
+
+fn data_movement_delete_marker_metadata_identity(metadata: &HashMap<String, String>) -> Option<HashMap<String, String>> {
+    let mut identity = HashMap::with_capacity(metadata.len());
+    let mut local_tier_free_version_id = None;
+    for (key, value) in metadata {
+        let Some(suffix) = rustfs_utils::http::strip_internal_prefix_preserving_case(key) else {
+            identity.insert(key.clone(), value.clone());
+            continue;
+        };
+
+        if suffix.eq_ignore_ascii_case(rustfs_utils::http::SUFFIX_TIER_FV_ID) {
+            let version_id = Uuid::parse_str(value).ok().filter(|version_id| !version_id.is_nil())?;
+            if local_tier_free_version_id.is_some_and(|expected| expected != version_id) {
+                return None;
+            }
+            local_tier_free_version_id = Some(version_id);
+            continue;
+        }
+
+        let canonical_suffix = [
+            rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP,
+            rustfs_utils::http::SUFFIX_REPLICA_STATUS,
+            rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,
+            rustfs_utils::http::SUFFIX_REPLICATION_STATUS,
+            rustfs_utils::http::SUFFIX_PURGESTATUS,
+        ]
+        .into_iter()
+        .find(|candidate| suffix.eq_ignore_ascii_case(candidate))
+        .map(str::to_string)
+        .or_else(|| {
+            [
+                rustfs_utils::http::SUFFIX_REPLICATION_RESET_ARN_PREFIX,
+                rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX,
+            ]
+            .into_iter()
+            .find_map(|prefix| {
+                suffix
+                    .get(..prefix.len())
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+                    .then(|| format!("{prefix}{}", &suffix[prefix.len()..]))
+            })
+        })
+        .unwrap_or_else(|| suffix.to_string());
+        let canonical_value = if canonical_suffix.eq_ignore_ascii_case(rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP)
+            || canonical_suffix.eq_ignore_ascii_case(rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP)
+        {
+            rustfs_filemeta::parse_replication_timestamp(value)?
+                .unix_timestamp_nanos()
+                .to_string()
+        } else {
+            value.clone()
+        };
+        let canonical_key = format!("{}{canonical_suffix}", rustfs_utils::http::RUSTFS_INTERNAL_PREFIX);
+        if identity
+            .insert(canonical_key, canonical_value.clone())
+            .is_some_and(|existing| existing != canonical_value)
+        {
+            return None;
+        }
+    }
+    for (status_suffix, timestamp_suffix) in [
+        (rustfs_utils::http::SUFFIX_REPLICA_STATUS, rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP),
+        (
+            rustfs_utils::http::SUFFIX_REPLICATION_STATUS,
+            rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,
+        ),
+    ] {
+        let status_key = format!("{}{status_suffix}", rustfs_utils::http::RUSTFS_INTERNAL_PREFIX);
+        let timestamp_key = format!("{}{timestamp_suffix}", rustfs_utils::http::RUSTFS_INTERNAL_PREFIX);
+        match (identity.contains_key(&status_key), identity.contains_key(&timestamp_key)) {
+            (true, false) => {
+                identity.insert(timestamp_key, OffsetDateTime::UNIX_EPOCH.unix_timestamp_nanos().to_string());
+            }
+            (false, true) => return None,
+            _ => {}
+        }
+    }
+    Some(identity)
+}
+
 fn is_data_movement_delete_marker(info: &ObjectInfo) -> bool {
     info.delete_marker
+}
+
+fn is_expected_data_movement_delete_marker_source(source: &ObjectInfo, expected_mod_time: Option<OffsetDateTime>) -> bool {
+    is_data_movement_delete_marker(source)
+        && source.mod_time.is_some()
+        && source.mod_time == expected_mod_time
+        && data_movement_delete_marker_metadata_identity(&source.user_defined).is_some()
+}
+
+fn current_data_movement_delete_marker_opts(source: &ObjectInfo, opts: &ObjectOptions) -> Option<ObjectOptions> {
+    let replica_status = rustfs_utils::http::get_str(&source.user_defined, rustfs_utils::http::SUFFIX_REPLICA_STATUS);
+    let replica_timestamp = rustfs_utils::http::get_str(&source.user_defined, rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP);
+    let (replica_status, replica_timestamp) = match (replica_status, replica_timestamp) {
+        (None, None) => Default::default(),
+        (Some(status), timestamp) => {
+            let status = crate::bucket::replication::ReplicationStatusType::from(status.as_str());
+            if status.is_empty() {
+                return None;
+            }
+            let timestamp = match timestamp {
+                Some(timestamp) => rustfs_filemeta::parse_replication_timestamp(&timestamp)?,
+                None => OffsetDateTime::UNIX_EPOCH,
+            };
+            (status, Some(timestamp))
+        }
+        (None, Some(_)) => return None,
+    };
+    let replication_status = rustfs_utils::http::get_str(&source.user_defined, rustfs_utils::http::SUFFIX_REPLICATION_STATUS);
+    let replication_timestamp =
+        rustfs_utils::http::get_str(&source.user_defined, rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP);
+    let (replication_status, replication_timestamp, replication_targets) = match (replication_status, replication_timestamp) {
+        (None, None) => Default::default(),
+        (Some(status), timestamp) => {
+            let direct_status = crate::bucket::replication::ReplicationStatusType::from(status.as_str());
+            let targets = crate::bucket::replication::replication_statuses_map(status.as_str());
+            if direct_status.is_empty() && targets.is_empty() {
+                return None;
+            }
+            let timestamp = match timestamp {
+                Some(timestamp) => rustfs_filemeta::parse_replication_timestamp(&timestamp)?,
+                None => OffsetDateTime::UNIX_EPOCH,
+            };
+            (Some(status), Some(timestamp), targets)
+        }
+        (None, Some(_)) => return None,
+    };
+    let mut state = source.replication_state();
+    if state.target_delete_marker_version_ids_corrupt {
+        return None;
+    }
+    state.replica_status = replica_status;
+    state.replica_timestamp = replica_timestamp;
+    state.replication_status_internal = replication_status;
+    state.replication_timestamp = replication_timestamp;
+    state.targets = replication_targets;
+    state.replicate_decision_str = source.replication_decision.clone();
+    state.delete_marker = true;
+
+    let mut target_opts = opts.clone();
+    target_opts.mod_time = source.mod_time;
+    target_opts.delete_replication = Some(state);
+    Some(target_opts)
 }
 
 fn expected_data_movement_tiered_object(source: &rustfs_filemeta::FileInfo) -> ObjectInfo {
@@ -637,14 +1464,21 @@ fn expected_data_movement_tiered_object(source: &rustfs_filemeta::FileInfo) -> O
 
 fn is_equivalent_data_movement_tiered_object(source: &rustfs_filemeta::FileInfo, target: &ObjectInfo) -> bool {
     let expected = expected_data_movement_tiered_object(source);
+    let Some(source_actual_size) = effective_object_actual_size(&expected) else {
+        return false;
+    };
+    let Some(target_actual_size) = effective_object_actual_size(target) else {
+        return false;
+    };
 
     source.version_id == target.version_id
         && !target.delete_marker
         && source.size == target.size
         && source.get_etag() == target.etag
         && source.checksum == target.checksum
+        && crate::data_movement::are_equivalent_data_movement_parts(&source.parts, &target.parts)
         && source.mod_time == target.mod_time
-        && expected.user_defined == target.user_defined
+        && crate::data_movement::is_equivalent_data_movement_metadata(&expected, target, source_actual_size, target_actual_size)
         && expected.user_tags == target.user_tags
         && expected.expires == target.expires
         && expected.storage_class == target.storage_class
@@ -653,11 +1487,32 @@ fn is_equivalent_data_movement_tiered_object(source: &rustfs_filemeta::FileInfo,
         && expected.version_purge_status_internal == target.version_purge_status_internal
         && expected.version_purge_status == target.version_purge_status
         && expected.transitioned_object.status == target.transitioned_object.status
+        && expected.transition_version_state == target.transition_version_state
         && expected.transitioned_object.name == target.transitioned_object.name
         && expected.transitioned_object.tier == target.transitioned_object.tier
         && expected.transitioned_object.version_id == target.transitioned_object.version_id
         && expected.transitioned_object.free_version == target.transitioned_object.free_version
-        && effective_object_actual_size(target) == Some(source.size)
+        && source_actual_size == target_actual_size
+}
+
+fn tiered_data_movement_source_matches(
+    expected: &rustfs_filemeta::FileInfo,
+    current: &rustfs_filemeta::FileInfo,
+) -> Result<bool> {
+    let expected_backend = crate::services::tier::tier::tier_destination_id_from_metadata(&expected.metadata)?;
+    let current_backend = crate::services::tier::tier::tier_destination_id_from_metadata(&current.metadata)?;
+    Ok(expected.version_id == current.version_id
+        && expected.data_dir == current.data_dir
+        && expected.mod_time == current.mod_time
+        && expected.size == current.size
+        && expected.get_etag() == current.get_etag()
+        && expected.transition_status == current.transition_status
+        && expected.transitioned_objname == current.transitioned_objname
+        && expected.transition_tier == current.transition_tier
+        && expected.transition_version_id == current.transition_version_id
+        && expected.transition_version == current.transition_version
+        && expected.transition_version_state == current.transition_version_state
+        && expected_backend == current_backend)
 }
 
 fn should_check_data_movement_resume_target(src_pool_idx: usize, target_pool_idx: usize) -> bool {
@@ -724,6 +1579,14 @@ fn return_batch_delete_lock_error(objects: &[ObjectToDelete], err: Error) -> (Ve
     (del_objects, del_errs)
 }
 
+fn return_batch_delete_lock_error_with_accounting(
+    objects: &[ObjectToDelete],
+    err: Error,
+) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+    let (deleted, errors) = return_batch_delete_lock_error(objects, err);
+    (deleted, errors, vec![None; objects.len()])
+}
+
 fn sorted_unique_delete_object_names(objects: &[ObjectToDelete]) -> Vec<&str> {
     let mut object_names: Vec<&str> = objects.iter().map(|object| object.object_name.as_str()).collect();
     object_names.sort_unstable();
@@ -755,7 +1618,7 @@ impl ECStore {
         )))
     }
 
-    async fn object_lock_config_snapshot_under_lifecycle_fence(
+    pub(super) async fn object_lock_config_snapshot_under_lifecycle_fence(
         &self,
         bucket: &str,
         lifecycle_fence: &NamespaceLockFence,
@@ -785,6 +1648,68 @@ impl ECStore {
     /// This is an additive two-stage counterpart to `get_object_reader`. The
     /// existing method remains the compatibility path for callers that do not
     /// need a pre-reader decision point.
+    pub async fn prepare_select_object_snapshot(
+        &self,
+        bucket: &str,
+        object: &str,
+        headers: &HeaderMap,
+        opts: &ObjectOptions,
+    ) -> std::result::Result<SelectObjectSnapshot, PrepareSelectObjectSnapshotError> {
+        check_get_obj_args(bucket, object)?;
+
+        let object = encode_dir_object(object);
+        let mut opts = opts.clone();
+        opts.no_lock = false;
+        opts.metadata_cache_safe = false;
+        let read_lock_guards = self
+            .acquire_all_object_read_locks("select_object", bucket, &object, &mut opts)
+            .await?;
+        if self.ctx.lock_manager().is_disabled() {
+            return Err(SnapshotConsistencyError::LockingDisabled.into());
+        }
+        if read_lock_guards.iter().any(ObjectLockDiagGuard::is_lock_lost) {
+            return Err(SnapshotConsistencyError::LockLost.into());
+        }
+
+        let pool = if self.single_pool() {
+            Arc::clone(&self.pools[0])
+        } else {
+            let (_, pool_idx) = self.get_latest_object_info_with_idx(bucket, &object, &opts).await?;
+            self.pools.get(pool_idx).cloned().ok_or_else(|| {
+                StorageError::other(format!("resolved SelectObjectContent pool index {pool_idx} is out of bounds"))
+            })?
+        };
+        let mut metadata = pool.prepare_get_object_reader_metadata(bucket, &object, &opts).await?;
+        if read_lock_guards.iter().any(ObjectLockDiagGuard::is_lock_lost) {
+            return Err(SnapshotConsistencyError::LockLost.into());
+        }
+        if let Some(error) = latest_object_access_delete_marker_error(bucket, &object, metadata.object_info(), &opts) {
+            return Err(error.into());
+        }
+
+        let logical_size_i64 = metadata.object_info().get_actual_size().map_err(StorageError::from)?;
+        let logical_size = u64::try_from(logical_size_i64)
+            .map_err(|_| PrepareSelectObjectSnapshotError::InvalidLogicalSize { size: logical_size_i64 })?;
+        let read_semantics_identity = metadata.read_semantics_identity();
+        let object_info = metadata.take_object_info();
+        if read_lock_guards.iter().any(ObjectLockDiagGuard::is_lock_lost) {
+            return Err(SnapshotConsistencyError::LockLost.into());
+        }
+
+        Ok(SelectObjectSnapshot {
+            pool,
+            bucket: bucket.to_owned(),
+            object,
+            headers: rustfs_utils::http::project_ssec_transport_headers(headers),
+            opts,
+            object_info,
+            logical_size,
+            read_semantics_identity,
+            first_metadata: ParkingMutex::new(Some(metadata)),
+            lease: Arc::new(SelectObjectSnapshotLease::new(read_lock_guards)),
+        })
+    }
+
     pub async fn prepare_get_object_reader(
         &self,
         bucket: &str,
@@ -979,6 +1904,219 @@ impl ECStore {
         )))
     }
 
+    pub(crate) async fn acquire_decommission_object_mutation_fence(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> Result<ObjectLockDiagGuard> {
+        if self.ctx.lock_manager().is_disabled() {
+            return Err(Error::other("decommission object migration requires namespace locking"));
+        }
+
+        #[cfg(test)]
+        let test_namespace_lock_fence =
+            decommission_mutation_fence_for_test(bucket, object, DecommissionMutationFenceTestPhase::Migration);
+        let object = encode_dir_object(object);
+        let mut opts = ObjectOptions::default();
+        let guard = self
+            .acquire_object_read_lock_if_needed("decommission_object", bucket, &object, &mut opts)
+            .await?
+            .ok_or_else(|| Error::other("decommission object migration failed to acquire its namespace fence"))?;
+        #[cfg(test)]
+        let guard = {
+            let mut guard = guard;
+            guard.test_namespace_lock_fence = test_namespace_lock_fence;
+            guard
+        };
+        Ok(guard)
+    }
+
+    pub(super) async fn apply_decommission_target_mutation_fence(
+        &self,
+        target_pool_idx: usize,
+        object: &str,
+        opts: &mut ObjectOptions,
+        mutation_fence: Option<&ObjectLockDiagGuard>,
+    ) {
+        let Some(mutation_fence) = mutation_fence else {
+            return;
+        };
+
+        mutation_fence.add_namespace_lock_fence(opts);
+        let fixed_set = self.pools.first().and_then(|pool| pool.disk_set.first());
+        let target_set = self.pools.get(target_pool_idx).map(|pool| pool.get_disks_by_key(object));
+        opts.no_lock = match (fixed_set, target_set) {
+            (Some(fixed), Some(target)) => fixed.shares_namespace_lock_domain(&target).await,
+            _ => false,
+        };
+    }
+
+    pub(crate) async fn acquire_decommission_source_cleanup_fence(
+        &self,
+        bucket: &str,
+        object: &str,
+        source_set: &SetDisks,
+    ) -> Result<SourceCleanupMutationFence> {
+        if self.ctx.lock_manager().is_disabled() {
+            return Err(Error::other("decommission source cleanup requires namespace locking"));
+        }
+
+        #[cfg(test)]
+        crate::data_movement::notify_source_cleanup_mutation_fence_pending(bucket, object);
+        #[cfg(test)]
+        let test_namespace_lock_fence =
+            decommission_mutation_fence_for_test(bucket, object, DecommissionMutationFenceTestPhase::SourceCleanup);
+        let object = encode_dir_object(object);
+        let fixed_set = Arc::clone(&self.pools[0].disk_set[0]);
+        let source_lock_covered = fixed_set.shares_namespace_lock_domain(source_set).await;
+        // Lock order: fixed store mutation domain first; source cleanup takes its
+        // hashed source-domain lock second only when this guard does not cover it.
+        let guard = self
+            .acquire_object_write_lock("decommission_source_cleanup", bucket, &object)
+            .await?;
+        #[cfg(test)]
+        let guard = {
+            let mut guard = guard;
+            guard.test_namespace_lock_fence = test_namespace_lock_fence;
+            guard
+        };
+
+        Ok(SourceCleanupMutationFence {
+            guard,
+            source_lock_covered,
+        })
+    }
+
+    pub(crate) async fn acquire_all_object_read_locks(
+        &self,
+        op: &'static str,
+        bucket: &str,
+        object: &str,
+        opts: &mut ObjectOptions,
+    ) -> Result<Vec<ObjectLockDiagGuard>> {
+        let diag_enabled = is_object_lock_diag_enabled();
+        let mut guards = Vec::with_capacity(self.pools.len() + 1);
+
+        // Lock order is the store fixed domain first, then pool index ascending
+        // for each object's hashed set. DELETE and same-key CopyObject use the
+        // fixed domain, while PUT commits and data movement use the hashed set.
+        let distributed = self.ctx.is_dist_erasure().await;
+        if let Some(guard) = self.acquire_object_read_lock_if_needed(op, bucket, object, opts).await? {
+            guards.push(guard);
+        }
+        let fixed_set = Arc::clone(&self.pools[0].disk_set[0]);
+        let mut locked_sets = vec![fixed_set];
+
+        for pool in &self.pools {
+            let hashed_set = pool.get_disks_by_key(object);
+            let lock_domain_already_held = !distributed
+                || locked_sets
+                    .iter()
+                    .any(|locked_set| same_distributed_lock_domain(&locked_set.lockers, &hashed_set.lockers));
+            if lock_domain_already_held {
+                continue;
+            }
+            let ns_lock = hashed_set.new_ns_lock(bucket, object).await?;
+            let acquire_start = Instant::now();
+            let guard = ns_lock
+                .get_read_lock(get_lock_acquire_timeout())
+                .await
+                .map_err(|err| Self::map_namespace_lock_error(bucket, object, "read", err))?;
+            let owner = diag_enabled.then(|| ns_lock.owner().to_string());
+            log_object_lock_acquire_if_slow(
+                op,
+                bucket,
+                object,
+                owner.as_deref(),
+                ObjectLockDiagMode::Read,
+                acquire_start.elapsed(),
+                diag_enabled,
+            );
+            guards.push(ObjectLockDiagGuard::new(
+                guard,
+                diag_enabled,
+                op,
+                diag_enabled.then(|| bucket.to_string()),
+                diag_enabled.then(|| object.to_string()),
+                owner,
+                ObjectLockDiagMode::Read,
+            ));
+            locked_sets.push(hashed_set);
+        }
+        Ok(guards)
+    }
+
+    async fn acquire_data_movement_object_write_locks(
+        &self,
+        bucket: &str,
+        object: &str,
+        source_pool_idx: usize,
+        target_pool_idx: usize,
+        opts: &mut ObjectOptions,
+    ) -> Result<Vec<ObjectLockDiagGuard>> {
+        if self.ctx.lock_manager().is_disabled() {
+            return Err(Error::other("tiered data movement requires namespace locking"));
+        }
+        let distributed = self.ctx.is_dist_erasure().await;
+        let diag_enabled = is_object_lock_diag_enabled();
+        let mut pool_indices = [source_pool_idx, target_pool_idx];
+        pool_indices.sort_unstable();
+        let fixed_set = Arc::clone(&self.pools[0].disk_set[0]);
+        let mut locked_sets = vec![fixed_set];
+        let mut guards = Vec::with_capacity(3);
+
+        // Lock order matches journal recovery: fixed store domain first, then
+        // hashed domains by ascending pool index. This also serializes source
+        // revalidation and target publication against ordinary object deletes.
+        guards.push(self.acquire_object_write_lock("tiered_data_movement", bucket, object).await?);
+        for pool_idx in pool_indices {
+            let pool = self
+                .pools
+                .get(pool_idx)
+                .ok_or_else(|| Error::other(format!("invalid tiered data movement pool {pool_idx}")))?;
+            let set = pool.get_disks_by_key(object);
+            let lock_domain_already_held = !distributed
+                || locked_sets.iter().any(|locked_set: &Arc<crate::set_disk::SetDisks>| {
+                    same_distributed_lock_domain(&locked_set.lockers, &set.lockers)
+                });
+            if lock_domain_already_held {
+                continue;
+            }
+            let ns_lock = set.new_ns_lock(bucket, object).await?;
+            let acquire_start = Instant::now();
+            let guard = ns_lock
+                .get_write_lock(get_lock_acquire_timeout())
+                .await
+                .map_err(|err| Self::map_namespace_lock_error(bucket, object, "write", err))?;
+            let owner = diag_enabled.then(|| ns_lock.owner().to_string());
+            log_object_lock_acquire_if_slow(
+                "tiered_data_movement",
+                bucket,
+                object,
+                owner.as_deref(),
+                ObjectLockDiagMode::Write,
+                acquire_start.elapsed(),
+                diag_enabled,
+            );
+            guards.push(ObjectLockDiagGuard::new(
+                guard,
+                diag_enabled,
+                "tiered_data_movement",
+                diag_enabled.then(|| bucket.to_string()),
+                diag_enabled.then(|| object.to_string()),
+                owner,
+                ObjectLockDiagMode::Write,
+            ));
+            locked_sets.push(set);
+        }
+        opts.no_lock = true;
+        for signal in guards.iter().filter_map(ObjectLockDiagGuard::lock_lost_signal) {
+            opts.add_namespace_lock_lost_signal(signal);
+        }
+        opts.ensure_namespace_lock_fence();
+        Ok(guards)
+    }
+
     fn attach_read_lock_guard(mut reader: GetObjectReader, guard: Option<ObjectLockDiagGuard>) -> GetObjectReader {
         if is_lock_optimization_enabled() || reader.buffered_body.is_some() {
             return reader;
@@ -1034,7 +2172,8 @@ impl ECStore {
         target_pool_idx: usize,
         opts: &ObjectOptions,
     ) -> Result<Option<ObjectInfo>> {
-        let lookup_opts = version_aware_lookup_opts(opts, true);
+        let mut lookup_opts = version_aware_lookup_opts(opts, true);
+        lookup_opts.include_part_checksums = true;
 
         let Some(pool) = self.pools.get(target_pool_idx) else {
             return Err(Error::other(format!(
@@ -1101,8 +2240,22 @@ impl ECStore {
     ) -> Result<()> {
         check_put_object_args(bucket, object)?;
 
-        let object = encode_dir_object(object);
+        let mut opts = opts.clone();
+        let bucket_incarnation_fence = if is_meta_bucketname(bucket) {
+            None
+        } else {
+            let expected = opts
+                .expected_bucket_incarnation_id
+                .ok_or_else(|| Error::other("tiered data movement is missing its bucket incarnation snapshot"))?;
+            let guard = self.acquire_bucket_incarnation_fence(bucket, expected).await?;
+            if let Some(namespace_guard) = guard.namespace_lock_guard() {
+                opts.add_bucket_lifecycle_lock_guard(namespace_guard);
+            }
+            Some(guard)
+        };
 
+        let logical_object = object;
+        let object = encode_dir_object(logical_object);
         if self.single_pool() {
             return Self::resolve_decommission_tiered_object_result(
                 Err(Error::other("single pool deployments cannot decommission tiered objects")),
@@ -1113,7 +2266,8 @@ impl ECStore {
 
         let idx = if opts.data_movement && opts.version_id.is_some() {
             Self::resolve_decommission_target_pool_idx_result(
-                self.select_data_movement_pool_idx(bucket, &object, fi.size, opts, true).await,
+                self.select_data_movement_pool_idx(bucket, &object, fi.size, &opts, true)
+                    .await,
                 bucket,
                 &object,
             )?
@@ -1124,13 +2278,40 @@ impl ECStore {
                 &object,
             )?
         };
+        let _object_guards = self
+            .acquire_data_movement_object_write_locks(bucket, &object, opts.src_pool_idx, idx, &mut opts)
+            .await?;
+        let source_pool = self
+            .pools
+            .get(opts.src_pool_idx)
+            .ok_or_else(|| Error::other(format!("invalid tiered data movement source pool {}", opts.src_pool_idx)))?;
+        let source_versions = source_pool
+            .get_disks_by_key(&object)
+            .load_file_info_versions_exact(bucket, logical_object)
+            .await?;
+        let current_source = source_versions
+            .as_ref()
+            .and_then(|versions| {
+                versions
+                    .versions
+                    .iter()
+                    .find(|current| current.version_id == fi.version_id && !current.tier_free_version())
+            })
+            .ok_or_else(|| to_object_err(StorageError::FileNotFound, vec![bucket, object.as_str()]))?;
+        if !tiered_data_movement_source_matches(fi, current_source)? {
+            return Err(to_object_err(StorageError::FileNotFound, vec![bucket, object.as_str()]));
+        }
+        let mut fi = current_source.clone();
+        if opts.data_movement {
+            crate::data_movement::prepare_tiered_data_movement_file_info(&mut fi)?;
+        }
         if opts.data_movement && idx == opts.src_pool_idx {
             let resume_target_pool_idx = self
                 .get_available_pool_idx_excluding(bucket, &object, fi.size, opts.src_pool_idx)
                 .await;
             let target_pool_idx = resolve_data_movement_resume_target_pool(idx, resume_target_pool_idx, opts.src_pool_idx);
             if self
-                .has_equivalent_data_movement_tiered_object(bucket, &object, fi, opts, target_pool_idx)
+                .has_equivalent_data_movement_tiered_object(bucket, &object, &fi, &opts, target_pool_idx)
                 .await?
             {
                 return Ok(());
@@ -1143,17 +2324,30 @@ impl ECStore {
             ));
         }
 
-        Self::resolve_decommission_tiered_object_result(
-            self.pools[idx]
-                .get_disks_by_key(&object)
-                .decommission_tiered_object(bucket, &object, fi, opts)
-                .await,
-            bucket,
-            &object,
-        )
+        let result = self.pools[idx]
+            .get_disks_by_key(&object)
+            .decommission_tiered_object(bucket, &object, &fi, &opts)
+            .await;
+        if matches!(result, Err(Error::PreconditionFailed)) {
+            if self
+                .has_equivalent_data_movement_tiered_object(bucket, &object, &fi, &opts, idx)
+                .await?
+            {
+                return Ok(());
+            }
+            return Err(StorageError::DataMovementOverwriteErr(
+                bucket.to_owned(),
+                object,
+                opts.version_id.clone().unwrap_or_default(),
+            ));
+        }
+        if bucket_incarnation_fence.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+            return Err(Error::other("tiered data movement bucket incarnation fence was lost during target write"));
+        }
+        Self::resolve_decommission_tiered_object_result(result, bucket, &object)
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, h))]
     #[hotpath::measure(impl_type = "ECStore")]
     pub(super) async fn handle_get_object_reader(
         &self,
@@ -1165,7 +2359,7 @@ impl ECStore {
     ) -> Result<GetObjectReader> {
         check_get_obj_args(bucket, object)?;
 
-        let object = encode_dir_object(object);
+        let object = rustfs_utils::path::encode_dir_object_ref(object);
         let mut opts = opts.clone();
         let read_lock_guard = self
             .acquire_object_read_lock_if_needed("get_object", bucket, &object, &mut opts)
@@ -1173,29 +2367,21 @@ impl ECStore {
 
         let reader = if self.single_pool() {
             self.pools[0]
-                .get_object_reader(bucket, object.as_str(), range, h, &opts)
+                .get_object_reader(bucket, object.as_ref(), range, h, &opts)
                 .await?
         } else {
             let (_, idx) = self
                 .get_latest_accessible_object_info_with_idx(bucket, &object, &opts)
                 .await?;
             self.pools[idx]
-                .get_object_reader(bucket, object.as_str(), range, h, &opts)
+                .get_object_reader(bucket, object.as_ref(), range, h, &opts)
                 .await?
         };
 
         Ok(Self::attach_read_lock_guard(reader, read_lock_guard))
     }
 
-    #[instrument(level = "debug", skip(self, data))]
-    #[hotpath::measure(impl_type = "ECStore")]
-    pub(super) async fn handle_put_object(
-        &self,
-        bucket: &str,
-        object: &str,
-        data: &mut PutObjReader,
-        opts: &ObjectOptions,
-    ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
+    async fn prepare_put_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<(String, ObjectOptions)> {
         check_put_object_args(bucket, object)?;
 
         let object = encode_dir_object(object);
@@ -1222,22 +2408,20 @@ impl ECStore {
             };
             snapshot.add_lock_fences(&mut opts);
         }
+        Ok((object, opts))
+    }
 
-        // Keep PUT atomic-read friendly: SetDisks takes the object write lock only
-        // around precondition checks and the final rename/commit.
+    async fn select_put_object_pool_idx(&self, bucket: &str, object: &str, size: i64, opts: &ObjectOptions) -> Result<usize> {
         if self.single_pool() {
-            return self.pools[0]
-                .put_object_with_old_current_size(bucket, object.as_str(), data, &opts)
-                .await;
+            return Ok(0);
         }
 
         let idx = if opts.data_movement && opts.version_id.is_some() {
-            self.select_data_movement_pool_idx(bucket, &object, data.size(), &opts, false)
-                .await?
+            self.select_data_movement_pool_idx(bucket, object, size, opts, false).await?
         } else if opts.no_lock {
-            self.get_pool_idx_no_lock(bucket, &object, data.size()).await?
+            self.get_pool_idx_no_lock(bucket, object, size).await?
         } else {
-            self.get_pool_idx(bucket, &object, data.size()).await?
+            self.get_pool_idx(bucket, object, size).await?
         };
 
         if opts.data_movement && idx == opts.src_pool_idx {
@@ -1247,7 +2431,53 @@ impl ECStore {
                 opts.version_id.clone().unwrap_or_default(),
             ));
         }
+        Ok(idx)
+    }
 
+    pub(crate) async fn put_object_for_data_movement(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+        mutation_fence: Option<&ObjectLockDiagGuard>,
+    ) -> Result<(usize, Result<ObjectInfo>)> {
+        if !opts.data_movement {
+            return Err(Error::other("data movement PUT requires data_movement options"));
+        }
+        let (object, mut opts) = self.prepare_put_object(bucket, object, opts).await?;
+        let idx = self
+            .select_put_object_pool_idx(bucket, object.as_str(), data.size(), &opts)
+            .await?;
+        self.apply_decommission_target_mutation_fence(idx, object.as_str(), &mut opts, mutation_fence)
+            .await;
+        let result = self.pools[idx]
+            .put_object_with_old_current_size(bucket, &object, data, &opts)
+            .await
+            .map(|(object_info, _)| object_info);
+        let result = enqueue_transition_after_write(result, LcEventSrc::S3PutObject).await;
+        if result.is_ok() {
+            list_objects::observe_list_objects_mutation(self, bucket).await;
+        }
+        Ok((idx, result))
+    }
+
+    #[instrument(level = "debug", skip(self, data))]
+    #[hotpath::measure(impl_type = "ECStore")]
+    pub(super) async fn handle_put_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
+        let (object, opts) = self.prepare_put_object(bucket, object, opts).await?;
+        let idx = self
+            .select_put_object_pool_idx(bucket, object.as_str(), data.size(), &opts)
+            .await?;
+
+        // Keep PUT atomic-read friendly: SetDisks takes the object write lock only
+        // around precondition checks and the final rename/commit.
         self.pools[idx]
             .put_object_with_old_current_size(bucket, &object, data, &opts)
             .await
@@ -1358,7 +2588,7 @@ impl ECStore {
 
         if cp_src_dst_same {
             let pool_idx = self
-                .get_pool_info_existing_with_opts(src_bucket, &src_object, &version_aware_lookup_opts(src_opts, true))
+                .get_pool_info_existing_with_opts(src_bucket, &src_object, &writer_pool_lookup_opts(src_opts, true))
                 .await?
                 .0
                 .index;
@@ -1539,6 +2769,22 @@ impl ECStore {
         result
     }
 
+    pub async fn delete_objects_with_tier_delete_journal_and_accounting(
+        self: &Arc<Self>,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+        let result = self
+            .handle_delete_objects_with_journal_and_accounting(bucket, objects, opts, Some(Arc::clone(self)))
+            .await;
+        let success_count = result.1.iter().filter(|err| err.is_none()).count();
+        if success_count > 0 {
+            list_objects::observe_list_objects_mutations(self, bucket, success_count).await;
+        }
+        result
+    }
+
     #[instrument(skip(self))]
     pub(super) async fn handle_delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         self.handle_delete_object_with_journal(bucket, object, opts, None).await
@@ -1552,6 +2798,10 @@ impl ECStore {
         tier_journal_api: Option<Arc<ECStore>>,
     ) -> Result<ObjectInfo> {
         check_del_obj_args(bucket, object)?;
+
+        if opts.lifecycle_delete_all.is_some() && self.ctx.lock_manager().is_disabled() {
+            return Err(Error::other("lifecycle delete-all requires namespace locking"));
+        }
 
         let _bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
             None
@@ -1567,6 +2817,11 @@ impl ECStore {
         };
         let object = object.as_str();
         let mut opts = opts;
+        let delete_all_configs = if opts.lifecycle_delete_all.is_some() {
+            Some(get_expiry_configs(self, bucket).await?)
+        } else {
+            None
+        };
         opts.tier_delete_journal_api = tier_journal_api.clone();
         if let Some(guard) = _bucket_lifecycle_guard.as_ref() {
             opts.add_bucket_lifecycle_lock_guard(guard);
@@ -1603,9 +2858,7 @@ impl ECStore {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
         #[cfg(test)]
-        if current_bucket_incarnation_id.is_some() {
-            pause_delete_after_object_lock_snapshot(bucket).await;
-        }
+        pause_delete_after_object_lock_snapshot(bucket).await;
 
         if opts.delete_prefix && !opts.delete_prefix_object {
             // Prefix deletes cover multiple object keys; an exact lock on the prefix string
@@ -1666,12 +2919,44 @@ impl ECStore {
         } else {
             None
         };
+        #[cfg(test)]
+        if _object_lock_guard.is_some() {
+            notify_delete_namespace_acquired(bucket);
+        }
+        if let Some(trigger) = opts.lifecycle_delete_all.as_ref() {
+            let configs = delete_all_configs.as_ref().ok_or(StorageError::PreconditionFailed)?;
+            let expected_bucket_incarnation_id = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
+            if configs.table_bucket_enabled || configs.bucket_incarnation_id != expected_bucket_incarnation_id {
+                return Err(StorageError::PreconditionFailed);
+            }
+            let lifecycle = configs.lifecycle.as_ref().ok_or(StorageError::PreconditionFailed)?;
+            let (mut current, _) = self
+                .get_latest_object_info_with_idx(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        no_lock: true,
+                        metadata_cache_safe: false,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let current_version_id = current.version_id.filter(|version_id| !version_id.is_nil());
+            if current_version_id != trigger.version_id || current.delete_marker != trigger.delete_marker {
+                return Err(StorageError::PreconditionFailed);
+            }
+            current.name = decode_dir_object(&current.name);
+            let current_event = eval_action_from_lifecycle(lifecycle, configs.object_lock.as_deref(), &current).await;
+            if current_event.action != trigger.action || current_event.rule_id != trigger.rule_id {
+                return Err(StorageError::PreconditionFailed);
+            }
+        }
         if opts.delete_prefix {
             delete_prefix_with_tier_delete_journal(self, bucket, object, &opts, tier_journal_api.as_ref()).await?;
             return Ok(ObjectInfo::default());
         }
 
-        let gopts = version_aware_lookup_opts(&opts, true);
+        let gopts = delete_pool_lookup_opts(&opts, true);
 
         if opts.data_movement {
             let existing_pool_info = self.get_pool_info_existing_with_opts(bucket, object, &gopts).await;
@@ -1692,6 +2977,50 @@ impl ECStore {
             };
             let target_pool_idx =
                 resolve_data_movement_resume_target_pool(selected_target_pool_idx, resume_target_pool_idx, opts.src_pool_idx);
+            let mut delete_marker_target_opts = None;
+
+            if opts.delete_marker && should_check_data_movement_resume_target(opts.src_pool_idx, target_pool_idx) {
+                let source = self
+                    .find_data_movement_target_info(bucket, object, opts.src_pool_idx, &opts)
+                    .await?;
+                let Some(source) = source else {
+                    return Err(StorageError::DataMovementOverwriteErr(
+                        bucket.to_owned(),
+                        object.to_owned(),
+                        opts.version_id.unwrap_or_default(),
+                    ));
+                };
+                if !is_expected_data_movement_delete_marker_source(&source, opts.mod_time) {
+                    return Err(StorageError::DataMovementOverwriteErr(
+                        bucket.to_owned(),
+                        object.to_owned(),
+                        opts.version_id.unwrap_or_default(),
+                    ));
+                }
+                let Some(target_opts) = current_data_movement_delete_marker_opts(&source, &opts) else {
+                    return Err(StorageError::DataMovementOverwriteErr(
+                        bucket.to_owned(),
+                        object.to_owned(),
+                        opts.version_id.unwrap_or_default(),
+                    ));
+                };
+                let target = self
+                    .find_data_movement_target_info(bucket, object, target_pool_idx, &target_opts)
+                    .await?;
+                if let Some(target) = target {
+                    if is_equivalent_data_movement_delete_marker(&source, &target) {
+                        let mut target = target;
+                        target.name = decode_dir_object(object);
+                        return Ok(target);
+                    }
+                    return Err(StorageError::DataMovementOverwriteErr(
+                        bucket.to_owned(),
+                        object.to_owned(),
+                        opts.version_id.unwrap_or_default(),
+                    ));
+                }
+                delete_marker_target_opts = Some(target_opts);
+            }
 
             if !should_check_data_movement_resume_target(opts.src_pool_idx, target_pool_idx) {
                 if let Ok((source_pool_info, _)) = existing_pool_info
@@ -1719,7 +3048,8 @@ impl ECStore {
                 ));
             }
 
-            let mut obj = self.pools[target_pool_idx].delete_object(bucket, object, opts).await?;
+            let target_opts = delete_marker_target_opts.unwrap_or(opts);
+            let mut obj = self.pools[target_pool_idx].delete_object(bucket, object, target_opts).await?;
             obj.name = decode_dir_object(obj.name.as_str());
             return Ok(obj);
         }
@@ -1731,6 +3061,8 @@ impl ECStore {
             Err(err) if is_err_object_not_found(&err) && should_create_delete_marker_for_missing_object(&opts) => {
                 let target_pool_idx = self.get_pool_idx_no_lock(bucket, object, 0).await?;
                 let mut obj = self.pools[target_pool_idx].delete_object(bucket, object, opts).await?;
+                #[cfg(test)]
+                pause_versioned_delete_marker_after_commit(bucket, object).await;
                 obj.name = decode_dir_object(object);
                 return Ok(obj);
             }
@@ -1769,7 +3101,7 @@ impl ECStore {
             None
         };
 
-        if !errs.is_empty() && !opts.versioned && !opts.version_suspended {
+        if should_delete_from_all_pools(&opts, errs.len()) {
             let mut obj = match self.delete_object_from_all_pools(bucket, object, &opts, errs).await {
                 Ok(obj) => obj,
                 Err(err) => {
@@ -1787,8 +3119,14 @@ impl ECStore {
         }
 
         for pool in self.pools.iter() {
+            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
+                continue;
+            }
+
             match pool.delete_object(bucket, object, opts.clone()).await {
                 Ok(res) => {
+                    #[cfg(test)]
+                    pause_versioned_delete_marker_after_commit(bucket, object).await;
                     if let (Some(api), Some(je)) = (tier_journal_api.as_ref(), journal_entry.as_ref()) {
                         commit_prepared_tier_delete_journal_entry(api, je).await;
                     }
@@ -1832,6 +3170,19 @@ impl ECStore {
         opts: ObjectOptions,
         tier_journal_api: Option<Arc<ECStore>>,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
+        let (deleted, errors, _) = self
+            .handle_delete_objects_with_journal_and_accounting(bucket, objects, opts, tier_journal_api)
+            .await;
+        (deleted, errors)
+    }
+
+    pub(super) async fn handle_delete_objects_with_journal_and_accounting(
+        &self,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+        tier_journal_api: Option<Arc<ECStore>>,
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
         // encode object name
         let objects: Vec<ObjectToDelete> = objects
             .iter()
@@ -1844,6 +3195,7 @@ impl ECStore {
 
         // Default return value
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
+        let mut accounting = vec![None; objects.len()];
 
         let mut del_errs = Vec::with_capacity(objects.len());
         for _ in 0..objects.len() {
@@ -1857,7 +3209,7 @@ impl ECStore {
         } else {
             match self.acquire_bucket_lifecycle_read_lock(bucket).await {
                 Ok(guard) => Some(guard),
-                Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+                Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
             }
         };
         if let Some(guard) = _bucket_lifecycle_guard.as_ref() {
@@ -1869,21 +3221,21 @@ impl ECStore {
                 Err(err) => {
                     let message = err.to_string();
                     let errors = (0..objects.len()).map(|_| Some(Error::other(message.clone()))).collect();
-                    return (del_objects, errors);
+                    return (del_objects, errors, accounting);
                 }
             }
         }
         if !is_meta_bucketname(bucket)
             && let Err(err) = get_cached_bucket_incarnation_id_in(&self.ctx, bucket).await
         {
-            return return_batch_delete_lock_error(objects.as_slice(), err);
+            return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err);
         }
         let _object_lock_metadata_guard = if is_meta_bucketname(bucket) {
             None
         } else {
             Some(match acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await {
                 Ok(guard) => guard,
-                Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+                Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
             })
         };
         if let Some(guard) = _object_lock_metadata_guard.as_ref() {
@@ -1893,7 +3245,7 @@ impl ECStore {
             let (state, incarnation_id, config_revision) =
                 match get_object_lock_config_and_incarnation_from_disk_in(&self.ctx, bucket).await {
                     Ok(snapshot) => snapshot,
-                    Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+                    Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
                 };
             opts.object_lock_config_snapshot = Some(Arc::new(ObjectLockConfigSnapshot::for_store_bucket(
                 self.id,
@@ -1909,7 +3261,10 @@ impl ECStore {
         if let (Some(expected), Some(current)) = (opts.expected_bucket_incarnation_id, current_bucket_incarnation_id)
             && expected != current
         {
-            return return_batch_delete_lock_error(objects.as_slice(), StorageError::BucketNotFound(bucket.to_string()));
+            return return_batch_delete_lock_error_with_accounting(
+                objects.as_slice(),
+                StorageError::BucketNotFound(bucket.to_string()),
+            );
         }
         #[cfg(test)]
         if current_bucket_incarnation_id.is_some() {
@@ -1917,29 +3272,113 @@ impl ECStore {
         }
         let _object_lock_guards = match self.acquire_delete_objects_write_locks(bucket, &objects, &mut opts).await {
             Ok(guards) => guards,
-            Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+            Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
         };
+        #[cfg(test)]
+        if !_object_lock_guards.is_empty() {
+            notify_delete_namespace_acquired(bucket);
+        }
+
+        let delete_config_snapshot = opts
+            .delete_replication_config_snapshot
+            .as_deref()
+            .expect("batch delete replication config snapshot should be loaded");
+        let latest_marker_objects = objects
+            .iter()
+            .map(|object| batch_delete_creates_latest_marker(object, delete_config_snapshot))
+            .collect::<Vec<_>>();
+        let marker_target_results = join_all(objects.iter().zip(&latest_marker_objects).map(
+            |(object, creates_marker)| async move {
+                if *creates_marker {
+                    Some(self.get_pool_idx_no_lock(bucket, &object.object_name, 0).await)
+                } else {
+                    None
+                }
+            },
+        ))
+        .await;
+        let mut marker_target_pool_indices = Vec::with_capacity(objects.len());
+        for (idx, target_result) in marker_target_results.into_iter().enumerate() {
+            match target_result {
+                Some(Ok(pool_idx)) => marker_target_pool_indices.push(Some(pool_idx)),
+                Some(Err(err)) => {
+                    del_errs[idx] = Some(err);
+                    marker_target_pool_indices.push(None);
+                }
+                None => marker_target_pool_indices.push(None),
+            }
+        }
 
         let mut futures = Vec::with_capacity(self.pools.len());
-
         for pool in self.pools.iter() {
-            futures.push(pool.delete_objects(bucket, objects.clone(), opts.clone()));
+            if self.is_pool_rebalancing(pool.pool_idx).await {
+                continue;
+            }
+
+            let (object_indices, pool_objects): (Vec<_>, Vec<_>) = objects
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| {
+                    batch_delete_targets_pool(latest_marker_objects[*idx], marker_target_pool_indices[*idx], pool.pool_idx)
+                })
+                .map(|(idx, object)| (idx, object.clone()))
+                .unzip();
+            if pool_objects.is_empty() {
+                continue;
+            }
+
+            let pool_opts = opts.clone();
+            futures.push(async move {
+                #[cfg(test)]
+                let pool_object_names = pool_objects
+                    .iter()
+                    .map(|object| object.object_name.clone())
+                    .collect::<Vec<_>>();
+                let result = pool.delete_objects_with_accounting(bucket, pool_objects, pool_opts).await;
+                #[cfg(test)]
+                let result = {
+                    let mut result = result;
+                    let (deleted, errors, _) = &mut result;
+                    inject_batch_delete_pool_errors(bucket, pool.pool_idx, &pool_object_names, deleted, errors);
+                    result
+                };
+                (object_indices, result)
+            });
         }
 
         let results = join_all(futures).await;
 
         for idx in 0..del_objects.len() {
-            for (dels, errs) in results.iter() {
-                if errs[idx].is_none() && dels[idx].found {
-                    del_errs[idx] = None;
-                    del_objects[idx] = dels[idx].clone();
-                    break;
-                }
+            let pool_results = results.iter().filter_map(|(object_indices, (dels, errs, _))| {
+                let pool_object_idx = object_indices.binary_search(&idx).ok()?;
+                Some((&dels[pool_object_idx], &errs[pool_object_idx]))
+            });
+            let (deleted, error, attempted) = resolve_batch_delete_pool_results(del_errs[idx].take(), pool_results);
+            if let Some(deleted) = deleted {
+                del_objects[idx] = deleted;
+            }
+            del_errs[idx] = error;
 
-                if del_errs[idx].is_none() {
-                    del_errs[idx] = errs[idx].clone();
-                    del_objects[idx] = dels[idx].clone();
-                }
+            if !attempted && del_errs[idx].is_none() && latest_marker_objects[idx] {
+                del_objects[idx] = DeletedObject {
+                    object_name: objects[idx].object_name.clone(),
+                    version_id: objects[idx].version_id,
+                    ..Default::default()
+                };
+                del_errs[idx] = Some(StorageError::ObjectNotFound(bucket.to_owned(), objects[idx].object_name.clone()));
+            }
+        }
+
+        for (object_indices, (_, _, pool_accounting)) in &results {
+            for (pool_object_idx, object_idx) in object_indices.iter().enumerate() {
+                accounting[*object_idx] = pool_accounting.get(pool_object_idx).cloned().flatten();
+            }
+        }
+
+        #[cfg(test)]
+        for (idx, object) in objects.iter().enumerate() {
+            if del_errs[idx].is_none() && del_objects[idx].delete_marker {
+                pause_versioned_delete_marker_after_commit(bucket, &object.object_name).await;
             }
         }
 
@@ -1947,7 +3386,7 @@ impl ECStore {
             v.object_name = decode_dir_object(&v.object_name);
         });
 
-        (del_objects, del_errs)
+        (del_objects, del_errs, accounting)
 
         // let mut futures = Vec::with_capacity(objects.len());
 
@@ -2090,7 +3529,7 @@ impl ECStore {
             ..Default::default()
         };
         let (_, idx) = self
-            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &writer_pool_lookup_opts(&opts, opts.no_lock))
             .await?;
 
         let _ = self.pools[idx].add_partial(bucket, object.as_str(), version_id).await;
@@ -2181,7 +3620,7 @@ impl ECStore {
         }
 
         let (_, idx) = self
-            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &writer_pool_lookup_opts(&opts, opts.no_lock))
             .await?;
 
         self.pools[idx]
@@ -2224,7 +3663,7 @@ impl ECStore {
         }
 
         let (_, idx) = self
-            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &writer_pool_lookup_opts(&opts, opts.no_lock))
             .await?;
 
         let result = self.pools[idx].put_object_metadata(bucket, object.as_str(), &opts).await;
@@ -2259,7 +3698,7 @@ impl ECStore {
         }
 
         let (_, idx) = self
-            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), opts)
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &writer_pool_lookup_opts(opts, opts.no_lock))
             .await?;
 
         self.pools[idx].put_object_tags(bucket, object.as_str(), tags, opts).await
@@ -2294,7 +3733,7 @@ impl ECStore {
         }
 
         let (_, idx) = self
-            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), opts)
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &writer_pool_lookup_opts(opts, opts.no_lock))
             .await?;
 
         self.pools[idx].delete_object_tags(bucket, object.as_str(), opts).await
@@ -2322,30 +3761,169 @@ mod tests {
     use super::*;
     use crate::bucket::lifecycle::core::TRANSITION_COMPLETE;
     use crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState;
+    use crate::bucket::metadata_sys::ObjectLockConfigState;
     use crate::bucket::replication::{
         ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_state_to_filemeta, replication_statuses_map,
         version_purge_statuses_map,
     };
-    use crate::ecstore_validation_blackbox::make_local_set_disks;
+    use crate::core::sets::make_local_two_set_sets_with_ctx;
+    use crate::ecstore_validation_blackbox::{make_local_set_disks, make_local_set_disks_with_ctx};
     use crate::layout::{
-        endpoints::{Endpoints, PoolEndpoints},
+        endpoints::{Endpoints, PoolEndpoints, SetupType},
         format::FormatV3,
     };
     use crate::object_api::{
         GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, GetObjectBodySource, clear_get_object_body_cache_hook,
         lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
     };
-    use crate::set_disk::SetDisks;
+    use crate::set_disk::{SetDisks, disk_call_counters};
     use crate::storage_api_contracts::bucket::MakeBucketOptions;
     use crate::storage_api_contracts::lifecycle::TransitionedObject;
     use bytes::Bytes;
     use std::io::Cursor;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::AsyncReadExt;
+
+    struct WaitForLockLossReader {
+        inner: Cursor<Vec<u8>>,
+        poll_started: Option<tokio::sync::oneshot::Sender<()>>,
+        resume: ParkingMutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl AsyncRead for WaitForLockLossReader {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+            if let Some(poll_started) = self.poll_started.take() {
+                let _ = poll_started.send(());
+                if self.resume.lock().recv_timeout(Duration::from_secs(10)).is_err() {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "lock-loss signal was not observed during read",
+                    )));
+                }
+            }
+            poll
+        }
+    }
+
+    struct PermanentlyPendingReader {
+        poll_started: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl AsyncRead for PermanentlyPendingReader {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if let Some(poll_started) = self.poll_started.take() {
+                let _ = poll_started.send(());
+            }
+            Poll::Pending
+        }
+    }
 
     struct CountingMissHook {
         calls: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct RefreshFailureLockClient {
+        inner: LocalClient,
+        fail_refresh: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl rustfs_lock::LockClient for RefreshFailureLockClient {
+        async fn acquire_lock(&self, request: &rustfs_lock::LockRequest) -> rustfs_lock::Result<rustfs_lock::LockResponse> {
+            rustfs_lock::LockClient::acquire_lock(&self.inner, request).await
+        }
+
+        async fn release(&self, lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            rustfs_lock::LockClient::release(&self.inner, lock_id).await
+        }
+
+        async fn refresh(&self, lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            if self.fail_refresh.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            rustfs_lock::LockClient::refresh(&self.inner, lock_id).await
+        }
+
+        async fn force_release(&self, lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            rustfs_lock::LockClient::force_release(&self.inner, lock_id).await
+        }
+
+        async fn check_status(&self, lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<Option<rustfs_lock::LockInfo>> {
+            rustfs_lock::LockClient::check_status(&self.inner, lock_id).await
+        }
+
+        async fn get_stats(&self) -> rustfs_lock::Result<rustfs_lock::LockStats> {
+            rustfs_lock::LockClient::get_stats(&self.inner).await
+        }
+
+        async fn close(&self) -> rustfs_lock::Result<()> {
+            rustfs_lock::LockClient::close(&self.inner).await
+        }
+
+        async fn is_online(&self) -> bool {
+            rustfs_lock::LockClient::is_online(&self.inner).await
+        }
+
+        async fn is_local(&self) -> bool {
+            rustfs_lock::LockClient::is_local(&self.inner).await
+        }
+    }
+
+    async fn refresh_failure_test_guard(
+        owner: &'static str,
+    ) -> (
+        ObjectLockDiagGuard,
+        Arc<rustfs_lock::distributed_lock::LockLostSignal>,
+        Arc<RefreshFailureLockClient>,
+    ) {
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::Enabled(Arc::new(
+            rustfs_lock::FastObjectLockManager::new(),
+        )));
+        let client = Arc::new(RefreshFailureLockClient {
+            inner: LocalClient::with_manager(manager),
+            fail_refresh: AtomicBool::new(false),
+        });
+        let namespace_lock = rustfs_lock::NamespaceLock::with_clients_and_quorum(
+            owner.to_string(),
+            vec![Arc::clone(&client) as Arc<dyn rustfs_lock::LockClient>],
+            1,
+        );
+        let request =
+            rustfs_lock::LockRequest::new(rustfs_lock::ObjectKey::new("bucket", "object"), rustfs_lock::LockType::Shared, owner)
+                .with_ttl(Duration::from_secs(2))
+                .with_refresh_interval(Duration::from_millis(20));
+        let guard = namespace_lock
+            .acquire_guard(&request)
+            .await
+            .expect("distributed read lock acquisition should succeed")
+            .expect("distributed read lock should reach quorum");
+        let guard = ObjectLockDiagGuard::new(
+            guard,
+            false,
+            "SelectObjectContent",
+            Some("bucket".to_string()),
+            Some("object".to_string()),
+            Some(owner.to_string()),
+            ObjectLockDiagMode::Read,
+        );
+        let signal = guard
+            .lock_lost_signal()
+            .expect("a distributed guard should expose a lock-loss signal");
+        (guard, signal, client)
+    }
+
+    async fn refresh_failure_test_lease(
+        owner: &'static str,
+    ) -> (
+        Arc<SelectObjectSnapshotLease>,
+        Arc<rustfs_lock::distributed_lock::LockLostSignal>,
+        Arc<RefreshFailureLockClient>,
+    ) {
+        let (guard, signal, client) = refresh_failure_test_guard(owner).await;
+        (Arc::new(SelectObjectSnapshotLease::new(vec![guard])), signal, client)
     }
 
     #[async_trait::async_trait]
@@ -2357,6 +3935,244 @@ mod tests {
     }
 
     struct BodyCacheHookGuard;
+
+    #[test]
+    fn select_snapshot_deduplicates_same_distributed_lock_domain() {
+        let first: Arc<dyn rustfs_lock::LockClient> = Arc::new(rustfs_lock::LocalClient::new());
+        let second: Arc<dyn rustfs_lock::LockClient> = Arc::new(rustfs_lock::LocalClient::new());
+        let other: Arc<dyn rustfs_lock::LockClient> = Arc::new(rustfs_lock::LocalClient::new());
+
+        assert!(same_distributed_lock_domain(
+            &[Arc::clone(&first), Arc::clone(&second)],
+            &[Arc::clone(&second), Arc::clone(&first)]
+        ));
+        assert!(same_distributed_lock_domain(
+            &[Arc::clone(&first), Arc::clone(&first), Arc::clone(&second)],
+            &[Arc::clone(&second), Arc::clone(&first)]
+        ));
+        assert!(!same_distributed_lock_domain(&[first, second], &[other]));
+    }
+
+    #[tokio::test]
+    async fn decommission_fence_covers_dist_sets_with_same_clients_despite_different_namespaces() {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (_dirs, original_sets) = make_local_two_set_sets_with_ctx(Arc::clone(&ctx)).await;
+        let mut second_set = (*original_sets.disk_set[1]).clone();
+        second_set.lockers = original_sets.disk_set[0].lockers.clone();
+        let mut sets = (*original_sets).clone();
+        sets.disk_set[1] = Arc::new(second_set);
+        let sets = Arc::new(sets);
+        ctx.update_erasure_type(SetupType::DistErasure).await;
+
+        assert!(
+            sets.disk_set[0]
+                .lockers
+                .iter()
+                .zip(&sets.disk_set[1].lockers)
+                .all(|(fixed, hashed)| Arc::ptr_eq(fixed, hashed)),
+            "the regression requires identical distributed lock clients"
+        );
+        assert_ne!(sets.disk_set[0].set_index, sets.disk_set[1].set_index);
+
+        let pool_config = sets.endpoints.clone();
+        let store = new_prepared_reader_test_store_from_pools(vec![Arc::clone(&sets)], vec![pool_config], ctx);
+        let object = (0..1_000)
+            .map(|index| format!("decommission-dist-domain-{index}.bin"))
+            .find(|candidate| Arc::ptr_eq(&sets.get_disks_by_key(candidate), &sets.disk_set[1]))
+            .expect("a key should hash to the second set namespace");
+        let mutation_fence = store
+            .acquire_decommission_object_mutation_fence("bucket", &object)
+            .await
+            .expect("the fixed distributed mutation fence should be acquired");
+        let target_lock = sets.disk_set[1]
+            .new_ns_lock("bucket", &object)
+            .await
+            .expect("the hashed-set namespace lock should be created");
+        let target_err = target_lock
+            .get_write_lock(Duration::from_millis(50))
+            .await
+            .expect_err("the fixed read fence must conflict through the shared clients");
+        assert!(matches!(target_err, rustfs_lock::LockError::Timeout { .. }));
+
+        let mut put_opts = ObjectOptions::default();
+        store
+            .apply_decommission_target_mutation_fence(0, &object, &mut put_opts, Some(&mutation_fence))
+            .await;
+        assert!(put_opts.no_lock, "migration target PUT must reuse the covering fixed fence");
+
+        let mut multipart_opts = ObjectOptions::default();
+        store
+            .apply_decommission_target_mutation_fence(0, &object, &mut multipart_opts, Some(&mutation_fence))
+            .await;
+        assert!(multipart_opts.no_lock, "migration target multipart must reuse the covering fixed fence");
+        drop(mutation_fence);
+
+        let cleanup_object = (0..1_000)
+            .map(|index| format!("decommission-dist-cleanup-{index}.bin"))
+            .find(|candidate| Arc::ptr_eq(&sets.get_disks_by_key(candidate), &sets.disk_set[1]))
+            .expect("a cleanup key should hash to the second set namespace");
+        let source_fence = store
+            .acquire_decommission_source_cleanup_fence("bucket", &cleanup_object, sets.disk_set[1].as_ref())
+            .await
+            .expect("the fixed distributed cleanup fence should be acquired");
+        assert!(source_fence.source_lock_covered(), "source cleanup must reuse the covering fixed fence");
+        let source_lock = sets.disk_set[1]
+            .new_ns_lock("bucket", &cleanup_object)
+            .await
+            .expect("the source-set namespace lock should be created");
+        let source_err = source_lock
+            .get_read_lock(Duration::from_millis(50))
+            .await
+            .expect_err("the fixed write fence must conflict through the shared clients");
+        assert!(matches!(source_err, rustfs_lock::LockError::Timeout { .. }));
+    }
+
+    #[test]
+    fn select_snapshot_version_matching_normalizes_null_and_uuid_forms() {
+        let nil = Uuid::nil();
+        for actual in [None, Some(nil)] {
+            assert!(select_snapshot_version_matches(actual, "null"));
+            assert!(select_snapshot_version_matches(actual, "NULL"));
+            assert!(select_snapshot_version_matches(actual, &nil.to_string()));
+        }
+
+        let version = Uuid::new_v4();
+        assert!(select_snapshot_version_matches(Some(version), &version.to_string().to_uppercase()));
+        assert!(!select_snapshot_version_matches(Some(version), "null"));
+        assert!(!select_snapshot_version_matches(Some(version), "not-a-version"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn select_snapshot_reader_rolls_back_bytes_when_lock_is_lost_during_poll() {
+        let (lease, signal, client) = refresh_failure_test_lease("select-snapshot-lock-loss").await;
+
+        let (poll_started_tx, poll_started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let release_client = Arc::clone(&client);
+        let release_lease = Arc::clone(&lease);
+        let release_signal = Arc::clone(&signal);
+        let release_task = tokio::spawn(async move {
+            poll_started_rx.await.expect("reader poll should start");
+            release_client.fail_refresh.store(true, Ordering::Release);
+            tokio::time::timeout(Duration::from_secs(5), release_signal.notified())
+                .await
+                .expect("heartbeat should observe the rejected refresh");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !release_lease.is_lost() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("snapshot monitor should publish lock loss");
+            resume_tx.send(()).expect("reader poll should still be waiting");
+        });
+
+        let mut reader = SelectObjectSnapshotReader {
+            inner: Box::new(WaitForLockLossReader {
+                inner: Cursor::new(b"must-not-escape".to_vec()),
+                poll_started: Some(poll_started_tx),
+                resume: ParkingMutex::new(resume_rx),
+            }),
+            lock_loss_wake: SelectObjectSnapshotLockLossWake::new(lease.subscribe_lock_loss()),
+            lease,
+        };
+        let mut output = Vec::new();
+        let error = reader
+            .read_to_end(&mut output)
+            .await
+            .expect_err("a read that loses its lease must fail");
+        release_task.await.expect("backend release task should not panic");
+
+        assert!(signal.is_lost(), "heartbeat should report the rejected refresh");
+        assert!(output.is_empty(), "bytes read during the failed poll must be rolled back");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn select_snapshot_reader_checks_guards_at_eof_before_monitor_runs() {
+        let (guard, signal, client) = refresh_failure_test_guard("select-snapshot-eof-fence").await;
+        client.fail_refresh.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(5), signal.notified())
+            .await
+            .expect("heartbeat should observe the rejected refresh");
+
+        let lease = Arc::new(SelectObjectSnapshotLease::new(vec![guard]));
+        assert!(!lease.is_lost(), "current-thread monitor must not run before the synchronous read");
+        let mut reader = SelectObjectSnapshotReader {
+            inner: Box::new(Cursor::new(b"old-generation".to_vec())),
+            lock_loss_wake: SelectObjectSnapshotLockLossWake::new(lease.subscribe_lock_loss()),
+            lease,
+        };
+        let mut output = Vec::new();
+
+        let error = reader
+            .read_to_end(&mut output)
+            .await
+            .expect_err("EOF fence must reject a lease lost before its monitor is scheduled");
+
+        assert_eq!(output, b"old-generation");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn select_snapshot_lock_loss_is_broadcast_to_remaining_pending_readers() {
+        let (first_guard, first_signal, first_client) = refresh_failure_test_guard("select-snapshot-pending-first-lock").await;
+        let (second_guard, second_signal, second_client) =
+            refresh_failure_test_guard("select-snapshot-pending-second-lock").await;
+        let lease = Arc::new(SelectObjectSnapshotLease::new(vec![first_guard, second_guard]));
+        let dropped_reader = SelectObjectSnapshotReader {
+            inner: Box::new(PermanentlyPendingReader { poll_started: None }),
+            lock_loss_wake: SelectObjectSnapshotLockLossWake::new(lease.subscribe_lock_loss()),
+            lease: Arc::clone(&lease),
+        };
+        drop(dropped_reader);
+
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
+        let mut first_reader = SelectObjectSnapshotReader {
+            inner: Box::new(PermanentlyPendingReader {
+                poll_started: Some(first_started_tx),
+            }),
+            lock_loss_wake: SelectObjectSnapshotLockLossWake::new(lease.subscribe_lock_loss()),
+            lease: Arc::clone(&lease),
+        };
+        let mut second_reader = SelectObjectSnapshotReader {
+            inner: Box::new(PermanentlyPendingReader {
+                poll_started: Some(second_started_tx),
+            }),
+            lock_loss_wake: SelectObjectSnapshotLockLossWake::new(lease.subscribe_lock_loss()),
+            lease,
+        };
+        let first_read_task = tokio::spawn(async move {
+            let mut byte = [0_u8; 1];
+            first_reader.read(&mut byte).await
+        });
+        let second_read_task = tokio::spawn(async move {
+            let mut byte = [0_u8; 1];
+            second_reader.read(&mut byte).await
+        });
+
+        first_started_rx.await.expect("first inner reader should reach Poll::Pending");
+        second_started_rx
+            .await
+            .expect("second inner reader should reach Poll::Pending");
+        second_client.fail_refresh.store(true, Ordering::Release);
+        let (first_result, second_result) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), first_read_task),
+            tokio::time::timeout(Duration::from_secs(5), second_read_task),
+        );
+        for result in [first_result, second_result] {
+            let error = result
+                .expect("lock loss should wake every reader whose inner I/O remains pending")
+                .expect("reader task should not panic")
+                .expect_err("lost snapshot lease must fail every pending read");
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        }
+
+        assert!(!first_client.fail_refresh.load(Ordering::Acquire));
+        assert!(!first_signal.is_lost());
+        assert!(second_signal.is_lost());
+    }
 
     #[test]
     fn tier_delete_entry_is_prepared_and_bound_to_source_generation() {
@@ -2451,6 +4267,247 @@ mod tests {
             ..target
         };
         assert!(!is_equivalent_data_movement_delete_marker(&source, &mismatched));
+    }
+
+    #[test]
+    fn equivalent_data_movement_delete_marker_accepts_distinct_local_free_version_ids() {
+        let mut source = ObjectInfo {
+            version_id: Some(Uuid::from_u128(1)),
+            delete_marker: true,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut source.user_defined),
+            rustfs_utils::http::SUFFIX_TIER_FV_ID,
+            Uuid::from_u128(2).to_string(),
+        );
+        let mut target = source.clone();
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_TIER_FV_ID,
+            Uuid::from_u128(3).to_string(),
+        );
+
+        assert!(is_equivalent_data_movement_delete_marker(&source, &target));
+
+        Arc::make_mut(&mut target.user_defined).insert(
+            format!("{}{}", rustfs_utils::http::MINIO_INTERNAL_PREFIX, rustfs_utils::http::SUFFIX_TIER_FV_ID),
+            Uuid::from_u128(4).to_string(),
+        );
+        assert!(!is_equivalent_data_movement_delete_marker(&source, &target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_delete_marker_accepts_replication_alias_expansion() {
+        let key = format!(
+            "{}{}",
+            rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+            rustfs_utils::http::SUFFIX_REPLICATION_STATUS
+        );
+        let timestamp_key = format!(
+            "{}{}",
+            rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+            rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP
+        );
+        let source = ObjectInfo {
+            version_id: Some(Uuid::from_u128(1)),
+            delete_marker: true,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            user_defined: Arc::new(HashMap::from([
+                (key.clone(), "arn=COMPLETED;".to_string()),
+                (timestamp_key, "1970-01-01T00:00:01Z".to_string()),
+            ])),
+            ..Default::default()
+        };
+        let mut target = source.clone();
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_REPLICATION_STATUS,
+            "arn=COMPLETED;".to_string(),
+        );
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,
+            (OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND).to_string(),
+        );
+        assert!(is_equivalent_data_movement_delete_marker(&source, &target));
+
+        Arc::make_mut(&mut target.user_defined).insert(key, "arn=FAILED;".to_string());
+        assert!(!is_equivalent_data_movement_delete_marker(&source, &target));
+    }
+
+    #[test]
+    fn data_movement_delete_marker_source_requires_persisted_mod_time() {
+        let source = ObjectInfo {
+            delete_marker: true,
+            ..Default::default()
+        };
+        assert!(!is_expected_data_movement_delete_marker_source(&source, None));
+
+        let source = ObjectInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..source
+        };
+        assert!(is_expected_data_movement_delete_marker_source(&source, Some(OffsetDateTime::UNIX_EPOCH)));
+        assert!(!is_expected_data_movement_delete_marker_source(&source, None));
+    }
+
+    #[test]
+    fn data_movement_delete_marker_uses_current_source_replication_state() {
+        let expected_timestamp = OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND;
+        let timestamp = expected_timestamp.to_string();
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_REPLICA_STATUS,
+            ReplicationStatusType::Replica.to_string(),
+        );
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP, timestamp.clone());
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP, timestamp);
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_REPLICATION_STATUS,
+            "arn=COMPLETED;".to_string(),
+        );
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            &format!(
+                "{}{}",
+                rustfs_utils::http::SUFFIX_REPLICATION_RESET_ARN_PREFIX,
+                "arn:minio:replication::TenantA:bucket"
+            ),
+            "reset-id".to_string(),
+        );
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            &format!(
+                "{}{}",
+                rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX,
+                "arn:minio:replication::TenantA:bucket"
+            ),
+            "target-version".to_string(),
+        );
+        let source = ObjectInfo {
+            delete_marker: true,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            replication_status_internal: Some("arn=COMPLETED;".to_string()),
+            replication_decision: "arn=replicate;".to_string(),
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            mod_time: source.mod_time,
+            delete_replication: Some(ReplicationState {
+                replication_status_internal: Some("arn=PENDING;".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let target_opts = current_data_movement_delete_marker_opts(&source, &opts).expect("valid current source state");
+        let state = target_opts.delete_replication.as_ref().expect("current replication state");
+        assert_eq!(state.replication_status_internal.as_deref(), Some("arn=COMPLETED;"));
+        assert_eq!(state.replica_status, crate::bucket::replication::ReplicationStatusType::Replica);
+        assert_eq!(state.replica_timestamp, Some(expected_timestamp));
+        assert_eq!(state.replication_timestamp, state.replica_timestamp);
+        assert_eq!(state.replicate_decision_str, "arn=replicate;");
+        assert_eq!(
+            state
+                .reset_statuses_map
+                .get("arn:minio:replication::TenantA:bucket")
+                .map(String::as_str),
+            Some("reset-id")
+        );
+        assert_eq!(
+            state
+                .target_delete_marker_version_ids
+                .get("arn:minio:replication::TenantA:bucket")
+                .map(String::as_str),
+            Some("target-version")
+        );
+    }
+
+    #[test]
+    fn data_movement_delete_marker_rejects_corrupt_target_version_maps() {
+        let suffix = format!("{}not-an-arn", rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX);
+        let mut malformed = HashMap::new();
+        rustfs_utils::http::insert_str(&mut malformed, &suffix, "target-version".to_string());
+        let malformed_source = ObjectInfo {
+            delete_marker: true,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            user_defined: Arc::new(malformed),
+            ..Default::default()
+        };
+        assert!(current_data_movement_delete_marker_opts(&malformed_source, &ObjectOptions::default()).is_none());
+
+        let mut conflicted = HashMap::new();
+        let suffix = format!(
+            "{}arn:minio:replication::target:bucket",
+            rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX
+        );
+        rustfs_utils::http::insert_str(&mut conflicted, &suffix, "target-version-a".to_string());
+        conflicted.insert(
+            format!("{}{suffix}", rustfs_utils::http::MINIO_INTERNAL_PREFIX),
+            "target-version-b".to_string(),
+        );
+        let conflicted_source = ObjectInfo {
+            user_defined: Arc::new(conflicted),
+            ..malformed_source.clone()
+        };
+        assert!(current_data_movement_delete_marker_opts(&conflicted_source, &ObjectOptions::default()).is_none());
+
+        let mut over_cap = HashMap::new();
+        for index in 0..=1_000 {
+            let suffix = format!(
+                "{}arn:minio:replication::target:bucket-{index}",
+                rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX
+            );
+            rustfs_utils::http::insert_str(&mut over_cap, &suffix, format!("target-version-{index}"));
+        }
+        let over_cap_source = ObjectInfo {
+            user_defined: Arc::new(over_cap),
+            ..malformed_source
+        };
+        assert!(current_data_movement_delete_marker_opts(&over_cap_source, &ObjectOptions::default()).is_none());
+    }
+
+    #[test]
+    fn data_movement_delete_marker_normalizes_legacy_missing_replication_timestamps() {
+        let mut source_metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut source_metadata,
+            rustfs_utils::http::SUFFIX_REPLICA_STATUS,
+            ReplicationStatusType::Replica.to_string(),
+        );
+        rustfs_utils::http::insert_str(
+            &mut source_metadata,
+            rustfs_utils::http::SUFFIX_REPLICATION_STATUS,
+            "arn=COMPLETED;".to_string(),
+        );
+        let source = ObjectInfo {
+            delete_marker: true,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            replication_status_internal: Some("arn=COMPLETED;".to_string()),
+            user_defined: Arc::new(source_metadata),
+            ..Default::default()
+        };
+
+        let target_opts = current_data_movement_delete_marker_opts(&source, &ObjectOptions::default())
+            .expect("legacy status-only metadata should remain migratable");
+        let state = target_opts
+            .delete_replication
+            .expect("replication state should be reconstructed");
+        assert_eq!(state.replica_timestamp, Some(OffsetDateTime::UNIX_EPOCH));
+        assert_eq!(state.replication_timestamp, Some(OffsetDateTime::UNIX_EPOCH));
+
+        let mut target_metadata = (*source.user_defined).clone();
+        let epoch = OffsetDateTime::UNIX_EPOCH
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        rustfs_utils::http::insert_str(&mut target_metadata, rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP, epoch.clone());
+        rustfs_utils::http::insert_str(&mut target_metadata, rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP, epoch);
+        assert!(is_equivalent_data_movement_delete_marker_metadata(&source.user_defined, &target_metadata));
     }
 
     #[test]
@@ -2598,10 +4655,99 @@ mod tests {
     }
 
     #[test]
+    fn tiered_data_movement_source_match_rejects_transition_identity_changes() {
+        let source = tiered_equivalence_source();
+        assert!(tiered_data_movement_source_matches(&source, &source).expect("matching source metadata should parse"));
+
+        let mut changed_remote = source.clone();
+        changed_remote.transitioned_objname = "remote/replaced".to_string();
+        assert!(!tiered_data_movement_source_matches(&source, &changed_remote).expect("changed remote metadata should parse"));
+
+        let mut changed_backend = source.clone();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut changed_backend.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex([9; 32]),
+        );
+        assert!(!tiered_data_movement_source_matches(&source, &changed_backend).expect("backend metadata should parse"));
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_uses_logical_compressed_and_encrypted_sizes() {
+        let mut compressed = tiered_equivalence_source();
+        compressed.size = 600;
+        rustfs_utils::http::insert_str(&mut compressed.metadata, rustfs_utils::http::SUFFIX_COMPRESSION, "S2".to_string());
+        rustfs_utils::http::insert_str(&mut compressed.metadata, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "1024".to_string());
+        let compressed_target = tiered_equivalence_target(&compressed);
+        assert!(is_equivalent_data_movement_tiered_object(&compressed, &compressed_target));
+
+        let mut encrypted = tiered_equivalence_source();
+        encrypted.size = 640;
+        encrypted.metadata.insert(
+            rustfs_utils::http::object_encryption_keys::INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(),
+            "key-id".to_string(),
+        );
+        encrypted.metadata.insert(
+            rustfs_utils::http::object_encryption_keys::INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER.to_string(),
+            "1024".to_string(),
+        );
+        let encrypted_target = tiered_equivalence_target(&encrypted);
+        assert!(is_equivalent_data_movement_tiered_object(&encrypted, &encrypted_target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_accepts_transition_alias_expansion() {
+        let mut source = tiered_equivalence_source();
+        let suffix = rustfs_utils::http::SUFFIX_TRANSITION_TIER;
+        source.metadata.insert(
+            format!("{}{suffix}", rustfs_utils::http::MINIO_INTERNAL_PREFIX),
+            source.transition_tier.clone(),
+        );
+        let mut target = tiered_equivalence_target(&source);
+        Arc::make_mut(&mut target.user_defined)
+            .insert(rustfs_utils::http::internal_key_rustfs(suffix), source.transition_tier.clone());
+
+        assert!(is_equivalent_data_movement_tiered_object(&source, &target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_requires_hydrated_part_checksums() {
+        let mut source = tiered_equivalence_source();
+        source.parts = vec![rustfs_filemeta::ObjectPartInfo {
+            number: 1,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND),
+            checksums: Some(HashMap::from([("CRC32C".to_string(), "AAAAAA==".to_string())])),
+            ..Default::default()
+        }];
+        rustfs_utils::http::insert_str(
+            &mut source.metadata,
+            rustfs_utils::http::SUFFIX_PART_CHECKSUMS,
+            r#"[[1,[["CRC32C","AAAAAA=="]]]]"#.to_string(),
+        );
+        let mut target = tiered_equivalence_target(&source);
+        Arc::make_mut(&mut target.parts)[0].mod_time = None;
+        assert!(is_equivalent_data_movement_tiered_object(&source, &target));
+
+        let mut missing = target;
+        Arc::make_mut(&mut missing.parts)[0].checksums = None;
+        assert!(!is_equivalent_data_movement_tiered_object(&source, &missing));
+    }
+
+    #[test]
     fn equivalent_data_movement_tiered_object_rejects_transition_mismatch() {
         let source = tiered_equivalence_source();
         let mut target = tiered_equivalence_target(&source);
         target.transitioned_object.name = "remote/target".to_string();
+
+        assert!(!is_equivalent_data_movement_tiered_object(&source, &target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_rejects_transition_version_state_mismatch() {
+        let mut source = tiered_equivalence_source();
+        source.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
+        let mut target = tiered_equivalence_target(&source);
+        target.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown;
 
         assert!(!is_equivalent_data_movement_tiered_object(&source, &target));
     }
@@ -2924,6 +5070,176 @@ mod tests {
     }
 
     #[test]
+    fn writer_pool_lookup_opts_skips_rebalance_sources() {
+        let lookup_opts = writer_pool_lookup_opts(
+            &ObjectOptions {
+                version_id: Some("vid-1".to_string()),
+                ..Default::default()
+            },
+            true,
+        );
+
+        assert!(lookup_opts.no_lock);
+        assert!(lookup_opts.metadata_chg);
+        assert!(lookup_opts.skip_decommissioned);
+        assert!(lookup_opts.skip_rebalancing);
+        assert_eq!(lookup_opts.version_id.as_deref(), Some("vid-1"));
+    }
+
+    #[test]
+    fn ordinary_delete_lookup_includes_decommission_source_and_skips_rebalance_source() {
+        let lookup_opts = delete_pool_lookup_opts(&ObjectOptions::default(), true);
+
+        assert!(lookup_opts.no_lock);
+        assert!(!lookup_opts.skip_decommissioned);
+        assert!(lookup_opts.skip_rebalancing);
+
+        let explicit_version = delete_pool_lookup_opts(
+            &ObjectOptions {
+                versioned: true,
+                version_id: Some(uuid::Uuid::new_v4().to_string()),
+                ..Default::default()
+            },
+            true,
+        );
+        assert!(!explicit_version.skip_decommissioned);
+    }
+
+    #[test]
+    fn delete_fans_out_for_unversioned_and_explicit_version_mutations() {
+        assert!(should_delete_from_all_pools(&ObjectOptions::default(), 1));
+        assert!(should_delete_from_all_pools(
+            &ObjectOptions {
+                versioned: true,
+                version_id: Some(uuid::Uuid::new_v4().to_string()),
+                ..Default::default()
+            },
+            2,
+        ));
+        assert!(!should_delete_from_all_pools(
+            &ObjectOptions {
+                versioned: true,
+                ..Default::default()
+            },
+            1,
+        ));
+        assert!(!should_delete_from_all_pools(&ObjectOptions::default(), 0));
+    }
+
+    #[test]
+    fn batch_delete_identifies_only_latest_versioned_markers() {
+        let versioned = DeleteReplicationConfigSnapshot::from_configs_for_test(
+            s3s::dto::VersioningConfiguration {
+                status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::ENABLED)),
+                ..Default::default()
+            },
+            None,
+        );
+        let latest = ObjectToDelete {
+            object_name: "latest".to_string(),
+            ..Default::default()
+        };
+        assert!(batch_delete_creates_latest_marker(&latest, &versioned));
+        assert!(!batch_delete_targets_pool(true, Some(1), 0));
+        assert!(batch_delete_targets_pool(true, Some(1), 1));
+        assert!(!batch_delete_targets_pool(true, Some(1), 2));
+
+        let explicit = ObjectToDelete {
+            object_name: "explicit".to_string(),
+            version_id: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+        assert!(!batch_delete_creates_latest_marker(&explicit, &versioned));
+        assert!(batch_delete_targets_pool(false, Some(1), 0));
+
+        let unversioned = DeleteReplicationConfigSnapshot::default();
+        assert!(!batch_delete_creates_latest_marker(&latest, &unversioned));
+        assert!(batch_delete_targets_pool(false, None, 0));
+    }
+
+    #[test]
+    fn batch_delete_pool_failures_override_success_in_any_pool_order() {
+        let success = DeletedObject {
+            object_name: "object".to_string(),
+            found: true,
+            ..Default::default()
+        };
+        let source_errors = [
+            StorageError::ErasureWriteQuorum,
+            StorageError::NamespaceLockQuorumUnavailable {
+                mode: "delete_objects_commit",
+                bucket: "bucket".to_string(),
+                object: "object".to_string(),
+                required: 1,
+                achieved: 0,
+            },
+        ];
+
+        for source_error in source_errors {
+            for source_first in [true, false] {
+                let failed = (DeletedObject::default(), Some(source_error.clone()));
+                let succeeded = (success.clone(), None);
+                let pool_results = if source_first {
+                    vec![failed, succeeded]
+                } else {
+                    vec![succeeded, failed]
+                };
+
+                let (_, error, attempted) =
+                    resolve_batch_delete_pool_results(None, pool_results.iter().map(|(deleted, error)| (deleted, error)));
+
+                assert!(attempted);
+                assert_eq!(error, Some(source_error.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn batch_delete_ignores_missing_pool_only_after_another_pool_succeeds() {
+        let success = DeletedObject {
+            object_name: "object".to_string(),
+            found: true,
+            ..Default::default()
+        };
+        let missing_errors = [
+            StorageError::ObjectNotFound("bucket".to_string(), "object".to_string()),
+            StorageError::VersionNotFound("bucket".to_string(), "object".to_string(), "version".to_string()),
+        ];
+
+        for missing_error in missing_errors {
+            let missing = (DeletedObject::default(), Some(missing_error.clone()));
+            for missing_first in [true, false] {
+                let succeeded = (success.clone(), None);
+                let pool_results = if missing_first {
+                    vec![missing.clone(), succeeded]
+                } else {
+                    vec![succeeded, missing.clone()]
+                };
+                let (deleted, error, attempted) =
+                    resolve_batch_delete_pool_results(None, pool_results.iter().map(|(deleted, error)| (deleted, error)));
+
+                assert!(attempted);
+                let deleted = deleted.expect("successful pool result should be retained");
+                assert!(deleted.found);
+                assert_eq!(deleted.object_name, success.object_name.as_str());
+                assert!(error.is_none());
+            }
+
+            let missing_only = [missing];
+            let (_, error, attempted) =
+                resolve_batch_delete_pool_results(None, missing_only.iter().map(|(deleted, error)| (deleted, error)));
+            assert!(attempted);
+            assert_eq!(error, Some(missing_error));
+        }
+
+        let silent_missing = [(DeletedObject::default(), None)];
+        let (_, error, attempted) =
+            resolve_batch_delete_pool_results(None, silent_missing.iter().map(|(deleted, error)| (deleted, error)));
+        assert!(attempted);
+        assert!(error.is_none());
+    }
+
+    #[test]
     fn data_movement_pool_lookup_opts_keeps_no_lock_for_tiered_moves() {
         let lookup_opts = data_movement_pool_lookup_opts(
             &ObjectOptions {
@@ -2948,6 +5264,7 @@ mod tests {
         });
 
         assert!(lookup_opts.skip_decommissioned);
+        assert!(lookup_opts.skip_rebalancing);
         assert!(!lookup_opts.no_lock);
     }
 
@@ -2959,6 +5276,7 @@ mod tests {
         });
 
         assert!(lookup_opts.skip_decommissioned);
+        assert!(lookup_opts.skip_rebalancing);
         assert!(lookup_opts.no_lock);
     }
 
@@ -3017,6 +5335,13 @@ mod tests {
     }
 
     async fn new_prepared_reader_test_store(set_disks: &[Arc<SetDisks>]) -> ECStore {
+        new_prepared_reader_test_store_with_ctx(set_disks, crate::runtime::instance::bootstrap_ctx()).await
+    }
+
+    async fn new_prepared_reader_test_store_with_ctx(
+        set_disks: &[Arc<SetDisks>],
+        ctx: Arc<crate::runtime::instance::InstanceContext>,
+    ) -> ECStore {
         let mut pool_configs = Vec::with_capacity(set_disks.len());
         let mut pools = Vec::with_capacity(set_disks.len());
 
@@ -3034,31 +5359,50 @@ mod tests {
                 platform: "test".to_string(),
             };
             let disks = set_disks.disks.read().await.clone();
-            let pool = Sets::new(disks, &pool_config, &set_disks.format, pool_idx, set_disks.default_parity_count)
-                .await
-                .expect("prepared-reader test pool should be created from local disks");
+            let pool = Sets::new_with_instance_ctx(
+                disks,
+                &pool_config,
+                &set_disks.format,
+                pool_idx,
+                set_disks.default_parity_count,
+                Arc::clone(&ctx),
+            )
+            .await
+            .expect("prepared-reader test pool should be created from local disks");
             pool_configs.push(pool_config);
             pools.push(pool);
         }
 
+        new_prepared_reader_test_store_from_pools(pools, pool_configs, ctx)
+    }
+
+    fn new_prepared_reader_test_store_from_pools(
+        pools: Vec<Arc<Sets>>,
+        pool_configs: Vec<PoolEndpoints>,
+        ctx: Arc<crate::runtime::instance::InstanceContext>,
+    ) -> ECStore {
         let endpoint_pools = EndpointServerPools::from(pool_configs);
         ECStore {
             id: Uuid::new_v4(),
             disk_map: HashMap::new(),
             pools,
-            peer_sys: S3PeerSys::new(&endpoint_pools),
+            peer_sys: S3PeerSys::new_with_instance_ctx(&endpoint_pools, Arc::clone(&ctx)),
             pool_meta: RwLock::new(PoolMeta::default()),
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::new(()),
-            ctx: crate::runtime::instance::bootstrap_ctx(),
+            ctx,
             bucket_fence_registry: std::sync::Arc::default(),
         }
     }
 
     async fn assert_prepared_reader_blocks_writer(store: &ECStore, bucket: &str, object: &str) {
-        let manager = Arc::clone(store.pools[0].disk_set[0].local_lock_manager_for_test());
+        assert_pool_writer_is_blocked(store, 0, bucket, object).await;
+    }
+
+    async fn assert_pool_writer_is_blocked(store: &ECStore, pool_idx: usize, bucket: &str, object: &str) {
+        let manager = Arc::clone(store.pools[pool_idx].get_disks_by_key(object).local_lock_manager_for_test());
         let lock = rustfs_lock::NamespaceLock::with_local_manager("prepared-reader-writer".to_string(), manager);
         let err = lock
             .get_write_lock(rustfs_lock::ObjectKey::new(bucket, object), "competing-writer", Duration::from_millis(50))
@@ -3068,7 +5412,16 @@ mod tests {
     }
 
     async fn acquire_prepared_reader_writer(store: &ECStore, bucket: &str, object: &str) -> rustfs_lock::NamespaceLockGuard {
-        let manager = Arc::clone(store.pools[0].disk_set[0].local_lock_manager_for_test());
+        acquire_pool_writer(store, 0, bucket, object).await
+    }
+
+    async fn acquire_pool_writer(
+        store: &ECStore,
+        pool_idx: usize,
+        bucket: &str,
+        object: &str,
+    ) -> rustfs_lock::NamespaceLockGuard {
+        let manager = Arc::clone(store.pools[pool_idx].get_disks_by_key(object).local_lock_manager_for_test());
         let lock = rustfs_lock::NamespaceLock::with_local_manager("prepared-reader-writer".to_string(), manager);
         lock.get_write_lock(rustfs_lock::ObjectKey::new(bucket, object), "competing-writer", Duration::from_secs(1))
             .await
@@ -3184,6 +5537,373 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(body_cache_hook)]
+    async fn select_snapshot_holds_namespace_lock_independent_of_get_optimization() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true"))], async {
+            let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+            let store = new_prepared_reader_test_store(&[set_disks]).await;
+            let bucket = "select-snapshot-lock-lifetime";
+            let object = "object.bin";
+            let payload = b"select-snapshot-lock-lifetime-payload-".repeat(40_000);
+            let put_opts = ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            };
+
+            store.pools[0]
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+            let mut put_reader = PutObjReader::from_vec(payload.clone());
+            store.pools[0]
+                .put_object(bucket, object, &mut put_reader, &put_opts)
+                .await
+                .expect("object should be written");
+
+            use rustfs_utils::http::headers::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
+            let mut request_headers = HeaderMap::new();
+            request_headers.insert(SSEC_ALGORITHM_HEADER, "AES256".parse().expect("valid SSE-C algorithm header"));
+            request_headers.insert(SSEC_KEY_HEADER, "secret-key".parse().expect("valid SSE-C key header"));
+            request_headers.insert(SSEC_KEY_MD5_HEADER, "key-md5".parse().expect("valid SSE-C key digest header"));
+            request_headers.insert("authorization", "credential".parse().expect("valid authorization header"));
+            let snapshot = store
+                .prepare_select_object_snapshot(bucket, object, &request_headers, &ObjectOptions::default())
+                .await
+                .expect("SelectObjectContent snapshot should be prepared");
+            assert_eq!(snapshot.headers.len(), 3);
+            assert_eq!(snapshot.headers.get(SSEC_ALGORITHM_HEADER), request_headers.get(SSEC_ALGORITHM_HEADER));
+            assert_eq!(snapshot.headers.get(SSEC_KEY_HEADER), request_headers.get(SSEC_KEY_HEADER));
+            assert_eq!(snapshot.headers.get(SSEC_KEY_MD5_HEADER), request_headers.get(SSEC_KEY_MD5_HEADER));
+            assert!(snapshot.headers.get("authorization").is_none());
+            assert!(snapshot.headers.values().all(http::HeaderValue::is_sensitive));
+            assert!(!format!("{:?}", snapshot.headers).contains("secret-key"));
+            assert_eq!(
+                snapshot.logical_size(),
+                u64::try_from(payload.len()).expect("test payload length should fit in u64")
+            );
+            assert_eq!(
+                snapshot.object_info().size,
+                i64::try_from(payload.len()).expect("test payload length should fit in i64")
+            );
+            assert_prepared_reader_blocks_writer(&store, bucket, object).await;
+
+            let mut reader = snapshot.open_reader(None).await.expect("snapshot reader should open");
+            let mut restored = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut restored)
+                .await
+                .expect("snapshot body should stream");
+            assert_eq!(restored, payload);
+            drop(reader);
+            assert_prepared_reader_blocks_writer(&store, bucket, object).await;
+
+            drop(snapshot);
+            drop(acquire_prepared_reader_writer(&store, bucket, object).await);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn select_snapshot_identity_compares_encoded_directory_object_key() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let store = new_prepared_reader_test_store(&[set_disks]).await;
+        let bucket = "select-snapshot-directory-identity";
+        let source_object = "source.bin";
+
+        store.pools[0]
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(b"source".to_vec());
+        store.pools[0]
+            .put_object(
+                bucket,
+                source_object,
+                &mut put_reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source object should be written");
+
+        let mut snapshot = store
+            .prepare_select_object_snapshot(bucket, source_object, &HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("source object snapshot should be prepared");
+        snapshot.object = encode_dir_object("directory/");
+
+        assert!(snapshot.is_for(bucket, "directory/"));
+        assert!(!snapshot.is_for(bucket, "different/"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn select_snapshot_reuses_initial_metadata_fanout_for_first_reader() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let store = new_prepared_reader_test_store(&[set_disks]).await;
+        let bucket = "select-snapshot-initial-metadata";
+        let object = "initial-metadata.bin";
+        let payload = b"select snapshot initial metadata".repeat(4_000);
+        let no_lock_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        store.pools[0]
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        store.pools[0]
+            .put_object(bucket, object, &mut put_reader, &no_lock_opts)
+            .await
+            .expect("object should be written");
+
+        let calls = disk_call_counters::observe(object);
+        let snapshot = store
+            .prepare_select_object_snapshot(bucket, object, &HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("snapshot should prepare metadata");
+        assert_eq!(
+            calls.total(disk_call_counters::KIND_READ_VERSION),
+            4,
+            "snapshot preparation should fan out metadata once"
+        );
+
+        let mut reader = snapshot.open_reader(None).await.expect("first snapshot reader should open");
+        assert_eq!(
+            calls.total(disk_call_counters::KIND_READ_VERSION),
+            4,
+            "first reader should consume the metadata captured during preparation"
+        );
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("snapshot body should stream");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn select_snapshot_rejects_identity_change_before_second_reader() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let store = new_prepared_reader_test_store(&[Arc::clone(&set_disks)]).await;
+        let bucket = "select-snapshot-identity-change";
+        let object = "identity-change.bin";
+        let no_lock_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut initial_reader = PutObjReader::from_vec(b"first generation".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut initial_reader, &no_lock_opts)
+            .await
+            .expect("initial generation should be written");
+        let mut snapshot = store
+            .prepare_select_object_snapshot(bucket, object, &HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("snapshot should be prepared");
+        drop(
+            snapshot
+                .open_reader(None)
+                .await
+                .expect("first snapshot reader should consume captured metadata"),
+        );
+        snapshot.opts.metadata_cache_safe = false;
+
+        let mut replacement_reader = PutObjReader::from_vec(b"replacement generation".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut replacement_reader, &no_lock_opts)
+            .await
+            .expect("test-only no-lock write should replace the object");
+        let error = match snapshot.open_reader(None).await {
+            Ok(_) => panic!("a later reader must reject the replacement generation"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SelectObjectSnapshotReadError::Consistency(SnapshotConsistencyError::ObjectChanged)
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn select_snapshot_rejects_latest_versioned_delete_marker_during_prepare() {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (_first_dirs, first_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let (_second_dirs, second_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let store = new_prepared_reader_test_store_with_ctx(&[Arc::clone(&first_set), Arc::clone(&second_set)], ctx).await;
+        let bucket = "select-snapshot-latest-delete-marker";
+        let object = "versioned-object.bin";
+        let versioned_opts = ObjectOptions {
+            no_lock: true,
+            versioned: true,
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
+
+        for set_disks in [&first_set, &second_set] {
+            set_disks
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+        }
+        let mut older_reader = PutObjReader::from_vec(b"older visible generation".to_vec());
+        first_set
+            .put_object(bucket, object, &mut older_reader, &versioned_opts)
+            .await
+            .expect("older versioned object should be written");
+        let mut put_reader = PutObjReader::from_vec(b"hidden generation".to_vec());
+        second_set
+            .put_object(bucket, object, &mut put_reader, &versioned_opts)
+            .await
+            .expect("versioned object should be written");
+        let marker = second_set
+            .delete_object(bucket, object, versioned_opts.clone())
+            .await
+            .expect("versioned delete should create a marker");
+        assert!(marker.delete_marker);
+        assert!(marker.version_id.is_some_and(|version_id| !version_id.is_nil()));
+
+        let error = store
+            .prepare_select_object_snapshot(
+                bucket,
+                object,
+                &HeaderMap::new(),
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("latest delete marker should hide the prior object generation");
+        assert!(matches!(
+            error,
+            PrepareSelectObjectSnapshotError::Storage(ref error) if is_err_object_not_found(error)
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn select_snapshot_blocks_store_delete_for_object_in_nonzero_set() {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (_dirs, sets) = make_local_two_set_sets_with_ctx(Arc::clone(&ctx)).await;
+        ctx.update_erasure_type(SetupType::DistErasure).await;
+        assert!(
+            sets.disk_set[0]
+                .lockers
+                .iter()
+                .all(|first| sets.disk_set[1].lockers.iter().all(|second| !Arc::ptr_eq(first, second)))
+        );
+        let pool_config = sets.endpoints.clone();
+        let store = Arc::new(new_prepared_reader_test_store_from_pools(vec![Arc::clone(&sets)], vec![pool_config], ctx));
+        let bucket = RUSTFS_META_BUCKET;
+        let object = (0..1_000)
+            .map(|index| format!("nonzero-set-{index}.bin"))
+            .find(|candidate| Arc::ptr_eq(&sets.get_disks_by_key(candidate), &sets.disk_set[1]))
+            .expect("a key should hash to the second set");
+        let mut put_reader = PutObjReader::from_vec(b"stable snapshot body".to_vec());
+        sets.put_object(
+            bucket,
+            &object,
+            &mut put_reader,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("object should be written to the second set");
+        assert!(Arc::ptr_eq(&sets.get_disks_by_key(&object), &sets.disk_set[1]));
+
+        let snapshot = store
+            .prepare_select_object_snapshot(bucket, &object, &HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("snapshot should acquire both lock domains");
+        let hashed_set_writer = rustfs_lock::NamespaceLock::with_clients_and_quorum(
+            "select-nonzero-set-writer".to_string(),
+            sets.disk_set[1].lockers.clone(),
+            2,
+        );
+        let writer_error = hashed_set_writer
+            .get_write_lock(
+                rustfs_lock::ObjectKey::new(bucket, object.as_str()),
+                "competing-hashed-set-writer",
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("Select must hold the nonzero hashed-set read lock");
+        assert!(matches!(writer_error, rustfs_lock::LockError::Timeout { .. }));
+        let barrier = DeleteAfterObjectLockSnapshotBarrier::install(bucket);
+        let delete_store = Arc::clone(&store);
+        let delete_object = object.clone();
+        let mut delete = tokio::spawn(async move {
+            delete_store
+                .delete_object(bucket, &delete_object, ObjectOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+        barrier.release();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut delete).await.is_err(),
+            "store DELETE must wait for the fixed-domain Select read lock"
+        );
+
+        drop(snapshot);
+        let deleted = tokio::time::timeout(Duration::from_secs(10), delete)
+            .await
+            .expect("DELETE should resume after the snapshot is dropped")
+            .expect("DELETE task should not panic")
+            .expect("DELETE should complete");
+        assert_eq!(deleted.name, object);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn select_snapshot_fails_closed_when_local_locking_is_disabled() {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::with_lock_manager_for_test(Arc::new(
+            rustfs_lock::GlobalLockManager::Disabled(rustfs_lock::DisabledLockManager::new()),
+        )));
+        let (_dirs, set_disks) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let store = new_prepared_reader_test_store_with_ctx(&[set_disks], ctx).await;
+        let bucket = "select-snapshot-lock-disabled";
+        let object = "object.bin";
+        let mut put_reader = PutObjReader::from_vec(b"payload".to_vec());
+        let no_lock_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        store.pools[0]
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        store.pools[0]
+            .put_object(bucket, object, &mut put_reader, &no_lock_opts)
+            .await
+            .expect("object should be written without namespace locking");
+
+        let error = store
+            .prepare_select_object_snapshot(bucket, object, &HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect_err("SelectObjectContent must reject a disabled lock manager");
+        assert!(matches!(
+            error,
+            PrepareSelectObjectSnapshotError::Consistency(SnapshotConsistencyError::LockingDisabled)
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
     async fn prepared_object_info_releases_namespace_lock_immediately() {
         let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
         let store = new_prepared_reader_test_store(&[set_disks]).await;
@@ -3253,6 +5973,53 @@ mod tests {
             .await
             .expect("prepared body should stream");
         assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn select_snapshot_locks_the_hashed_set_in_every_pool() {
+        let (_first_dirs, first_set) = make_local_set_disks(4, 2).await;
+        let (_second_dirs, second_set) = make_local_set_disks(4, 2).await;
+        let store = new_prepared_reader_test_store(&[first_set, second_set]).await;
+        let bucket = "select-snapshot-all-pools";
+        let object = "object.bin";
+        let payload = b"second-pool-snapshot".to_vec();
+        let no_lock_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        for pool in &store.pools {
+            pool.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created in each pool");
+        }
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        store.pools[1]
+            .put_object(bucket, object, &mut put_reader, &no_lock_opts)
+            .await
+            .expect("object should be written only to the second pool");
+
+        let snapshot = store
+            .prepare_select_object_snapshot(bucket, object, &HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("snapshot should resolve the second-pool object");
+        assert_pool_writer_is_blocked(&store, 0, bucket, object).await;
+        assert_pool_writer_is_blocked(&store, 1, bucket, object).await;
+
+        let mut reader = snapshot.open_reader(None).await.expect("snapshot reader should open");
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("snapshot body should stream");
+        assert_eq!(restored, payload);
+        drop(reader);
+        drop(snapshot);
+
+        drop(acquire_pool_writer(&store, 0, bucket, object).await);
+        drop(acquire_pool_writer(&store, 1, bucket, object).await);
     }
 
     // Phase 5 Slice 2 (backlog#939): the instance context flows down the whole

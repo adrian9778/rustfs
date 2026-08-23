@@ -729,7 +729,7 @@ fn timestamp_elapsed_seconds_since(now: Timestamp, earlier: Timestamp) -> u64 {
         return 0;
     }
 
-    u64::try_from(duration.as_secs()).map_or(u64::MAX, |seconds| seconds)
+    u64::try_from(duration.as_secs()).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -781,6 +781,19 @@ struct ScannerBucketDriveResultValue {
     last_seen: u64,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ScannerActiveBucketDriveKey {
+    source: String,
+    bucket: String,
+    drive: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScannerActiveBucketDriveValue {
+    count: u64,
+    started_at: Timestamp,
+}
+
 // ---------------------------------------------------------------------------
 // Metrics
 // ---------------------------------------------------------------------------
@@ -813,6 +826,7 @@ pub struct Metrics {
     scanner_set_scans_active: AtomicU64,
     scanner_disk_bucket_scan_states: Mutex<HashMap<ScannerDiskBucketScanKey, ScannerDiskBucketScanState>>,
     scanner_bucket_drive_results: Mutex<ScannerBucketDriveResults>,
+    scanner_active_bucket_drive_scans: Mutex<HashMap<ScannerActiveBucketDriveKey, ScannerActiveBucketDriveValue>>,
     scanner_bucket_drive_result_clock: AtomicU64,
     current_scan_cycle_bucket_drive_results_start: Mutex<HashMap<ScannerBucketDriveResultKey, u64>>,
     last_scan_cycle_bucket_drive_results: Mutex<Vec<ScannerBucketDriveResultSnapshot>>,
@@ -887,6 +901,10 @@ pub struct Metrics {
     scanner_cycle_max_duration_millis: AtomicU64,
     scanner_cycle_max_objects: AtomicU64,
     scanner_cycle_max_directories: AtomicU64,
+    scanner_cycle_timeout_total: AtomicU64,
+    scanner_cycle_recovery_required_total: AtomicU64,
+    scanner_cycle_last_progress_age_seconds: AtomicU64,
+    scanner_leader_lease_without_progress: AtomicBool,
     scanner_bitrot_cycle_enabled: AtomicBool,
     scanner_bitrot_cycle_millis: AtomicU64,
     scanner_checkpoint: Mutex<Option<ScannerCheckpointReport>>,
@@ -915,11 +933,13 @@ const SCAN_CYCLE_RESULT_SUCCESS: u8 = 1;
 const SCAN_CYCLE_RESULT_ERROR: u8 = 2;
 const SCAN_CYCLE_RESULT_PARTIAL: u8 = 3;
 const SCAN_CYCLE_RESULT_SUPERSEDED: u8 = 4;
+const SCAN_CYCLE_RESULT_DEFERRED: u8 = 5;
 const SCAN_CYCLE_RESULT_UNKNOWN_LABEL: &str = "unknown";
 const SCAN_CYCLE_RESULT_SUCCESS_LABEL: &str = "success";
 const SCAN_CYCLE_RESULT_ERROR_LABEL: &str = "error";
 const SCAN_CYCLE_RESULT_PARTIAL_LABEL: &str = "partial";
 const SCAN_CYCLE_RESULT_SUPERSEDED_LABEL: &str = "superseded";
+const SCAN_CYCLE_RESULT_DEFERRED_LABEL: &str = "deferred";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ScanCyclePartialReason {
@@ -1041,6 +1061,15 @@ pub struct ScannerBucketDriveResultSnapshot {
     pub drive: String,
     pub result: String,
     pub count: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerActiveBucketDriveSnapshot {
+    pub source: String,
+    pub bucket: String,
+    pub drive: String,
+    pub count: u64,
+    pub age_seconds: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1345,6 +1374,14 @@ pub struct ScannerMetricsReport {
     #[serde(default)]
     pub cycle_max_directories: u64,
     #[serde(default)]
+    pub cycle_timeout_total: u64,
+    #[serde(default)]
+    pub cycle_recovery_required_total: u64,
+    #[serde(default)]
+    pub cycle_last_progress_age: u64,
+    #[serde(default)]
+    pub leader_lease_without_progress: bool,
+    #[serde(default)]
     pub bitrot_cycle_enabled: bool,
     #[serde(default)]
     pub bitrot_cycle_seconds: f64,
@@ -1385,6 +1422,8 @@ pub struct ScannerRuntimeDetailsReport {
     pub current_cycle_bucket_drive_results: Vec<ScannerBucketDriveResultSnapshot>,
     #[serde(default)]
     pub last_cycle_bucket_drive_results: Vec<ScannerBucketDriveResultSnapshot>,
+    #[serde(default)]
+    pub active_bucket_drive_scans: Vec<ScannerActiveBucketDriveSnapshot>,
 }
 
 impl CurrentCycle {
@@ -1399,24 +1438,13 @@ impl CurrentCycle {
 }
 
 /// OTEL metric name constants for scanner metrics
-const OTEL_SCANNER_OBJECTS_SCANNED: &str = "rustfs_scanner_objects_scanned_total";
-const OTEL_SCANNER_DIRECTORIES_SCANNED: &str = "rustfs_scanner_directories_scanned_total";
 const OTEL_SCANNER_BUCKETS_SCANNED: &str = "rustfs_scanner_buckets_scanned_total";
 const OTEL_SCANNER_CYCLES: &str = "rustfs_scanner_cycles_total";
 const OTEL_SCANNER_CYCLE_DURATION_SECONDS: &str = "rustfs_scanner_cycle_duration_seconds";
 const OTEL_SCANNER_BUCKET_DRIVE_DURATION_SECONDS: &str = "rustfs_scanner_bucket_drive_duration_seconds";
-
-fn emit_otel_counter(metric: usize, count: u64) {
-    match Metric::from_index(metric) {
-        Some(Metric::ScanObject) => {
-            metrics::counter!(OTEL_SCANNER_OBJECTS_SCANNED).increment(count);
-        }
-        Some(Metric::ScanFolder) => {
-            metrics::counter!(OTEL_SCANNER_DIRECTORIES_SCANNED).increment(count);
-        }
-        _ => {}
-    }
-}
+const OTEL_SCANNER_CYCLE_TIMEOUT_TOTAL: &str = "rustfs_scanner_cycle_timeout_total";
+const OTEL_SCANNER_CYCLE_LAST_PROGRESS_AGE: &str = "rustfs_scanner_cycle_last_progress_age";
+const OTEL_SCANNER_LEADER_LEASE_WITHOUT_PROGRESS: &str = "rustfs_scanner_leader_lease_without_progress";
 
 fn scan_cycle_result_label(result: u8) -> &'static str {
     match result {
@@ -1424,6 +1452,7 @@ fn scan_cycle_result_label(result: u8) -> &'static str {
         SCAN_CYCLE_RESULT_ERROR => SCAN_CYCLE_RESULT_ERROR_LABEL,
         SCAN_CYCLE_RESULT_PARTIAL => SCAN_CYCLE_RESULT_PARTIAL_LABEL,
         SCAN_CYCLE_RESULT_SUPERSEDED => SCAN_CYCLE_RESULT_SUPERSEDED_LABEL,
+        SCAN_CYCLE_RESULT_DEFERRED => SCAN_CYCLE_RESULT_DEFERRED_LABEL,
         _ => SCAN_CYCLE_RESULT_UNKNOWN_LABEL,
     }
 }
@@ -1752,7 +1781,12 @@ pub fn emit_scan_cycle_superseded(duration: Duration) {
     metrics::counter!(OTEL_SCANNER_CYCLES, "result" => SCAN_CYCLE_RESULT_SUPERSEDED_LABEL).increment(1);
 }
 
-pub fn emit_scan_bucket_drive_complete(success: bool, bucket: &str, disk: &str, duration: Duration) {
+pub fn emit_scan_cycle_deferred(duration: Duration) {
+    global_metrics().record_scan_cycle_deferred(duration);
+    metrics::counter!(OTEL_SCANNER_CYCLES, "result" => SCAN_CYCLE_RESULT_DEFERRED_LABEL).increment(1);
+}
+
+pub fn emit_scan_bucket_drive_complete(_source: ScannerWorkSource, success: bool, bucket: &str, disk: &str, duration: Duration) {
     let result = if success { "success" } else { "error" };
     global_metrics().record_scanner_bucket_drive_result(bucket, disk, result);
     metrics::counter!(
@@ -1770,7 +1804,7 @@ pub fn emit_scan_bucket_drive_complete(success: bool, bucket: &str, disk: &str, 
     .record(duration.as_secs_f64());
 }
 
-pub fn emit_scan_bucket_drive_partial(bucket: &str, disk: &str, duration: Duration) {
+pub fn emit_scan_bucket_drive_partial(_source: ScannerWorkSource, bucket: &str, disk: &str, duration: Duration) {
     global_metrics().record_scanner_bucket_drive_result(bucket, disk, SCAN_CYCLE_RESULT_PARTIAL_LABEL);
     metrics::counter!(
         OTEL_SCANNER_BUCKETS_SCANNED,
@@ -1823,6 +1857,7 @@ impl Metrics {
             scanner_set_scans_active: AtomicU64::new(0),
             scanner_disk_bucket_scan_states: Mutex::new(HashMap::new()),
             scanner_bucket_drive_results: Mutex::new(ScannerBucketDriveResults::default()),
+            scanner_active_bucket_drive_scans: Mutex::new(HashMap::new()),
             scanner_bucket_drive_result_clock: AtomicU64::new(0),
             current_scan_cycle_bucket_drive_results_start: Mutex::new(HashMap::new()),
             last_scan_cycle_bucket_drive_results: Mutex::new(Vec::new()),
@@ -1893,6 +1928,10 @@ impl Metrics {
             scanner_cycle_max_duration_millis: AtomicU64::new(0),
             scanner_cycle_max_objects: AtomicU64::new(0),
             scanner_cycle_max_directories: AtomicU64::new(0),
+            scanner_cycle_timeout_total: AtomicU64::new(0),
+            scanner_cycle_recovery_required_total: AtomicU64::new(0),
+            scanner_cycle_last_progress_age_seconds: AtomicU64::new(0),
+            scanner_leader_lease_without_progress: AtomicBool::new(false),
             scanner_bitrot_cycle_enabled: AtomicBool::new(false),
             scanner_bitrot_cycle_millis: AtomicU64::new(0),
             scanner_checkpoint: Mutex::new(None),
@@ -1952,7 +1991,6 @@ impl Metrics {
             let duration = SystemTime::now().duration_since(start).unwrap_or_default();
             global_metrics().operations[metric_idx].fetch_add(1, Ordering::Relaxed);
             global_metrics().record_source_work_for_metric(metric, 1);
-            emit_otel_counter(metric_idx, 1);
             if metric_idx < Metric::LastRealtime as usize {
                 global_metrics().latency[metric_idx].add(duration);
             }
@@ -1968,7 +2006,6 @@ impl Metrics {
             let duration = SystemTime::now().duration_since(start).unwrap_or_default();
             global_metrics().operations[metric_idx].fetch_add(1, Ordering::Relaxed);
             global_metrics().record_source_work_for_metric(metric, 1);
-            emit_otel_counter(metric_idx, 1);
             if metric_idx < Metric::LastRealtime as usize {
                 global_metrics().latency[metric_idx].add_size(duration, size);
             }
@@ -1984,7 +2021,6 @@ impl Metrics {
             let duration = SystemTime::now().duration_since(start).unwrap_or_default();
             global_metrics().operations[metric_idx].fetch_add(1, Ordering::Relaxed);
             global_metrics().record_source_work_for_metric(metric, 1);
-            emit_otel_counter(metric_idx, 1);
             if metric_idx < Metric::LastRealtime as usize {
                 global_metrics().latency[metric_idx].add(duration);
             }
@@ -2002,7 +2038,6 @@ impl Metrics {
                 let count = usize_to_u64_saturated(count);
                 global_metrics().operations[metric_idx].fetch_add(count, Ordering::Relaxed);
                 global_metrics().record_source_work_for_metric(metric, count);
-                emit_otel_counter(metric_idx, count);
                 if metric_idx < Metric::LastRealtime as usize {
                     global_metrics().latency[metric_idx].add(duration);
                 }
@@ -2023,7 +2058,6 @@ impl Metrics {
                 let duration = SystemTime::now().duration_since(start).unwrap_or_default();
                 let metric_idx = Metric::Ilm as usize;
                 global_metrics().operations[metric_idx].fetch_add(versions, Ordering::Relaxed);
-                emit_otel_counter(metric_idx, versions);
                 global_metrics().actions[a_idx].fetch_add(versions, Ordering::Relaxed);
                 global_metrics().actions_latency[a_idx].add(duration);
             })
@@ -2036,7 +2070,6 @@ impl Metrics {
         let metric_idx = metric as usize;
         global_metrics().operations[metric_idx].fetch_add(1, Ordering::Relaxed);
         global_metrics().record_source_work_for_metric(metric, 1);
-        emit_otel_counter(metric_idx, 1);
         if metric_idx < Metric::LastRealtime as usize {
             global_metrics().latency[metric_idx].add(duration);
         }
@@ -2320,8 +2353,45 @@ impl Metrics {
         }
     }
 
-    pub fn record_scan_bucket_drive_start(&self) {
+    pub fn record_scan_bucket_drive_start(&self, source: ScannerWorkSource, bucket: &str, drive: &str) {
         self.operations[Metric::ScanBucketDriveStart as usize].fetch_add(1, Ordering::Relaxed);
+        if bucket.is_empty() || drive.is_empty() {
+            return;
+        }
+        let key = ScannerActiveBucketDriveKey {
+            source: source.as_str().to_string(),
+            bucket: bucket.to_string(),
+            drive: drive.to_string(),
+        };
+        let mut active = self
+            .scanner_active_bucket_drive_scans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active
+            .entry(key)
+            .and_modify(|value| value.count = value.count.saturating_add(1))
+            .or_insert(ScannerActiveBucketDriveValue {
+                count: 1,
+                started_at: Timestamp::now(),
+            });
+    }
+
+    pub fn record_scan_bucket_drive_end(&self, source: ScannerWorkSource, bucket: &str, drive: &str) {
+        let key = ScannerActiveBucketDriveKey {
+            source: source.as_str().to_string(),
+            bucket: bucket.to_string(),
+            drive: drive.to_string(),
+        };
+        let mut active = self
+            .scanner_active_bucket_drive_scans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(value) = active.get_mut(&key) {
+            value.count = value.count.saturating_sub(1);
+            if value.count == 0 {
+                active.remove(&key);
+            }
+        }
     }
 
     pub fn record_scan_bucket_drive_failure(&self) {
@@ -2361,10 +2431,27 @@ impl Metrics {
             .store(cycle_max_objects.unwrap_or_default(), Ordering::Relaxed);
         self.scanner_cycle_max_directories
             .store(cycle_max_directories.unwrap_or_default(), Ordering::Relaxed);
+        self.scanner_leader_lease_without_progress.store(false, Ordering::Relaxed);
+        self.scanner_cycle_last_progress_age_seconds.store(0, Ordering::Relaxed);
+        metrics::gauge!(OTEL_SCANNER_LEADER_LEASE_WITHOUT_PROGRESS).set(0.0);
+        metrics::gauge!(OTEL_SCANNER_CYCLE_LAST_PROGRESS_AGE).set(0.0);
         self.scanner_bitrot_cycle_enabled
             .store(bitrot_cycle.is_some(), Ordering::Relaxed);
         self.scanner_bitrot_cycle_millis
             .store(bitrot_cycle.map(duration_millis_saturated).unwrap_or_default(), Ordering::Relaxed);
+    }
+
+    pub fn record_scanner_cycle_timeout(&self, recovery_required: bool, progress_age: Duration) {
+        self.scanner_cycle_timeout_total.fetch_add(1, Ordering::Relaxed);
+        if recovery_required {
+            self.scanner_cycle_recovery_required_total.fetch_add(1, Ordering::Relaxed);
+        }
+        self.scanner_cycle_last_progress_age_seconds
+            .store(progress_age.as_secs(), Ordering::Relaxed);
+        self.scanner_leader_lease_without_progress.store(true, Ordering::Relaxed);
+        metrics::counter!(OTEL_SCANNER_CYCLE_TIMEOUT_TOTAL).increment(1);
+        metrics::gauge!(OTEL_SCANNER_CYCLE_LAST_PROGRESS_AGE).set(progress_age.as_secs_f64());
+        metrics::gauge!(OTEL_SCANNER_LEADER_LEASE_WITHOUT_PROGRESS).set(1.0);
     }
 
     pub fn record_scanner_set_scan_state(&self, concurrency_limit: Option<usize>, queued: Option<usize>, active: Option<usize>) {
@@ -2542,6 +2629,17 @@ impl Metrics {
         self.superseded_scan_cycles.fetch_add(1, Ordering::Relaxed);
         self.last_scan_cycle_result
             .store(SCAN_CYCLE_RESULT_SUPERSEDED, Ordering::Relaxed);
+        self.last_scan_cycle_partial_reason
+            .store(ScanCyclePartialReason::Unknown as u8, Ordering::Relaxed);
+        self.last_scan_cycle_partial_source.store(0, Ordering::Relaxed);
+        self.last_scan_cycle_duration_millis
+            .store(duration_millis_saturated(duration), Ordering::Relaxed);
+    }
+
+    pub fn record_scan_cycle_deferred(&self, duration: Duration) {
+        self.record_scanner_cycle_end_time();
+        self.last_scan_cycle_result
+            .store(SCAN_CYCLE_RESULT_DEFERRED, Ordering::Relaxed);
         self.last_scan_cycle_partial_reason
             .store(ScanCyclePartialReason::Unknown as u8, Ordering::Relaxed);
         self.last_scan_cycle_partial_source.store(0, Ordering::Relaxed);
@@ -2783,6 +2881,26 @@ impl Metrics {
         } else {
             Vec::new()
         };
+        let now = Timestamp::now();
+        let mut active_bucket_drive_scans = self
+            .scanner_active_bucket_drive_scans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(key, value)| ScannerActiveBucketDriveSnapshot {
+                source: key.source.clone(),
+                bucket: key.bucket.clone(),
+                drive: key.drive.clone(),
+                count: value.count,
+                age_seconds: timestamp_elapsed_seconds_since(now, value.started_at),
+            })
+            .collect::<Vec<_>>();
+        active_bucket_drive_scans.sort_by(|left, right| {
+            left.source
+                .cmp(&right.source)
+                .then_with(|| left.bucket.cmp(&right.bucket))
+                .then_with(|| left.drive.cmp(&right.drive))
+        });
         ScannerRuntimeDetailsReport {
             disk_bucket_scan_states: self.scanner_disk_bucket_scan_state_snapshots(),
             bucket_drive_results: self.scanner_bucket_drive_result_counter_snapshots(),
@@ -2792,6 +2910,7 @@ impl Metrics {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
+            active_bucket_drive_scans,
         }
     }
 
@@ -3182,6 +3301,10 @@ impl Metrics {
         m.cycle_max_duration_seconds = self.scanner_cycle_max_duration_millis.load(Ordering::Relaxed) as f64 / 1000.0;
         m.cycle_max_objects = self.scanner_cycle_max_objects.load(Ordering::Relaxed);
         m.cycle_max_directories = self.scanner_cycle_max_directories.load(Ordering::Relaxed);
+        m.cycle_timeout_total = self.scanner_cycle_timeout_total.load(Ordering::Relaxed);
+        m.cycle_recovery_required_total = self.scanner_cycle_recovery_required_total.load(Ordering::Relaxed);
+        m.cycle_last_progress_age = self.scanner_cycle_last_progress_age_seconds.load(Ordering::Relaxed);
+        m.leader_lease_without_progress = self.scanner_leader_lease_without_progress.load(Ordering::Relaxed);
         m.bitrot_cycle_enabled = self.scanner_bitrot_cycle_enabled.load(Ordering::Relaxed);
         m.bitrot_cycle_seconds = self.scanner_bitrot_cycle_millis.load(Ordering::Relaxed) as f64 / 1000.0;
         m.scan_checkpoint = match self.scanner_checkpoint.lock() {
@@ -4265,6 +4388,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn report_tracks_deferred_cycle_without_failed_increment() {
+        let metrics = Metrics::new();
+        metrics.record_scan_cycle_deferred(Duration::from_millis(250));
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.last_cycle_result, SCAN_CYCLE_RESULT_DEFERRED_LABEL);
+        assert_eq!(report.last_cycle_result_code, u64::from(SCAN_CYCLE_RESULT_DEFERRED));
+        assert_eq!(report.last_cycle_duration_seconds, 0.25);
+        assert_eq!(report.failed_cycles, 0);
+        assert_eq!(report.superseded_cycles, 0);
+        assert_eq!(report.partial_cycles, 0);
+    }
+
+    #[tokio::test]
     async fn report_tracks_successful_scan_cycle_without_failed_increment() {
         let metrics = Metrics::new();
         metrics.record_scan_cycle_partial_with_source(
@@ -4357,13 +4495,34 @@ mod tests {
     #[tokio::test]
     async fn report_includes_bucket_drive_scan_starts() {
         let metrics = Metrics::new();
-        metrics.record_scan_bucket_drive_start();
+        metrics.record_scan_bucket_drive_start(ScannerWorkSource::Usage, "bucket-a", "/mnt/data/1");
         metrics.record_scan_bucket_drive_failure();
 
         let report = metrics.report().await;
 
         assert_eq!(report.life_time_ops.get("scan_bucket_drive_start"), Some(&1));
         assert_eq!(report.life_time_ops.get("scan_bucket_drive_failure"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn active_bucket_drive_snapshot_is_structured_and_retired_on_end() {
+        let metrics = Metrics::new();
+        metrics.record_scan_bucket_drive_start(ScannerWorkSource::Usage, "bucket-a", "/mnt/data/1");
+        metrics.record_scan_bucket_drive_start(ScannerWorkSource::Usage, "bucket-a", "/mnt/data/1");
+        let active = metrics.scanner_runtime_details_report().active_bucket_drive_scans;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].source, ScannerWorkSource::Usage.as_str());
+        assert_eq!(active[0].bucket, "bucket-a");
+        assert_eq!(active[0].drive, "/mnt/data/1");
+        assert_eq!(active[0].count, 2);
+
+        metrics.record_scan_bucket_drive_end(ScannerWorkSource::Usage, "bucket-a", "/mnt/data/1");
+        assert_eq!(metrics.scanner_runtime_details_report().active_bucket_drive_scans[0].count, 1);
+        metrics.record_scan_bucket_drive_end(ScannerWorkSource::Usage, "bucket-a", "/mnt/data/1");
+        assert!(metrics.scanner_runtime_details_report().active_bucket_drive_scans.is_empty());
+
+        metrics.record_scan_bucket_drive_start(ScannerWorkSource::Usage, "", "/mnt/data/1");
+        assert!(metrics.scanner_runtime_details_report().active_bucket_drive_scans.is_empty());
     }
 
     #[tokio::test]
@@ -4806,5 +4965,21 @@ mod tests {
         assert_eq!(report.cycle_max_directories, 0);
         assert!(!report.bitrot_cycle_enabled);
         assert_eq!(report.bitrot_cycle_seconds, 0.0);
+    }
+
+    #[tokio::test]
+    async fn scanner_cycle_timeout_metrics_reset_for_a_new_cycle() {
+        let metrics = Metrics::new();
+        metrics.record_scanner_cycle_timeout(true, Duration::from_secs(17));
+        let timed_out = metrics.report().await;
+        assert_eq!(timed_out.cycle_timeout_total, 1);
+        assert_eq!(timed_out.cycle_last_progress_age, 17);
+        assert!(timed_out.leader_lease_without_progress);
+
+        metrics.record_scanner_cycle_config(Duration::from_secs(60), None, Some(Duration::from_secs(1)), None, None);
+        let current = metrics.report().await;
+        assert_eq!(current.cycle_timeout_total, 1);
+        assert_eq!(current.cycle_last_progress_age, 0);
+        assert!(!current.leader_lease_without_progress);
     }
 }

@@ -57,6 +57,13 @@ pub const DEFAULT_MAX_IO_EVENTS_PER_TICK: usize = 1024;
 pub const DEFAULT_EVENT_INTERVAL: u32 = 61;
 pub const DEFAULT_RNG_SEED: Option<u64> = None; // None means random
 
+/// Dedicated blocking thread pool for fsync/fdatasync operations.
+/// When > 1, fsync operations are isolated from the main blocking pool to
+/// prevent device-bound fsync from starving read operations (pread/stat/open).
+/// Default 64 isolates fsync from the main blocking pool to prevent device-bound fsync from starving read I/O.
+pub const ENV_FSYNC_BLOCKING_THREADS: &str = "RUSTFS_RUNTIME_FSYNC_BLOCKING_THREADS";
+pub const DEFAULT_FSYNC_BLOCKING_THREADS: usize = 64;
+
 // Dial9 Tokio Telemetry Default values
 pub const DEFAULT_RUNTIME_DIAL9_ENABLED: bool = false; // Disabled by default
 pub const DEFAULT_RUNTIME_DIAL9_OUTPUT_DIR: &str = "/var/log/rustfs/telemetry";
@@ -81,6 +88,9 @@ pub const ENV_TEST_IAM_FAIL_INIT_ATTEMPTS: &str = "RUSTFS_TEST_IAM_FAIL_INIT_ATT
 pub const ENV_TEST_IAM_RETRY_INTERVAL_MS: &str = "RUSTFS_TEST_IAM_RETRY_INTERVAL_MS";
 /// Runtime env var controlling the transition worker count.
 pub const ENV_TRANSITION_WORKERS: &str = "RUSTFS_MAX_TRANSITION_WORKERS";
+/// Runtime env var controlling the ILM expiry worker count. A set, parsable,
+/// non-zero value wins; anything else falls back to `min(cpus, 16)`.
+pub const ENV_MAX_EXPIRY_WORKERS: &str = "RUSTFS_MAX_EXPIRY_WORKERS";
 /// Runtime env var controlling the absolute maximum transition workers.
 pub const ENV_TRANSITION_WORKERS_ABSOLUTE_MAX: &str = "RUSTFS_ABSOLUTE_MAX_WORKERS";
 /// Runtime env var controlling the transition queue capacity.

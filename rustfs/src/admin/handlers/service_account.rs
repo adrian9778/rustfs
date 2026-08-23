@@ -359,6 +359,13 @@ impl Operation for AddServiceAccount {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
+        // This family deliberately calls `is_allowed` directly instead of going
+        // through `validate_admin_request`, and must keep doing so
+        // (backlog#1886). The shared helper returns as soon as *any* candidate
+        // action is allowed — an OR. The checks here are an AND: each one must
+        // pass, and a later stage additionally needs `owner` for the GHSA-5354
+        // parent-scope guard and drives `deny_only` dynamically. Replacing these
+        // with the shared gate would widen authorization.
         if !iam_store
             .is_allowed(&Args {
                 account: &cred.access_key,
@@ -631,7 +638,9 @@ impl Operation for UpdateServiceAccount {
             .await
             .map_err(|e| map_service_account_lookup_error(e, "get service account failed"))?;
 
-        if !is_service_account_owner_of(&cred, &svc_account.parent_user) {
+        // The admin action permits updates within a caller's scope; only an
+        // owner may cross service-account parent boundaries.
+        if !owner && !is_service_account_owner_of(&cred, &svc_account.parent_user) {
             return Err(s3_error!(AccessDenied, "access denied"));
         }
 

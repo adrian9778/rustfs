@@ -14,15 +14,14 @@
 
 use crate::admin::auth::{authenticate_request, validate_admin_request};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{app_context_from_req, object_store_from_extensions};
+use crate::admin::runtime_sources::app_context_from_req;
 use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
 use crate::admin::storage_api::bucket::utils::is_valid_object_prefix;
-use crate::admin::storage_api::contract::heal::HealOperations as _;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
 use crate::storage::rpc::node_service::heal::{
-    HealControlCoordinator, NodeHealProgress, NodeHealStatusSnapshot, capture_node_heal_status, decode_node_heal_status,
-    heal_control_coordinator, heal_topology_fingerprint,
+    HealControlCoordinator, NodeHealStatusSnapshot, capture_node_heal_status, decode_node_heal_status,
+    decode_node_replacement_recovery_status, heal_control_coordinator, heal_topology_fingerprint,
 };
 use bytes::Bytes;
 use futures_util::future::join_all;
@@ -40,7 +39,7 @@ use rustfs_utils::path::path_join;
 use s3s::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,7 +52,10 @@ const LOG_SUBSYSTEM_HEAL_ADMIN: &str = "heal_admin";
 const EVENT_ADMIN_REQUEST_REJECTED: &str = "admin_request_rejected";
 const EVENT_ADMIN_REQUEST_FAILED: &str = "admin_request_failed";
 const EVENT_ADMIN_RESPONSE_EMITTED: &str = "admin_response_emitted";
+const LEGACY_ROOT_HEAL_RESPONSE_ID: &str = ".";
 const PEER_HEAL_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const REPLACEMENT_RECOVERY_STATUS_ROUTE_SUFFIX: &str = "/v4/heal/replacement-recovery";
+const REPLACEMENT_RECOVERY_STATUS_CONTRACT_VERSION: u32 = 2;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct HealInitParams {
@@ -63,6 +65,9 @@ struct HealInitParams {
     client_token: String,
     force_start: bool,
     force_stop: bool,
+    /// Incremental result cursor (HS-06): only result items with a sequence
+    /// greater than this are returned; absent means full snapshot.
+    since_seq: Option<u64>,
 }
 
 fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> S3Result<HealInitParams> {
@@ -94,6 +99,16 @@ fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> 
                         return Err(s3_error!(InvalidArgument, "duplicate heal query parameter"));
                     }
                     hip.force_stop = parse_heal_query_bool(value.as_ref())?;
+                }
+                "sinceSeq" => {
+                    if !seen.insert("sinceSeq") {
+                        return Err(s3_error!(InvalidArgument, "duplicate heal query parameter"));
+                    }
+                    hip.since_seq = Some(
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| s3_error!(InvalidArgument, "sinceSeq must be a non-negative integer"))?,
+                    );
                 }
                 _ => return Err(s3_error!(InvalidArgument, "unknown heal query parameter")),
             }
@@ -148,6 +163,26 @@ fn validate_heal_target(bucket: &str, obj_prefix: &str) -> S3Result<()> {
     Ok(())
 }
 
+fn encode_heal_control_path(bucket: &str, obj_prefix: &str) -> String {
+    if bucket.is_empty() && obj_prefix.is_empty() {
+        return String::new();
+    }
+
+    path_join(&[PathBuf::from(bucket), PathBuf::from(obj_prefix)])
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn heal_control_response_id(heal_path: &str, client_token: &str) -> String {
+    if !client_token.is_empty() {
+        return client_token.to_string();
+    }
+    if heal_path.is_empty() {
+        return LEGACY_ROOT_HEAL_RESPONSE_ID.to_string();
+    }
+    heal_path.to_string()
+}
+
 pub fn register_heal_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     // Some APIs are only available in EC mode
     // if is_dist_erasure().await || is_erasure().await {
@@ -173,6 +208,12 @@ pub fn register_heal_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/background-heal/status").as_str(),
         AdminOperation(&BackgroundHealStatusHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, REPLACEMENT_RECOVERY_STATUS_ROUTE_SUFFIX).as_str(),
+        AdminOperation(&ReplacementRecoveryStatusHandler {}),
     )?;
 
     Ok(())
@@ -231,6 +272,11 @@ enum HealRuntimeState {
     Uninitialized,
     Idle,
     Active,
+    /// One or more nodes were unreachable and the reachable ones report no
+    /// active work, so no definitive cluster verdict exists. Distinct from
+    /// `Idle` on purpose: an unreachable peer might be healing, and a partial
+    /// answer must not read as "nothing is running".
+    Degraded,
 }
 
 #[cfg(test)]
@@ -252,14 +298,7 @@ fn background_heal_runtime_state(
     }
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BackgroundHealProgress {
-    objects_scanned: u64,
-    objects_healed: u64,
-    objects_failed: u64,
-    bytes_processed: u64,
-}
+type BackgroundHealProgress = rustfs_heal::HealProgress;
 
 #[derive(Debug)]
 struct ClusterHealStatusSnapshot {
@@ -283,6 +322,7 @@ fn add_source_counts(total: &mut rustfs_heal::HealSourceCounts, next: rustfs_hea
     total.auto_heal = total.auto_heal.saturating_add(next.auto_heal);
     total.internal = total.internal.saturating_add(next.internal);
     total.read_repair = total.read_repair.saturating_add(next.read_repair);
+    total.mrf = total.mrf.saturating_add(next.mrf);
 }
 
 fn add_operations(total: &mut rustfs_heal::HealOperationsSnapshot, next: rustfs_heal::HealOperationsSnapshot) {
@@ -297,17 +337,10 @@ fn add_operations(total: &mut rustfs_heal::HealOperationsSnapshot, next: rustfs_
     add_source_counts(&mut total.retrying_by_source, next.retrying_by_source);
 }
 
-fn add_progress(total: &mut BackgroundHealProgress, next: NodeHealProgress) {
-    total.objects_scanned = total.objects_scanned.saturating_add(next.objects_scanned);
-    total.objects_healed = total.objects_healed.saturating_add(next.objects_healed);
-    total.objects_failed = total.objects_failed.saturating_add(next.objects_failed);
-    total.bytes_processed = total.bytes_processed.saturating_add(next.bytes_processed);
-}
-
 fn aggregate_cluster_heal_status(snapshots: Vec<NodeHealStatusSnapshot>) -> ClusterHealStatusSnapshot {
     let mut info = BackgroundHealInfo::default();
     let mut operations = rustfs_heal::HealOperationsSnapshot::default();
-    let mut progress = None;
+    let mut progress = Vec::new();
     let mut any_services_enabled = false;
     let mut any_initialized = false;
 
@@ -324,17 +357,11 @@ fn aggregate_cluster_heal_status(snapshots: Vec<NodeHealStatusSnapshot>) -> Clus
         }
         add_operations(&mut operations, snapshot.operations);
         if let Some(next) = snapshot.progress {
-            add_progress(
-                progress.get_or_insert(BackgroundHealProgress {
-                    objects_scanned: 0,
-                    objects_healed: 0,
-                    objects_failed: 0,
-                    bytes_processed: 0,
-                }),
-                next,
-            );
+            progress.push(next);
         }
     }
+
+    let progress = rustfs_heal::aggregate_heal_progress(progress);
 
     let state = if operations.queue_length > 0 || operations.active_tasks > 0 || operations.retrying_tasks > 0 {
         HealRuntimeState::Active
@@ -386,6 +413,7 @@ fn merge_peer_heal_statuses(
     mut snapshots: Vec<NodeHealStatusSnapshot>,
     peer_statuses: Vec<Result<Option<NodeHealStatusSnapshot>, String>>,
     expected_nodes: usize,
+    topology_complete: bool,
 ) -> S3Result<ClusterHealStatusSnapshot> {
     for peer_status in peer_statuses {
         match peer_status {
@@ -407,20 +435,36 @@ fn merge_peer_heal_statuses(
                     component = LOG_COMPONENT_ADMIN_API,
                     subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
                     operation = "background_heal_status",
-                    result = "failed",
+                    result = "degraded",
                     reason = "peer_status_unavailable",
                     error = %err,
                     "cluster heal peer status unavailable"
                 );
-                return Err(cluster_heal_status_unavailable("peer_status_unavailable"));
             }
         }
     }
-    let complete = snapshots.len() == expected_nodes;
+    if snapshots.is_empty() {
+        return Err(cluster_heal_status_unavailable("no_node_status_available"));
+    }
+    // Completeness requires every condition, not just the snapshot count: the
+    // peer queries iterate `peer_clients` while the topology check also
+    // examines `all_peer_clients`, and the two are populated independently —
+    // so during a reconfiguration the count can equal `expected_nodes` while
+    // the topology is known-incomplete. Counting alone would report a
+    // definitive answer precisely when the membership itself is in doubt.
+    let complete = topology_complete && snapshots.len() == expected_nodes;
     let mut status = aggregate_cluster_heal_status(snapshots);
     status.complete = complete;
+    // A partial answer must never be mistakable for a definitive verdict: an
+    // unreachable peer might be mid-heal, so reporting the reachable nodes'
+    // "idle" (or disabled/uninitialized) as the cluster state would falsely
+    // reassure. Known-active work is safe to report as-is — it cannot
+    // reassure. Everything else degrades to an explicit Degraded state so the
+    // caller still gets the reachable nodes' data (queue depths, progress,
+    // bitrot cycle) with an honest label, instead of the previous cluster-wide
+    // 500 that carried no information at all (issue #5850).
     if !complete && status.state != HealRuntimeState::Active {
-        return Err(cluster_heal_status_unavailable("peer_status_unsupported_without_known_active_work"));
+        status.state = HealRuntimeState::Degraded;
     }
     Ok(status)
 }
@@ -455,7 +499,12 @@ async fn read_cluster_heal_status(
     let Some(notification_system) = notification_system else {
         return Err(cluster_heal_status_unavailable("notification_system_unavailable"));
     };
-    if !peer_topology_complete(
+    // An incomplete peer topology (a down member's client slot, a rolling
+    // upgrade) previously failed the whole endpoint here, before any peer was
+    // queried. Proceed instead: the per-peer query below reports unavailable
+    // slots as errors, and merge_peer_heal_statuses folds them into an
+    // explicit partial answer (issue #5850).
+    let topology_complete = peer_topology_complete(
         expected_nodes,
         notification_system.peer_clients.len(),
         notification_system
@@ -469,8 +518,17 @@ async fn read_cluster_heal_status(
             .iter()
             .filter(|client| client.is_some())
             .count(),
-    ) {
-        return Err(cluster_heal_status_unavailable("peer_topology_incomplete"));
+    );
+    if !topology_complete {
+        warn!(
+            event = EVENT_ADMIN_REQUEST_FAILED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+            operation = "background_heal_status",
+            result = "degraded",
+            reason = "peer_topology_incomplete",
+            "cluster heal status will be partial"
+        );
     }
 
     let peer_statuses = join_all(notification_system.peer_clients.iter().map(|client| async move {
@@ -482,7 +540,205 @@ async fn read_cluster_heal_status(
     }))
     .await;
 
-    merge_peer_heal_statuses(snapshots, peer_statuses, expected_nodes)
+    merge_peer_heal_statuses(snapshots, peer_statuses, expected_nodes, topology_complete)
+}
+
+async fn query_peer_replacement_recovery_status<E>(
+    host: &str,
+    request: impl std::future::Future<Output = Result<Option<Vec<u8>>, E>>,
+    request_timeout: Duration,
+) -> Result<Option<rustfs_heal::ReplacementRecoverySnapshot>, String>
+where
+    E: std::fmt::Display,
+{
+    match timeout(request_timeout, request).await {
+        Ok(Ok(Some(status))) => decode_node_replacement_recovery_status(&status)
+            .map(|snapshot| Some(snapshot.snapshot))
+            .map_err(|err| format!("peer {host}: {err}")),
+        Ok(Ok(None)) => Ok(None),
+        Ok(Err(err)) => Err(format!("peer {host}: {err}")),
+        Err(_) => Err(format!("peer {host}: replacement recovery status timed out")),
+    }
+}
+
+fn canonical_replacement_records(
+    records: &[rustfs_heal::ReplacementRecoveryRecord],
+) -> Vec<rustfs_heal::ReplacementRecoveryRecord> {
+    let mut records = records.to_vec();
+    for record in &mut records {
+        record.target_slots.sort();
+    }
+    records.sort_by(|left, right| {
+        (
+            &left.task_id,
+            &left.generation,
+            &left.set_disk_id,
+            left.state,
+            &left.target_slots,
+            &left.verified_at,
+            &left.reason,
+        )
+            .cmp(&(
+                &right.task_id,
+                &right.generation,
+                &right.set_disk_id,
+                right.state,
+                &right.target_slots,
+                &right.verified_at,
+                &right.reason,
+            ))
+    });
+    records
+}
+
+fn merge_replacement_recovery_records(
+    snapshots: &[rustfs_heal::ReplacementRecoverySnapshot],
+) -> Vec<rustfs_heal::ReplacementRecoveryRecord> {
+    let mut records = BTreeMap::<String, rustfs_heal::ReplacementRecoveryRecord>::new();
+    for snapshot in snapshots {
+        for record in canonical_replacement_records(&snapshot.records) {
+            match records.entry(record.task_id.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(record);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &record => {}
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let task_id = entry.key().clone();
+                    entry.insert(rustfs_heal::ReplacementRecoveryRecord {
+                        task_id,
+                        state: rustfs_heal::ReplacementRecoveryState::Unknown,
+                        generation: None,
+                        set_disk_id: None,
+                        target_slots: Vec::new(),
+                        reason: Some("peer replacement recovery records disagree".to_string()),
+                        verified_at: None,
+                    });
+                }
+            }
+        }
+    }
+    records.into_values().collect()
+}
+
+fn aggregate_replacement_recovery_cluster_status(
+    mut snapshots: Vec<rustfs_heal::ReplacementRecoverySnapshot>,
+    peer_statuses: Vec<Result<Option<rustfs_heal::ReplacementRecoverySnapshot>, String>>,
+    expected_nodes: usize,
+    topology_complete: bool,
+) -> ReplacementRecoveryClusterStatus {
+    let mut reason = None::<&'static str>;
+    if !topology_complete {
+        reason = Some("peer_topology_incomplete");
+    }
+
+    for status in peer_statuses {
+        match status {
+            Ok(Some(snapshot)) => snapshots.push(snapshot),
+            Ok(None) => {
+                reason.get_or_insert("peer_replacement_recovery_status_unsupported");
+            }
+            Err(_) => {
+                reason.get_or_insert("peer_replacement_recovery_status_unavailable");
+            }
+        }
+    }
+
+    if snapshots.len() != expected_nodes {
+        reason.get_or_insert("peer_replacement_recovery_status_incomplete");
+    }
+    if snapshots.iter().any(|snapshot| !snapshot.definitive) {
+        reason.get_or_insert("peer_replacement_recovery_status_not_definitive");
+    }
+
+    let first_records = snapshots
+        .first()
+        .map(|snapshot| canonical_replacement_records(&snapshot.records));
+    if let Some(first_records) = &first_records
+        && snapshots
+            .iter()
+            .skip(1)
+            .any(|snapshot| canonical_replacement_records(&snapshot.records) != *first_records)
+    {
+        reason.get_or_insert("peer_replacement_recovery_status_conflict");
+    }
+
+    let records = merge_replacement_recovery_records(&snapshots);
+    if records
+        .iter()
+        .any(|record| matches!(record.state, rustfs_heal::ReplacementRecoveryState::Unknown))
+    {
+        reason.get_or_insert("peer_replacement_recovery_status_conflict");
+    }
+
+    ReplacementRecoveryClusterStatus {
+        definitive: reason.is_none(),
+        reason: reason.map(str::to_string),
+        records,
+    }
+}
+
+async fn read_cluster_replacement_recovery_status(
+    local: rustfs_heal::ReplacementRecoverySnapshot,
+    notification_system: Option<&crate::admin::storage_api::runtime_sources::NotificationSys>,
+    expected_nodes: usize,
+) -> S3Result<ReplacementRecoveryClusterStatus> {
+    if expected_nodes == 1 {
+        return Ok(aggregate_replacement_recovery_cluster_status(
+            vec![local],
+            Vec::new(),
+            expected_nodes,
+            true,
+        ));
+    }
+    let Some(notification_system) = notification_system else {
+        return Ok(ReplacementRecoveryClusterStatus {
+            definitive: false,
+            reason: Some("notification_system_unavailable".to_string()),
+            records: local.records,
+        });
+    };
+    let topology_complete = peer_topology_complete(
+        expected_nodes,
+        notification_system.peer_clients.len(),
+        notification_system
+            .peer_clients
+            .iter()
+            .filter(|client| client.is_none())
+            .count(),
+        notification_system.all_peer_clients.len(),
+        notification_system
+            .all_peer_clients
+            .iter()
+            .filter(|client| client.is_some())
+            .count(),
+    );
+    if !topology_complete {
+        warn!(
+            event = EVENT_ADMIN_REQUEST_FAILED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+            operation = "replacement_recovery_status",
+            result = "degraded",
+            reason = "peer_topology_incomplete",
+            "cluster replacement recovery status will be partial"
+        );
+    }
+
+    let peer_statuses = join_all(notification_system.peer_clients.iter().map(|client| async move {
+        let Some(client) = client else {
+            return Err("configured peer is unavailable".to_string());
+        };
+        let host = client.host.to_string();
+        query_peer_replacement_recovery_status(&host, client.replacement_recovery_status(), PEER_HEAL_STATUS_TIMEOUT).await
+    }))
+    .await;
+
+    Ok(aggregate_replacement_recovery_cluster_status(
+        vec![local],
+        peer_statuses,
+        expected_nodes,
+        topology_complete,
+    ))
 }
 
 fn cluster_heal_control_unavailable(reason: &str) -> s3s::S3Error {
@@ -714,7 +970,15 @@ fn reject_heal_admission(result: rustfs_common::heal_channel::HealAdmissionResul
             result.result_label(),
             result.reason_label()
         ),
-        HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped) => s3_error!(
+        // Overlap rejections (HS-06) share this arm: the s3s footprint
+        // ratchet forbids new s3_error! sites, and the typed reason is
+        // preserved through reason_label() ("already_running" /
+        // "overlapping_paths") so madmin-style clients can distinguish.
+        HealAdmissionResult::Dropped(
+            HealAdmissionDropReason::PolicyDropped
+            | HealAdmissionDropReason::AlreadyRunning
+            | HealAdmissionDropReason::OverlappingPaths,
+        ) => s3_error!(
             OperationAborted,
             "heal request not admitted: admission={}, reason={}",
             result.result_label(),
@@ -934,41 +1198,6 @@ fn validate_heal_request_mode(hip: &HealInitParams) -> S3Result<()> {
     Ok(())
 }
 
-fn should_handle_root_heal_directly(_hip: &HealInitParams) -> bool {
-    false
-}
-
-fn map_root_heal_status(heal_err: Option<crate::admin::storage_api::error::Error>) -> S3Result<()> {
-    match heal_err {
-        None => Ok(()),
-        Some(crate::admin::storage_api::error::StorageError::NoHealRequired) => {
-            info!(
-                event = EVENT_ADMIN_RESPONSE_EMITTED,
-                component = LOG_COMPONENT_ADMIN_API,
-                subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
-                operation = "root_heal",
-                result = "success",
-                state = "no_heal_required",
-                "admin response emitted"
-            );
-            Ok(())
-        }
-        Some(err) => {
-            warn!(
-                event = EVENT_ADMIN_REQUEST_FAILED,
-                component = LOG_COMPONENT_ADMIN_API,
-                subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
-                operation = "root_heal",
-                result = "failed",
-                reason = "root_heal_failed",
-                error = %err,
-                "admin request failed"
-            );
-            Err(s3_error!(InternalError, "root heal failed: {err}"))
-        }
-    }
-}
-
 fn json_response(status: StatusCode, body: Vec<u8>) -> S3Response<(StatusCode, Body)> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -976,6 +1205,53 @@ fn json_response(status: StatusCode, body: Vec<u8>) -> S3Response<(StatusCode, B
         headers.insert(CONTENT_LENGTH, value);
     }
     S3Response::with_headers((status, Body::from(body)), headers)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReplacementRecoveryStatusResponse {
+    pub contract_version: u32,
+    pub path: String,
+    pub scope: &'static str,
+    pub local: rustfs_heal::ReplacementRecoverySnapshot,
+    pub cluster: ReplacementRecoveryClusterStatus,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReplacementRecoveryClusterStatus {
+    pub definitive: bool,
+    pub reason: Option<String>,
+    pub records: Vec<rustfs_heal::ReplacementRecoveryRecord>,
+}
+
+fn build_replacement_recovery_status_response(
+    local: rustfs_heal::ReplacementRecoverySnapshot,
+    cluster: ReplacementRecoveryClusterStatus,
+) -> ReplacementRecoveryStatusResponse {
+    ReplacementRecoveryStatusResponse {
+        contract_version: REPLACEMENT_RECOVERY_STATUS_CONTRACT_VERSION,
+        path: format!("{}{}", ADMIN_PREFIX, REPLACEMENT_RECOVERY_STATUS_ROUTE_SUFFIX),
+        scope: "cluster_survivor_disks",
+        local,
+        cluster,
+    }
+}
+
+fn encode_replacement_recovery_status(response: &ReplacementRecoveryStatusResponse) -> S3Result<Vec<u8>> {
+    serde_json::to_vec(response).map_err(|e| {
+        warn!(
+            event = EVENT_ADMIN_REQUEST_FAILED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+            operation = "replacement_recovery_status",
+            result = "failed",
+            reason = "serialize_replacement_recovery_status_failed",
+            error = %e,
+            "admin request failed"
+        );
+        s3_error!(InternalError, "failed to serialize replacement recovery status: {e}")
+    })
 }
 
 async fn validate_heal_admin_request(req: &S3Request<Body>) -> S3Result<()> {
@@ -1026,50 +1302,6 @@ impl Operation for HealHandler {
             }
         };
         let hip = extract_heal_init_params(&bytes, &req.uri, params)?;
-        // The heal channel currently models bucket/object work. Root heal reuses the
-        // existing format-heal path directly so `/v3/heal/` is accepted intentionally.
-        if should_handle_root_heal_directly(&hip) {
-            let Some(store) = object_store_from_extensions(&req.extensions) else {
-                warn!(
-                    event = EVENT_ADMIN_REQUEST_FAILED,
-                    component = LOG_COMPONENT_ADMIN_API,
-                    subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
-                    operation = "root_heal",
-                    result = "failed",
-                    reason = "server_not_initialized",
-                    "admin request failed"
-                );
-                return Err(s3_error!(InternalError, "server not initialized"));
-            };
-
-            let (_, heal_err) = store.heal_format(hip.hs.dry_run).await.map_err(|e| {
-                warn!(
-                    event = EVENT_ADMIN_REQUEST_FAILED,
-                    component = LOG_COMPONENT_ADMIN_API,
-                    subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
-                    operation = "root_heal",
-                    result = "failed",
-                    reason = "heal_format_failed",
-                    error = %e,
-                    "admin request failed"
-                );
-                s3_error!(InternalError, "root heal failed: {e}")
-            })?;
-
-            map_root_heal_status(heal_err)?;
-            let body = encode_heal_start_success("root-heal".to_string(), client_address)?;
-            info!(
-                event = EVENT_ADMIN_RESPONSE_EMITTED,
-                component = LOG_COMPONENT_ADMIN_API,
-                subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
-                operation = "root_heal",
-                result = "success",
-                state = "started",
-                "admin response emitted"
-            );
-
-            return Ok(json_response(StatusCode::OK, body));
-        }
         validate_heal_request_mode(&hip)?;
         let response_operation = if hip.force_stop {
             "cancel_heal"
@@ -1079,9 +1311,8 @@ impl Operation for HealHandler {
             "start_heal"
         };
 
-        let heal_path = path_join(&[PathBuf::from(hip.bucket.clone()), PathBuf::from(hip.obj_prefix.clone())]);
+        let heal_path = encode_heal_control_path(&hip.bucket, &hip.obj_prefix);
         if !hip.client_token.is_empty() && !hip.force_start && !hip.force_stop {
-            let heal_path_str = heal_path.to_str().unwrap_or_default().to_string();
             let client_token = hip.client_token.clone();
             let request_id = uuid::Uuid::new_v4().to_string();
             let context = app_context
@@ -1091,8 +1322,9 @@ impl Operation for HealHandler {
             let envelope = rustfs_protos::heal_control::Envelope::query(
                 request_id.clone(),
                 new_heal_control_metadata(&route)?,
-                heal_path_str,
+                heal_path,
                 client_token.clone(),
+                hip.since_seq,
             )
             .map_err(|err| s3_error!(InternalError, "encode heal control query failed: {err}"))?;
             let response = submit_cluster_heal_channel_command(context, route, envelope, &request_id, client_token).await?;
@@ -1123,7 +1355,6 @@ impl Operation for HealHandler {
             );
             return Ok(json_response(StatusCode::OK, body));
         } else if hip.force_stop {
-            let heal_path_str = heal_path.to_str().unwrap_or_default().to_string();
             let client_token = hip.client_token.clone();
             let request_id = uuid::Uuid::new_v4().to_string();
             let context = app_context
@@ -1133,22 +1364,12 @@ impl Operation for HealHandler {
             let envelope = rustfs_protos::heal_control::Envelope::cancel(
                 request_id.clone(),
                 new_heal_control_metadata(&route)?,
-                heal_path_str,
+                heal_path.clone(),
                 client_token.clone(),
             )
             .map_err(|err| s3_error!(InternalError, "encode heal control cancel failed: {err}"))?;
-            let response = submit_cluster_heal_channel_command(
-                context,
-                route,
-                envelope,
-                &request_id,
-                if client_token.is_empty() {
-                    heal_path.to_string_lossy().into_owned()
-                } else {
-                    client_token.clone()
-                },
-            )
-            .await?;
+            let response_id = heal_control_response_id(&heal_path, &client_token);
+            let response = submit_cluster_heal_channel_command(context, route, envelope, &request_id, response_id).await?;
             if !response.success {
                 return Err(s3_error!(
                     InternalError,
@@ -1248,19 +1469,57 @@ impl Operation for BackgroundHealStatusHandler {
     }
 }
 
+pub struct ReplacementRecoveryStatusHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ReplacementRecoveryStatusHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        validate_heal_admin_request(&req).await?;
+
+        let Some(context) = app_context_from_req(&req) else {
+            return Err(cluster_heal_status_unavailable("server_not_initialized"));
+        };
+        let Some(endpoints) = context.endpoints().handle() else {
+            return Err(cluster_heal_status_unavailable("endpoint_topology_unavailable"));
+        };
+        let expected_nodes = endpoints.get_nodes().len();
+        if expected_nodes == 0 {
+            return Err(cluster_heal_status_unavailable("endpoint_topology_empty"));
+        }
+        let notification_system = context.notification_system().handle();
+        let local = rustfs_heal::current_replacement_recovery_snapshot().await;
+        let cluster =
+            read_cluster_replacement_recovery_status(local.clone(), notification_system.as_deref(), expected_nodes).await?;
+        let response = build_replacement_recovery_status_response(local, cluster);
+        let body = encode_replacement_recovery_status(&response)?;
+        info!(
+            event = EVENT_ADMIN_RESPONSE_EMITTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+            operation = "replacement_recovery_status",
+            result = "success",
+            "admin response emitted"
+        );
+
+        Ok(json_response(StatusCode::OK, body))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::extract_heal_init_params;
     use super::{
         BackgroundHealProgress, HealInitParams, HealResp, HealRuntimeState, aggregate_cluster_heal_status,
-        background_heal_runtime_state, build_heal_channel_request, encode_background_heal_status, encode_heal_start_success,
-        encode_heal_task_status, execute_after_heal_control_capability, heal_channel_response_items,
-        heal_channel_response_progress, heal_channel_response_summary, json_response, map_heal_response, map_root_heal_status,
-        merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status, reject_heal_admission,
-        should_handle_root_heal_directly, validate_heal_request_mode, validate_heal_target,
+        aggregate_replacement_recovery_cluster_status, background_heal_runtime_state, build_heal_channel_request,
+        build_replacement_recovery_status_response, encode_background_heal_status, encode_heal_control_path,
+        encode_heal_start_success, encode_heal_task_status, execute_after_heal_control_capability, heal_channel_response_items,
+        heal_channel_response_progress, heal_channel_response_summary, heal_control_response_id, json_response,
+        map_heal_response, merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status,
+        query_peer_replacement_recovery_status, reject_heal_admission, validate_heal_request_mode, validate_heal_target,
     };
-    use crate::admin::storage_api::error::StorageError;
-    use crate::storage::rpc::node_service::heal::{NodeHealProgress, NodeHealStatusSnapshot};
+    use crate::storage::rpc::node_service::heal::{
+        NodeHealProgress, NodeHealStatusSnapshot, NodeReplacementRecoveryStatusSnapshot, encode_node_replacement_recovery_status,
+    };
     use bytes::Bytes;
     use http::StatusCode;
     use http::Uri;
@@ -1278,6 +1537,26 @@ mod tests {
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::sync::mpsc;
     use tokio::time::Duration;
+
+    fn replacement_record(task_id: &str) -> rustfs_heal::ReplacementRecoveryRecord {
+        rustfs_heal::ReplacementRecoveryRecord {
+            task_id: task_id.to_string(),
+            state: rustfs_heal::ReplacementRecoveryState::Completed,
+            generation: Some(task_id.to_string()),
+            set_disk_id: Some("pool_0_set_0".to_string()),
+            target_slots: vec!["http://node-a:9000/mnt/disk1".to_string()],
+            reason: None,
+            verified_at: Some(42),
+        }
+    }
+
+    fn replacement_snapshot(task_id: &str) -> rustfs_heal::ReplacementRecoverySnapshot {
+        rustfs_heal::ReplacementRecoverySnapshot {
+            records: vec![replacement_record(task_id)],
+            definitive: true,
+            reason: None,
+        }
+    }
 
     #[tokio::test]
     async fn cluster_capability_gate_runs_before_execution() {
@@ -1303,6 +1582,97 @@ mod tests {
         .await
         .unwrap();
         assert!(executed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn replacement_recovery_status_response_reports_cluster_proof() {
+        let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local.clone()], Vec::new(), 1, true);
+        let response = build_replacement_recovery_status_response(local, cluster);
+        let value = serde_json::to_value(response).expect("replacement status response should serialize");
+
+        assert_eq!(value["contractVersion"], 2);
+        assert_eq!(value["path"], "/rustfs/admin/v4/heal/replacement-recovery");
+        assert_eq!(value["scope"], "cluster_survivor_disks");
+        assert_eq!(value["local"]["definitive"], true);
+        assert_eq!(value["local"]["records"][0]["state"], "completed");
+        assert_eq!(value["cluster"]["definitive"], true);
+        assert!(value["cluster"]["reason"].is_null());
+        assert_eq!(value["cluster"]["records"][0]["state"], "completed");
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_requires_peer_capability() {
+        let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(None)], 2, true);
+
+        assert!(!cluster.definitive);
+        assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_unsupported"));
+        assert_eq!(cluster.records[0].state, rustfs_heal::ReplacementRecoveryState::Completed);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_requires_matching_peer_records() {
+        let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let peer = replacement_snapshot("22222222-2222-4222-8222-222222222222");
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(!cluster.definitive);
+        assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_conflict"));
+        assert_eq!(cluster.records.len(), 2);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_rejects_conflicting_records_inside_a_snapshot() {
+        let mut local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let mut conflicting = replacement_record("11111111-1111-4111-8111-111111111111");
+        conflicting.set_disk_id = Some("pool_0_set_1".to_string());
+        local.records.push(conflicting);
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], Vec::new(), 1, true);
+
+        assert!(!cluster.definitive);
+        assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_conflict"));
+        assert_eq!(cluster.records[0].state, rustfs_heal::ReplacementRecoveryState::Unknown);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_is_definitive_when_peers_match() {
+        let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let peer = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records.len(), 1);
+        assert_eq!(cluster.records[0].state, rustfs_heal::ReplacementRecoveryState::Completed);
+    }
+
+    #[tokio::test]
+    async fn peer_replacement_recovery_status_decodes_supported_peers() {
+        let payload = encode_node_replacement_recovery_status(&NodeReplacementRecoveryStatusSnapshot::new(replacement_snapshot(
+            "11111111-1111-4111-8111-111111111111",
+        )))
+        .expect("peer status should encode");
+        let decoded =
+            query_peer_replacement_recovery_status("node-a", async { Ok::<_, String>(Some(payload)) }, Duration::from_secs(1))
+                .await
+                .expect("peer query should succeed")
+                .expect("peer should support status");
+
+        assert_eq!(decoded.records[0].state, rustfs_heal::ReplacementRecoveryState::Completed);
+    }
+
+    #[tokio::test]
+    async fn peer_replacement_recovery_status_treats_missing_rpc_as_unknown() {
+        let decoded = query_peer_replacement_recovery_status(
+            "node-a",
+            async { Ok::<Option<Vec<u8>>, String>(None) },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("missing rpc should not be a transport failure");
+
+        assert!(decoded.is_none());
     }
 
     #[test]
@@ -1614,48 +1984,63 @@ mod tests {
     }
 
     #[test]
-    fn test_should_handle_root_heal_directly_is_disabled_for_root_start_modes() {
-        assert!(!should_handle_root_heal_directly(&HealInitParams::default()));
-        assert!(!should_handle_root_heal_directly(&HealInitParams {
-            force_start: true,
-            ..Default::default()
-        }));
-    }
-
-    #[test]
-    fn test_should_handle_root_heal_directly_skips_query_cancel_and_bucket_targets() {
-        assert!(!should_handle_root_heal_directly(&HealInitParams {
-            client_token: "heal-token".to_string(),
-            ..Default::default()
-        }));
-        assert!(!should_handle_root_heal_directly(&HealInitParams {
-            force_stop: true,
-            ..Default::default()
-        }));
-        assert!(!should_handle_root_heal_directly(&HealInitParams {
-            bucket: "bucket".to_string(),
-            ..Default::default()
-        }));
-        assert!(!should_handle_root_heal_directly(&HealInitParams {
-            hs: HealOpts {
-                pool: Some(1),
-                set: Some(2),
+    fn test_root_heal_shapes_route_through_cluster_coordination() {
+        // Root heal has no direct local store path: every start shape is either
+        // rejected by validate_heal_request_mode or submitted to the cluster
+        // heal channel as an Admin-sourced request (see HealHandler::call).
+        let accepted_root_starts = [
+            HealInitParams {
+                hs: HealOpts {
+                    recursive: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
-        }));
-    }
+            HealInitParams {
+                force_start: true,
+                hs: HealOpts {
+                    recursive: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            HealInitParams {
+                hs: HealOpts {
+                    pool: Some(1),
+                    set: Some(2),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ];
+        for hip in accepted_root_starts {
+            validate_heal_request_mode(&hip).expect("accepted root heal start must reach cluster coordination");
+            let request = build_heal_channel_request(&hip);
+            assert_eq!(request.bucket, "", "root heal must stay cluster-scoped");
+            assert_eq!(request.source, HealRequestSource::Admin);
+            assert!(!request.id.is_empty(), "cluster heal requests carry a dedup id");
+        }
 
-    #[test]
-    fn test_map_root_heal_status_allows_no_heal_required() {
-        map_root_heal_status(Some(StorageError::NoHealRequired)).expect("NoHealRequired should stay non-fatal");
-    }
-
-    #[test]
-    fn test_map_root_heal_status_rejects_fatal_errors() {
-        let err = map_root_heal_status(Some(StorageError::Unexpected)).expect_err("fatal status must fail");
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-        assert!(err.to_string().contains("root heal failed: Unexpected error"));
+        // Shapes that cannot start a tracked heal (plain start, bare force_start
+        // without recursive, bare pool) are rejected instead of falling back to
+        // a direct local path.
+        for hip in [
+            HealInitParams::default(),
+            HealInitParams {
+                force_start: true,
+                ..Default::default()
+            },
+            HealInitParams {
+                hs: HealOpts {
+                    pool: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ] {
+            let err = validate_heal_request_mode(&hip).expect_err("unscoped root heal start must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        }
     }
 
     #[test]
@@ -1671,6 +2056,20 @@ mod tests {
             ..Default::default()
         })
         .expect("root heal cancel should be accepted");
+    }
+
+    #[test]
+    fn test_encode_heal_control_path_keeps_root_empty() {
+        assert_eq!(encode_heal_control_path("", ""), "");
+        assert_eq!(encode_heal_control_path("bucket", ""), "bucket");
+        assert_eq!(encode_heal_control_path("bucket", "prefix"), "bucket/prefix");
+    }
+
+    #[test]
+    fn test_heal_control_response_id_preserves_existing_contract() {
+        assert_eq!(heal_control_response_id("", ""), ".");
+        assert_eq!(heal_control_response_id("bucket", ""), "bucket");
+        assert_eq!(heal_control_response_id("", "task-id"), "task-id");
     }
 
     #[test]
@@ -1782,10 +2181,19 @@ mod tests {
         };
 
         let progress = BackgroundHealProgress {
+            kind: rustfs_heal::heal::progress::HealProgressKind::ObjectSweep,
             objects_scanned: 7,
             objects_healed: 3,
             objects_failed: 1,
+            skipped_objects: 3,
+            objects_total_count: 10,
+            objects_total_size: 8192,
             bytes_processed: 4096,
+            progress_percentage: 50.0,
+            progress_state: rustfs_heal::heal::progress::HealProgressState::Running,
+            baseline_generation: Some(42),
+            baseline_known: true,
+            ..Default::default()
         };
 
         let encoded = encode_background_heal_status(
@@ -1801,7 +2209,14 @@ mod tests {
         assert_eq!(json["progress"]["objectsScanned"], 7);
         assert_eq!(json["progress"]["objectsHealed"], 3);
         assert_eq!(json["progress"]["objectsFailed"], 1);
+        assert_eq!(json["progress"]["skippedObjects"], 3);
+        assert_eq!(json["progress"]["objectsTotalCount"], 10);
+        assert_eq!(json["progress"]["objectsTotalSize"], 8192);
         assert_eq!(json["progress"]["bytesProcessed"], 4096);
+        assert_eq!(json["progress"]["progressState"], "running");
+        assert_eq!(json["progress"]["baselineGeneration"], 42);
+        assert_eq!(json["progress"]["baselineKnown"], true);
+        assert_eq!(json["progress"]["counterUnknown"], false);
     }
 
     #[test]
@@ -1823,10 +2238,18 @@ mod tests {
                 ..Default::default()
             },
             Some(NodeHealProgress {
+                kind: rustfs_heal::heal::progress::HealProgressKind::ObjectSweep,
                 objects_scanned: 3,
                 objects_healed: 1,
                 objects_failed: 0,
+                skipped_objects: 2,
+                objects_total_count: 6,
+                objects_total_size: 400,
                 bytes_processed: 100,
+                progress_state: rustfs_heal::heal::progress::HealProgressState::Running,
+                baseline_generation: Some(9),
+                baseline_known: true,
+                ..Default::default()
             }),
         );
         let peer = NodeHealStatusSnapshot::for_test(
@@ -1846,10 +2269,17 @@ mod tests {
                 ..Default::default()
             },
             Some(NodeHealProgress {
+                kind: rustfs_heal::heal::progress::HealProgressKind::ObjectSweep,
                 objects_scanned: 5,
                 objects_healed: 4,
                 objects_failed: 1,
+                objects_total_count: 4,
+                objects_total_size: 1600,
                 bytes_processed: 900,
+                progress_state: rustfs_heal::heal::progress::HealProgressState::Running,
+                baseline_generation: Some(9),
+                baseline_known: true,
+                ..Default::default()
             }),
         );
 
@@ -1868,7 +2298,15 @@ mod tests {
         assert_eq!(progress.objects_scanned, 8);
         assert_eq!(progress.objects_healed, 5);
         assert_eq!(progress.objects_failed, 1);
+        assert_eq!(progress.skipped_objects, 2);
+        assert_eq!(progress.objects_total_count, 10);
+        assert_eq!(progress.objects_total_size, 2000);
         assert_eq!(progress.bytes_processed, 1000);
+        assert_eq!(progress.progress_percentage, 50.0);
+        assert_eq!(progress.progress_state, rustfs_heal::heal::progress::HealProgressState::Running);
+        assert_eq!(progress.baseline_generation, Some(9));
+        assert!(progress.baseline_known);
+        assert!(!progress.counter_unknown);
 
         assert_eq!(peer_first.state, HealRuntimeState::Active);
         assert_eq!(peer_first.operations, local_first.operations);
@@ -1890,6 +2328,7 @@ mod tests {
             auto_heal: value,
             internal: value,
             read_repair: value,
+            mrf: value,
         };
         let operations = |value| rustfs_heal::HealOperationsSnapshot {
             queue_length: value,
@@ -1907,6 +2346,7 @@ mod tests {
             objects_healed: value,
             objects_failed: value,
             bytes_processed: value,
+            ..Default::default()
         };
         let saturated = NodeHealStatusSnapshot::for_test(
             true,
@@ -1936,7 +2376,7 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_status_merge_fails_closed_but_degrades_for_older_peers() {
+    fn test_peer_status_merge_degrades_explicitly_and_never_claims_idle() {
         let local = || {
             NodeHealStatusSnapshot::for_test(
                 true,
@@ -1946,11 +2386,19 @@ mod tests {
                 None,
             )
         };
-        let error = merge_peer_heal_statuses(vec![local()], vec![Err("peer timeout".to_string())], 2)
-            .expect_err("peer failure must fail closed");
-        assert_eq!(error.message(), Some("cluster heal status unavailable"));
+        // An unreachable peer must not fail the whole endpoint (issue #5850) —
+        // but the safety property of the previous fail-closed behaviour is
+        // preserved: the partial answer is labelled Degraded, never Idle, so
+        // unknown peer work cannot be mistaken for "nothing is running".
+        let partial = merge_peer_heal_statuses(vec![local()], vec![Err("peer timeout".to_string())], 2, true)
+            .expect("an unreachable peer degrades the answer instead of destroying it");
+        assert!(!partial.complete);
+        assert_eq!(partial.state, HealRuntimeState::Degraded);
 
-        merge_peer_heal_statuses(vec![local()], vec![Ok(None)], 2).expect_err("unknown peer work must not be reported as idle");
+        let older_peer = merge_peer_heal_statuses(vec![local()], vec![Ok(None)], 2, true)
+            .expect("an older peer degrades the answer instead of destroying it");
+        assert!(!older_peer.complete);
+        assert_eq!(older_peer.state, HealRuntimeState::Degraded);
 
         let known_active = NodeHealStatusSnapshot::for_test(
             true,
@@ -1962,9 +2410,56 @@ mod tests {
             },
             None,
         );
-        let partial = merge_peer_heal_statuses(vec![known_active], vec![Ok(None)], 2)
+        let partial_active = merge_peer_heal_statuses(vec![known_active], vec![Ok(None)], 2, true)
             .expect("known active work may be reported as an explicit partial status");
-        assert!(!partial.complete);
+        assert!(!partial_active.complete);
+        assert_eq!(partial_active.state, HealRuntimeState::Active);
+
+        merge_peer_heal_statuses(Vec::new(), vec![Err("peer timeout".to_string())], 2, true)
+            .expect_err("no snapshot at all still fails closed");
+    }
+
+    #[test]
+    fn test_incomplete_topology_forces_partial_even_with_full_snapshot_count() {
+        // peer_clients and all_peer_clients are populated independently, so
+        // during a reconfiguration every queried peer can answer — snapshot
+        // count == expected_nodes — while the topology check knows the
+        // membership itself is in doubt. Completeness must AND in the
+        // topology verdict or the answer looks definitive exactly when it
+        // is not.
+        let snapshot = || {
+            NodeHealStatusSnapshot::for_test(
+                true,
+                true,
+                BackgroundHealInfo::default(),
+                rustfs_heal::HealOperationsSnapshot::default(),
+                None,
+            )
+        };
+        let full_count_incomplete_topology = merge_peer_heal_statuses(vec![snapshot()], vec![Ok(Some(snapshot()))], 2, false)
+            .expect("incomplete topology degrades the answer instead of destroying it");
+        assert!(!full_count_incomplete_topology.complete);
+        assert_eq!(full_count_incomplete_topology.state, HealRuntimeState::Degraded);
+
+        let full_count_complete_topology = merge_peer_heal_statuses(vec![snapshot()], vec![Ok(Some(snapshot()))], 2, true)
+            .expect("complete topology and full count is a definitive answer");
+        assert!(full_count_complete_topology.complete);
+        assert_eq!(full_count_complete_topology.state, HealRuntimeState::Idle);
+    }
+
+    #[test]
+    fn test_degraded_state_serializes_distinctly_from_idle() {
+        let encoded = encode_background_heal_status(
+            &BackgroundHealInfo::default(),
+            HealRuntimeState::Degraded,
+            rustfs_heal::HealOperationsSnapshot::default(),
+            None,
+            false,
+        )
+        .expect("degraded status must serialize");
+        let json: serde_json::Value = serde_json::from_slice(&encoded).expect("valid json");
+        assert_eq!(json["state"], "degraded");
+        assert_eq!(json["clusterStatusComplete"], false);
     }
 
     #[tokio::test]

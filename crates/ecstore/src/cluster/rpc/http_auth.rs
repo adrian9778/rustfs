@@ -27,7 +27,10 @@
 //! Advisory: <https://github.com/rustfs/rustfs/security/advisories/GHSA-r5qv-rc46-hv8q>
 
 use crate::cluster::rpc::context_propagation::{inject_request_id_into_http_headers, inject_trace_context_into_http_headers};
-use crate::storage_api_contracts::internode::NS_SCANNER_PROTOCOL_VERSION;
+use crate::storage_api_contracts::internode::{
+    NS_SCANNER_PROTOCOL_VERSION, PUT_FILE_AUTH_TRAILER_DIGEST_LEN, PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_TRAILER_MAC_LEN,
+    PUT_FILE_AUTH_TRAILER_MAGIC, PUT_FILE_CAPABILITY_VERSION,
+};
 use base64::Engine as _;
 use base64::engine::general_purpose;
 use hmac::{Hmac, KeyInit, Mac};
@@ -37,8 +40,11 @@ use http::{HeaderMap, HeaderValue, Method, Uri};
 use rustfs_credentials::{DEFAULT_SECRET_KEY, RPC_SECRET_REQUIRED_MESSAGE};
 use rustfs_credentials::{RPC_SECRET_REQUIRED_OPERATOR_MESSAGE, try_get_rpc_token};
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_OPERATION_GRPC_OTHER, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
-    INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
+    INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_FORCE_UNLOCK, INTERNODE_OPERATION_GRPC_LOCK,
+    INTERNODE_OPERATION_GRPC_LOCK_BATCH, INTERNODE_OPERATION_GRPC_OTHER, INTERNODE_OPERATION_GRPC_READ_ALL,
+    INTERNODE_OPERATION_GRPC_READ_MULTIPLE, INTERNODE_OPERATION_GRPC_READ_VERSION, INTERNODE_OPERATION_GRPC_REFRESH,
+    INTERNODE_OPERATION_GRPC_UNLOCK, INTERNODE_OPERATION_GRPC_UNLOCK_BATCH, INTERNODE_OPERATION_GRPC_WRITE_ALL,
+    INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
 };
 use rustfs_object_data_cache::{MemoryBasis, resolve_effective_memory};
 use rustfs_utils::get_env_bool;
@@ -67,19 +73,26 @@ pub const RPC_REPLAY_SCOPE_NONCE_HEADER: &str = "x-rustfs-rpc-replay-nonce";
 pub const RPC_BOOT_EPOCH_HEADER: &str = "x-rustfs-rpc-boot-epoch";
 pub const RPC_BOOT_EPOCH_CHALLENGE_HEADER: &str = "x-rustfs-rpc-boot-epoch-challenge";
 pub const RPC_BOOT_EPOCH_PROOF_HEADER: &str = "x-rustfs-rpc-boot-epoch-proof";
+pub(crate) const RPC_REPLAY_CACHE_CAPABILITY_HEADER: &str = "x-rustfs-rpc-replay-cache-capability";
+pub(crate) const RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER: &str = "x-rustfs-rpc-replay-cache-capability-proof";
 const RPC_REPLAY_SCOPE_VERSION_V3: &str = "3";
 const RPC_RESPONSE_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-response-proof-v1\0";
 const RPC_REPLAY_SCOPE_DOMAIN: &[u8] = b"rustfs-rpc-replay-scope-v3\0";
 const RPC_BOOT_EPOCH_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-boot-epoch-proof-v1\0";
+const RPC_REPLAY_CACHE_CAPABILITY_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-replay-cache-capability-proof-v1\0";
+const RPC_REPLAY_CACHE_CAPABILITY_V1: &str = "dynamic-replay-cache-v1";
+const HTTP_PUT_FILE_AUTH_DOMAIN: &[u8] = b"rustfs-http-put-file-auth-v1\0";
+const HTTP_PUT_FILE_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-http-put-file-capability-v1\0";
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 const UNSIGNED_PAYLOAD_NONCE: &str = "unsigned";
 const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
 const REPLAY_CACHE_RETENTION: Duration = Duration::from_secs(601);
 const REPLAY_CACHE_RETENTION_SECS: usize = 601;
 const REPLAY_CACHE_ENTRY_BYTES_ESTIMATE: u64 = 128;
-const REPLAY_CACHE_AUTO_MEMORY_PERCENT: u64 = 8;
-const REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU: usize = 2048;
-const REPLAY_CACHE_AUTO_MAX_CAPACITY: usize = 16_777_216;
+// Keep 16 CPU / 32 GiB field nodes at the 32M cap without requiring an env override.
+const REPLAY_CACHE_AUTO_MEMORY_PERCENT: u64 = 13;
+const REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU: usize = 4096;
+const REPLAY_CACHE_AUTO_MAX_CAPACITY: usize = 33_554_432;
 const NS_SCANNER_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-capability-v3";
 pub const TONIC_RPC_PREFIX: &str = "/node_service.NodeService";
 static INTERNODE_RPC_SIGNATURE_STRICT: LazyLock<bool> = LazyLock::new(|| {
@@ -94,6 +107,10 @@ static INTERNODE_RPC_BODY_DIGEST_STRICT: LazyLock<bool> = LazyLock::new(|| {
         rustfs_config::DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT,
     )
 });
+
+pub(crate) fn internode_rpc_body_digest_strict() -> bool {
+    *INTERNODE_RPC_BODY_DIGEST_STRICT
+}
 static INTERNODE_RPC_REPLAY_SCOPE_STRICT: LazyLock<bool> = LazyLock::new(|| {
     get_env_bool(
         rustfs_config::ENV_INTERNODE_RPC_REPLAY_SCOPE_STRICT,
@@ -335,6 +352,7 @@ struct RpcNonceCacheMetrics<'a> {
     expired: usize,
     entries: usize,
     capacity: usize,
+    record_scope: Option<RpcReplayCacheMetricScope<'a>>,
     overflow_scope: Option<RpcReplayCacheMetricScope<'a>>,
 }
 
@@ -345,6 +363,13 @@ fn publish_nonce_cache_metrics(metrics: Option<RpcNonceCacheMetrics<'_>>) {
     let internode_metrics = global_internode_metrics();
     internode_metrics.record_replay_cache_evictions("expired", metrics.expired);
     internode_metrics.record_replay_cache_state(metrics.entries, metrics.capacity);
+    if let Some(scope) = metrics.record_scope {
+        internode_metrics.record_replay_cache_record_for_operation_and_backend_path(
+            scope.operation,
+            scope.backend,
+            scope.rpc_path,
+        );
+    }
     if let Some(scope) = metrics.overflow_scope {
         internode_metrics.record_replay_cache_overflow_for_operation_and_backend_path(
             scope.operation,
@@ -380,6 +405,7 @@ impl RpcNonceCache {
             expired,
             entries: self.nonces.len(),
             capacity: record.capacity,
+            record_scope: None,
             overflow_scope: None,
         };
         if self.nonces.contains(&record.nonce) {
@@ -404,6 +430,7 @@ impl RpcNonceCache {
             Ok(()),
             Some(RpcNonceCacheMetrics {
                 entries: self.nonces.len(),
+                record_scope: Some(record.metric_scope),
                 ..metrics
             }),
         )
@@ -475,6 +502,13 @@ fn signature_payload(url: &str, method: &Method, timestamp: i64) -> String {
     format!("{url}|{method}|{timestamp}")
 }
 
+fn canonical_path_and_query(url: &str) -> std::io::Result<String> {
+    let uri: Uri = url.parse().map_err(|_| std::io::Error::other("Invalid RPC URL"))?;
+    uri.path_and_query()
+        .map(ToString::to_string)
+        .ok_or_else(|| std::io::Error::other("Invalid RPC URL"))
+}
+
 fn redacted_rpc_path(url: &str) -> String {
     url.parse::<Uri>()
         .ok()
@@ -500,6 +534,106 @@ fn verify_signature(secret: &str, url: &str, method: &Method, timestamp: i64, si
     let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(data.as_bytes());
     mac.verify_slice(&signature).is_ok()
+}
+
+fn update_put_file_auth_mac(
+    mac: &mut HmacSha256,
+    url: &str,
+    method: &Method,
+    nonce: Uuid,
+    body_sha256: &str,
+) -> std::io::Result<()> {
+    if !valid_content_sha256(body_sha256) || body_sha256 == UNSIGNED_PAYLOAD {
+        return Err(std::io::Error::other("Invalid RPC content SHA-256"));
+    }
+    let path_and_query = canonical_path_and_query(url)?;
+    mac.update(HTTP_PUT_FILE_AUTH_DOMAIN);
+    for part in [
+        path_and_query.as_bytes(),
+        b"|",
+        method.as_str().as_bytes(),
+        b"|",
+        nonce.as_bytes(),
+        b"|",
+        body_sha256.as_bytes(),
+    ] {
+        mac.update(part);
+    }
+    Ok(())
+}
+
+fn put_file_auth_mac(url: &str, method: &Method, nonce: Uuid, body_sha256: &str) -> std::io::Result<[u8; 32]> {
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(get_shared_secret()?.as_bytes())
+        .map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    update_put_file_auth_mac(&mut mac, url, method, nonce, body_sha256)?;
+    Ok(mac.finalize().into_bytes().into())
+}
+
+fn verify_put_file_auth_mac(url: &str, method: &Method, nonce: Uuid, body_sha256: &str, signature: &[u8]) -> std::io::Result<()> {
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(get_shared_secret()?.as_bytes())
+        .map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    update_put_file_auth_mac(&mut mac, url, method, nonce, body_sha256)?;
+    mac.verify_slice(signature)
+        .map_err(|_| std::io::Error::other("Invalid put_file auth trailer"))
+}
+
+pub fn build_put_file_auth_trailer(url: &str, method: &Method, nonce: Uuid, body_sha256: &str) -> std::io::Result<Vec<u8>> {
+    let mac = put_file_auth_mac(url, method, nonce, body_sha256)?;
+    let mut trailer = Vec::with_capacity(PUT_FILE_AUTH_TRAILER_LEN);
+    trailer.extend_from_slice(PUT_FILE_AUTH_TRAILER_MAGIC);
+    trailer.extend_from_slice(body_sha256.as_bytes());
+    trailer.extend_from_slice(&mac);
+    Ok(trailer)
+}
+
+pub fn verify_put_file_auth_trailer(url: &str, method: &Method, nonce: Uuid, trailer: &[u8]) -> std::io::Result<String> {
+    if trailer.len() != PUT_FILE_AUTH_TRAILER_LEN {
+        return Err(std::io::Error::other("Invalid put_file auth trailer length"));
+    }
+    if &trailer[..PUT_FILE_AUTH_TRAILER_MAGIC.len()] != PUT_FILE_AUTH_TRAILER_MAGIC {
+        return Err(std::io::Error::other("Invalid put_file auth trailer"));
+    }
+    let digest_start = PUT_FILE_AUTH_TRAILER_MAGIC.len();
+    let digest_end = digest_start + PUT_FILE_AUTH_TRAILER_DIGEST_LEN;
+    let body_sha256 = std::str::from_utf8(&trailer[digest_start..digest_end])
+        .map_err(|_| std::io::Error::other("Invalid RPC content SHA-256"))?;
+    if !valid_content_sha256(body_sha256) || body_sha256 == UNSIGNED_PAYLOAD {
+        return Err(std::io::Error::other("Invalid RPC content SHA-256"));
+    }
+    let mac_start = digest_end;
+    let mac_end = mac_start + PUT_FILE_AUTH_TRAILER_MAC_LEN;
+    verify_put_file_auth_mac(url, method, nonce, body_sha256, &trailer[mac_start..mac_end])?;
+    Ok(body_sha256.to_string())
+}
+
+fn update_put_file_capability_mac(mac: &mut HmacSha256, challenge: Uuid, server_epoch: Uuid, version: u16) {
+    mac.update(HTTP_PUT_FILE_CAPABILITY_AUTH_DOMAIN);
+    mac.update(challenge.as_bytes());
+    mac.update(server_epoch.as_bytes());
+    mac.update(&version.to_be_bytes());
+}
+
+fn put_file_capability_mac(challenge: Uuid, server_epoch: Uuid, version: u16) -> std::io::Result<HmacSha256> {
+    if challenge.is_nil() || server_epoch.is_nil() || version != PUT_FILE_CAPABILITY_VERSION {
+        return Err(std::io::Error::other("Invalid put_file capability scope"));
+    }
+    let mut mac = HmacSha256::new_from_slice(get_shared_secret()?.as_bytes())
+        .map_err(|_| std::io::Error::other("Invalid RPC HMAC secret"))?;
+    update_put_file_capability_mac(&mut mac, challenge, server_epoch, version);
+    Ok(mac)
+}
+
+pub fn sign_put_file_capability(challenge: Uuid, server_epoch: Uuid, version: u16) -> std::io::Result<Vec<u8>> {
+    Ok(put_file_capability_mac(challenge, server_epoch, version)?
+        .finalize()
+        .into_bytes()
+        .to_vec())
+}
+
+pub fn verify_put_file_capability(challenge: Uuid, server_epoch: Uuid, version: u16, proof: &[u8]) -> std::io::Result<()> {
+    put_file_capability_mac(challenge, server_epoch, version)?
+        .verify_slice(proof)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid put_file capability proof"))
 }
 
 fn update_ns_scanner_capability_mac(mac: &mut HmacSha256, challenge: Uuid, server_epoch: Uuid) {
@@ -664,6 +798,50 @@ fn verify_boot_epoch_proof(secret: &str, audience: &str, challenge: Uuid, boot_e
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid RPC boot epoch proof"))
 }
 
+fn update_replay_cache_capability_proof(mac: &mut HmacSha256, audience: &str, challenge: Uuid, boot_epoch: Uuid) {
+    mac.update(RPC_REPLAY_CACHE_CAPABILITY_PROOF_DOMAIN);
+    for part in [
+        audience.as_bytes(),
+        b"|",
+        challenge.as_bytes(),
+        b"|",
+        boot_epoch.as_bytes(),
+        b"|",
+        RPC_REPLAY_CACHE_CAPABILITY_V1.as_bytes(),
+    ] {
+        mac.update(part);
+    }
+}
+
+fn generate_replay_cache_capability_proof(
+    secret: &str,
+    audience: &str,
+    challenge: Uuid,
+    boot_epoch: Uuid,
+) -> std::io::Result<String> {
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    update_replay_cache_capability_proof(&mut mac, audience, challenge, boot_epoch);
+    Ok(general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+}
+
+fn verify_replay_cache_capability_proof(
+    secret: &str,
+    audience: &str,
+    challenge: Uuid,
+    boot_epoch: Uuid,
+    proof: &str,
+) -> std::io::Result<()> {
+    let proof = general_purpose::STANDARD
+        .decode(proof)
+        .map_err(|_| std::io::Error::other("Invalid RPC replay cache capability proof"))?;
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    update_replay_cache_capability_proof(&mut mac, audience, challenge, boot_epoch);
+    mac.verify_slice(&proof)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid RPC replay cache capability proof"))
+}
+
 fn non_nil_uuid(value: &str, name: &str) -> std::io::Result<Uuid> {
     let value = Uuid::parse_str(value).map_err(|_| std::io::Error::other(format!("Invalid {name}")))?;
     (!value.is_nil())
@@ -746,15 +924,34 @@ pub fn tonic_boot_epoch_challenge(headers: &HeaderMap) -> std::io::Result<Option
 /// Build the authenticated response headers for a client boot-epoch challenge.
 pub fn tonic_boot_epoch_response_headers(audience: &str, challenge: Uuid) -> std::io::Result<HeaderMap> {
     let boot_epoch = tonic_rpc_boot_epoch();
-    let proof = generate_boot_epoch_proof(&get_shared_secret()?, audience, challenge, boot_epoch)?;
+    let secret = get_shared_secret()?;
+    let proof = generate_boot_epoch_proof(&secret, audience, challenge, boot_epoch)?;
+    let capability_proof = generate_replay_cache_capability_proof(&secret, audience, challenge, boot_epoch)?;
     let mut headers = HeaderMap::new();
     headers.insert(RPC_BOOT_EPOCH_HEADER, header_value(&boot_epoch.to_string(), RPC_BOOT_EPOCH_HEADER)?);
     headers.insert(RPC_BOOT_EPOCH_PROOF_HEADER, header_value(&proof, RPC_BOOT_EPOCH_PROOF_HEADER)?);
+    headers.insert(
+        RPC_REPLAY_CACHE_CAPABILITY_HEADER,
+        HeaderValue::from_static(RPC_REPLAY_CACHE_CAPABILITY_V1),
+    );
+    headers.insert(
+        RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER,
+        header_value(&capability_proof, RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER)?,
+    );
     Ok(headers)
 }
 
 /// Verify the server boot-epoch response for a challenge generated by this client.
 pub fn verify_tonic_boot_epoch_response(audience: &str, challenge: Uuid, headers: &HeaderMap) -> std::io::Result<Uuid> {
+    verify_tonic_boot_epoch_response_with_secret(&get_shared_secret()?, audience, challenge, headers)
+}
+
+fn verify_tonic_boot_epoch_response_with_secret(
+    secret: &str,
+    audience: &str,
+    challenge: Uuid,
+    headers: &HeaderMap,
+) -> std::io::Result<Uuid> {
     let boot_epoch = headers
         .get(RPC_BOOT_EPOCH_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -764,8 +961,45 @@ pub fn verify_tonic_boot_epoch_response(audience: &str, challenge: Uuid, headers
         .get(RPC_BOOT_EPOCH_PROOF_HEADER)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| std::io::Error::other("Missing RPC boot epoch proof"))?;
-    verify_boot_epoch_proof(&get_shared_secret()?, audience, challenge, boot_epoch, proof)?;
+    verify_boot_epoch_proof(secret, audience, challenge, boot_epoch, proof)?;
     Ok(boot_epoch)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedPeerReplayCapabilities {
+    pub(crate) boot_epoch: Uuid,
+    pub(crate) dynamic_replay_cache: bool,
+}
+
+pub(crate) fn verify_tonic_peer_replay_capabilities_response(
+    audience: &str,
+    challenge: Uuid,
+    headers: &HeaderMap,
+) -> std::io::Result<AuthenticatedPeerReplayCapabilities> {
+    let secret = get_shared_secret()?;
+    let boot_epoch = verify_tonic_boot_epoch_response_with_secret(&secret, audience, challenge, headers)?;
+    let capability = headers.get(RPC_REPLAY_CACHE_CAPABILITY_HEADER);
+    let proof = headers.get(RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER);
+    if capability.is_none() && proof.is_none() {
+        return Ok(AuthenticatedPeerReplayCapabilities {
+            boot_epoch,
+            dynamic_replay_cache: false,
+        });
+    }
+    let capability = capability
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing RPC replay cache capability"))?;
+    if capability != RPC_REPLAY_CACHE_CAPABILITY_V1 {
+        return Err(std::io::Error::other("Unsupported RPC replay cache capability"));
+    }
+    let proof = proof
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing RPC replay cache capability proof"))?;
+    verify_replay_cache_capability_proof(&secret, audience, challenge, boot_epoch, proof)?;
+    Ok(AuthenticatedPeerReplayCapabilities {
+        boot_epoch,
+        dynamic_replay_cache: true,
+    })
 }
 
 fn valid_content_sha256(value: &str) -> bool {
@@ -801,12 +1035,26 @@ fn tonic_rpc_metric_operation(path: &str) -> &'static str {
     match parse_tonic_rpc_path(path).ok().map(|(_, rpc_method)| rpc_method) {
         Some("ReadAll") => INTERNODE_OPERATION_GRPC_READ_ALL,
         Some("ReadMultiple") => INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+        Some("ReadVersion") => INTERNODE_OPERATION_GRPC_READ_VERSION,
+        Some("BatchReadVersion") => INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
         Some("WriteAll") => INTERNODE_OPERATION_GRPC_WRITE_ALL,
+        Some("Lock") => INTERNODE_OPERATION_GRPC_LOCK,
+        Some("UnLock") => INTERNODE_OPERATION_GRPC_UNLOCK,
+        Some("LockBatch") => INTERNODE_OPERATION_GRPC_LOCK_BATCH,
+        Some("UnLockBatch") => INTERNODE_OPERATION_GRPC_UNLOCK_BATCH,
+        Some("Refresh") => INTERNODE_OPERATION_GRPC_REFRESH,
+        Some("ForceUnLock") => INTERNODE_OPERATION_GRPC_FORCE_UNLOCK,
         _ => INTERNODE_OPERATION_GRPC_OTHER,
     }
 }
 
-fn check_and_record_nonce(nonce: Uuid, signed_at: i64, rpc_path: &str) -> std::io::Result<()> {
+fn check_and_record_nonce_with_scope(
+    nonce: Uuid,
+    signed_at: i64,
+    rpc_path: &str,
+    operation: &'static str,
+    backend: &'static str,
+) -> std::io::Result<()> {
     let wall_time = OffsetDateTime::now_utc().unix_timestamp();
     let (result, metrics) = {
         let mut cache = LOCAL_RPC_NONCE_CACHE
@@ -826,14 +1074,45 @@ fn check_and_record_nonce(nonce: Uuid, signed_at: i64, rpc_path: &str) -> std::i
             expires_at,
             capacity: *REPLAY_CACHE_CAPACITY,
             metric_scope: RpcReplayCacheMetricScope {
-                operation: tonic_rpc_metric_operation(rpc_path),
-                backend: INTERNODE_TRANSPORT_BACKEND_GRPC,
+                operation,
+                backend,
                 rpc_path,
             },
         })
     };
     publish_nonce_cache_metrics(metrics);
     result
+}
+
+fn check_and_record_tonic_nonce(nonce: Uuid, signed_at: i64, rpc_path: &str) -> std::io::Result<()> {
+    check_and_record_nonce_with_scope(
+        nonce,
+        signed_at,
+        rpc_path,
+        tonic_rpc_metric_operation(rpc_path),
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+    )
+}
+
+pub fn check_and_record_signed_rpc_nonce(
+    headers: &HeaderMap,
+    nonce: Uuid,
+    rpc_path: &str,
+    operation: &'static str,
+    backend: &'static str,
+) -> std::io::Result<()> {
+    if nonce.is_nil() {
+        return Err(std::io::Error::other("Invalid RPC nonce"));
+    }
+    let timestamp_header = headers
+        .get(TIMESTAMP_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing timestamp header"))?;
+    let timestamp = timestamp_header
+        .parse::<i64>()
+        .map_err(|_| std::io::Error::other("Invalid timestamp format"))?;
+    check_timestamp(timestamp)?;
+    check_and_record_nonce_with_scope(nonce, timestamp, rpc_path, operation, backend)
 }
 
 /// Build headers with authentication signature
@@ -933,6 +1212,23 @@ pub fn set_tonic_mutation_body_digest<T: rustfs_protos::CanonicalMutationBody>(
     set_tonic_canonical_body_digest(request, &canonical_body)
 }
 
+pub fn set_tonic_rolling_mutation_body_digest<T: rustfs_protos::CanonicalMutationBody>(
+    request: &mut tonic::Request<T>,
+) -> std::io::Result<()> {
+    set_tonic_mutation_body_digest(request)?;
+    request.extensions_mut().insert(RollingMutationBodyDigest);
+    Ok(())
+}
+
+pub fn set_tonic_rolling_canonical_body_digest<T>(request: &mut tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
+    set_tonic_canonical_body_digest(request, canonical_body)?;
+    request.extensions_mut().insert(RollingMutationBodyDigest);
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RollingMutationBodyDigest;
+
 pub fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
     let version = request
         .metadata()
@@ -969,7 +1265,7 @@ pub fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>, canoni
 /// including v1-downgraded ones. It converges independently of the signature-strict switch
 /// (<https://github.com/rustfs/backlog/issues/1327>).
 pub fn verify_tonic_mutation_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
-    verify_tonic_mutation_body_digest_with_strictness(request, canonical_body, *INTERNODE_RPC_BODY_DIGEST_STRICT)
+    verify_tonic_mutation_body_digest_with_strictness(request, canonical_body, internode_rpc_body_digest_strict())
 }
 
 /// [`verify_tonic_mutation_body_digest`] with the strict gate injected as a parameter, so both
@@ -1095,7 +1391,7 @@ fn verify_tonic_replay_scope_signature(audience: &str, path: &str, headers: &Hea
     if boot_epoch != tonic_rpc_boot_epoch() {
         return Err(std::io::Error::other("RPC boot epoch is stale"));
     }
-    check_and_record_nonce(nonce, signed_at, path)
+    check_and_record_tonic_nonce(nonce, signed_at, path)
 }
 
 /// Verify gRPC authentication, preferring v2 without downgrade on malformed v2 metadata.
@@ -1160,6 +1456,8 @@ pub fn tonic_rpc_auth_failure_reason(error: &std::io::Error) -> &'static str {
         "Invalid unsigned RPC nonce" => "invalid_unsigned_v2_nonce",
         "Missing RPC content SHA-256" => "missing_content_sha256",
         "Invalid RPC content SHA-256" => "invalid_content_sha256",
+        "Invalid put_file auth trailer length" => "invalid_put_file_auth_trailer_length",
+        "Invalid put_file auth trailer" => "invalid_put_file_auth_trailer",
         "Missing signature header" => "missing_v1_signature",
         "Invalid signature" => "invalid_v1_signature",
         "Invalid RPC HMAC key" => "invalid_hmac_key",
@@ -1286,7 +1584,7 @@ fn verify_tonic_rpc_signature_with_strictness(
         return Err(std::io::Error::other("Invalid RPC v2 signature"));
     }
     if let Some(nonce) = parsed_nonce {
-        check_and_record_nonce(nonce, timestamp, path)?;
+        check_and_record_tonic_nonce(nonce, timestamp, path)?;
     }
     Ok(())
 }
@@ -2021,6 +2319,23 @@ mod tests {
     }
 
     #[test]
+    fn replay_cache_capability_proof_binds_audience_challenge_epoch_and_value() {
+        ensure_test_rpc_secret();
+        let challenge = Uuid::new_v4();
+        let headers = tonic_boot_epoch_response_headers("node-a:9000", challenge).expect("capability headers should build");
+        let capabilities = verify_tonic_peer_replay_capabilities_response("node-a:9000", challenge, &headers)
+            .expect("matching capability proof should verify");
+        assert_eq!(capabilities.boot_epoch, tonic_rpc_boot_epoch());
+        assert!(capabilities.dynamic_replay_cache);
+        assert!(verify_tonic_peer_replay_capabilities_response("node-b:9000", challenge, &headers).is_err());
+        assert!(verify_tonic_peer_replay_capabilities_response("node-a:9000", Uuid::new_v4(), &headers).is_err());
+
+        let mut changed_capability = headers;
+        changed_capability.insert(RPC_REPLAY_CACHE_CAPABILITY_HEADER, HeaderValue::from_static("dynamic-replay-cache-v2"));
+        assert!(verify_tonic_peer_replay_capabilities_response("node-a:9000", challenge, &changed_capability).is_err());
+    }
+
+    #[test]
     fn tonic_rpc_auth_failure_reason_maps_security_relevant_errors() {
         for (message, reason) in [
             ("Invalid RPC v2 signature", "invalid_v2_signature"),
@@ -2031,6 +2346,8 @@ mod tests {
             ("Request timestamp expired", "timestamp_expired"),
             ("Missing RPC content SHA-256", "missing_content_sha256"),
             ("Invalid RPC content SHA-256", "invalid_content_sha256"),
+            ("Invalid put_file auth trailer length", "invalid_put_file_auth_trailer_length"),
+            ("Invalid put_file auth trailer", "invalid_put_file_auth_trailer"),
         ] {
             assert_eq!(
                 tonic_rpc_auth_failure_reason(&std::io::Error::other(message)),
@@ -2179,6 +2496,51 @@ mod tests {
     }
 
     #[test]
+    fn put_file_auth_trailer_binds_url_nonce_and_body_digest() {
+        ensure_test_rpc_secret();
+        let url = concat!(
+            "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
+            "&append=false&size=11&put_file_auth=digest-trailer-v1&put_file_nonce=11111111-2222-4333-8444-555555555555"
+        );
+        let nonce = Uuid::parse_str("11111111-2222-4333-8444-555555555555").expect("nonce");
+        let body_sha256 = hex_simd::encode_to_string(Sha256::digest(b"hello world"), hex_simd::AsciiCase::Lower);
+        let trailer = build_put_file_auth_trailer(url, &Method::PUT, nonce, &body_sha256).expect("trailer should build");
+
+        assert_eq!(trailer.len(), PUT_FILE_AUTH_TRAILER_LEN);
+        let verified = verify_put_file_auth_trailer(url, &Method::PUT, nonce, &trailer).expect("trailer should verify");
+        assert_eq!(verified, body_sha256);
+
+        let different_url = url.replace("size=11", "size=12");
+        let err = verify_put_file_auth_trailer(&different_url, &Method::PUT, nonce, &trailer)
+            .expect_err("trailer must bind the signed URL");
+        assert_eq!(err.to_string(), "Invalid put_file auth trailer");
+
+        let err =
+            verify_put_file_auth_trailer(url, &Method::PUT, Uuid::new_v4(), &trailer).expect_err("trailer must bind the nonce");
+        assert_eq!(err.to_string(), "Invalid put_file auth trailer");
+
+        let mut tampered = trailer;
+        tampered[PUT_FILE_AUTH_TRAILER_MAGIC.len()] = b'0';
+        let err =
+            verify_put_file_auth_trailer(url, &Method::PUT, nonce, &tampered).expect_err("trailer must bind the digest bytes");
+        assert_eq!(err.to_string(), "Invalid put_file auth trailer");
+    }
+
+    #[test]
+    fn put_file_capability_proof_binds_challenge_epoch_and_version() {
+        ensure_test_rpc_secret();
+        let challenge = Uuid::parse_str("11111111-2222-4333-8444-555555555555").expect("challenge");
+        let server_epoch = Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").expect("server epoch");
+        let proof = sign_put_file_capability(challenge, server_epoch, PUT_FILE_CAPABILITY_VERSION)
+            .expect("capability proof should build");
+
+        assert!(verify_put_file_capability(challenge, server_epoch, PUT_FILE_CAPABILITY_VERSION, &proof).is_ok());
+        assert!(verify_put_file_capability(Uuid::new_v4(), server_epoch, PUT_FILE_CAPABILITY_VERSION, &proof).is_err());
+        assert!(verify_put_file_capability(challenge, Uuid::new_v4(), PUT_FILE_CAPABILITY_VERSION, &proof).is_err());
+        assert!(verify_put_file_capability(challenge, server_epoch, PUT_FILE_CAPABILITY_VERSION + 1, &proof).is_err());
+    }
+
+    #[test]
     fn tier_mutation_rpc_contract_requires_method_bound_v2_body_digest() {
         ensure_test_rpc_secret();
         let mutation_id = uuid::uuid!("12345678-1234-5678-9abc-def012345678");
@@ -2260,8 +2622,40 @@ mod tests {
             INTERNODE_OPERATION_GRPC_READ_MULTIPLE
         );
         assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/ReadVersion"),
+            INTERNODE_OPERATION_GRPC_READ_VERSION
+        );
+        assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/BatchReadVersion"),
+            INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION
+        );
+        assert_eq!(
             tonic_rpc_metric_operation("/node_service.NodeService/WriteAll"),
             INTERNODE_OPERATION_GRPC_WRITE_ALL
+        );
+        assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/Lock"),
+            INTERNODE_OPERATION_GRPC_LOCK
+        );
+        assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/UnLock"),
+            INTERNODE_OPERATION_GRPC_UNLOCK
+        );
+        assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/LockBatch"),
+            INTERNODE_OPERATION_GRPC_LOCK_BATCH
+        );
+        assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/UnLockBatch"),
+            INTERNODE_OPERATION_GRPC_UNLOCK_BATCH
+        );
+        assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/Refresh"),
+            INTERNODE_OPERATION_GRPC_REFRESH
+        );
+        assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/ForceUnLock"),
+            INTERNODE_OPERATION_GRPC_FORCE_UNLOCK
         );
         assert_eq!(
             tonic_rpc_metric_operation("/node_service.NodeService/SignalService"),
@@ -2301,21 +2695,37 @@ mod tests {
 
         assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
         assert_eq!(decision.memory_basis, Some(MemoryBasis::Host));
-        assert_eq!(decision.memory_based_capacity, 10_737_418);
-        assert_eq!(decision.cpu_based_capacity, 9_846_784);
-        assert_eq!(decision.capacity, 9_846_784);
+        assert_eq!(decision.memory_based_capacity, 17_448_304);
+        assert_eq!(decision.cpu_based_capacity, 19_693_568);
+        assert_eq!(decision.capacity, 17_448_304);
     }
 
     #[test]
-    fn replay_cache_capacity_auto_reaches_hotpath_verified_capacity_on_larger_nodes() {
+    fn replay_cache_capacity_auto_uses_32m_on_field_sized_nodes() {
         let gib = 1024_u64 * 1024 * 1024;
         let decision =
             replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 16, Some(32 * gib), Some(MemoryBasis::Host));
 
         assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
-        assert_eq!(decision.memory_based_capacity, 21_474_836);
-        assert_eq!(decision.cpu_based_capacity, 19_693_568);
-        assert_eq!(decision.capacity, 16_777_216);
+        assert_eq!(decision.memory_based_capacity, 34_896_609);
+        assert_eq!(decision.cpu_based_capacity, 39_387_136);
+        assert_eq!(decision.capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
+
+        let observed_field_node =
+            replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 16, Some(31 * gib), Some(MemoryBasis::Host));
+        assert_eq!(observed_field_node.memory_based_capacity, 33_806_090);
+        assert_eq!(observed_field_node.cpu_based_capacity, 39_387_136);
+        assert_eq!(observed_field_node.capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
+    }
+
+    #[test]
+    fn replay_cache_capacity_auto_caps_extreme_nodes() {
+        let gib = 1024_u64 * 1024 * 1024;
+        let decision =
+            replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 128, Some(512 * gib), Some(MemoryBasis::Host));
+
+        assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
+        assert_eq!(decision.capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
     }
 
     #[test]
@@ -2337,13 +2747,20 @@ mod tests {
         let decision = replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Invalid, 8, None, None);
 
         assert_eq!(decision.source, ReplayCacheCapacitySource::AutoInvalidEnv);
-        assert_eq!(decision.capacity, 9_846_784);
+        assert_eq!(decision.capacity, 19_693_568);
     }
 
     fn check_test_nonce_record(cache: &mut RpcNonceCache, record: RpcNonceRecord<'_>) -> std::io::Result<()> {
         let (result, metrics) = cache.check_and_record(record);
         publish_nonce_cache_metrics(metrics);
         result
+    }
+
+    fn check_test_nonce_record_with_metrics<'a>(
+        cache: &mut RpcNonceCache,
+        record: RpcNonceRecord<'a>,
+    ) -> (std::io::Result<()>, Option<RpcNonceCacheMetrics<'a>>) {
+        cache.check_and_record(record)
     }
 
     fn test_nonce_record(
@@ -2387,6 +2804,48 @@ mod tests {
             .expect("expired nonce should release capacity");
         assert!(!cache.nonces.contains(&nonce_a));
         assert!(cache.nonces.contains(&nonce_b));
+    }
+
+    #[test]
+    fn nonce_cache_metrics_mark_successful_records_only() {
+        let now = Instant::now();
+        let expiry = now.checked_add(REPLAY_CACHE_RETENTION).expect("test expiry should fit");
+        let nonce_a = Uuid::new_v4();
+        let nonce_b = Uuid::new_v4();
+        let mut cache = RpcNonceCache::default();
+
+        let (recorded, metrics) =
+            check_test_nonce_record_with_metrics(&mut cache, test_nonce_record(nonce_a, 100, now, 100, expiry, 1));
+        recorded.expect("first nonce should be recorded");
+        let metrics = metrics.expect("successful nonce should publish metrics");
+        let record_scope = metrics.record_scope.expect("successful nonce should carry record scope");
+        assert_eq!(record_scope.operation, INTERNODE_OPERATION_GRPC_READ_ALL);
+        assert_eq!(record_scope.backend, INTERNODE_TRANSPORT_BACKEND_GRPC);
+        assert_eq!(record_scope.rpc_path, "/node_service.NodeService/ReadAll");
+        assert!(metrics.overflow_scope.is_none());
+
+        let (replay, metrics) =
+            check_test_nonce_record_with_metrics(&mut cache, test_nonce_record(nonce_a, 100, now, 100, expiry, 1));
+        assert_eq!(
+            replay.expect_err("duplicate nonce must fail closed").to_string(),
+            "RPC request replay detected"
+        );
+        let metrics = metrics.expect("replay rejection should still publish cache state");
+        assert!(metrics.record_scope.is_none());
+        assert!(metrics.overflow_scope.is_none());
+
+        let (overflow, metrics) =
+            check_test_nonce_record_with_metrics(&mut cache, test_nonce_record(nonce_b, 100, now, 100, expiry, 1));
+        assert_eq!(
+            overflow.expect_err("full cache must fail closed").to_string(),
+            "RPC replay cache capacity exceeded"
+        );
+        let metrics = metrics.expect("overflow should publish cache state");
+        assert!(metrics.record_scope.is_none());
+        let overflow_scope = metrics.overflow_scope.expect("overflow should keep diagnostic scope");
+        assert_eq!(overflow_scope.operation, INTERNODE_OPERATION_GRPC_READ_ALL);
+        assert_eq!(overflow_scope.backend, INTERNODE_TRANSPORT_BACKEND_GRPC);
+        assert_eq!(overflow_scope.rpc_path, "/node_service.NodeService/ReadAll");
     }
 
     // The `rpc_body_digest_fallback_counter` serial group covers every test that drives (or

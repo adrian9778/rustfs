@@ -30,8 +30,10 @@ use reqwest::StatusCode;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
+use serde_json;
 use std::ffi::OsStr;
 use std::fs as stdfs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Once;
@@ -51,6 +53,12 @@ pub(crate) const FAST_DATA_USAGE_SCANNER_ENV: &[(&str, &str)] =
     &[("RUSTFS_SCANNER_CYCLE", "1"), ("RUSTFS_SCANNER_START_DELAY_SECS", "0")];
 pub const TEST_BUCKET: &str = "e2e-test-bucket";
 const RUSTFS_FULL_FEATURE: &str = "full";
+const TEST_PORT_MIN: u16 = 20_000;
+// Keep allocator ports below the ephemeral range used by bind(..., 0) test helpers.
+const TEST_PORT_RANGE: u16 = 10_000;
+const TEST_PORT_COUNTER_PATH: &str = "/tmp/rustfs_e2e_next_port";
+const TEST_PORT_LOCK_DIR: &str = "/tmp/rustfs_e2e_port_allocator.lock";
+const TEST_PORT_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 
 fn capture_log_path(log_dir: &Path, temp_dir: &str) -> Option<PathBuf> {
     let temp_name = Path::new(temp_dir).file_name()?.to_string_lossy();
@@ -65,6 +73,77 @@ fn configured_capture_log_path(temp_dir: &str) -> Option<String> {
     }
 
     capture_log_path(Path::new(&log_dir), temp_dir).map(|path| path.to_string_lossy().into_owned())
+}
+
+struct PortAllocatorGuard;
+
+impl PortAllocatorGuard {
+    async fn acquire() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        loop {
+            match stdfs::create_dir(TEST_PORT_LOCK_DIR) {
+                Ok(()) => return Ok(Self),
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                    remove_stale_port_allocator_lock();
+                    sleep(Duration::from_millis(10)).await;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+}
+
+impl Drop for PortAllocatorGuard {
+    fn drop(&mut self) {
+        let _ = stdfs::remove_dir(TEST_PORT_LOCK_DIR);
+    }
+}
+
+fn advance_test_port(port: u16) -> u16 {
+    let offset = (port - TEST_PORT_MIN + 1) % TEST_PORT_RANGE;
+    TEST_PORT_MIN + offset
+}
+
+fn seeded_test_port() -> u16 {
+    let offset = (Uuid::new_v4().as_u128() % u128::from(TEST_PORT_RANGE)) as u16;
+    TEST_PORT_MIN + offset
+}
+
+fn read_next_test_port() -> u16 {
+    stdfs::read_to_string(TEST_PORT_COUNTER_PATH)
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| (TEST_PORT_MIN..TEST_PORT_MIN + TEST_PORT_RANGE).contains(port))
+        .unwrap_or_else(seeded_test_port)
+}
+
+fn remove_stale_port_allocator_lock() {
+    let Ok(metadata) = stdfs::metadata(TEST_PORT_LOCK_DIR) else {
+        return;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return;
+    };
+    if modified.elapsed().is_ok_and(|elapsed| elapsed > TEST_PORT_LOCK_STALE_AFTER) {
+        let _ = stdfs::remove_dir(TEST_PORT_LOCK_DIR);
+    }
+}
+
+fn write_next_test_port(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    stdfs::write(TEST_PORT_COUNTER_PATH, port.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn capture_command_logs(
+    command: &mut Command,
+    log_path: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(log_path) = log_path else {
+        return Ok(());
+    };
+    let file = stdfs::OpenOptions::new().create(true).append(true).open(log_path)?;
+    let stderr_file = file.try_clone()?;
+    command.stdout(Stdio::from(file)).stderr(Stdio::from(stderr_file));
+    Ok(())
 }
 
 pub(crate) fn build_test_s3_config(
@@ -138,6 +217,18 @@ pub(crate) async fn signed_s3_request(
     access_key: &str,
     secret_key: &str,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    signed_s3_request_with_session_token(method, url, body, content_type, access_key, secret_key, None).await
+}
+
+async fn signed_s3_request_with_session_token(
+    method: http::Method,
+    url: &str,
+    body: Option<String>,
+    content_type: Option<&str>,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
     let uri = url.parse::<http::Uri>()?;
     let authority = uri.authority().ok_or("S3 URL missing authority")?.to_string();
     let mut request = http::Request::builder()
@@ -150,7 +241,14 @@ pub(crate) async fn signed_s3_request(
     }
 
     let content_length = i64::try_from(body.as_ref().map_or(0, String::len)).map_err(|_| "S3 request body is too large")?;
-    let signed = sign_v4(request.body(Body::empty())?, content_length, access_key, secret_key, "", "us-east-1");
+    let signed = sign_v4(
+        request.body(Body::empty())?,
+        content_length,
+        access_key,
+        secret_key,
+        session_token.unwrap_or_default(),
+        "us-east-1",
+    );
 
     let mut request = local_http_client().request(method, url);
     for (name, value) in signed.headers() {
@@ -171,9 +269,22 @@ pub(crate) async fn admin_request(
     access_key: &str,
     secret_key: &str,
 ) -> Result<(StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
+    admin_request_with_session_token(base_url, method, path_and_query, body, access_key, secret_key, None).await
+}
+
+pub(crate) async fn admin_request_with_session_token(
+    base_url: &str,
+    method: http::Method,
+    path_and_query: &str,
+    body: Option<String>,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+) -> Result<(StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{base_url}{path_and_query}");
     let content_type = body.as_ref().map(|_| "application/json");
-    let response = signed_s3_request(method, &url, body, content_type, access_key, secret_key).await?;
+    let response =
+        signed_s3_request_with_session_token(method, &url, body, content_type, access_key, secret_key, session_token).await?;
     let status = response.status();
     let body = response.text().await?;
     Ok((status, body))
@@ -463,10 +574,21 @@ impl RustFSTestEnvironment {
     /// Find an available port for the test
     pub async fn find_available_port() -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
         use std::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        drop(listener);
-        Ok(port)
+        let _guard = PortAllocatorGuard::acquire().await?;
+        let mut next_port = read_next_test_port();
+
+        for _ in 0..TEST_PORT_RANGE {
+            let port = next_port;
+            next_port = advance_test_port(next_port);
+            write_next_test_port(next_port)?;
+
+            if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+                drop(listener);
+                return Ok(port);
+            }
+        }
+
+        Err("no available E2E test port found".into())
     }
 
     /// Kill any existing RustFS processes
@@ -525,13 +647,7 @@ impl RustFSTestEnvironment {
         for (key, value) in extra_env {
             command.env(key, value);
         }
-        // Optionally capture the child's stdout+stderr to a file so the test can
-        // grep server logs (e.g. to confirm which GET reader path was taken).
-        if let Some(log_path) = &self.capture_log_path {
-            let file = stdfs::OpenOptions::new().create(true).append(true).open(log_path)?;
-            let stderr_file = file.try_clone()?;
-            command.stdout(Stdio::from(file)).stderr(Stdio::from(stderr_file));
-        }
+        capture_command_logs(&mut command, self.capture_log_path.as_deref())?;
         let process = command.args(&args).spawn()?;
 
         self.process = Some(process);
@@ -1019,6 +1135,7 @@ pub struct RustFSTestClusterEnvironment {
     pub secret_key: String,
     pub extra_env: Vec<(String, String)>,
     pub node_extra_env: Vec<Vec<(String, String)>>,
+    pub node_capture_log_paths: Vec<Option<String>>,
     pub topology: ClusterTopology,
 }
 
@@ -1118,6 +1235,7 @@ impl RustFSTestClusterEnvironment {
             secret_key: "rustfs-cluster-test-secret".to_string(),
             extra_env,
             node_extra_env: vec![Vec::new(); topology.node_count],
+            node_capture_log_paths: vec![None; topology.node_count],
             topology,
         })
     }
@@ -1144,6 +1262,20 @@ impl RustFSTestClusterEnvironment {
     {
         self.ensure_node_index(node_idx)?;
         self.node_extra_env[node_idx].push((key.into(), value.into()));
+        Ok(())
+    }
+
+    /// Capture stdout+stderr for a single cluster node process.
+    pub fn set_node_capture_log_path<P>(
+        &mut self,
+        node_idx: usize,
+        path: P,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        P: Into<String>,
+    {
+        self.ensure_node_index(node_idx)?;
+        self.node_capture_log_paths[node_idx] = Some(path.into());
         Ok(())
     }
 
@@ -1236,6 +1368,7 @@ impl RustFSTestClusterEnvironment {
             for (key, value) in &self.node_extra_env[i] {
                 command.env(key, value);
             }
+            capture_command_logs(&mut command, self.node_capture_log_paths[i].as_deref())?;
 
             let process = command.current_dir(&node.data_dir).spawn()?;
 
@@ -1262,6 +1395,7 @@ impl RustFSTestClusterEnvironment {
 
         let binary_path = rustfs_binary_path();
         let volumes_arg = self.build_volumes_arg();
+        let log_path = self.node_capture_log_paths[node_idx].clone();
         let node = &mut self.nodes[node_idx];
         info!("Starting cluster node {} on {}", node_idx, node.address);
 
@@ -1280,6 +1414,7 @@ impl RustFSTestClusterEnvironment {
         for (key, value) in &self.node_extra_env[node_idx] {
             command.env(key, value);
         }
+        capture_command_logs(&mut command, log_path.as_deref())?;
 
         let process = command.current_dir(&node.data_dir).spawn()?;
         node.process = Some(process);
@@ -1449,6 +1584,156 @@ impl Drop for RustFSTestClusterEnvironment {
     }
 }
 
+/// Send a SigV4-signed HTTP request and return the raw `reqwest::Response`.
+///
+/// Unlike [`signed_s3_request`], this variant accepts `body: Option<Vec<u8>>`
+/// (binary-safe) and reorders parameters so that `access_key`/`secret_key`
+/// appear before the body — matching the convention used by the replication
+/// extension and object-lambda e2e suites.
+pub(crate) async fn signed_request(
+    method: http::Method,
+    url: &str,
+    access_key: &str,
+    secret_key: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    let uri = url.parse::<http::Uri>()?;
+    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
+    let mut request = http::Request::builder().method(method.clone()).uri(uri);
+    request = request.header(HOST, authority);
+    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+    if let Some(content_type) = content_type {
+        request = request.header(CONTENT_TYPE, content_type);
+    }
+
+    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
+    let signed = sign_v4(request.body(Body::empty())?, content_len, access_key, secret_key, "", "us-east-1");
+
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
+    let client = local_http_client();
+    let mut request_builder = client.request(reqwest_method, url);
+    for (name, value) in signed.headers() {
+        request_builder = request_builder.header(name, value);
+    }
+    if let Some(body) = body {
+        request_builder = request_builder.body(body);
+    }
+
+    Ok(request_builder.send().await?)
+}
+
+/// Like [`signed_request`], but uses a caller-supplied `reqwest::Client`
+/// instead of the shared [`local_http_client`].
+pub(crate) async fn signed_request_with_client(
+    client: &reqwest::Client,
+    method: http::Method,
+    url: &str,
+    access_key: &str,
+    secret_key: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    let uri = url.parse::<http::Uri>()?;
+    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
+    let mut request = http::Request::builder().method(method.clone()).uri(uri);
+    request = request.header(HOST, authority);
+    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+    if let Some(content_type) = content_type {
+        request = request.header(CONTENT_TYPE, content_type);
+    }
+
+    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
+    let signed = sign_v4(request.body(Body::empty())?, content_len, access_key, secret_key, "", "us-east-1");
+
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
+    let mut request_builder = client.request(reqwest_method, url);
+    for (name, value) in signed.headers() {
+        request_builder = request_builder.header(name, value);
+    }
+    if let Some(body) = body {
+        request_builder = request_builder.body(body);
+    }
+
+    Ok(request_builder.send().await?)
+}
+
+/// Like [`signed_request`], but includes a `session_token` in the
+/// `x-amz-security-token` header and passes it to the SigV4 signer.
+pub(crate) async fn signed_request_with_session_token(
+    method: http::Method,
+    url: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    let uri = url.parse::<http::Uri>()?;
+    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
+    let mut request = http::Request::builder().method(method.clone()).uri(uri);
+    request = request.header(HOST, authority);
+    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+    if !session_token.is_empty() {
+        request = request.header("x-amz-security-token", session_token);
+    }
+    if let Some(content_type) = content_type {
+        request = request.header(CONTENT_TYPE, content_type);
+    }
+
+    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
+    let signed = sign_v4(
+        request.body(Body::empty())?,
+        content_len,
+        access_key,
+        secret_key,
+        session_token,
+        "us-east-1",
+    );
+
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
+    let client = local_http_client();
+    let mut request_builder = client.request(reqwest_method, url);
+    for (name, value) in signed.headers() {
+        request_builder = request_builder.header(name, value);
+    }
+    if let Some(body) = body {
+        request_builder = request_builder.body(body);
+    }
+
+    Ok(request_builder.send().await?)
+}
+
+/// Create a new user via the admin API.
+pub(crate) async fn admin_create_user(
+    env: &RustFSTestEnvironment,
+    username: &str,
+    secret_key: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", env.url, username);
+    let body = serde_json::json!({
+        "secretKey": secret_key,
+        "status": "enabled"
+    });
+    let response = signed_request(
+        http::Method::PUT,
+        &url,
+        &env.access_key,
+        &env.secret_key,
+        Some(body.to_string().into_bytes()),
+        Some("application/json"),
+    )
+    .await?;
+
+    if response.status() != reqwest::StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("create user failed: {status} {body}").into());
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1531,6 +1816,7 @@ mod tests {
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             extra_env: Vec::new(),
             node_extra_env: vec![Vec::new(); topology.node_count],
+            node_capture_log_paths: vec![None; topology.node_count],
             topology,
         }
     }
@@ -1624,6 +1910,16 @@ mod tests {
             env.node_extra_env[2].as_slice(),
             [("RUSTFS_INTERNODE_RPC_MSGPACK_ONLY".to_string(), "true".to_string())]
         );
+    }
+
+    #[test]
+    fn cluster_node_log_capture_supports_per_node_paths() {
+        let mut env = fake_cluster(ClusterTopology::single_pool(3));
+        env.set_node_capture_log_path(1, "/tmp/node1.log").unwrap();
+        assert_eq!(env.node_capture_log_paths[0], None);
+        assert_eq!(env.node_capture_log_paths[1], Some("/tmp/node1.log".to_string()));
+        assert_eq!(env.node_capture_log_paths[2], None);
+        assert!(env.set_node_capture_log_path(3, "/tmp/invalid.log").is_err());
     }
 
     #[test]

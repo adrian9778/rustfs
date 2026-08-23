@@ -25,11 +25,9 @@ use super::common::{LocalKMSTestEnvironment, create_key_with_specific_id};
 use crate::common::init_logging;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, ServerSideEncryption, VersioningConfiguration};
-use serial_test::serial;
 use tracing::info;
 
 #[tokio::test]
-#[serial]
 async fn test_self_copy_of_historical_sse_s3_version_is_readable() {
     init_logging();
     info!("Issue #4238 (SSE): restoring an encrypted historical version must stay decryptable");
@@ -58,7 +56,7 @@ async fn test_self_copy_of_historical_sse_s3_version_is_readable() {
         )
         .await
         .expect("failed to start RustFS with local KMS");
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await.expect("KMS ready");
 
     let client = kms_env.base_env.create_s3_client();
     let bucket = "copy-object-version-restore-sse-test";

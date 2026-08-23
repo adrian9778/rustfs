@@ -23,6 +23,7 @@ use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, SRBucketDeleteOp};
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use futures::stream::{self, StreamExt};
+use rustfs_policy::policy::BucketPolicy;
 use std::collections::BTreeMap;
 use std::future::Future;
 
@@ -52,7 +53,10 @@ fn validate_table_bucket_delete_allowed(
 async fn table_catalog_metadata_exists(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<bool> {
     let local_disks = runtime_sources::local_disks_in(ctx).await;
     for disk in local_disks.iter() {
-        let catalog_path = disk.path().join(bucket).join(BUCKET_TABLE_RESERVED_PREFIX);
+        let Some(bucket_path) = disk.get_bucket_path_for_io_if_local(bucket) else {
+            continue;
+        };
+        let catalog_path = bucket_path?.join(BUCKET_TABLE_RESERVED_PREFIX);
         if has_xlmeta_files(&catalog_path).await? {
             return Ok(true);
         }
@@ -150,6 +154,31 @@ where
 }
 
 impl ECStore {
+    pub async fn get_bucket_metadata(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+        sys.read().await.get(bucket).await
+    }
+
+    pub async fn get_bucket_policy(&self, bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+        sys.read().await.get_bucket_policy(bucket).await
+    }
+
+    pub async fn get_bucket_policy_raw(&self, bucket: &str) -> Result<(String, OffsetDateTime)> {
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+        sys.read().await.get_bucket_policy_raw(bucket).await
+    }
+
+    pub async fn restricts_public_bucket_access(&self, bucket: &str) -> Result<bool> {
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+        let (config, _) = sys.read().await.get_public_access_block_config(bucket).await?;
+        Ok(config.restrict_public_buckets.unwrap_or(false))
+    }
+
+    pub async fn update_bucket_metadata_config(&self, bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
+        metadata_sys::update_in(&self.ctx, bucket, config_file, data).await
+    }
+
     pub async fn bucket_incarnation_id(&self, bucket: &str) -> Result<Uuid> {
         metadata_sys::get_cached_bucket_incarnation_id_in(&self.ctx, bucket).await
     }
@@ -197,8 +226,8 @@ impl ECStore {
             registry: self.bucket_fence_registry.clone(),
             inner,
         };
-        let memoized = pieces.enter(bucket);
-        let current = match memoized {
+        let registration = pieces.enter(bucket);
+        let current = match registration.memoized {
             Some(current) => current,
             None => match metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await {
                 Ok(current) => {
@@ -210,16 +239,16 @@ impl ECStore {
                     current
                 }
                 Err(err) => {
-                    pieces.abandon(bucket);
+                    pieces.abandon(bucket, registration.token);
                     return Err(err);
                 }
             },
         };
         if current != expected {
-            pieces.abandon(bucket);
+            pieces.abandon(bucket, registration.token);
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
-        Ok(pieces.into_guard(bucket))
+        Ok(pieces.into_guard(bucket, registration.token))
     }
 
     pub(crate) async fn acquire_bucket_lifecycle_write_lock(&self, bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
@@ -298,7 +327,7 @@ impl ECStore {
     async fn cleanup_bucket_usage(&self, bucket: &str, guard: Option<&rustfs_lock::NamespaceLockGuard>) -> Result<()> {
         run_bucket_usage_cleanup(guard, bucket, async {
             crate::data_usage::prepare_bucket_usage_for_namespace_change(bucket, guard).await?;
-            crate::data_usage::remove_bucket_usage_from_backend_with_guard(self, bucket, guard).await
+            crate::data_usage::remove_bucket_usage_from_backend_with_guard_fenced(self, bucket, guard).await
         })
         .await
     }
@@ -428,7 +457,13 @@ impl ECStore {
             None
         };
 
-        let mut meta = existing_metadata.unwrap_or_else(|| BucketMetadata::new(bucket));
+        let mut meta = existing_metadata.unwrap_or_else(|| {
+            if confirmed_missing && !is_meta_bucketname(bucket) {
+                BucketMetadata::new_with_default_durability(bucket)
+            } else {
+                BucketMetadata::new(bucket)
+            }
+        });
         let existing_incarnation_is_authoritative = meta.bucket_incarnation_sidecar;
         if confirmed_missing || is_meta_bucketname(bucket) {
             meta.set_created(opts.created_at);
@@ -566,7 +601,7 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
-        // TODO: opts.cached
+        // TODO(backlog): support cached bucket listing via opts.cached
 
         let mut buckets = self.peer_sys.list_bucket(opts).await?;
 
@@ -727,7 +762,10 @@ impl ECStore {
             if !opts.force {
                 let local_disks = runtime_sources::local_disks_in(&self.ctx).await;
                 for disk in local_disks.iter() {
-                    let bucket_path = disk.path().join(bucket);
+                    let Some(bucket_path) = disk.get_bucket_path_for_io_if_local(bucket) else {
+                        continue;
+                    };
+                    let bucket_path = bucket_path?;
                     if has_xlmeta_files(&bucket_path).await? {
                         return Err(StorageError::BucketNotEmpty(bucket.to_string()));
                     }
@@ -1069,6 +1107,26 @@ mod tests {
         }
 
         (temp_dir, ecstore)
+    }
+
+    #[tokio::test]
+    async fn request_metadata_methods_fail_closed_before_instance_initialization() {
+        let (_temp_dir, store) = setup_multi_pool_scanner_listing_test_env().await;
+
+        let expected = "bucket metadata sys not initialized for this instance";
+        let errors = [
+            store.get_bucket_metadata("bucket").await.unwrap_err(),
+            store.get_bucket_policy("bucket").await.unwrap_err(),
+            store.get_bucket_policy_raw("bucket").await.unwrap_err(),
+            store.restricts_public_bucket_access("bucket").await.unwrap_err(),
+            store
+                .update_bucket_metadata_config("bucket", crate::bucket::metadata::BUCKET_POLICY_CONFIG, Vec::new())
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            assert_eq!(error.to_string(), format!("Io error: {expected}"));
+        }
     }
 
     async fn create_bucket_with_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str) {
@@ -1502,6 +1560,76 @@ mod tests {
         assert!(
             !meta.versioning_config_xml.is_empty(),
             "Object Lock requires versioning, so that must be persisted too"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn make_bucket_seeds_new_bucket_durability_override() {
+        temp_env::async_with_vars([(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, None::<&str>)], async {
+            let (_disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+            let bucket = format!("bucket-default-durability-{}", Uuid::new_v4().simple());
+
+            ecstore
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("new bucket should be created");
+
+            let metadata = metadata_sys::get_in(&ecstore.ctx, &bucket)
+                .await
+                .expect("metadata should load for the new bucket");
+            assert_eq!(
+                metadata.durability_config().and_then(|cfg| cfg.normalized_mode()).as_deref(),
+                Some(crate::bucket::durability::BUCKET_DURABILITY_MODE_RELAXED)
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn force_create_existing_bucket_keeps_durability_override() {
+        let (_disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-force-durability-{}", Uuid::new_v4().simple());
+
+        temp_env::async_with_vars([(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, Some("inherit"))], async {
+            ecstore
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("plain bucket should be created without a durability override");
+        })
+        .await;
+        assert!(
+            metadata_sys::get_in(&ecstore.ctx, &bucket)
+                .await
+                .expect("metadata should load after initial create")
+                .durability_config()
+                .is_none(),
+            "test setup: the existing bucket must start without an override"
+        );
+
+        temp_env::async_with_vars([(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, None::<&str>)], async {
+            ecstore
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        force_create: true,
+                        lock_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("force create should update existing bucket metadata");
+        })
+        .await;
+
+        let metadata = metadata_sys::get_in(&ecstore.ctx, &bucket)
+            .await
+            .expect("metadata should load after force create");
+        assert!(metadata.lock_enabled, "force create sanity check: Object Lock should be enabled");
+        assert!(
+            metadata.durability_config().is_none(),
+            "force create must not apply the new-bucket default to existing bucket metadata"
         );
     }
 

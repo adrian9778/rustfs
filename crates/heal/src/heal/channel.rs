@@ -66,8 +66,20 @@ struct HealTaskStatusPayload<'a> {
     summary: &'a str,
     items: &'a [HealResultItem],
     truncated: bool,
+    /// Cursor for incremental consumption (HS-06): sequence of the next item
+    /// to be produced. Absent on responses without sequencing (0).
+    #[serde(skip_serializing_if = "u64_is_zero")]
+    next_seq: u64,
+    /// Oldest sequence still retained; with `truncated`, tells a lagging
+    /// client where to restart its cursor.
+    #[serde(skip_serializing_if = "u64_is_zero")]
+    min_seq: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     progress: Option<&'a HealProgress>,
+}
+
+fn u64_is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 fn encode_heal_task_status_payload(
@@ -75,12 +87,16 @@ fn encode_heal_task_status_payload(
     mut items: Vec<HealResultItem>,
     progress: Option<&HealProgress>,
     mut truncated: bool,
+    next_seq: u64,
+    min_seq: u64,
 ) -> Result<(Vec<u8>, bool)> {
     loop {
         let data = serde_json::to_vec(&HealTaskStatusPayload {
             summary,
             items: &items,
             truncated,
+            next_seq,
+            min_seq,
             progress,
         })
         .map_err(|e| Error::Serialization(format!("failed to serialize heal task status: {e}")))?;
@@ -109,8 +125,10 @@ fn encode_heal_status_response(
     progress: Option<&HealProgress>,
     detail: Option<String>,
     truncated: bool,
+    next_seq: u64,
+    min_seq: u64,
 ) -> Result<(Vec<u8>, Option<String>)> {
-    let (data, truncated) = encode_heal_task_status_payload(summary, items, progress, truncated)?;
+    let (data, truncated) = encode_heal_task_status_payload(summary, items, progress, truncated, next_seq, min_seq)?;
     Ok((data, heal_status_detail(detail, truncated)))
 }
 
@@ -138,8 +156,19 @@ impl HealChannelProcessor {
 
     /// Execute a token query directly against the manager.
     pub async fn execute_query_request(&self, heal_path: String, client_token: String) -> Result<HealChannelResponse> {
+        self.execute_query_request_since(heal_path, client_token, None).await
+    }
+
+    /// Incremental variant of [`Self::execute_query_request`] (HS-06).
+    pub async fn execute_query_request_since(
+        &self,
+        heal_path: String,
+        client_token: String,
+        since_seq: Option<u64>,
+    ) -> Result<HealChannelResponse> {
         let (response_tx, response_rx) = oneshot::channel();
-        self.process_query_request(heal_path, client_token, response_tx).await?;
+        self.process_query_request(heal_path, client_token, since_seq, response_tx)
+            .await?;
         response_rx
             .await
             .map_err(|err| Error::other(format!("heal query channel closed: {err}")))?
@@ -262,8 +291,12 @@ impl HealChannelProcessor {
             HealChannelCommand::Query {
                 heal_path,
                 client_token,
+                since_seq,
                 response_tx,
-            } => self.process_query_request(heal_path, client_token, response_tx).await,
+            } => {
+                self.process_query_request(heal_path, client_token, since_seq, response_tx)
+                    .await
+            }
             HealChannelCommand::Cancel {
                 heal_path,
                 client_token,
@@ -384,6 +417,7 @@ impl HealChannelProcessor {
         &self,
         heal_path: String,
         client_token: String,
+        since_seq: Option<u64>,
         response_tx: oneshot::Sender<std::result::Result<HealChannelResponse, String>>,
     ) -> Result<()> {
         debug!(
@@ -398,72 +432,118 @@ impl HealChannelProcessor {
         );
 
         let report = if heal_path.trim_matches('/').is_empty() {
-            self.heal_manager.get_task_report(&client_token).await
+            self.heal_manager.get_task_report_since(&client_token, since_seq).await
         } else {
-            self.heal_manager.get_task_report_for_path(&heal_path, &client_token).await
+            self.heal_manager
+                .get_task_report_for_path_since(&heal_path, &client_token, since_seq)
+                .await
         };
 
-        let (summary, detail, items, truncated, progress) = match report {
+        let (summary, detail, items, truncated, progress, next_seq, min_seq) = match report {
             Ok(HealTaskReport {
                 status: HealTaskStatus::Pending | HealTaskStatus::Running,
                 result_items,
                 result_items_truncated,
                 progress,
-            }) => ("running".to_string(), None, result_items, result_items_truncated, progress),
+                next_seq,
+                min_seq,
+            }) => (
+                "running".to_string(),
+                None,
+                result_items,
+                result_items_truncated,
+                progress,
+                next_seq,
+                min_seq,
+            ),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Retrying { error, retry_attempt },
                 result_items,
                 result_items_truncated,
                 progress,
+                next_seq,
+                min_seq,
             }) => (
                 "running".to_string(),
                 Some(format!("heal task retrying after recoverable failure, attempt {retry_attempt}: {error}")),
                 result_items,
                 result_items_truncated,
                 progress,
+                next_seq,
+                min_seq,
             ),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Completed,
                 result_items,
                 result_items_truncated,
                 progress,
-            }) => ("finished".to_string(), None, result_items, result_items_truncated, progress),
+                next_seq,
+                min_seq,
+            }) => (
+                "finished".to_string(),
+                None,
+                result_items,
+                result_items_truncated,
+                progress,
+                next_seq,
+                min_seq,
+            ),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Cancelled,
                 result_items,
                 result_items_truncated,
                 progress,
+                next_seq,
+                min_seq,
             }) => (
                 "stopped".to_string(),
                 Some("heal task cancelled".to_string()),
                 result_items,
                 result_items_truncated,
                 progress,
+                next_seq,
+                min_seq,
             ),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Timeout,
                 result_items,
                 result_items_truncated,
                 progress,
+                next_seq,
+                min_seq,
             }) => (
                 "stopped".to_string(),
                 Some("heal task timed out".to_string()),
                 result_items,
                 result_items_truncated,
                 progress,
+                next_seq,
+                min_seq,
             ),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Failed { error },
                 result_items,
                 result_items_truncated,
                 progress,
-            }) => ("stopped".to_string(), Some(error), result_items, result_items_truncated, progress),
+                next_seq,
+                min_seq,
+            }) => (
+                "stopped".to_string(),
+                Some(error),
+                result_items,
+                result_items_truncated,
+                progress,
+                next_seq,
+                min_seq,
+            ),
             Err(crate::Error::TaskNotFound { .. }) => (
                 "notFound".to_string(),
                 Some("heal task not found or expired".to_string()),
                 Vec::new(),
                 false,
                 None,
+                0,
+                0,
             ),
             Err(crate::Error::InvalidClientToken) => {
                 let response = HealChannelResponse {
@@ -490,7 +570,8 @@ impl HealChannelProcessor {
             }
         };
 
-        let (data, detail) = encode_heal_status_response(&summary, items, progress.as_ref(), detail, truncated)?;
+        let (data, detail) =
+            encode_heal_status_response(&summary, items, progress.as_ref(), detail, truncated, next_seq, min_seq)?;
 
         let response = HealChannelResponse {
             request_id: client_token,
@@ -612,7 +693,8 @@ impl HealChannelProcessor {
             HealRequestSource::Admin
             | HealRequestSource::AutoHeal
             | HealRequestSource::Internal
-            | HealRequestSource::ReadRepair => true,
+            | HealRequestSource::ReadRepair
+            | HealRequestSource::Mrf => true,
         });
 
         // Build HealOptions with all available fields
@@ -677,7 +759,7 @@ impl HealChannelProcessor {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{DiskStore, Endpoint};
+    use super::super::DiskStore;
     use super::*;
     use crate::heal::manager::HealConfig;
     use crate::heal::storage::{HealObjectInfo, HealStorageAPI};
@@ -694,44 +776,17 @@ mod tests {
         async fn get_object_meta(&self, _bucket: &str, _object: &str) -> crate::Result<Option<HealObjectInfo>> {
             Ok(None)
         }
-        async fn get_object_data(&self, _bucket: &str, _object: &str) -> crate::Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
-        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> crate::Result<()> {
-            Ok(())
-        }
-        async fn delete_object(&self, _bucket: &str, _object: &str) -> crate::Result<()> {
-            Ok(())
-        }
-        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> crate::Result<bool> {
-            Ok(true)
-        }
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> crate::Result<Vec<u8>> {
             Ok(vec![])
         }
-        async fn get_disk_status(&self, _endpoint: &Endpoint) -> crate::Result<crate::heal::storage::DiskStatus> {
-            Ok(crate::heal::storage::DiskStatus::Ok)
-        }
-        async fn format_disk(&self, _endpoint: &Endpoint) -> crate::Result<()> {
-            Ok(())
-        }
         async fn get_bucket_info(&self, _bucket: &str) -> crate::Result<Option<crate::heal::storage_api::status::BucketInfo>> {
             Ok(None)
-        }
-        async fn heal_bucket_metadata(&self, _bucket: &str) -> crate::Result<()> {
-            Ok(())
         }
         async fn list_buckets(&self) -> crate::Result<Vec<crate::heal::storage_api::status::BucketInfo>> {
             Ok(vec![])
         }
         async fn object_exists(&self, _bucket: &str, _object: &str) -> crate::Result<bool> {
             Ok(false)
-        }
-        async fn get_object_size(&self, _bucket: &str, _object: &str) -> crate::Result<Option<u64>> {
-            Ok(None)
-        }
-        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> crate::Result<Option<String>> {
-            Ok(None)
         }
         async fn heal_object(
             &self,
@@ -755,18 +810,12 @@ mod tests {
         ) -> crate::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<crate::Error>)> {
             Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
         }
-        async fn list_objects_for_heal(
-            &self,
-            _bucket: &str,
-            _prefix: &str,
-        ) -> crate::Result<Vec<crate::heal::storage::HealListItem>> {
-            Ok(vec![])
-        }
         async fn list_objects_for_heal_page(
             &self,
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> crate::Result<(Vec<crate::heal::storage::HealListItem>, Option<String>, bool)> {
             Ok((vec![], None, false))
         }
@@ -785,9 +834,15 @@ mod tests {
         let heal_manager = create_test_heal_manager();
         let processor = HealChannelProcessor::new(heal_manager);
 
-        // Verify processor is created successfully
-        let _sender = processor.get_response_sender();
-        // If we can get the sender, processor was created correctly
+        let sender = processor.get_response_sender();
+        sender
+            .send(HealChannelResponse {
+                request_id: "request-id".to_string(),
+                success: true,
+                data: None,
+                error: None,
+            })
+            .expect("a freshly constructed processor must accept responses on its channel");
     }
 
     #[test]
@@ -797,7 +852,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let (data, detail) = encode_heal_status_response("running", items, None, None, false).unwrap();
+        let (data, detail) = encode_heal_status_response("running", items, None, None, false, 0, 0).unwrap();
 
         assert!(data.len() <= MAX_HEAL_STATUS_PAYLOAD_SIZE);
         let payload: serde_json::Value = serde_json::from_slice(&data).unwrap();
@@ -1567,7 +1622,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
 
         processor
-            .process_query_request("bucket".to_string(), "completed-token".to_string(), tx)
+            .process_query_request("bucket".to_string(), "completed-token".to_string(), None, tx)
             .await
             .expect("query should process");
 
@@ -1583,6 +1638,60 @@ mod tests {
                 .expect("status payload should be json");
         assert_eq!(payload["summary"], "notFound");
         assert_eq!(payload["items"].as_array().expect("items should be an array").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_process_query_request_reports_displaced_terminal_detail() {
+        let heal_manager = Arc::new(HealManager::new(
+            Arc::new(MockStorage),
+            Some(HealConfig {
+                queue_size: 1,
+                ..HealConfig::default()
+            }),
+        ));
+        let mut displaced = HealRequest::new(
+            HealType::Bucket {
+                bucket: "displaced-channel".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        displaced.id = "displaced-channel-task".to_string();
+        let displaced_id = displaced.id.clone();
+        heal_manager
+            .submit_heal_request(displaced)
+            .await
+            .expect("initial channel task should queue");
+        heal_manager
+            .submit_heal_request(HealRequest::new(
+                HealType::Bucket {
+                    bucket: "successor-channel".to_string(),
+                },
+                HealOptions::default(),
+                HealPriority::High,
+            ))
+            .await
+            .expect("successor channel task should displace the initial task");
+
+        let processor = HealChannelProcessor::new(heal_manager);
+        let (tx, rx) = oneshot::channel();
+        processor
+            .process_query_request("displaced-channel".to_string(), displaced_id, None, tx)
+            .await
+            .expect("displaced query should process");
+        let response = rx
+            .await
+            .expect("query response should be returned")
+            .expect("displaced query should remain successful");
+        let payload: serde_json::Value = serde_json::from_slice(response.data.as_deref().expect("status payload should exist"))
+            .expect("status payload should be json");
+        assert_eq!(payload["summary"], "stopped");
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|detail| detail.contains("reason=displaced"))
+        );
     }
 
     #[tokio::test]
@@ -1602,7 +1711,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
 
         processor
-            .process_query_request("bucket".to_string(), task_id.clone(), tx)
+            .process_query_request("bucket".to_string(), task_id.clone(), None, tx)
             .await
             .expect("query should process");
 
@@ -1635,7 +1744,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
 
         processor
-            .process_query_request("bucket".to_string(), "wrong-token".to_string(), tx)
+            .process_query_request("bucket".to_string(), "wrong-token".to_string(), None, tx)
             .await
             .expect("query should process");
 
@@ -1660,7 +1769,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
 
         processor
-            .process_query_request(String::new(), "wrong-token".to_string(), tx)
+            .process_query_request(String::new(), "wrong-token".to_string(), None, tx)
             .await
             .expect("query should process");
 
@@ -1697,7 +1806,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
 
         processor
-            .process_query_request(String::new(), task_id.clone(), tx)
+            .process_query_request(String::new(), task_id.clone(), None, tx)
             .await
             .expect("query should process");
 
@@ -1778,9 +1887,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_cancel_request_treats_unknown_path_as_stopped() {
+    async fn test_process_cancel_request_cancels_cluster_task_for_legacy_root_path() {
         let heal_manager = create_test_heal_manager();
-        let processor = HealChannelProcessor::new(heal_manager);
+        let cluster_request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::High);
+        let cluster_task_id = cluster_request.id.clone();
+        let bucket_request = HealRequest::bucket("bucket".to_string());
+        let bucket_task_id = bucket_request.id.clone();
+        heal_manager
+            .submit_heal_request(cluster_request)
+            .await
+            .expect("cluster request should be accepted");
+        heal_manager
+            .submit_heal_request(bucket_request)
+            .await
+            .expect("bucket request should be accepted");
+
+        let processor = HealChannelProcessor::new(heal_manager.clone());
         let (tx, rx) = oneshot::channel();
 
         processor
@@ -1794,6 +1916,38 @@ mod tests {
             .expect("cancel response should be returned");
         assert!(response.success);
         assert_eq!(response.request_id, ".");
+        assert_eq!(response.data.as_deref(), Some("stopped".as_bytes()));
+        assert!(response.error.is_none());
+        assert!(matches!(
+            heal_manager.get_task_status(&cluster_task_id).await,
+            Err(crate::Error::TaskNotFound { .. })
+        ));
+        assert_eq!(
+            heal_manager
+                .get_task_status(&bucket_task_id)
+                .await
+                .expect("bucket request should not match the root path"),
+            HealTaskStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_cancel_request_treats_unknown_path_as_stopped() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+        let (tx, rx) = oneshot::channel();
+
+        processor
+            .process_cancel_request("missing".to_string(), String::new(), tx)
+            .await
+            .expect("cancel should process");
+
+        let response = rx
+            .await
+            .expect("oneshot should resolve")
+            .expect("cancel response should be returned");
+        assert!(response.success);
+        assert_eq!(response.request_id, "missing");
         assert_eq!(response.data.as_deref(), Some("stopped".as_bytes()));
         assert!(response.error.is_none());
     }

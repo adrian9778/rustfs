@@ -32,6 +32,11 @@ workspace = true
 
 [features]
 default = []
+# Compiles the controlled list-objects namespace-journal chaos injector into a
+# production binary (it is always available to tests). Off by default so the
+# RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_* env vars cannot rewrite journal
+# state in a stock build (backlog#1832).
+list-chaos = []
 rio-v2 = ["dep:rustfs-rio-v2"]
 hotpath = [
     "hotpath/hotpath",
@@ -181,6 +186,7 @@ path-absolutize = { workspace = true }
 rmp.workspace = true
 rmp-serde.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
+tokio-stream = { workspace = true, features = ["sync"] }
 base64 = { workspace = true }
 hmac = { workspace = true }
 sha1 = { workspace = true }
@@ -223,7 +229,6 @@ base64-simd.workspace = true
 serde_urlencoded.workspace = true
 google-cloud-storage = { workspace = true }
 google-cloud-auth = { workspace = true }
-aws-config = { workspace = true }
 faster-hex = { workspace = true }
 ratelimit = { workspace = true }
 aws-smithy-http-client = { workspace = true, default-features = false, features = ["rustls-aws-lc"] }
@@ -239,7 +244,19 @@ rustfs-uring = "0.2.1"
 
 [target.'cfg(windows)'.dependencies]
 winapi-util.workspace = true
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { workspace = true, features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_SystemServices",
+    "Win32_System_WindowsProgramming",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Ioctl"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "fs"] }
@@ -250,11 +267,13 @@ tracing-subscriber = { workspace = true, features = ["json", "env-filter", "time
 # dispatcher to keep tracing's process-global callsite-interest cache honest.
 tracing-core = { workspace = true }
 serial_test = { workspace = true }
+metrics-util = { workspace = true, features = ["debugging"] }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 proptest = "1"
 rcgen.workspace = true
 insta = { workspace = true, features = ["yaml", "json"] }
 rustfs-crypto = { workspace = true }
+tonic-prost = { workspace = true }
 
 [build-dependencies]
 shadow-rs = { workspace = true, default-features = false, features = ["build", "metadata"] }

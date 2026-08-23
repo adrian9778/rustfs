@@ -335,6 +335,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Post, "/rustfs/admin/v3/heal/{bucket}", HEAL, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/heal/{bucket}/{prefix}", HEAL, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/background-heal/status", HEAL, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v4/heal/replacement-recovery",
+        HEAL,
+        RouteRiskLevel::Sensitive,
+    ),
     admin(HttpMethod::Get, "/rustfs/admin/v3/tier", LIST_TIER, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/tier-stats", LIST_TIER, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/tier/{tier}", LIST_TIER, RouteRiskLevel::Sensitive),
@@ -422,6 +428,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Get, "/rustfs/admin/v3/config", CONFIG_UPDATE, RouteRiskLevel::High),
     admin(HttpMethod::Put, "/rustfs/admin/v3/config", CONFIG_UPDATE, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/v3/scanner/status", SERVER_INFO, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/scanner/cycle-state/reset",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/ilm/expiry/status",
@@ -924,6 +936,7 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         DELETE_TABLE_NAMESPACE,
         RouteRiskLevel::High,
     ),
+    admin(HttpMethod::Post, "/iceberg/v1/{warehouse}/tables/rename", SET_TABLE, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables",
@@ -1208,6 +1221,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/tables/rename",
+        SET_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Get,
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables",
         GET_TABLE,
@@ -1446,10 +1465,13 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         REPLICATION_DIFF,
         RouteRiskLevel::Sensitive,
     ),
+    // The default stream enumerates object names/version ids and requires
+    // ReplicationDiff (MinIO parity); only ?aggregate=true relaxes to
+    // GetReplicationMetrics in the handler.
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/replication/mrf",
-        GET_REPLICATION_METRICS,
+        REPLICATION_DIFF,
         RouteRiskLevel::Sensitive,
     ),
 ];
@@ -1543,6 +1565,11 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
         DeferredRoutePolicyReason::MultipleActions,
     ),
     deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/usage/{bucket}",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
+    deferred(
         HttpMethod::Post,
         "/rustfs/admin/v3/object-zip-downloads",
         DeferredRoutePolicyReason::S3Action,
@@ -1577,6 +1604,10 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
     ),
 ];
 
+#[allow(
+    dead_code,
+    reason = "asserted by this file's tests; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub fn validate_admin_route_policy_specs() -> Result<(), AdminRouteMatrixError> {
     validate_admin_route_specs(ADMIN_ROUTE_POLICY_SPECS)
 }
@@ -1654,7 +1685,7 @@ mod tests {
         let table_specs = ADMIN_ROUTE_POLICY_SPECS
             .iter()
             .filter(|spec| spec.path().starts_with("/iceberg/v1") || spec.path().starts_with("/_iceberg/v1"));
-        assert_eq!(table_specs.count(), 96);
+        assert_eq!(table_specs.count(), 98);
         assert_action(HttpMethod::Put, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/_iceberg/v1/buckets/{warehouse}", GET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
@@ -1673,6 +1704,8 @@ mod tests {
         );
         assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
         assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/tables/rename", SET_TABLE);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/tables/rename", SET_TABLE);
         assert_action(
             HttpMethod::Get,
             "/iceberg/v1/{warehouse}/namespaces/{namespace}/views",
@@ -1991,6 +2024,12 @@ mod tests {
     fn route_policy_allows_server_info_for_ilm_expiry_status() {
         assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/expiry/status", SERVER_INFO);
         assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/expiry/status", SET_TIER);
+    }
+
+    #[test]
+    fn route_policy_requires_config_update_for_scanner_cycle_reset() {
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/scanner/cycle-state/reset", CONFIG_UPDATE);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/scanner/cycle-state/reset", SERVER_INFO);
     }
 
     #[test]

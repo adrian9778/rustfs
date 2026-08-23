@@ -52,7 +52,7 @@ The `/v3/scanner/status` response reports each effective runtime value with a
 | `scanner.max_wait` | `RUSTFS_SCANNER_MAX_WAIT_SECS` | seconds | preset-derived | Caps one scanner sleep. |
 | `scanner.cycle` | `RUSTFS_SCANNER_CYCLE` | seconds | preset-derived | Sets the interval between scanner cycles. |
 | `scanner.start_delay` | `RUSTFS_SCANNER_START_DELAY_SECS` | seconds | unset | Sets startup delay and, for compatibility, the cycle interval when `scanner.cycle` is unset. |
-| `scanner.cycle_max_duration` | `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` | seconds | `0` | Caps one cycle's runtime. `0` disables this budget. |
+| `scanner.cycle_max_duration` | `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` | seconds | `1800` | Caps one cycle's runtime. An explicit `0` disables this budget. |
 | `scanner.cycle_max_objects` | `RUSTFS_SCANNER_CYCLE_MAX_OBJECTS` | objects | `0` | Caps objects processed by one cycle. `0` disables this budget. |
 | `scanner.cycle_max_directories` | `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` | directories | `0` | Caps directories entered by one cycle. `0` disables this budget. |
 | `heal.bitrot_cycle` | `RUSTFS_SCANNER_BITROT_CYCLE_SECS` | seconds | `2592000` | Controls periodic deep bitrot scans. `false`, `off`, `no`, or `disabled` disables periodic deep scans; `0`, `true`, `on`, or `yes` runs deep mode every scanner cycle. |
@@ -69,6 +69,26 @@ The `fastest`, `fast`, `default`, `slow`, and `slowest` presets set the base
 sleep multiplier, maximum wait, and cycle interval. Use `scanner.delay`,
 `scanner.max_wait`, and `scanner.cycle` when the preset is close but one axis
 needs a precise override.
+
+When the cycle duration control is unset, RustFS uses a finite 1800-second
+(30-minute) default, matching the scanner benchmark guidance. An explicit `0`
+preserves the compatibility behavior of an unbounded cycle; object and
+directory budgets likewise remain unbounded when explicitly set to `0`. Invalid
+or overflowing duration environment values are configuration errors rather than
+silent fallback values.
+
+When a finite deadline expires, RustFS cancels cooperative scanner work and
+waits only for the existing bounded shutdown window. A non-yielding I/O future
+is dropped after that window. RustFS then attempts a higher leadership epoch so
+late cycle, usage, cache, and remote writes from the old generation fail closed.
+If the worker cannot stop cooperatively, the cycle state was not confirmed
+durable, or that epoch fence cannot be durably persisted, the scanner reports
+`recovery-required`; it does not claim an uncooperative cursor was saved.
+
+An explicit `scanner.cycle` or `RUSTFS_SCANNER_CYCLE` is a minimum inter-cycle
+cadence: dirty-usage notifications do not bypass that configured interval.
+The default adaptive policy continues to use dirty-usage notifications to wake
+the scanner between timer-driven cycles.
 
 ## Single-disk clean-idle scheduling
 
@@ -139,6 +159,10 @@ metrics.maintenance_control.primary_control
 metrics.source_work
 metrics.replication_repair
 metrics.scan_checkpoint
+metrics.cycle_timeout_total
+metrics.cycle_last_progress_age
+metrics.leader_lease_without_progress
+metrics.cycle_recovery_required_total
 ```
 
 ## Reading Pacing Pressure
@@ -212,6 +236,18 @@ missed work. Scanner-originated object checks should appear under
 `scanner/low` for opportunistic work, while manual admin heal should appear
 under `admin/high`. If scanner work grows but admin work remains blocked, treat
 that as heal queue pressure rather than scanner pacing pressure.
+
+## Replacement Recovery Completion
+
+`POST /v3/background-heal/status` is an execution-queue view. `state=idle`, zero queue and active counts, an online disk, a readable object, or acceptance of an Admin deep-heal request do not independently prove that a replacement disk contains every erasure shard.
+
+Treat replacement recovery as verified only after the repair task has completed for the exact replacement instance and an operator has confirmed the target disk contains the expected `xl.meta` and data parts for every relevant object version. A replacement that is not mounted, is unsafe to format, loses its marker, or returns a partial target outcome must be treated as deferred or incomplete rather than complete.
+
+The v3 route and its peer status protocol preserve their existing fields for mixed-version clusters. A new node must not infer replacement completion from an old or unavailable peer; regard that information as unknown or degraded until every required peer can report the same replacement instance and verified completion. Do not automate destructive replacement actions from an `idle` observation alone.
+
+`GET /rustfs/admin/v4/heal/replacement-recovery` reports durable automatic replacement records from survivor disks. Its `local.records[]` entries distinguish `waiting_for_replacement`, `running`, `incomplete`, `unrecoverable`, `cleanup_pending`, `completed`, and `unknown`; `local.definitive=false` or any `unknown` record means the node could not prove a local replacement state. Its `cluster` section queries the replacement-recovery peer RPC and sets `cluster.definitive=true` only when the expected peer topology is complete, every peer supports the RPC, every peer snapshot is locally definitive, and all peers report the same replacement records. Old peers, unavailable peers, malformed peer payloads, topology gaps, and generation disagreements are reported as degraded or unknown rather than complete.
+
+Replacement resume and checkpoint files use an independent on-disk schema. A newer reader rejects a future schema rather than continuing with data it cannot interpret, while an older binary cannot safely enforce the new generation fence because it may ignore fields it does not know. Do not roll a cluster back after a replacement generation has started. Complete that recovery with the current-or-newer release; if it cannot complete, keep that version for diagnosis rather than deleting its durable records or continuing with an older binary.
 
 ## Reading Replication Repair
 

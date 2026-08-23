@@ -17,9 +17,14 @@ use crate::storage::storage_api::options_consumer::contract::{object::HTTPPrecon
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
-    SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header,
-    insert_header_map,
+    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_FORCE_DELETE, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
+    SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
+    SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_PROXY_REQUEST,
+    SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_REQUEST,
+    SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_SOURCE_VERSION_ID,
+    SUFFIX_TAGGING_TIMESTAMP, get_header,
+    header_compat::{MINIO_ENCRYPTION_PREFIX, RUSTFS_ENCRYPTION_PREFIX},
+    insert_header_map, insert_str,
     metadata_compat::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX},
 };
 use rustfs_utils::http::{
@@ -59,11 +64,51 @@ use s3s::dto::VersioningConfiguration;
 #[cfg(test)]
 pub(crate) static VERSIONING_CONFIG_LOOKUPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
+type VersioningConfigTestHook = (String, std::sync::Arc<tokio::sync::Barrier>, std::sync::Arc<tokio::sync::Barrier>);
+
+#[cfg(test)]
+static VERSIONING_CONFIG_TEST_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<VersioningConfigTestHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_versioning_config_test_hook(
+    bucket: String,
+    entered: std::sync::Arc<tokio::sync::Barrier>,
+    resume: std::sync::Arc<tokio::sync::Barrier>,
+) {
+    *VERSIONING_CONFIG_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("versioning config test hook lock should not be poisoned") = Some((bucket, entered, resume));
+}
+
+#[cfg(test)]
+async fn wait_for_versioning_config_test_hook(bucket: &str) {
+    let hook = {
+        let mut slot = VERSIONING_CONFIG_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("versioning config test hook lock should not be poisoned");
+        if slot.as_ref().is_some_and(|(expected_bucket, _, _)| expected_bucket == bucket) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_bucket, entered, resume)) = hook {
+        entered.wait().await;
+        resume.wait().await;
+    }
+}
+
 /// Fetch the bucket's versioning configuration once so callers can derive
 /// enabled/suspended state without repeated metadata-sys lookups per request.
 pub(crate) async fn bucket_versioning_config(bucket: &str) -> VersioningConfiguration {
     #[cfg(test)]
     VERSIONING_CONFIG_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    wait_for_versioning_config_test_hook(bucket).await;
     match BucketVersioningSys::get(bucket).await {
         Ok(cfg) => cfg,
         Err(err) => {
@@ -232,6 +277,19 @@ pub async fn get_opts(
     // Background scanner still performs full integrity checks asynchronously.
     opts.skip_verify_bitrot = get_skip_verify_bitrot();
 
+    // Anti-loop markers for the replication read proxy
+    // (`{x-rustfs-,x-minio-}source-proxy-request` header family).
+    // MinIO semantics: the header being PRESENT at all (`ProxyHeaderSet`)
+    // disables proxying, whatever its value — a peer's replication worker
+    // sends "false" on its convergence HEADs so the receiver answers locally
+    // instead of proxying the miss back (a proxied echo would fake
+    // convergence and the object would never replicate). Deliberately not
+    // gated on replication authorization: the header only disables proxying
+    // (it grants nothing).
+    let proxy_header = get_header(headers, SUFFIX_SOURCE_PROXY_REQUEST);
+    opts.proxy_header_set = proxy_header.is_some();
+    opts.proxy_request = proxy_header.map(|v| v.as_ref() == "true").unwrap_or_default();
+
     fill_conditional_writes_opts_from_header(headers, &mut opts)?;
 
     Ok(opts)
@@ -352,9 +410,11 @@ pub fn get_complete_multipart_upload_opts_with_replication_authorization(
 
     let mut replication_request = false;
     let mut mod_time = None;
+    let mut preserve_etag = None;
     if replication_request_authorized && get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
         replication_request = true;
         mod_time = replication_source_mtime(headers);
+        preserve_etag = replication_source_etag(headers);
         if let Some(actual_size_str) = get_header(headers, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE) {
             rustfs_utils::http::insert_str(
                 &mut user_defined,
@@ -375,8 +435,12 @@ pub fn get_complete_multipart_upload_opts_with_replication_authorization(
         user_defined,
         replication_request,
         mod_time,
+        preserve_etag,
         ..Default::default()
     };
+    if replication_request {
+        apply_replication_timestamps_from_headers(headers, &mut opts);
+    }
     apply_replica_status_from_headers(headers, &mut opts, replication_request_authorized);
 
     fill_conditional_writes_opts_from_header(headers, &mut opts)?;
@@ -413,6 +477,12 @@ pub fn put_opts_from_headers(headers: &HeaderMap<HeaderValue>, metadata: HashMap
     put_opts_from_headers_with_replication_authorization(headers, metadata, false)
 }
 
+pub(crate) fn has_replication_retention_update(headers: &HeaderMap<HeaderValue>, replication_request_authorized: bool) -> bool {
+    replication_request_authorized
+        && get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true")
+        && replication_timestamp_header(headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP).is_some()
+}
+
 pub fn put_opts_from_headers_with_replication_authorization(
     headers: &HeaderMap<HeaderValue>,
     metadata: HashMap<String, String>,
@@ -423,8 +493,29 @@ pub fn put_opts_from_headers_with_replication_authorization(
     if replication_request_authorized && get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
         opts.replication_request = true;
         opts.mod_time = replication_source_mtime(headers);
+        opts.preserve_etag = replication_source_etag(headers);
+        // SSE-C ciphertext passthrough: restore the stored encryption metadata
+        // from the transport headers and mark the body as already encrypted so
+        // the write path stores it verbatim.
+        if let Some(restored) = rustfs_utils::http::ssec_transport_to_stored_metadata(headers) {
+            opts.user_defined.extend(restored);
+            opts.preserve_ciphertext = true;
+        }
+        if let Some(crc) = get_header(headers, SUFFIX_REPLICATION_SSEC_CRC) {
+            insert_header_map(&mut opts.user_defined, SUFFIX_REPLICATION_SSEC_CRC, crc.into_owned());
+        }
+        apply_replication_timestamps_from_headers(headers, &mut opts);
     }
     Ok(opts)
+}
+
+/// Replicas must keep the source object's ETag: managed-SSE replication
+/// re-encrypts on the target, so a recomputed ETag would differ from the
+/// source and every HEAD comparison would re-schedule the object forever.
+fn replication_source_etag(headers: &HeaderMap<HeaderValue>) -> Option<String> {
+    let value = get_header(headers, SUFFIX_SOURCE_ETAG)?;
+    let value = value.trim().trim_matches('"');
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn replication_source_mtime(headers: &HeaderMap<HeaderValue>) -> Option<time::OffsetDateTime> {
@@ -435,6 +526,47 @@ fn replication_source_mtime(headers: &HeaderMap<HeaderValue>) -> Option<time::Of
         Err(err) => {
             tracing::warn!("Invalid source-mtime value '{}' (replication request=true): {}", value, err);
             None
+        }
+    }
+}
+
+/// Parses one replication LWW timestamp header. Invalid values are dropped
+/// with a warning (same tolerance as [`replication_source_mtime`]) so a
+/// malformed source header cannot wedge the replication queue.
+fn replication_timestamp_header(headers: &HeaderMap<HeaderValue>, suffix: &str) -> Option<time::OffsetDateTime> {
+    let value = get_header(headers, suffix)?;
+    let value = value.trim();
+    match time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339) {
+        Ok(timestamp) => Some(timestamp),
+        Err(err) => {
+            tracing::warn!("Invalid {} value '{}' (replication request=true): {}", suffix, value, err);
+            None
+        }
+    }
+}
+
+/// Callers must gate on an authorized replication request: these headers are
+/// trusted source-cluster state, not client input.
+fn apply_replication_timestamps_from_headers(headers: &HeaderMap<HeaderValue>, opts: &mut ObjectOptions) {
+    opts.replication_tagging_timestamp = replication_timestamp_header(headers, SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP);
+    opts.replication_retention_timestamp = replication_timestamp_header(headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP);
+    opts.replication_legalhold_timestamp = replication_timestamp_header(headers, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP);
+
+    // Persist into the internal metadata keys so a later outbound replication
+    // pass (replication_target_boundary) reads the source's modification
+    // times instead of falling back to mod_time.
+    // TODO(P1-6): receiver-side LWW is still missing — when the stored
+    // per-category timestamp is newer than the inbound one, the existing
+    // tags/retention/legal-hold should win instead of being overwritten.
+    for (timestamp, suffix) in [
+        (opts.replication_tagging_timestamp, SUFFIX_TAGGING_TIMESTAMP),
+        (opts.replication_retention_timestamp, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP),
+        (opts.replication_legalhold_timestamp, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP),
+    ] {
+        if let Some(timestamp) = timestamp
+            && let Ok(value) = timestamp.format(&time::format_description::well_known::Rfc3339)
+        {
+            insert_str(&mut opts.user_defined, suffix, value);
         }
     }
 }
@@ -450,6 +582,18 @@ fn apply_replica_status_from_headers(headers: &HeaderMap<HeaderValue>, opts: &mu
         .is_some_and(|status| status.eq_ignore_ascii_case(ReplicationStatusType::Replica.as_str()))
     {
         opts.set_replica_status(ReplicationStatusType::Replica);
+        // Persist REPLICA into the object metadata as well (mirrors the
+        // Snowball inbound path). The read side derives
+        // ObjectInfo::replication_status from this key, and must_replicate's
+        // anti-loop guard consumes it — without it, HEAD/GET report no
+        // status and the scanner's existing-object pass cascades the replica
+        // onward. `opts.delete_replication` alone only reaches delete flows.
+        opts.user_defined
+            .retain(|key, _| !key.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS));
+        opts.user_defined.insert(
+            AMZ_BUCKET_REPLICATION_STATUS.to_string(),
+            ReplicationStatusType::Replica.as_str().to_string(),
+        );
     }
 }
 
@@ -571,8 +715,6 @@ fn archive_content_encoding_strict_mode() -> bool {
 
 const USER_METADATA_PREFIXES: &[&str] = &["x-amz-meta-", "x-rustfs-meta-", "x-minio-meta-"];
 const CANONICAL_USER_METADATA_PREFIX: &str = "x-amz-meta-";
-const RUSTFS_ENCRYPTION_PREFIX: &str = "x-rustfs-encryption-";
-const MINIO_ENCRYPTION_PREFIX: &str = "x-minio-encryption-";
 
 /// Keys a client must not be able to materialize as bare stored metadata.
 ///
@@ -588,6 +730,13 @@ fn is_reserved_user_metadata_key(key: &str) -> bool {
         || starts_with_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX)
         || starts_with_ignore_ascii_case(key, RUSTFS_ENCRYPTION_PREFIX)
         || starts_with_ignore_ascii_case(key, MINIO_ENCRYPTION_PREFIX)
+        // Replication transport names (source-replication timestamps,
+        // source-mtime/-etag/-version-id, ...). A bare stored key with one of
+        // these names is forwarded verbatim by the outbound replication
+        // header builder on a server-authorized request, so the receiver
+        // would persist attacker-chosen values as trusted internal LWW state.
+        || starts_with_ignore_ascii_case(key, "x-rustfs-source-")
+        || starts_with_ignore_ascii_case(key, "x-minio-source-")
 }
 
 fn stored_user_metadata_key(key: &str) -> String {
@@ -869,12 +1018,6 @@ pub fn parse_copy_source_range(range_str: &str) -> S3Result<HTTPRangeSpec> {
         Err(s3_error!(InvalidArgument, "Invalid range format"))
     }
 }
-
-#[allow(dead_code)]
-pub(crate) fn get_content_sha256(headers: &HeaderMap<HeaderValue>) -> Option<String> {
-    get_content_sha256_with_query(headers, None)
-}
-
 pub(crate) fn get_content_sha256_with_query(headers: &HeaderMap<HeaderValue>, query: Option<&str>) -> Option<String> {
     match get_request_auth_type_with_query(headers, query) {
         AuthType::Presigned | AuthType::Signed => {
@@ -887,14 +1030,6 @@ pub(crate) fn get_content_sha256_with_query(headers: &HeaderMap<HeaderValue>, qu
         _ => None,
     }
 }
-
-/// skip_content_sha256_cksum returns true if caller needs to skip
-/// payload checksum, false if not.
-#[allow(dead_code)]
-fn skip_content_sha256_cksum(headers: &HeaderMap<HeaderValue>) -> bool {
-    skip_content_sha256_cksum_with_query(headers, None)
-}
-
 fn skip_content_sha256_cksum_with_query(headers: &HeaderMap<HeaderValue>, query: Option<&str>) -> bool {
     let include_query_values = matches!(get_request_auth_type_with_query(headers, query), AuthType::Presigned);
     let content_sha256 = get_content_sha256_value(headers, query, include_query_values);
@@ -989,12 +1124,6 @@ fn get_content_sha256_value(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
 }
-
-#[allow(dead_code)]
-fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: ServiceType) -> String {
-    get_content_sha256_cksum_with_query(headers, None, service_type)
-}
-
 #[cfg(test)]
 #[allow(unused_imports)]
 mod tests {
@@ -1007,15 +1136,16 @@ mod tests {
         del_opts_with_versioning, detect_content_type_from_object_name, extract_metadata, extract_metadata_from_mime,
         extract_metadata_from_mime_with_object_name, filter_object_metadata, get_complete_multipart_upload_opts,
         get_complete_multipart_upload_opts_with_replication_authorization, get_default_opts, get_opts,
-        namespace_reserved_user_metadata, parse_copy_source_range, put_opts, put_opts_from_headers,
-        put_opts_from_headers_with_replication_authorization, put_opts_with_replication_authorization,
+        has_replication_retention_update, namespace_reserved_user_metadata, parse_copy_source_range, put_opts,
+        put_opts_from_headers, put_opts_from_headers_with_replication_authorization, put_opts_with_replication_authorization,
         validate_archive_content_encoding,
     };
     use http::{HeaderMap, HeaderValue};
     use rustfs_utils::http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER,
-        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME,
-        SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, insert_header,
+        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG,
+        SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
+        SUFFIX_SOURCE_VERSION_ID, insert_header,
     };
     use s3s::S3ErrorCode;
     use s3s::dto::{BucketVersioningStatus, ExcludedPrefix, VersioningConfiguration};
@@ -1431,6 +1561,7 @@ mod tests {
         insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         let valid_mtime = "2024-05-20T10:30:00+08:00";
         insert_header(&mut headers, SUFFIX_SOURCE_MTIME, valid_mtime);
+        insert_header(&mut headers, SUFFIX_SOURCE_ETAG, "0123456789abcdef0123456789abcdef");
 
         let metadata = HashMap::new();
 
@@ -1441,6 +1572,75 @@ mod tests {
 
         assert!(!opts.replication_request);
         assert!(opts.mod_time.is_none());
+        assert!(opts.preserve_etag.is_none());
+    }
+
+    #[test]
+    fn test_replication_retention_update_requires_authorization() {
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, "2026-01-01T00:00:00Z");
+
+        assert!(!has_replication_retention_update(&headers, false));
+        assert!(has_replication_retention_update(&headers, true));
+
+        let mut missing_request = HeaderMap::new();
+        insert_header(
+            &mut missing_request,
+            SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
+            "2026-01-01T00:00:00Z",
+        );
+        assert!(!has_replication_retention_update(&missing_request, true));
+    }
+
+    #[test]
+    fn test_put_opts_from_headers_gates_ssec_passthrough_on_authorization() {
+        use rustfs_utils::http::object_encryption_keys::{
+            INTERNAL_ENCRYPTION_IV_HEADER, REPLICATION_ENCRYPTION_IV_HEADER, REPLICATION_SSEC_ALGORITHM_HEADER,
+        };
+
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        headers.insert(
+            REPLICATION_SSEC_ALGORITHM_HEADER.parse::<http::HeaderName>().unwrap(),
+            HeaderValue::from_static("AES256"),
+        );
+        headers.insert(
+            REPLICATION_ENCRYPTION_IV_HEADER.parse::<http::HeaderName>().unwrap(),
+            HeaderValue::from_static("iv-value"),
+        );
+
+        // Unauthorized: the transport headers must be inert — no restored
+        // encryption metadata, no ciphertext-passthrough flag.
+        let untrusted = put_opts_from_headers(&headers, HashMap::new()).expect("ordinary PUT options should be created");
+        assert!(!untrusted.preserve_ciphertext);
+        assert!(!untrusted.user_defined.contains_key(INTERNAL_ENCRYPTION_IV_HEADER));
+        assert!(
+            !untrusted
+                .user_defined
+                .contains_key("x-amz-server-side-encryption-customer-algorithm")
+        );
+
+        // Authorized: the stored keys are restored and the write path is told
+        // the body is already ciphertext.
+        let trusted = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
+            .expect("authorized replication request should parse");
+        assert!(trusted.preserve_ciphertext);
+        assert_eq!(
+            trusted.user_defined.get(INTERNAL_ENCRYPTION_IV_HEADER).map(String::as_str),
+            Some("iv-value")
+        );
+        assert_eq!(
+            trusted
+                .user_defined
+                .get("x-amz-server-side-encryption-customer-algorithm")
+                .map(String::as_str),
+            Some("AES256")
+        );
+        assert_eq!(
+            trusted.user_defined.get("x-amz-server-side-encryption").map(String::as_str),
+            Some("AES256")
+        );
     }
 
     #[test]
@@ -1449,11 +1649,15 @@ mod tests {
         insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         let valid_mtime = "2024-05-20T10:30:00+08:00";
         insert_header(&mut headers, SUFFIX_SOURCE_MTIME, valid_mtime);
+        insert_header(&mut headers, SUFFIX_SOURCE_ETAG, "\"0123456789abcdef0123456789abcdef-3\"");
 
         let opts = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
             .expect("authorized replication request should parse");
 
         assert!(opts.replication_request);
+        // The replica keeps the source ETag verbatim (quotes trimmed) so the
+        // replication HEAD comparison converges after target-side re-encryption.
+        assert_eq!(opts.preserve_etag.as_deref(), Some("0123456789abcdef0123456789abcdef-3"));
 
         let expected_mtime = time::OffsetDateTime::parse(valid_mtime, &time::format_description::well_known::Rfc3339).unwrap();
         assert_eq!(opts.mod_time, Some(expected_mtime));
@@ -1468,6 +1672,136 @@ mod tests {
         assert!(opts_invalid.mod_time.is_none());
     }
 
+    /// A client PUT must not materialize the replication transport names as
+    /// bare stored user-metadata keys: the outbound replication header
+    /// builder forwards user metadata verbatim on a server-authorized
+    /// request, so a bare `x-rustfs-source-replication-*-timestamp` key would
+    /// deliver an attacker-chosen value into the replica's trusted internal
+    /// LWW state (for a tagless object nothing later overwrites it).
+    #[test]
+    fn test_replication_transport_names_cannot_be_forged_via_user_metadata() {
+        let mut headers = HeaderMap::new();
+        for name in [
+            "x-amz-meta-x-rustfs-source-replication-tagging-timestamp",
+            "x-amz-meta-x-minio-source-replication-legalhold-timestamp",
+            "x-rustfs-meta-x-rustfs-source-replication-retention-timestamp",
+            "x-amz-meta-x-rustfs-source-mtime",
+        ] {
+            headers.insert(
+                http::header::HeaderName::from_static(name),
+                HeaderValue::from_static("2026-01-02T03:04:05Z"),
+            );
+        }
+
+        let metadata = extract_metadata(&headers);
+
+        for forged in [
+            "x-rustfs-source-replication-tagging-timestamp",
+            "x-minio-source-replication-legalhold-timestamp",
+            "x-rustfs-source-replication-retention-timestamp",
+            "x-rustfs-source-mtime",
+        ] {
+            assert!(
+                !metadata.contains_key(forged),
+                "{forged} must not be storable as a bare user-metadata key"
+            );
+        }
+        // The values survive, namespaced back under the user-metadata prefix.
+        assert_eq!(
+            metadata
+                .get("x-amz-meta-x-rustfs-source-replication-tagging-timestamp")
+                .map(String::as_str),
+            Some("2026-01-02T03:04:05Z")
+        );
+    }
+
+    #[test]
+    fn test_put_opts_from_headers_gates_replication_timestamp_persistence_on_authorization() {
+        // Sender-side LWW state (replication_target_boundary.rs) is read back
+        // from these internal metadata keys, so an authorized replication PUT
+        // must persist the inbound timestamp headers; an unauthorized client
+        // must not be able to forge them.
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        insert_header(&mut headers, "source-replication-tagging-timestamp", "2026-01-02T03:04:05Z");
+        insert_header(&mut headers, "source-replication-retention-timestamp", "2026-01-02T03:04:06Z");
+        insert_header(&mut headers, "source-replication-legalhold-timestamp", "2026-01-02T03:04:07Z");
+
+        let untrusted = put_opts_from_headers(&headers, HashMap::new()).expect("ordinary PUT options should be created");
+        for suffix in [
+            "tagging-timestamp",
+            "objectlock-retention-timestamp",
+            "objectlock-legalhold-timestamp",
+        ] {
+            assert!(
+                rustfs_utils::http::get_str(&untrusted.user_defined, suffix).is_none(),
+                "unauthorized clients must not persist the {suffix} internal key"
+            );
+        }
+        assert!(untrusted.replication_tagging_timestamp.is_none());
+        assert!(untrusted.replication_retention_timestamp.is_none());
+        assert!(untrusted.replication_legalhold_timestamp.is_none());
+
+        let trusted = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
+            .expect("authorized replication request should parse");
+        let parse = |value: &str| {
+            time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).expect("valid RFC3339")
+        };
+        assert_eq!(trusted.replication_tagging_timestamp, Some(parse("2026-01-02T03:04:05Z")));
+        assert_eq!(trusted.replication_retention_timestamp, Some(parse("2026-01-02T03:04:06Z")));
+        assert_eq!(trusted.replication_legalhold_timestamp, Some(parse("2026-01-02T03:04:07Z")));
+        for (suffix, expected) in [
+            ("tagging-timestamp", "2026-01-02T03:04:05Z"),
+            ("objectlock-retention-timestamp", "2026-01-02T03:04:06Z"),
+            ("objectlock-legalhold-timestamp", "2026-01-02T03:04:07Z"),
+        ] {
+            assert_eq!(
+                rustfs_utils::http::get_str(&trusted.user_defined, suffix).as_deref(),
+                Some(expected),
+                "authorized replication must persist the {suffix} internal key"
+            );
+        }
+    }
+
+    #[test]
+    fn test_complete_multipart_opts_persist_replication_timestamps_when_authorized() {
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        insert_header(&mut headers, "replication-actual-object-size", "1");
+        insert_header(&mut headers, "source-replication-tagging-timestamp", "2026-01-02T03:04:05Z");
+        insert_header(&mut headers, "source-replication-retention-timestamp", "2026-01-02T03:04:06Z");
+        insert_header(&mut headers, "source-replication-legalhold-timestamp", "2026-01-02T03:04:07Z");
+
+        let untrusted = get_complete_multipart_upload_opts(&headers).expect("ordinary multipart options should be created");
+        for suffix in [
+            "tagging-timestamp",
+            "objectlock-retention-timestamp",
+            "objectlock-legalhold-timestamp",
+        ] {
+            assert!(
+                rustfs_utils::http::get_str(&untrusted.user_defined, suffix).is_none(),
+                "unauthorized multipart completes must not persist the {suffix} internal key"
+            );
+        }
+
+        let trusted = get_complete_multipart_upload_opts_with_replication_authorization(&headers, true)
+            .expect("authorized multipart complete should parse");
+        for (suffix, expected) in [
+            ("tagging-timestamp", "2026-01-02T03:04:05Z"),
+            ("objectlock-retention-timestamp", "2026-01-02T03:04:06Z"),
+            ("objectlock-legalhold-timestamp", "2026-01-02T03:04:07Z"),
+        ] {
+            assert_eq!(
+                rustfs_utils::http::get_str(&trusted.user_defined, suffix).as_deref(),
+                Some(expected),
+                "authorized multipart completes must persist the {suffix} internal key"
+            );
+        }
+        assert!(trusted.replication_tagging_timestamp.is_some());
+        assert!(trusted.replication_retention_timestamp.is_some());
+        assert!(trusted.replication_legalhold_timestamp.is_some());
+    }
+
     #[test]
     fn test_put_opts_from_headers_with_replica_status() {
         let mut headers = HeaderMap::new();
@@ -1479,10 +1813,25 @@ mod tests {
         let opts = put_opts_from_headers(&headers, HashMap::new()).expect("replica status header should be ignored");
 
         assert_eq!(opts.delete_marker_replication_status(), ReplicationStatusType::Empty);
+        assert!(
+            !opts
+                .user_defined
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS)),
+            "an unauthorized client must not forge a persisted REPLICA status"
+        );
 
         let authorized = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
             .expect("authorized replica status header should parse");
         assert_eq!(authorized.delete_marker_replication_status(), ReplicationStatusType::Replica);
+        // The status must reach the object metadata: the read side derives
+        // ObjectInfo::replication_status from this key and the scanner's
+        // anti-cascade guard consumes it.
+        assert_eq!(
+            authorized.user_defined.get(AMZ_BUCKET_REPLICATION_STATUS).map(String::as_str),
+            Some(ReplicationStatusType::Replica.as_str()),
+            "authorized inbound replication must persist REPLICA into object metadata"
+        );
     }
 
     #[tokio::test]
@@ -1522,10 +1871,27 @@ mod tests {
         let opts = get_complete_multipart_upload_opts(&headers).expect("replica status header should be ignored");
 
         assert_eq!(opts.delete_marker_replication_status(), ReplicationStatusType::Empty);
+        assert!(
+            !opts
+                .user_defined
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS)),
+            "an unauthorized client must not forge a persisted REPLICA status"
+        );
 
         let authorized = get_complete_multipart_upload_opts_with_replication_authorization(&headers, true)
             .expect("authorized replica status header should parse");
         assert_eq!(authorized.delete_marker_replication_status(), ReplicationStatusType::Replica);
+        // For multipart the on-disk stamp actually comes from the SAME header
+        // at initiate time (create-multipart builds its options through
+        // put_opts_with_replication_authorization and persists user_defined
+        // into the upload's metadata); the completion-time insert asserted
+        // here feeds the anti-cascade must_replicate check on completion.
+        assert_eq!(
+            authorized.user_defined.get(AMZ_BUCKET_REPLICATION_STATUS).map(String::as_str),
+            Some(ReplicationStatusType::Replica.as_str()),
+            "authorized inbound multipart completion must carry REPLICA in its metadata"
+        );
     }
 
     #[test]
@@ -1534,11 +1900,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         insert_header(&mut headers, SUFFIX_SOURCE_MTIME, source_mtime);
+        insert_header(&mut headers, SUFFIX_SOURCE_ETAG, "\"0123456789abcdef0123456789abcdef-3\"");
 
         let untrusted = get_complete_multipart_upload_opts(&headers)
             .expect("ordinary multipart completion options should ignore replication headers");
         assert!(!untrusted.replication_request);
         assert!(untrusted.mod_time.is_none());
+        assert!(untrusted.preserve_etag.is_none());
 
         let authorized = get_complete_multipart_upload_opts_with_replication_authorization(&headers, true)
             .expect("authorized multipart replication options should parse");
@@ -1546,6 +1914,7 @@ mod tests {
             .expect("test source mtime should be valid");
         assert!(authorized.replication_request);
         assert_eq!(authorized.mod_time, Some(expected));
+        assert_eq!(authorized.preserve_etag.as_deref(), Some("0123456789abcdef0123456789abcdef-3"));
 
         insert_header(&mut headers, SUFFIX_SOURCE_MTIME, "invalid-time");
         let invalid = get_complete_multipart_upload_opts_with_replication_authorization(&headers, true)
@@ -2168,5 +2537,81 @@ mod tests {
                 Err(_) => prop_assert!(false, "parse_copy_source_range panicked for input {:?}", input),
             }
         }
+    }
+
+    /// The replication read-proxy anti-loop markers must be honored under
+    /// both interop prefixes (a MinIO peer sends x-minio-, a RustFS peer
+    /// sends both). `proxy_request` is set only for the literal value
+    /// "true", while `proxy_header_set` (MinIO `ProxyHeaderSet`) is set by
+    /// the header's mere presence — "false" (the replication worker's
+    /// convergence-HEAD marker) and arbitrary values included — so the
+    /// selector refuses to proxy either way.
+    #[tokio::test]
+    async fn test_get_opts_parses_source_proxy_request_under_both_prefixes() {
+        for header_name in ["x-rustfs-source-proxy-request", "x-minio-source-proxy-request"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header_name, HeaderValue::from_static("true"));
+            let opts = get_opts("test-bucket", "test-object", None, None, &headers)
+                .await
+                .expect("get_opts should succeed");
+            assert!(opts.proxy_request, "{header_name} must set opts.proxy_request");
+            assert!(opts.proxy_header_set, "{header_name} must set opts.proxy_header_set");
+        }
+
+        let opts = get_opts("test-bucket", "test-object", None, None, &HeaderMap::new())
+            .await
+            .expect("get_opts should succeed");
+        assert!(!opts.proxy_request, "absent header must leave proxy_request off");
+        assert!(!opts.proxy_header_set, "absent header must leave proxy_header_set off");
+
+        for (header_name, value) in [
+            ("x-minio-source-proxy-request", "false"),
+            ("x-rustfs-source-proxy-request", "false"),
+            ("x-minio-source-proxy-request", "anything-else"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header_name, HeaderValue::from_static(value));
+            let opts = get_opts("test-bucket", "test-object", None, None, &headers)
+                .await
+                .expect("get_opts should succeed");
+            assert!(!opts.proxy_request, "{header_name}: non-'true' value must leave proxy_request off");
+            assert!(
+                opts.proxy_header_set,
+                "{header_name}: value {value:?} must still set proxy_header_set (presence disables proxying)"
+            );
+        }
+    }
+
+    /// Pin that the source-proxy-request transport family cannot be
+    /// materialized as bare stored metadata via an `x-*-meta-` disguise: the
+    /// reserved-key namespacing (`x-rustfs-source-` / `x-minio-source-`
+    /// prefixes in `is_reserved_user_metadata_key`) must keep covering it.
+    #[test]
+    fn test_source_proxy_request_family_is_reserved_user_metadata() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-meta-x-minio-source-proxy-request", HeaderValue::from_static("true"));
+        headers.insert("x-rustfs-meta-x-rustfs-source-proxy-request", HeaderValue::from_static("true"));
+        // The bare transport header itself is not a user-metadata prefix and
+        // must never land in stored metadata at all.
+        headers.insert("x-minio-source-proxy-request", HeaderValue::from_static("true"));
+
+        let metadata = extract_metadata(&headers);
+
+        assert!(
+            !metadata.contains_key("x-minio-source-proxy-request"),
+            "bare source-proxy-request key must not be storable: {metadata:?}"
+        );
+        assert!(
+            !metadata.contains_key("x-rustfs-source-proxy-request"),
+            "bare source-proxy-request key must not be storable: {metadata:?}"
+        );
+        assert!(
+            metadata.contains_key("x-amz-meta-x-minio-source-proxy-request"),
+            "disguised key must be namespaced back under x-amz-meta-: {metadata:?}"
+        );
+        assert!(
+            metadata.contains_key("x-amz-meta-x-rustfs-source-proxy-request"),
+            "disguised key must be namespaced back under x-amz-meta-: {metadata:?}"
+        );
     }
 }

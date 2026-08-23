@@ -25,18 +25,30 @@ use lazy_static::lazy_static;
 use rustfs_lock::client::LockClient;
 use std::{
     collections::HashMap,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::SystemTime,
 };
 use tokio::sync::{OnceCell, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
-use uuid::Uuid;
 
 pub const DISK_ASSUME_UNKNOWN_SIZE: u64 = 1 << 30;
 pub const DISK_MIN_INODES: u64 = 1000;
 pub const DISK_FILL_FRACTION: f64 = 0.99;
 pub const DISK_RESERVE_FRACTION: f64 = 0.15;
+
+static GET_METADATA_READ_VERSION_COALESCING_SERVICE_READY: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn mark_get_metadata_read_version_coalescing_service_ready() {
+    GET_METADATA_READ_VERSION_COALESCING_SERVICE_READY.store(true, Ordering::Release);
+}
+
+pub(crate) fn get_metadata_read_version_coalescing_service_ready() -> bool {
+    GET_METADATA_READ_VERSION_COALESCING_SERVICE_READY.load(Ordering::Acquire)
+}
 
 // Global singletons for backward compatibility with MinIO port.
 // These should be migrated to AppContext over time.
@@ -107,18 +119,6 @@ pub fn set_global_rustfs_port(value: u16) {
     if GLOBAL_RUSTFS_PORT.set(value).is_err() {
         warn!("global rustfs port already initialized, ignoring re-initialization");
     }
-}
-
-/// Set the global deployment id
-///
-/// # Arguments
-/// * `id` - The Uuid to set as the global deployment id
-///
-/// # Returns
-/// * None
-///
-pub fn set_global_deployment_id(id: Uuid) {
-    current_ctx().set_deployment_id(id);
 }
 
 /// Get the global deployment id
@@ -288,19 +288,6 @@ pub fn get_global_region() -> Option<s3s::region::Region> {
     current_ctx().region()
 }
 
-/// Initialize the global background services cancellation token
-///
-/// # Arguments
-/// * `cancel_token` - The CancellationToken instance to set globally
-///
-/// # Returns
-/// * `Ok(())` if successful
-/// * `Err(CancellationToken)` if setting fails
-///
-pub fn init_background_services_cancel_token(cancel_token: CancellationToken) -> Result<(), CancellationToken> {
-    current_ctx().init_background_cancel_token(cancel_token)
-}
-
 /// Get the global background services cancellation token
 ///
 /// # Returns
@@ -308,18 +295,6 @@ pub fn init_background_services_cancel_token(cancel_token: CancellationToken) ->
 ///
 pub fn get_background_services_cancel_token() -> Option<CancellationToken> {
     current_ctx().background_cancel_token()
-}
-
-/// Create and initialize the global background services cancellation token
-///
-/// # Returns
-/// * `CancellationToken` - The newly created global cancellation token
-///
-pub fn create_background_services_cancel_token() -> CancellationToken {
-    let cancel_token = CancellationToken::new();
-    init_background_services_cancel_token(cancel_token.clone())
-        .expect("background services cancel token should be initialized once during startup");
-    cancel_token
 }
 
 /// Shutdown all background services gracefully

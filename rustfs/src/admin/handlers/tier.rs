@@ -53,25 +53,18 @@ const EVENT_ADMIN_TIER_STATE: &str = "admin_tier_state";
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct AddTierQuery {
     #[serde(rename = "accessKey")]
-    #[allow(dead_code)]
     pub access_key: Option<String>,
-    #[allow(dead_code)]
     pub status: Option<String>,
     #[serde(rename = "secretKey")]
-    #[allow(dead_code)]
     pub secret_key: Option<String>,
     #[serde(rename = "serviceName")]
-    #[allow(dead_code)]
     pub service_name: Option<String>,
     #[serde(rename = "sessionToken")]
-    #[allow(dead_code)]
     pub session_token: Option<String>,
     pub tier: Option<String>,
     #[serde(rename = "tierName")]
-    #[allow(dead_code)]
     pub tier_name: Option<String>,
     #[serde(rename = "tierType")]
-    #[allow(dead_code)]
     pub tier_type: Option<String>,
     pub force: Option<String>,
 }
@@ -532,7 +525,6 @@ impl Operation for EditTier {
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct BucketQuery {
     #[serde(rename = "bucket")]
-    #[allow(dead_code)]
     pub bucket: String,
 }
 pub struct ListTiers {}
@@ -672,7 +664,6 @@ impl Operation for RemoveTier {
     }
 }
 
-#[allow(dead_code)]
 pub struct VerifyTier {}
 #[async_trait::async_trait]
 impl Operation for VerifyTier {
@@ -776,7 +767,6 @@ fn filter_tier_stats(daily_stats: DailyAllTierStats, tier_name: Option<&str>) ->
         .collect()
 }
 
-#[allow(dead_code)]
 fn map_tier_verify_error(err: std::io::Error) -> S3Error {
     if let Some(admin_err) = err.get_ref().and_then(|inner| inner.downcast_ref::<AdminError>()) {
         return match admin_err.code.as_str() {

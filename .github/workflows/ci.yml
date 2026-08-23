@@ -59,7 +59,7 @@ on:
   merge_group:
     types: [ checks_requested ]
   schedule:
-    - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
+    - cron: "11 0 * * 0" # Weekly on Sunday 00:11 UTC
   workflow_dispatch:
 
 permissions:
@@ -118,7 +118,9 @@ jobs:
           persist-credentials: false
 
       - name: Install ripgrep
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2
+        with:
+          tool: ripgrep@15.2.0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -151,6 +153,18 @@ jobs:
 
       - name: Check s3s footprint ratchet
         run: ./scripts/check_s3s_footprint.sh
+
+      - name: Check cryptographic capability wording
+        run: ./scripts/check_fips_wording.sh
+
+      - name: Check no embedded secret material
+        run: ./scripts/check_embedded_secrets.sh
+
+      - name: Check test wiring
+        run: |
+          python3 ./scripts/check_test_wiring.py --self-test
+          python3 ./scripts/check_scheduled_validation_freshness.py --self-test
+          python3 ./scripts/check_test_wiring.py
 
       - name: Check no planning docs committed
         run: ./scripts/check_no_planning_docs.sh
@@ -389,7 +403,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
     needs: [ quick-checks ]
     runs-on: sm-standard-4
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -429,7 +443,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
     needs: [ quick-checks ]
     runs-on: sm-standard-4
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -459,7 +473,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
     needs: [ quick-checks ]
     runs-on: sm-standard-4
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       # On a PR, one failing protocol leg is enough to know the PR is not ready,
       # so stop the sibling leg instead of paying another ~40 minutes for it.
@@ -533,7 +547,12 @@ jobs:
 
   build-rustfs-debug-binary-rio-v2:
     name: Build RustFS Debug Binary (rio-v2)
-    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    # Dormant rio-v2 variant (rustfs/backlog#1835): the feature ships in no
+    # default build, so this full-suite lane runs only on the weekly schedule
+    # and manual dispatch. Per-PR cfg-seam coverage stays with
+    # test-and-lint-rio-v2. Lifecycle and the promote-or-delete condition:
+    # docs/architecture/minio-file-format-compat.md ("rio-v2 variant lifecycle").
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: [ quick-checks ]
     runs-on: sm-standard-4
     timeout-minutes: 30
@@ -673,9 +692,9 @@ jobs:
       - name: Make binary executable
         run: chmod +x ./target/debug/rustfs
 
-      # Build the e2e test graph once. The archive is reused by the security
-      # count-floor check and the smoke run below, avoiding a second compile of
-      # the same e2e_test target on cold runners (backlog#1645).
+      # Build the e2e test graph once. The archive is reused by the smoke
+      # selection guard, security exact-count check, and run below, avoiding a
+      # second compile of the same e2e_test target on cold runners (backlog#1645).
       - name: Archive e2e smoke test binaries
         env:
           NEXTEST_ARCHIVE: ${{ runner.temp }}/rustfs-e2e-smoke.tar.zst
@@ -683,6 +702,7 @@ jobs:
         run: |
           cargo nextest archive --profile e2e-smoke -p e2e_test --archive-file "${NEXTEST_ARCHIVE}"
           cargo nextest list --profile e2e-smoke --archive-file "${NEXTEST_ARCHIVE}" --message-format json > "${NEXTEST_LISTING}"
+          python3 ./scripts/check_test_wiring.py --check-profile e2e-smoke "${NEXTEST_LISTING}"
           ./scripts/check_security_smoke_count.sh check "${NEXTEST_LISTING}"
 
       # PR smoke subset of the in-repo e2e suite (backlog#1149 ci-4). The
@@ -747,7 +767,7 @@ jobs:
     # suites — KMS, object_lock, multipart_auth, quota, checksum, encryption,
     # security-boundary, ... — via the e2e-full nextest profile. Too heavy for
     # every PR, so it is gated to main pushes, the merge queue, and manual
-    # dispatch. protocols / the 6 cluster suites / replication / #[ignore] are
+    # dispatch. protocols / the 7 cluster suites / replication / #[ignore] are
     # owned by other lanes (see .config/nextest.toml profile.e2e-full).
     if: >-
       github.event_name == 'workflow_dispatch' ||
@@ -807,6 +827,13 @@ jobs:
       - name: Make binary executable
         run: chmod +x ./target/debug/rustfs
 
+      - name: Verify e2e full membership
+        env:
+          NEXTEST_LISTING: ${{ runner.temp }}/rustfs-e2e-full-list.json
+        run: |
+          cargo nextest list --profile e2e-full -p e2e_test --message-format json > "${NEXTEST_LISTING}"
+          python3 ./scripts/check_test_wiring.py --check-profile e2e-full "${NEXTEST_LISTING}"
+
       # Full single-node e2e lane (backlog#1149 ci-5). The e2e-full
       # default-filter in .config/nextest.toml is the single wiring mechanism —
       # extend that filter, never add ad-hoc e2e jobs here. Reuses the downloaded
@@ -819,11 +846,16 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: e2e-full-junit-${{ github.run_number }}
-          path: target/nextest/e2e-full/junit.xml
+          path: |
+            target/nextest/e2e-full/junit.xml
+            ${{ runner.temp }}/rustfs-e2e-full-list.json
           retention-days: 7
 
   e2e-tests-rio-v2:
     name: End-to-End Tests (rio-v2)
+    # Inherits the schedule/dispatch-only gate through needs: on every other
+    # event build-rustfs-debug-binary-rio-v2 is skipped, so this job skips
+    # with it (see the dormant-variant comment on that job).
     needs: [ build-rustfs-debug-binary-rio-v2 ]
     runs-on: sm-standard-2
     timeout-minutes: 30
@@ -1003,3 +1035,37 @@ jobs:
           path: artifacts/s3tests-single/**
           if-no-files-found: ignore
           retention-days: 3
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs:
+      - typos
+      - quick-checks
+      - test-and-lint
+      - test-ilm-integration-serial
+      - test-and-lint-rio-v2
+      - test-and-lint-protocols
+      - build-rustfs-debug-binary
+      - build-rustfs-debug-binary-rio-v2
+      - uring-integration
+      - e2e-tests
+      - e2e-full
+      - e2e-tests-rio-v2
+      - s3-implemented-tests
+      - s3-lifecycle-behavior-tests
+    if: >-
+      always() && github.event_name == 'schedule' &&
+      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}

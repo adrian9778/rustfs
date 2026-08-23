@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::FutureExt;
+#![recursion_limit = "256"]
+
 use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
 use rustfs_scanner::scanner_folder::ScannerItem;
 use rustfs_scanner::scanner_io::ScannerIODisk;
@@ -21,10 +22,8 @@ use rustfs_scanner::{
     scanner::init_data_scanner,
 };
 use s3s::dto::RestoreRequest;
-use serial_test::serial;
 use std::{
     collections::HashMap,
-    env,
     path::{Path, PathBuf},
     sync::{Arc, Once, OnceLock},
     time::Duration,
@@ -204,7 +203,6 @@ async fn setup_isolated_test_env(init_expiry: bool) -> (Vec<PathBuf>, Arc<ECStor
 }
 
 /// Test helper: Create a test bucket
-#[allow(dead_code)]
 async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
     (**ecstore)
         .make_bucket(bucket_name, &Default::default())
@@ -249,7 +247,6 @@ async fn modeled_versioned_delete_opts(bucket: &str, object: &str) -> ObjectOpti
 }
 
 /// Test helper: Set bucket lifecycle configuration
-#[allow(dead_code)]
 async fn set_bucket_lifecycle(bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Create a simple lifecycle configuration XML with 0 days expiry for immediate testing
     let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -272,7 +269,6 @@ async fn set_bucket_lifecycle(bucket_name: &str) -> Result<(), Box<dyn std::erro
 }
 
 /// Test helper: Set bucket lifecycle configuration
-#[allow(dead_code)]
 async fn set_bucket_lifecycle_deletemarker(bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Create lifecycle rule that targets delete-marker cleanup only.
     // Keep Expiration.Days unset to avoid expiring live transitioned object versions.
@@ -295,7 +291,6 @@ async fn set_bucket_lifecycle_deletemarker(bucket_name: &str) -> Result<(), Box<
     Ok(())
 }
 
-#[allow(dead_code)]
 async fn set_bucket_lifecycle_delmarker_expiration(bucket_name: &str, days: i64) -> Result<(), Box<dyn std::error::Error>> {
     let lifecycle_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -318,7 +313,6 @@ async fn set_bucket_lifecycle_delmarker_expiration(bucket_name: &str, days: i64)
     Ok(())
 }
 
-#[allow(dead_code)]
 async fn set_bucket_lifecycle_transition_with_tier(
     bucket_name: &str,
     storage_class: &str,
@@ -366,7 +360,6 @@ async fn object_exists(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bo
 }
 
 /// Test helper: Check if object exists
-#[allow(dead_code)]
 async fn object_is_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bool {
     if let Ok(oi) = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
         println!("oi: {oi:?}");
@@ -377,7 +370,6 @@ async fn object_is_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &
     }
 }
 
-#[allow(dead_code)]
 async fn wait_for_object_absence(ecstore: &Arc<ECStore>, bucket: &str, object: &str, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
 
@@ -540,31 +532,15 @@ async fn wait_for_transition(ecstore: &Arc<ECStore>, bucket: &str, object: &str,
     }
 }
 
-// SAFETY: this helper is used only by `#[serial]` tests and runs under the single-threaded Tokio
-// runtime (`worker_threads = 1`), so no concurrent test can mutate process environment during the
-// `env::set_var` / `env::remove_var` window.
-#[allow(unsafe_code)]
+// Run `test_fn` with `ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT`
+// set to `"1"` for its duration. `temp_env` serializes environment mutations
+// globally, preventing data races when multiple tests run in parallel.
 async fn with_forced_immediate_enqueue_timeout<F, Fut>(test_fn: F)
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let original = env::var_os(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT);
-    unsafe {
-        env::set_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, "1");
-    }
-    let result = std::panic::AssertUnwindSafe(test_fn()).catch_unwind().await;
-    match original {
-        Some(value) => unsafe {
-            env::set_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, value);
-        },
-        None => unsafe {
-            env::remove_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT);
-        },
-    }
-    if let Err(err) = result {
-        std::panic::resume_unwind(err);
-    }
+    temp_env::async_with_vars([(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, Some("1"))], test_fn()).await;
 }
 
 mod serial_tests {
@@ -597,7 +573,6 @@ mod serial_tests {
     ///     body (GET won) or a clean object/version-not-found (expiry won). A
     ///     tier-fetch failure -- the #3491 symptom -- is never tolerated.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-2)"]
     async fn test_expire_transitioned_object_never_races_concurrent_get() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
@@ -743,7 +718,6 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
     async fn rejected_transition_candidate_is_recovered_from_persisted_delete_journal() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
@@ -830,7 +804,6 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
     async fn cancelled_before_cleanup_store_resolution_persists_journal() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
@@ -924,7 +897,6 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
     async fn rejected_transition_cleanup_durability_matrix() {
         #[derive(Clone, Copy)]
@@ -1063,10 +1035,26 @@ mod serial_tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
+    #[test]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
-    async fn test_transition_and_restore_flows() {
+    fn test_transition_and_restore_flows() {
+        std::thread::Builder::new()
+            .name("scanner-transition-restore-flows".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("transition and restore test runtime should build");
+
+                runtime.block_on(test_transition_and_restore_flows_inner());
+            })
+            .expect("transition and restore test thread should spawn")
+            .join()
+            .expect("transition and restore test thread should finish");
+    }
+
+    async fn test_transition_and_restore_flows_inner() {
         let (disk_paths, ecstore) = setup_test_env().await;
 
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
@@ -1373,7 +1361,6 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_scanner_enqueues_free_version_cleanup_for_stale_transitioned_object() {
         let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
@@ -1434,7 +1421,6 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_scanner_cleanup_still_works_after_immediate_compensation_transition() {
         let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
@@ -1492,7 +1478,6 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_existing_object_backfill_is_idempotent_after_immediate_compensation_transition() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
@@ -1535,7 +1520,6 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "FAILING on main: excluded from the serial ILM lane pending a fix, see rustfs/backlog#1148 (ilm-1 partial)"]
     async fn test_noncurrent_expiry_still_works_after_immediate_compensation_transition() {
         let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
@@ -1619,7 +1603,6 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "FAILING on main: excluded from the serial ILM lane pending a fix, see rustfs/backlog#1148 (ilm-1 partial)"]
     async fn test_noncurrent_transition_still_works_after_immediate_compensation_transition() {
         let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
@@ -1702,7 +1685,6 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_modeled_versioned_delete_creates_delete_marker_after_immediate_compensation_transition() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
@@ -1750,7 +1732,6 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_modeled_delete_marker_cleanup_after_immediate_compensation_transition() {
         let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
@@ -1827,7 +1808,6 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_scanner_expires_zero_day_current_version() {
         let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
@@ -1854,7 +1834,6 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_put_object_immediately_enqueues_zero_day_current_expiry() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
@@ -1892,7 +1871,6 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_scanner_expires_zero_day_noncurrent_version() {
         let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
@@ -1959,7 +1937,6 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_put_object_immediately_enqueues_zero_day_noncurrent_expiry() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
@@ -2020,7 +1997,6 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     async fn test_background_scanner_expires_zero_day_current_version() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
 
@@ -2044,7 +2020,6 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_background_scanner_expires_zero_day_current_version_for_exact_key_prefix() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
@@ -2110,7 +2085,6 @@ mod serial_tests {
     /// tier object is untouched (zero `remove` calls) -> GET streams from the
     /// tier again -> a second restore succeeds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8)"]
     async fn test_restore_chain_local_read_expiry_keeps_remote_and_allows_re_restore() {
         let (_disk_paths, ecstore) = setup_test_env().await;
@@ -2242,7 +2216,6 @@ mod serial_tests {
     /// parts) must reassemble the exact part layout: part count and sizes,
     /// the multipart ETag, and byte-identical content across part boundaries.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8)"]
     async fn test_multipart_restore_preserves_parts_and_etag() {
         let (_disk_paths, ecstore) = setup_test_env().await;

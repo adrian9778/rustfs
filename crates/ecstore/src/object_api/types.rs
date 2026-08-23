@@ -24,7 +24,7 @@ use crate::storage_api_contracts::{
 pub struct NamespaceLockFence {
     signals: Arc<Vec<Arc<rustfs_lock::distributed_lock::LockLostSignal>>>,
     #[cfg(test)]
-    forced_lost: Arc<std::sync::atomic::AtomicBool>,
+    forced_lost: Arc<Vec<Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 impl Debug for NamespaceLockFence {
@@ -40,13 +40,17 @@ impl NamespaceLockFence {
         Self {
             signals: Arc::default(),
             #[cfg(test)]
-            forced_lost: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            forced_lost: Arc::new(vec![Arc::new(std::sync::atomic::AtomicBool::new(false))]),
         }
     }
 
     pub(crate) fn is_lock_lost(&self) -> bool {
         #[cfg(test)]
-        if self.forced_lost.load(std::sync::atomic::Ordering::Acquire) {
+        if self
+            .forced_lost
+            .iter()
+            .any(|lost| lost.load(std::sync::atomic::Ordering::Acquire))
+        {
             return true;
         }
         self.signals.iter().any(|signal| signal.is_lost())
@@ -57,27 +61,26 @@ impl NamespaceLockFence {
     }
 
     fn extend(&mut self, other: &Self) {
-        if Arc::ptr_eq(&self.signals, &other.signals) {
-            return;
+        if !Arc::ptr_eq(&self.signals, &other.signals) {
+            Arc::make_mut(&mut self.signals).extend(other.signals.iter().cloned());
         }
-        Arc::make_mut(&mut self.signals).extend(other.signals.iter().cloned());
         #[cfg(test)]
-        if other.forced_lost.load(std::sync::atomic::Ordering::Acquire) {
-            self.forced_lost.store(true, std::sync::atomic::Ordering::Release);
+        if !Arc::ptr_eq(&self.forced_lost, &other.forced_lost) {
+            Arc::make_mut(&mut self.forced_lost).extend(other.forced_lost.iter().cloned());
         }
     }
 
     #[cfg(test)]
     pub(crate) fn lost_for_test() -> Self {
         let fence = Self::new();
-        fence.forced_lost.store(true, std::sync::atomic::Ordering::Release);
+        fence.forced_lost[0].store(true, std::sync::atomic::Ordering::Release);
         fence
     }
 
     #[cfg(test)]
     pub(crate) fn loss_handle_for_test() -> (Self, Arc<std::sync::atomic::AtomicBool>) {
         let fence = Self::new();
-        (fence.clone(), Arc::clone(&fence.forced_lost))
+        (fence.clone(), Arc::clone(&fence.forced_lost[0]))
     }
 }
 
@@ -172,6 +175,7 @@ impl ObjectLockConfigSnapshot {
         }
     }
 
+    #[allow(dead_code, reason = "snapshot-scope predicate asserted by this file's tests (backlog#1823)")]
     pub(crate) fn is_for_store_bucket(
         &self,
         store_id: Uuid,
@@ -211,6 +215,83 @@ impl ObjectLockConfigSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaAdmission {
+    current_usage: u64,
+    quota_limit: u64,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleDeleteAllRequest {
+    pub(crate) version_id: Option<Uuid>,
+    pub(crate) delete_marker: bool,
+    pub(crate) action: rustfs_common::metrics::IlmAction,
+    pub(crate) rule_id: String,
+    pub(crate) phase: LifecycleDeleteAllPhase,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleDeleteAllPhase {
+    Preflight,
+    History,
+    FinalPreflight,
+    Trigger,
+}
+
+#[doc(hidden)]
+#[derive(Default)]
+pub struct LifecycleDeleteAllJournalState {
+    prepared: HashMap<String, crate::bucket::lifecycle::tier_sweeper::Jentry>,
+    mutation_started: bool,
+}
+
+impl Debug for LifecycleDeleteAllJournalState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LifecycleDeleteAllJournalState")
+            .field("prepared_count", &self.prepared.len())
+            .field("mutation_started", &self.mutation_started)
+            .finish()
+    }
+}
+
+impl LifecycleDeleteAllJournalState {
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.prepared.contains_key(name)
+    }
+
+    pub(crate) fn insert(&mut self, name: String, entry: crate::bucket::lifecycle::tier_sweeper::Jentry) {
+        self.prepared.insert(name, entry);
+    }
+
+    pub(crate) fn prepared_entries(&self) -> Vec<crate::bucket::lifecycle::tier_sweeper::Jentry> {
+        self.prepared.values().cloned().collect()
+    }
+
+    pub(crate) fn mark_mutation_started(&mut self) {
+        self.mutation_started = true;
+    }
+
+    pub(crate) fn mutation_started(&self) -> bool {
+        self.mutation_started
+    }
+}
+
+impl QuotaAdmission {
+    pub(crate) fn current_usage(self) -> u64 {
+        self.current_usage
+    }
+
+    pub(crate) fn quota_limit(self) -> u64 {
+        self.quota_limit
+    }
+
+    pub(crate) fn remaining(self) -> u64 {
+        self.quota_limit - self.current_usage
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
@@ -221,6 +302,11 @@ pub struct ObjectOptions {
     pub delete_prefix: bool,
     pub delete_prefix_object: bool,
     pub version_id: Option<String>,
+    /// Lifecycle-only staged purge request checked under the object write lock.
+    #[doc(hidden)]
+    pub lifecycle_delete_all: Option<LifecycleDeleteAllRequest>,
+    #[doc(hidden)]
+    pub lifecycle_delete_all_journal: Option<Arc<parking_lot::Mutex<LifecycleDeleteAllJournalState>>>,
     /// RustFS-only compare-and-set condition checked under the object write lock.
     pub expected_current_version_id: Option<String>,
     /// Persisted bucket incarnation observed before authorization.
@@ -240,6 +326,9 @@ pub struct ObjectOptions {
 
     pub data_movement: bool,
     pub raw_data_movement_read: bool,
+    /// Materialize the data-movement per-part checksum sidecar for APIs that
+    /// return part checksums. Ordinary object reads leave it encoded.
+    pub include_part_checksums: bool,
     pub src_pool_idx: usize,
     pub user_defined: HashMap<String, String>,
     pub preserve_etag: Option<String>,
@@ -253,6 +342,31 @@ pub struct ObjectOptions {
     /// fence avoids recursively acquiring the read lock behind a queued writer.
     pub bucket_lifecycle_lock_fence: Option<NamespaceLockFence>,
     pub replication_request: bool,
+    /// True when the inbound request carried the
+    /// `{x-rustfs-,x-minio-}source-proxy-request` header family with the
+    /// value "true": the request was already proxied by a replication peer,
+    /// so this server must not proxy a local miss onward (anti-loop,
+    /// MinIO-compatible). The header only disables proxying — it grants no
+    /// capability — so no authorization gate is required to honor it.
+    pub proxy_request: bool,
+    /// True when the `source-proxy-request` header family was present at
+    /// all, regardless of value (MinIO's `ProxyHeaderSet`). A replication
+    /// peer sends `source-proxy-request: false` on its worker convergence
+    /// HEADs precisely so the receiver answers locally instead of proxying
+    /// back — otherwise a proxied 404->200 echo makes the worker believe the
+    /// object already converged and it never replicates it.
+    pub proxy_header_set: bool,
+    /// Source-cluster LWW timestamps carried by an authorized replication
+    /// request; None when the source never modified the category. Only the
+    /// replication-authorized options builders may set these.
+    pub replication_tagging_timestamp: Option<OffsetDateTime>,
+    pub replication_retention_timestamp: Option<OffsetDateTime>,
+    pub replication_legalhold_timestamp: Option<OffsetDateTime>,
+    /// Authorized SSE-C replication passthrough: the body is already
+    /// ciphertext, so the write path must not encrypt or compress it and
+    /// stores the restored encryption metadata verbatim. Only the
+    /// replication-authorized options builders may set this.
+    pub preserve_ciphertext: bool,
     pub delete_marker: bool,
     pub synthetic_version_id: bool,
 
@@ -270,12 +384,22 @@ pub struct ObjectOptions {
     pub want_checksum: Option<Checksum>,
     pub skip_verify_bitrot: bool,
     pub capacity_scope_token: Option<Uuid>,
+    /// Server-derived bucket-quota snapshot for commit-boundary admission.
+    pub quota_admission: Option<QuotaAdmission>,
     /// Storage-owned journal writer used by the atomic delete path. This is
     /// populated only by the `ECStore` wrapper that holds the namespace locks.
     pub tier_delete_journal_api: Option<Arc<crate::store::ECStore>>,
 }
 
 impl ObjectOptions {
+    pub fn set_quota_admission(&mut self, current_usage: u64, quota_limit: u64) -> bool {
+        self.quota_admission = (current_usage <= quota_limit).then_some(QuotaAdmission {
+            current_usage,
+            quota_limit,
+        });
+        self.quota_admission.is_some()
+    }
+
     pub(crate) fn overwrites_existing_version(&self) -> bool {
         self.version_id.is_some() || !self.versioned || self.version_suspended
     }
@@ -288,6 +412,22 @@ impl ObjectOptions {
 
     pub(crate) fn ensure_namespace_lock_fence(&mut self) {
         self.namespace_lock_fence.get_or_insert_with(NamespaceLockFence::new);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn add_namespace_lock_fence_for_test(&mut self, fence: &NamespaceLockFence) {
+        self.namespace_lock_fence
+            .get_or_insert_with(NamespaceLockFence::new)
+            .extend(fence);
+    }
+
+    pub(crate) fn ensure_lifecycle_delete_all_journal(&mut self) {
+        self.lifecycle_delete_all_journal
+            .get_or_insert_with(|| Arc::new(parking_lot::Mutex::new(LifecycleDeleteAllJournalState::default())));
+    }
+
+    pub(crate) fn lifecycle_delete_all_journal(&self) -> Option<&Arc<parking_lot::Mutex<LifecycleDeleteAllJournalState>>> {
+        self.lifecycle_delete_all_journal.as_ref()
     }
 
     pub fn add_namespace_lock_guard(&mut self, guard: &rustfs_lock::NamespaceLockGuard) {
@@ -559,6 +699,9 @@ impl ObjectInfo {
     }
 
     pub fn get_actual_size(&self) -> std::io::Result<i64> {
+        if self.actual_size < -1 || (self.actual_size == -1 && !self.is_compressed()) {
+            return Err(std::io::Error::other("invalid negative actual size"));
+        }
         if self.actual_size > 0 {
             return Ok(self.actual_size);
         }
@@ -570,10 +713,25 @@ impl ObjectInfo {
                 let size = size_str.parse::<i64>().map_err(|e| std::io::Error::other(e.to_string()))?;
                 return Ok(size);
             }
-            let mut actual_size = 0;
-            self.parts.iter().for_each(|part| {
-                actual_size += part.actual_size;
-            });
+            if self.actual_size == -1 && self.parts.is_empty() {
+                return Ok(-1);
+            }
+            let mut actual_size = 0_i64;
+            let mut unknown = false;
+            for part in self.parts.iter() {
+                match part.actual_size {
+                    -1 => unknown = true,
+                    size if size >= 0 => {
+                        actual_size = actual_size
+                            .checked_add(size)
+                            .ok_or_else(|| std::io::Error::other("compressed actual size overflow"))?;
+                    }
+                    _ => return Err(std::io::Error::other("invalid negative compressed part size")),
+                }
+            }
+            if unknown {
+                return Ok(-1);
+            }
             if actual_size == 0 && actual_size != self.size {
                 return Err(std::io::Error::other(format!("invalid decompressed size {} {}", actual_size, self.size)));
             }
@@ -588,14 +746,35 @@ impl ObjectInfo {
         Ok(self.size)
     }
 
-    pub fn from_file_info(fi: &FileInfo, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
-        let name = decode_dir_object(object);
+    /// Returns a non-negative size for client and replication boundaries.
+    ///
+    /// Compressed legacy metadata can retain the internal `-1` unknown-size
+    /// sentinel. Those boundaries cannot emit a negative length, so they use
+    /// the persisted physical size while quota accounting keeps the sentinel
+    /// distinction in [`crate::data_usage::quota_object_size`].
+    pub fn get_actual_size_or_physical(&self) -> i64 {
+        self.get_actual_size()
+            .map(|size| if size >= 0 { size } else { self.size.max(0) })
+            .unwrap_or_else(|_| self.size.max(0))
+    }
 
+    pub fn from_file_info(fi: &FileInfo, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
         let mut version_id = fi.version_id;
 
         if versioned && version_id.is_none() {
             version_id = Some(Uuid::nil())
         }
+
+        Self::from_file_info_with_version_id(fi, bucket, object, version_id)
+    }
+
+    pub(crate) fn from_file_info_with_version_id(
+        fi: &FileInfo,
+        bucket: &str,
+        object: &str,
+        version_id: Option<Uuid>,
+    ) -> ObjectInfo {
+        let name = decode_dir_object(object);
 
         // etag
         let (content_type, content_encoding, etag) = {
@@ -952,7 +1131,7 @@ impl ObjectInfo {
                     }
                 };
 
-                // TODO:VersionPurgeStatus
+                // TODO(backlog): handle VersionPurgeStatus in object listing
                 let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
                 objects.push(ObjectInfo::from_file_info(&fi, bucket, &entry.name, versioned));
 
@@ -1041,7 +1220,10 @@ impl ObjectInfo {
         if let Some(data) = &self.checksum {
             if self.is_encrypted() {
                 // Object-level encrypted checksum bytes require SSE decrypt material,
-                // so do not expose them as plaintext checksum headers here.
+                // so do not expose them as plaintext checksum headers here. The
+                // `false` multipart flag feeds the response-path COMPOSITE
+                // fallback; callers that need accurate multipart routing must
+                // consult `is_multipart()` instead of this value.
                 return Ok((HashMap::new(), false));
             }
 
@@ -1508,6 +1690,18 @@ mod tests {
     }
 
     #[test]
+    fn from_file_info_with_version_id_keeps_normalized_absent_version() {
+        let fi = FileInfo {
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        let info = ObjectInfo::from_file_info_with_version_id(&fi, "bucket", "object", None);
+
+        assert_eq!(info.version_id, None, "a normalized absent version must not be rewritten to nil");
+    }
+
+    #[test]
     fn from_file_info_reports_effective_storage_class_for_legacy_metadata() {
         for legacy_label in [
             storageclass::STANDARD_IA,
@@ -1713,6 +1907,34 @@ mod tests {
     }
 
     #[test]
+    fn decrypt_checksums_keeps_encrypted_multipart_flag_false_for_response_paths() {
+        let checksum = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"encrypted-object")
+            .expect("test checksum should be valid");
+        let info = ObjectInfo {
+            checksum: Some(checksum.to_bytes(&[])),
+            // Multipart ETag shape: md5-of-md5s with a part-count suffix.
+            etag: Some("0123456789abcdef0123456789abcdef-3".to_string()),
+            user_defined: Arc::new(HashMap::from([(
+                rustfs_utils::http::headers::AMZ_SERVER_SIDE_ENCRYPTION.to_string(),
+                "AES256".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        let (checksums, is_multipart) = info
+            .decrypt_checksums(0, &HeaderMap::new())
+            .expect("encrypted checksum should fail closed");
+
+        // The response path infers COMPOSITE from is_multipart=true when the
+        // checksum type is unreadable, so encrypted objects must keep the
+        // flag false here even when the object itself is multipart. Callers
+        // that need routing (replication) consult is_multipart() directly.
+        assert!(checksums.is_empty());
+        assert!(!is_multipart);
+        assert!(info.is_multipart());
+    }
+
+    #[test]
     fn decrypt_checksums_keeps_encrypted_part_checksum_metadata() {
         let checksum = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"encrypted-object")
             .expect("test checksum should be valid");
@@ -1799,5 +2021,14 @@ mod tests {
         assert!(default_cloned.user_defined.is_empty());
         assert!(default_cloned.user_tags.is_empty());
         assert!(default_cloned.parts.is_empty());
+    }
+
+    #[test]
+    fn object_options_default_does_not_allocate_lifecycle_delete_all_journal() {
+        let mut opts = ObjectOptions::default();
+
+        assert!(opts.lifecycle_delete_all_journal().is_none());
+        opts.ensure_lifecycle_delete_all_journal();
+        assert!(opts.lifecycle_delete_all_journal().is_some());
     }
 }

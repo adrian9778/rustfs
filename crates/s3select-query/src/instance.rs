@@ -26,7 +26,7 @@ use rustfs_s3select_api::{
         dispatcher::QueryDispatcher,
         execution::QueryStateMachineRef,
         logical_planner::Plan,
-        session::{DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES as DEFAULT_MEMORY_LIMIT_BYTES, SessionCtxFactory},
+        session::{DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES as DEFAULT_MEMORY_LIMIT_BYTES, QueryAdmission, SessionCtxFactory},
     },
     server::dbms::{DatabaseManagerSystem, QueryHandle},
 };
@@ -64,8 +64,18 @@ impl<D> DatabaseManagerSystem for RustFSms<D>
 where
     D: QueryDispatcher,
 {
+    fn try_reserve_query(&self) -> QueryResult<QueryAdmission> {
+        self.query_dispatcher.try_reserve_query()
+    }
+
     async fn execute(&self, query: &Query) -> QueryResult<QueryHandle> {
         let result = self.query_dispatcher.execute_query(query).await?;
+
+        Ok(QueryHandle::new(query.clone(), result))
+    }
+
+    async fn execute_admitted(&self, query: &Query, admission: QueryAdmission) -> QueryResult<QueryHandle> {
+        let result = self.query_dispatcher.execute_query_admitted(query, admission).await?;
 
         Ok(QueryHandle::new(query.clone(), result))
     }
@@ -282,7 +292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live RustFS store with a pre-seeded test object (bucket 'dandan')"]
     async fn test_simple_sql() {
         let sql = "select * from S3Object";
         let input = SelectObjectContentInput {
@@ -344,7 +354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live RustFS store with a pre-seeded test object (bucket 'dandan')"]
     async fn test_func_sql() {
         let sql = "SELECT * FROM S3Object s";
         let input = SelectObjectContentInput {

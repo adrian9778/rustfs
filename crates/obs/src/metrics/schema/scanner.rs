@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
@@ -57,6 +55,24 @@ pub static SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD: LazyLock<MetricDescriptor> = La
         MetricName::Custom("cycle_bucket_drive_result".to_string()),
         "Scanner bucket-drive scan results by cycle scope, server, bucket, drive, and result",
         &[SERVER_LABEL, CYCLE_SCOPE_LABEL, BUCKET_LABEL, DRIVE_LABEL, RESULT_LABEL],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_ACTIVE_BUCKET_DRIVE_SCANS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("active_bucket_drive_scans".to_string()),
+        "Current active scanner bucket-drive scans by server, source, bucket, and drive",
+        &[SERVER_LABEL, SOURCE_LABEL, BUCKET_LABEL, DRIVE_LABEL],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_ACTIVE_BUCKET_DRIVE_SCAN_AGE_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("active_bucket_drive_scan_age_seconds".to_string()),
+        "Age of the oldest active scanner bucket-drive scan by server, source, bucket, and drive",
+        &[SERVER_LABEL, SOURCE_LABEL, BUCKET_LABEL, DRIVE_LABEL],
         subsystems::SCANNER,
     )
 });
@@ -460,7 +476,7 @@ pub static SCANNER_CURRENT_SCAN_MODE_MD: LazyLock<MetricDescriptor> = LazyLock::
 pub static SCANNER_LAST_CYCLE_RESULT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ScannerLastCycleResult,
-        "Last scanner cycle result: 0 unknown, 1 success, 2 error, 3 partial, 4 superseded.",
+        "Last scanner cycle result: 0 unknown, 1 success, 2 error, 3 partial, 4 superseded, 5 deferred.",
         &[],
         subsystems::SCANNER,
     )

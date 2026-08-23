@@ -153,8 +153,6 @@ test_delete_objects_if_match_size
 test_delete_objects_version_if_match
 test_delete_objects_version_if_match_last_modified_time
 test_delete_objects_version_if_match_size
-test_encryption_sse_c_multipart_invalid_chunks_1
-test_encryption_sse_c_multipart_invalid_chunks_2
 test_get_multipart_checksum_object_attributes
 test_head_bucket_usage
 # -----------------------------------------------------------------------------
@@ -200,7 +198,6 @@ test_lifecycle_noncur_cloud_transition
 # -----------------------------------------------------------------------------
 test_list_buckets_anonymous
 test_list_buckets_paginated
-test_list_multipart_upload
 test_list_multipart_upload_owner
 test_multipart_get_part
 test_multipart_single_get_part
@@ -310,3 +307,10 @@ test_object_acl_write
 test_object_acl_writeacp
 test_put_bucket_acl_grant_group_read
 test_object_raw_get_bucket_acl
+
+# Require upstream cloud-storage or IAM account services
+test_bucket_logging_requester_assumed_role
+test_lifecycle_cloud_transition_target_by_bucket
+test_lifecycle_cloud_transition_target_by_bucket_multiple_buckets
+test_list_object_versions_restore_status
+test_list_objects_restore_status

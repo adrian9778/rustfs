@@ -17,9 +17,10 @@ use bytes::Bytes;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::{
-    SUFFIX_COMPRESSION, SUFFIX_DATA_MOVED, SUFFIX_FREE_VERSION, SUFFIX_HEALING, SUFFIX_INLINE_DATA, SUFFIX_TIER_FV_ID,
-    SUFFIX_TIER_FV_MARKER, SUFFIX_TIER_SKIP_FV_ID, contains_key_str, get_str, has_internal_suffix, insert_str,
-    is_encryption_metadata_key, starts_with_ignore_ascii_case,
+    AMZ_OBJECT_TAGGING, SUFFIX_COMPRESSION, SUFFIX_DATA_MOVED, SUFFIX_DATA_MOVED_TAGS, SUFFIX_FREE_VERSION, SUFFIX_HEALING,
+    SUFFIX_INLINE_DATA, SUFFIX_OBJECT_TRANSACTION_EPOCH, SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER, SUFFIX_TIER_SKIP_FV_ID,
+    contains_key_str, get_consistent_str, get_str, has_internal_suffix, insert_str, is_encryption_metadata_key,
+    starts_with_ignore_ascii_case,
 };
 use s3s::dto::{RestoreStatus, Timestamp};
 use s3s::header::X_AMZ_RESTORE;
@@ -41,6 +42,9 @@ const FILEINFO_PART_BITMAP_WORD_BITS: usize = std::mem::size_of::<u64>() * 8;
 const FILEINFO_PART_BITMAP_WORDS: usize = MAX_FILEINFO_PARTS.div_ceil(FILEINFO_PART_BITMAP_WORD_BITS);
 
 // Additional constants from Go version
+// Intentionally duplicated (S3 wire literal): rustfs-replication and
+// rustfs-object-data-cache carry their own independent "null" constants so
+// they stay free of a rustfs-filemeta dependency. Keep all three in sync.
 pub const NULL_VERSION_ID: &str = "null";
 // pub const RUSTFS_ERASURE_UPGRADED: &str = "x-rustfs-internal-erasure-upgraded";
 
@@ -232,6 +236,17 @@ pub enum TransitionVersionState {
     Exact,
 }
 
+impl TransitionVersionState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::KnownDisabled => "known-disabled",
+            Self::SuspendedNull => "suspended-null",
+            Self::Exact => "exact",
+        }
+    }
+}
+
 #[derive(PartialEq, Clone, Default)]
 pub struct FileInfo {
     pub volume: String,
@@ -277,8 +292,13 @@ pub struct FileInfo {
 /// Values of these keys must never reach logs at any level.
 fn is_sensitive_metadata_key(key: &str) -> bool {
     // `is_encryption_metadata_key` covers the x-minio-internal- SSE prefix but not
-    // its x-rustfs-internal- twin, which the dual-key invariant writes alongside it.
-    is_encryption_metadata_key(key) || starts_with_ignore_ascii_case(key, "x-rustfs-internal-server-side-encryption-")
+    // its reserved x-rustfs-internal- twin, which has no writer today but must
+    // stay redacted in case one appears.
+    is_encryption_metadata_key(key)
+        || starts_with_ignore_ascii_case(key, rustfs_utils::http::RUSTFS_INTERNAL_ENCRYPTION_PREFIX)
+        || rustfs_utils::http::REPLICATION_SSE_TRANSPORT_PREFIXES
+            .iter()
+            .any(|prefix| starts_with_ignore_ascii_case(key, prefix))
 }
 
 struct RedactedMetadata<'a>(&'a HashMap<String, String>);
@@ -1146,7 +1166,30 @@ impl FileInfo {
     }
 
     pub fn set_data_moved(&mut self) {
+        let tags_proof = format!("v1:{}", self.metadata.get(AMZ_OBJECT_TAGGING).map(String::as_str).unwrap_or_default());
+        insert_str(&mut self.metadata, SUFFIX_DATA_MOVED_TAGS, tags_proof);
         insert_str(&mut self.metadata, SUFFIX_DATA_MOVED, "true".to_string());
+    }
+
+    pub fn acknowledge_data_movement(&mut self) {
+        // Keep both empty aliases so mixed-version disks retain one metadata identity.
+        insert_str(&mut self.metadata, SUFFIX_DATA_MOVED, String::new());
+    }
+
+    pub fn set_object_transaction_epoch(&mut self, epoch: Uuid) {
+        insert_str(&mut self.metadata, SUFFIX_OBJECT_TRANSACTION_EPOCH, epoch.to_string());
+    }
+
+    pub fn object_transaction_epoch(&self) -> Result<Option<Uuid>> {
+        if !contains_key_str(&self.metadata, SUFFIX_OBJECT_TRANSACTION_EPOCH) {
+            return Ok(None);
+        }
+        let value = get_consistent_str(&self.metadata, SUFFIX_OBJECT_TRANSACTION_EPOCH).ok_or(Error::FileCorrupt)?;
+        let epoch = Uuid::parse_str(value).map_err(|_| Error::FileCorrupt)?;
+        if epoch.is_nil() {
+            return Err(Error::FileCorrupt);
+        }
+        Ok(Some(epoch))
     }
 
     pub fn inline_data(&self) -> bool {
@@ -1459,6 +1502,46 @@ mod tests {
         assert_eq!(ei.get_checksum_info(2).algorithm, HashAlgorithm::SHA256);
         // A part_number with no entry still falls back to the streaming default.
         assert_eq!(ei.get_checksum_info(99).algorithm, HashAlgorithm::HighwayHash256S);
+    }
+
+    #[test]
+    fn object_transaction_epoch_uses_consistent_dual_internal_metadata() {
+        let mut fi = validation_test_fileinfo();
+        assert_eq!(fi.object_transaction_epoch().expect("absent epoch should decode"), None);
+
+        let epoch = Uuid::new_v4();
+        let epoch_text = epoch.to_string();
+        fi.set_object_transaction_epoch(epoch);
+        assert_eq!(fi.object_transaction_epoch().expect("written epoch should decode"), Some(epoch));
+        assert_eq!(fi.metadata.get("x-rustfs-internal-object-transaction-epoch"), Some(&epoch_text));
+        assert_eq!(fi.metadata.get("x-minio-internal-object-transaction-epoch"), Some(&epoch_text));
+
+        let mut rustfs_only = validation_test_fileinfo();
+        rustfs_only
+            .metadata
+            .insert("x-rustfs-internal-object-transaction-epoch".to_string(), epoch_text);
+        assert_eq!(
+            rustfs_only
+                .object_transaction_epoch()
+                .expect("single compatibility key should decode"),
+            Some(epoch)
+        );
+
+        let mut conflicting = fi.clone();
+        conflicting
+            .metadata
+            .insert("x-minio-internal-object-transaction-epoch".to_string(), Uuid::new_v4().to_string());
+        assert_eq!(conflicting.object_transaction_epoch(), Err(Error::FileCorrupt));
+
+        let mut malformed = validation_test_fileinfo();
+        malformed
+            .metadata
+            .insert("x-rustfs-internal-object-transaction-epoch".to_string(), "not-a-uuid".to_string());
+        assert_eq!(malformed.object_transaction_epoch(), Err(Error::FileCorrupt));
+
+        let mut nil = validation_test_fileinfo();
+        nil.set_object_transaction_epoch(Uuid::nil());
+        assert_eq!(nil.object_transaction_epoch(), Err(Error::FileCorrupt));
     }
 
     // backlog#949: distribution range/permutation validation.
@@ -2556,6 +2639,30 @@ mod tests {
         assert!(dump.contains("X-Rustfs-Internal-Server-Side-Encryption-Sealed-Key"));
         assert!(dump.contains(&format!("<redacted {} bytes>", sealed_key.len())));
         // Non-sensitive metadata values keep their diagnostic value.
+        assert!(dump.contains("text/plain"));
+    }
+
+    #[test]
+    fn debug_redacts_replication_sse_transport_metadata_values() {
+        let sealed_key = "IAAfANqt7wIJfVSgFAG3f5S6HuC2eyM5DdJlx7RSJKw2ZakSb3d5";
+        let mut fi = FileInfo::default();
+        for key in [
+            "X-Rustfs-Replication-Server-Side-Encryption-Sealed-Key",
+            "X-Rustfs-Replication-Server-Side-Encryption-Iv",
+            "X-Rustfs-Replication-Encryption-Iv",
+            "X-Rustfs-Replication-Ssec-Key-Md5",
+        ] {
+            fi.metadata.insert(key.to_string(), sealed_key.to_string());
+        }
+        fi.metadata.insert("content-type".to_string(), "text/plain".to_string());
+
+        let dump = format!("{fi:?}");
+        assert!(
+            !dump.contains(sealed_key),
+            "replication SSE transport value leaked into Debug output: {dump}"
+        );
+        assert!(dump.contains("X-Rustfs-Replication-Server-Side-Encryption-Sealed-Key"));
+        assert!(dump.contains(&format!("<redacted {} bytes>", sealed_key.len())));
         assert!(dump.contains("text/plain"));
     }
 

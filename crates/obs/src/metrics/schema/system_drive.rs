@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
@@ -256,6 +254,24 @@ pub static DRIVE_HEALTH_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::DriveHealth,
         "Drive health (0 = offline, 1 = healthy, 2 = healing)",
+        &ALL_DRIVE_LABELS[..],
+        subsystems::SYSTEM_DRIVE,
+    )
+});
+
+pub static DRIVE_WRITES_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::DriveWritesTotal,
+        "Total successful write operations on a drive",
+        &ALL_DRIVE_LABELS[..],
+        subsystems::SYSTEM_DRIVE,
+    )
+});
+
+pub static DRIVE_DELETES_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::DriveDeletesTotal,
+        "Total successful delete operations on a drive",
         &ALL_DRIVE_LABELS[..],
         subsystems::SYSTEM_DRIVE,
     )

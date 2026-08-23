@@ -12,16 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::FileType;
 use std::io::ErrorKind;
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ReplTargetSizeSummary;
 use crate::data_usage_define::{
-    DATA_USAGE_SCAN_CHECKPOINT_VERSION, DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageScanCheckpoint,
-    DataUsageScanCheckpointReason, PendingScannerHeal, PendingScannerHealKind, SizeSummary, hash_path,
+    DATA_USAGE_SCAN_CHECKPOINT_VERSION, DataUsageCache, DataUsageCacheInfo, DataUsageEntry, DataUsageHash, DataUsageHashMap,
+    DataUsageScanCheckpoint, DataUsageScanCheckpointReason, PendingScannerHeal, PendingScannerHealKind, ScannerSizeSummaryExt,
+    SizeReconciliationEntry, SizeSummary, hash_path,
 };
 use crate::error::ScannerError;
 use crate::runtime_config::{
@@ -32,6 +33,7 @@ use crate::scanner_io::{
     SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _, is_scanner_metadata_corrupt_error, is_scanner_metadata_transient_error,
 };
 use crate::sleeper::DynamicSleeper;
+use crate::storage_api::owner::{EcstoreEventArgs, ecstore_send_event};
 use metrics::{counter, describe_counter};
 use rustfs_common::heal_channel::{
     HEAL_DELETE_DANGLING, HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest,
@@ -41,9 +43,13 @@ use rustfs_common::metrics::{
     CloseDiskGuard, IlmAction, Metric, Metrics, ScannerReplicationRepairKind, ScannerSourceWorkUpdate, ScannerWorkSource,
     UpdateCurrentPathFn, current_path_updater, global_metrics,
 };
-use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit, trace_subscriber_count};
+use rustfs_filemeta::{
+    MAX_META_CACHE_HEAL_CANDIDATES, MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS, MetaCacheEntries, MetaCacheEntry,
+    MetaCacheHealCandidateKind,
+};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
-use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
+use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, VersioningConfiguration};
 use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc;
@@ -51,10 +57,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::{
-    BucketVersioningSys, Disk, DiskError, DiskInfoOptions, Evaluator, Event, LcEventSrc, ListPathRawOptions, ObjectOpts,
-    ReplicationConfig, ReplicationHealObject, ReplicationQueueAdmission, ReplicationStatusType, STORAGE_FORMAT_FILE,
-    ScannerDiskExt as _, ScannerLifecycleConfigExt as _, ScannerVersioningConfigExt as _, StorageError, apply_expiry_rule,
-    apply_transition_rule, enqueue_runtime_newer_noncurrent, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
+    Disk, DiskError, DiskInfoOptions, Evaluator, Event, LcEventSrc, ListPathRawOptions, ObjectOpts, ReplicationConfig,
+    ReplicationHealObject, ReplicationQueueAdmission, ReplicationStatusType, STORAGE_FORMAT_FILE, ScannerDiskExt as _,
+    ScannerLifecycleConfigExt as _, ScannerVersioningConfigExt as _, StorageError, apply_expiry_rule, apply_transition_rule,
+    enqueue_runtime_newer_noncurrent, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
     path2_bucket_object_with_base_path, queue_replication_heal, scanner_is_erasure,
     scanner_replication_config_for_lifecycle_eval,
 };
@@ -65,10 +71,10 @@ const LOG_SUBSYSTEM_FOLDER: &str = "folder";
 const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
 const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_SCANNER_FOLDER_STATE: &str = "scanner_folder_state";
+const EVENT_SCANNER_METADATA_CORRUPT: &str = "scanner_metadata_corrupt";
 const EVENT_SCANNER_LIFECYCLE_ACTION: &str = "scanner_lifecycle_action";
 const EVENT_SCANNER_HEAL_ADMISSION: &str = "scanner_heal_admission";
 const EVENT_SCANNER_ALERT_STATE: &str = "scanner_alert_state";
-const EVENT_SCANNER_COMPAT_STATE: &str = "scanner_compat_state";
 
 const DATA_USAGE_UPDATE_DIR_CYCLES: u32 = 16;
 const DATA_SCANNER_COMPACT_LEAST_OBJECT: usize = 500;
@@ -89,17 +95,118 @@ const ENV_FAILED_OBJECTS_MAX: &str = "RUSTFS_DATA_USAGE_FAILED_OBJECTS_MAX";
 const DEFAULT_FAILED_OBJECT_TTL_SECS: u32 = 86_400;
 const DEFAULT_FAILED_OBJECTS_MAX: u32 = 10_000;
 const DEFAULT_SCANNER_DEEP_VERIFY_COOLDOWN_SECS: u64 = 60;
-const METRIC_SCANNER_INLINE_HEAL_TOTAL: &str = "rustfs_scanner_inline_heal_total";
 const METRIC_SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL: &str = "rustfs_scanner_excess_object_versions_total";
 const METRIC_SCANNER_EXCESS_OBJECT_VERSION_SIZE_TOTAL: &str = "rustfs_scanner_excess_object_version_size_total";
 const METRIC_SCANNER_EXCESS_FOLDERS_TOTAL: &str = "rustfs_scanner_excess_folders_total";
 const METRIC_SCANNER_PENDING_HEAL_PRUNE_TOTAL: &str = "rustfs_scanner_pending_heal_prune_total";
 const METRIC_SCANNER_PENDING_HEAL_MALFORMED_TOTAL: &str = "rustfs_scanner_pending_heal_malformed_total";
+const METRIC_SCANNER_HEAL_DISCOVERY_CANDIDATES_TOTAL: &str = "rustfs_scanner_heal_discovery_candidates_total";
+const METRIC_SCANNER_HEAL_DISCOVERY_SUB_QUORUM_TOTAL: &str = "rustfs_scanner_heal_discovery_sub_quorum_total";
+const METRIC_SCANNER_HEAL_DISCOVERY_UNVERIFIED_TOTAL: &str = "rustfs_scanner_heal_discovery_unverified_total";
+const METRIC_SCANNER_HEAL_DISCOVERY_QUEUED_TOTAL: &str = "rustfs_scanner_heal_discovery_queued_total";
+const METRIC_SCANNER_HEAL_DISCOVERY_TRUNCATED_TOTAL: &str = "rustfs_scanner_heal_discovery_truncated_total";
 const MAX_PENDING_SCANNER_HEAL_RETRIES_PER_BUCKET: usize = 128;
-const MAX_PENDING_SCANNER_HEALS_PER_BUCKET: usize = 10_000;
+const MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET: usize = 10_000;
+const MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET: usize = 8 * 1024 * 1024;
+const MAX_SIZE_RECONCILIATION_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
-static SCANNER_INLINE_HEAL_WARN_ONCE: Once = Once::new();
-static SCANNER_INLINE_HEAL_METRICS_ONCE: Once = Once::new();
+// --- scanner excess alerts as S3 notification events (rustfs/backlog#1868) --
+//
+// The excess-versions / excess-version-size / excess-folders alerts were
+// metrics-and-logs only; subscribers (consoles, external auditors) had no way
+// to hear them. MinIO emits s3:ObjectManyVersions / s3:ObjectLargeVersions /
+// s3:PrefixManyFolders for the same conditions — RustFS carries those as
+// EventName::Scanner* with the wire names below. Without a cooldown a single
+// over-threshold object would re-emit on every scan cycle (~a minute), so
+// emissions are edge-held per (kind, bucket, object) for 24h.
+
+/// `s3:Scanner:ManyVersions` (MinIO `s3:ObjectManyVersions`).
+pub const EVENT_SCANNER_MANY_VERSIONS: &str = "s3:Scanner:ManyVersions";
+/// `s3:Scanner:LargeVersions` (MinIO `s3:ObjectLargeVersions`).
+pub const EVENT_SCANNER_LARGE_VERSIONS: &str = "s3:Scanner:LargeVersions";
+/// `s3:Scanner:BigPrefix` (MinIO `s3:PrefixManyFolders`).
+pub const EVENT_SCANNER_BIG_PREFIX: &str = "s3:Scanner:BigPrefix";
+const ENV_SCANNER_ALERT_COOLDOWN_SECS: &str = "RUSTFS_SCANNER_ALERT_COOLDOWN_SECS";
+const DEFAULT_SCANNER_ALERT_COOLDOWN_SECS: u64 = 86_400;
+/// Hard cap on distinct cooldown keys; a pathological number of over-threshold
+/// objects clears the map wholesale instead of growing without bound (the
+/// worst case is one re-emission per still-hot key per scan cycle).
+const MAX_SCANNER_ALERT_COOLDOWN_KEYS: usize = 4096;
+
+/// Distinct alert kinds sharing one cooldown map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ScannerAlertKind {
+    ManyVersions,
+    LargeVersions,
+    BigPrefix,
+}
+
+type ScannerAlertCooldownKey = (ScannerAlertKind, String, String);
+type ScannerAlertCooldownMap = HashMap<ScannerAlertCooldownKey, Instant>;
+
+static SCANNER_ALERT_EMISSION_COOLDOWN: Mutex<Option<ScannerAlertCooldownMap>> = Mutex::new(None);
+
+fn scanner_alert_cooldown() -> Duration {
+    let raw = std::env::var(ENV_SCANNER_ALERT_COOLDOWN_SECS)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    Duration::from_secs(raw.unwrap_or(DEFAULT_SCANNER_ALERT_COOLDOWN_SECS))
+}
+
+/// Edge-held emission gate: returns `true` (and records the cooldown) only
+/// when this (kind, bucket, object) last fired longer than the cooldown ago —
+/// or never. Metrics and logs stay level-triggered every cycle; only the
+/// notification events are held back.
+fn scanner_alert_emission_allows(kind: ScannerAlertKind, bucket: &str, object: &str, cooldown: Duration) -> bool {
+    let key = (kind, bucket.to_string(), object.to_string());
+    let mut guard = SCANNER_ALERT_EMISSION_COOLDOWN
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let guard = guard.get_or_insert_with(ScannerAlertCooldownMap::new);
+    let now = Instant::now();
+    // Expired entries leave first; the cap is still exceeded only when live
+    // keys alone overflow it, in which case a wholesale clear trades one
+    // extra emission per hot key for a hard memory bound.
+    if guard.len() >= MAX_SCANNER_ALERT_COOLDOWN_KEYS {
+        guard.retain(|_, fired_at| now.duration_since(*fired_at) < cooldown);
+        if guard.len() >= MAX_SCANNER_ALERT_COOLDOWN_KEYS {
+            guard.clear();
+        }
+    }
+    match guard.get(&key) {
+        Some(fired_at) if now.duration_since(*fired_at) < cooldown => false,
+        _ => {
+            guard.insert(key, now);
+            true
+        }
+    }
+}
+
+/// Emit a scanner alert as an S3 notification event through the standard
+/// dispatch pipeline. Fire-and-forget: the notify layer owns delivery,
+/// retry, and target filtering; the scanner never waits on it.
+fn emit_scanner_alert_event(event_name: &str, bucket: &str, object: &str, size: i64, details: &[(&str, String)]) {
+    let mut req_params = HashMap::with_capacity(details.len());
+    for (key, value) in details {
+        req_params.insert((*key).to_string(), value.clone());
+    }
+    ecstore_send_event(EcstoreEventArgs {
+        event_name: event_name.to_string(),
+        bucket_name: bucket.to_string(),
+        object: crate::ScannerObjectInfo {
+            bucket: bucket.to_string(),
+            name: object.to_string(),
+            size,
+            ..Default::default()
+        },
+        req_params,
+        user_agent: "Scanner".to_string(),
+        ..Default::default()
+    });
+}
+const MAX_PENDING_SCANNER_HEALS_PER_BUCKET: usize = 10_000;
+const MAX_PENDING_SCANNER_HEAL_AGE_SECS: u64 = 24 * 60 * 60;
+
 static SCANNER_ALERT_METRICS_ONCE: Once = Once::new();
 
 #[cfg(test)]
@@ -151,27 +258,6 @@ fn effective_object_heal_scan_mode(heal_bitrot: bool, mod_time: Option<OffsetDat
     } else {
         HealScanMode::Deep
     }
-}
-
-fn scanner_inline_heal_enabled() -> bool {
-    scanner_inline_heal_enabled_from_value(std::env::var(rustfs_config::ENV_SCANNER_INLINE_HEAL_ENABLE).ok().as_deref())
-}
-
-fn scanner_inline_heal_enabled_from_value(value: Option<&str>) -> bool {
-    match value {
-        Some(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"),
-        None => rustfs_config::DEFAULT_SCANNER_INLINE_HEAL_ENABLE,
-    }
-}
-
-fn ensure_scanner_inline_heal_metric_registered() {
-    SCANNER_INLINE_HEAL_METRICS_ONCE.call_once(|| {
-        describe_counter!(
-            METRIC_SCANNER_INLINE_HEAL_TOTAL,
-            "Total number of inline heal operations executed directly by scanner."
-        );
-        counter!(METRIC_SCANNER_INLINE_HEAL_TOTAL).increment(0);
-    });
 }
 
 fn ensure_scanner_alert_metrics_registered() {
@@ -290,7 +376,7 @@ impl PendingScannerAccounting<'_> {
     fn apply(self, size_summary: &mut SizeSummary, cumulative_size: &mut i64, queued: bool) {
         let size = if queued { self.expired_size } else { self.retained_size };
         size_summary.actions_accounting(self.object, size, self.retained_size);
-        *cumulative_size += size;
+        *cumulative_size = cumulative_size.saturating_add(size);
     }
 }
 
@@ -407,26 +493,115 @@ fn should_alert_excessive_versions(remaining_versions: usize, cumulative_size: i
     (too_many_versions, too_large_versions)
 }
 
-fn warn_inline_heal_compat_requested() {
-    if !scanner_inline_heal_enabled() {
-        return;
-    }
+fn non_negative_i64_to_u64(value: i64) -> u64 {
+    value.max(0) as u64
+}
 
-    SCANNER_INLINE_HEAL_WARN_ONCE.call_once(|| {
-        warn!(
-            target: "rustfs::scanner::folder",
-            event = EVENT_SCANNER_COMPAT_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_HEAL,
-            env = rustfs_config::ENV_SCANNER_INLINE_HEAL_ENABLE,
-            state = "inline_heal_rollback_unsupported",
-            "Scanner inline-heal rollback is unsupported; using async heal admission"
-        );
+fn trace_start_instant() -> Option<Instant> {
+    (trace_subscriber_count() > 0).then(Instant::now)
+}
+
+fn emit_scanner_folder_trace(root: &str, folder: &str, objects: u64, started_at: Option<Instant>, state: &'static str) {
+    let Some(started_at) = started_at else {
+        return;
+    };
+
+    trace_emit(|| {
+        let (bucket, prefix) = path2_bucket_object_with_base_path(root, folder);
+        TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerFolder)
+            .with_bucket(bucket)
+            .with_object(prefix)
+            .with_duration(started_at.elapsed())
+            .with_attr("state", state)
+            .with_attr("objects", objects)
     });
 }
 
-fn non_negative_i64_to_u64(value: i64) -> u64 {
-    value.max(0) as u64
+fn emit_scanner_ilm_action_trace(
+    bucket: &str,
+    object: &str,
+    action: IlmAction,
+    count: u64,
+    queued: bool,
+    started_at: Option<Instant>,
+) {
+    let Some(started_at) = started_at else {
+        return;
+    };
+
+    let state = if queued { "queued" } else { "not_queued" };
+    trace_emit(|| {
+        TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerIlmAction)
+            .with_bucket(bucket)
+            .with_object(object)
+            .with_duration(started_at.elapsed())
+            .with_attr("state", state)
+            .with_attr("action", action.as_str())
+            .with_attr("count", count)
+            .with_attr("queued", queued)
+    });
+}
+
+struct ScannerHealCandidateTraceContext {
+    bucket: String,
+    object: Option<String>,
+    version_id: Option<String>,
+    scan_mode: Option<HealScanMode>,
+    started_at: Instant,
+}
+
+fn scanner_heal_candidate_trace_context(request: &HealChannelRequest) -> Option<ScannerHealCandidateTraceContext> {
+    let started_at = trace_start_instant()?;
+    Some(ScannerHealCandidateTraceContext {
+        bucket: request.bucket.clone(),
+        object: request.object_prefix.clone(),
+        version_id: request.object_version_id.clone(),
+        scan_mode: request.scan_mode,
+        started_at,
+    })
+}
+
+struct ScannerHealCandidateTrace<'a> {
+    candidate_type: &'static str,
+    bucket: &'a str,
+    object: Option<&'a str>,
+    version_id: Option<&'a str>,
+    priority: HealChannelPriority,
+    scan_mode: Option<HealScanMode>,
+    result: Result<HealAdmissionResult, &'a str>,
+    started_at: Instant,
+}
+
+fn emit_scanner_heal_candidate_trace(trace: ScannerHealCandidateTrace<'_>) {
+    trace_emit(|| {
+        let (state, admission, error) = match trace.result {
+            Ok(result) if result.is_admitted() => ("admitted", describe_heal_admission(result), None),
+            Ok(result) => ("not_admitted", describe_heal_admission(result), None),
+            Err(error) => ("submit_failed", "channel_error".to_string(), Some(error)),
+        };
+        let mut event = TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerHealCandidate)
+            .with_bucket(trace.bucket)
+            .with_duration(trace.started_at.elapsed())
+            .with_attr("state", state)
+            .with_attr("candidate_type", trace.candidate_type)
+            .with_attr("priority", heal_priority_label(trace.priority))
+            .with_attr("admission", admission);
+
+        if let Some(object) = trace.object {
+            event = event.with_object(object);
+        }
+        if let Some(version_id) = trace.version_id {
+            event = event.with_attr("version_id", version_id);
+        }
+        if let Some(scan_mode) = trace.scan_mode {
+            event = event.with_attr("scan_mode", scan_mode.as_str());
+        }
+        if let Some(error) = error {
+            event = event.with_attr("error", error);
+        }
+
+        event
+    });
 }
 
 fn apply_scanner_size_summary(into: &mut DataUsageEntry, summary: &SizeSummary) {
@@ -463,836 +638,6 @@ fn apply_scanner_size_summary(into: &mut DataUsageEntry, summary: &SizeSummary) 
     }
 
     into.add_tier_sizes(&summary.tier_stats);
-}
-
-/// Cached folder information for scanning
-#[derive(Clone, Debug)]
-pub struct CachedFolder {
-    pub name: String,
-    pub parent: Option<DataUsageHash>,
-    pub object_heal_prob_div: u32,
-}
-
-/// Type alias for get size function
-pub type GetSizeFn = Box<dyn Fn(ScannerItem) -> Result<SizeSummary, StorageError> + Send + Sync>;
-
-#[derive(Debug, PartialEq, Eq)]
-enum GetSizeFailureAction {
-    Skip,
-    RecordFailed,
-    HealMetadata { object: String },
-}
-
-fn build_bucket_heal_request(bucket: String, priority: HealChannelPriority) -> HealChannelRequest {
-    HealChannelRequest {
-        bucket,
-        priority,
-        recreate_missing: Some(false),
-        source: HealRequestSource::Scanner,
-        ..Default::default()
-    }
-}
-
-fn build_object_heal_request(
-    bucket: String,
-    object: String,
-    version_id: Option<String>,
-    scan_mode: HealScanMode,
-    priority: HealChannelPriority,
-) -> HealChannelRequest {
-    HealChannelRequest {
-        bucket,
-        object_prefix: Some(object),
-        object_version_id: version_id,
-        priority,
-        scan_mode: Some(scan_mode),
-        remove_corrupted: Some(HEAL_DELETE_DANGLING),
-        recreate_missing: Some(false),
-        source: HealRequestSource::Scanner,
-        ..Default::default()
-    }
-}
-
-fn pending_scanner_heal_candidate_type(kind: PendingScannerHealKind) -> &'static str {
-    match kind {
-        PendingScannerHealKind::Bucket => "bucket",
-        PendingScannerHealKind::Object => "object",
-    }
-}
-
-fn pending_scanner_heal_matches(
-    entry: &PendingScannerHeal,
-    kind: PendingScannerHealKind,
-    bucket: &str,
-    object: Option<&str>,
-    version_id: Option<&str>,
-) -> bool {
-    entry.kind == kind && entry.bucket == bucket && entry.object.as_deref() == object && entry.version_id.as_deref() == version_id
-}
-
-fn pending_scanner_heal_identity(entry: &PendingScannerHeal) -> (u8, &str, Option<&str>, Option<&str>) {
-    let kind = match entry.kind {
-        PendingScannerHealKind::Bucket => 0,
-        PendingScannerHealKind::Object => 1,
-    };
-    (kind, entry.bucket.as_str(), entry.object.as_deref(), entry.version_id.as_deref())
-}
-
-fn sort_pending_scanner_heals_for_retry(entries: &mut [PendingScannerHeal]) {
-    entries.sort_by(|a, b| {
-        a.last_attempt
-            .cmp(&b.last_attempt)
-            .then_with(|| a.attempts.cmp(&b.attempts))
-            .then_with(|| pending_scanner_heal_identity(a).cmp(&pending_scanner_heal_identity(b)))
-    });
-}
-
-fn pending_scanner_heal_retry_candidates(pending_heals: &[PendingScannerHeal], bucket: &str) -> Vec<PendingScannerHeal> {
-    let mut entries: Vec<PendingScannerHeal> = pending_heals.iter().filter(|entry| entry.bucket == bucket).cloned().collect();
-    sort_pending_scanner_heals_for_retry(&mut entries);
-    entries.truncate(MAX_PENDING_SCANNER_HEAL_RETRIES_PER_BUCKET);
-    entries
-}
-
-fn build_pending_scanner_heal_request(entry: &PendingScannerHeal) -> Option<HealChannelRequest> {
-    match entry.kind {
-        PendingScannerHealKind::Bucket => Some(build_bucket_heal_request(entry.bucket.clone(), HealChannelPriority::High)),
-        PendingScannerHealKind::Object => entry.object.as_ref().map(|object| {
-            build_object_heal_request(
-                entry.bucket.clone(),
-                object.clone(),
-                entry.version_id.clone(),
-                entry.scan_mode,
-                HealChannelPriority::High,
-            )
-        }),
-    }
-}
-
-fn resolve_object_heal_entry(entries: &MetaCacheEntries, resolver: MetadataResolutionParams) -> Option<MetaCacheEntry> {
-    if let Some(entry) = entries.resolve(resolver) {
-        return entry.is_object().then_some(entry);
-    }
-
-    entries
-        .as_ref()
-        .iter()
-        .flatten()
-        .find(|entry| entry.is_object() && !entry.name.ends_with(SLASH_SEPARATOR))
-        .cloned()
-}
-
-fn is_missing_path_disk_error(err: &DiskError) -> bool {
-    matches!(err, DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound)
-}
-
-fn disk_errors_are_only_missing_paths(errs: &[Option<DiskError>]) -> bool {
-    let mut saw_missing_path = false;
-    for err in errs.iter().flatten() {
-        if !is_missing_path_disk_error(err) {
-            return false;
-        }
-        saw_missing_path = true;
-    }
-    saw_missing_path
-}
-
-fn heal_priority_label(priority: HealChannelPriority) -> &'static str {
-    match priority {
-        HealChannelPriority::Low => "low",
-        HealChannelPriority::Normal => "normal",
-        HealChannelPriority::High => "high",
-        HealChannelPriority::Critical => "critical",
-    }
-}
-
-fn describe_heal_admission(result: HealAdmissionResult) -> String {
-    match result {
-        HealAdmissionResult::Accepted | HealAdmissionResult::Merged => result.result_label().to_string(),
-        HealAdmissionResult::Full => "queue_full".to_string(),
-        HealAdmissionResult::Dropped(reason) => format!("dropped:{}", reason.as_str()),
-    }
-}
-
-fn record_high_priority_heal_escalation(
-    candidate_type: &'static str,
-    priority: HealChannelPriority,
-    result: HealAdmissionResult,
-) {
-    counter!(
-        "rustfs_heal_candidate_priority_reject_total",
-        "type" => candidate_type.to_string(),
-        "priority" => heal_priority_label(priority).to_string(),
-        "result" => result.result_label().to_string(),
-        "reason" => result.reason_label().to_string()
-    )
-    .increment(1);
-}
-
-fn build_high_priority_heal_admission_error(
-    candidate_type: &'static str,
-    bucket: &str,
-    object: Option<&str>,
-    priority: HealChannelPriority,
-    result: HealAdmissionResult,
-) -> ScannerError {
-    let object_text = object.map(|object| format!(", object='{object}'")).unwrap_or_default();
-    ScannerError::Other(format!(
-        "high-priority heal request was not admitted: type={candidate_type}, bucket='{bucket}'{object_text}, priority={}, admission={}",
-        heal_priority_label(priority),
-        describe_heal_admission(result)
-    ))
-}
-
-fn record_heal_candidate_admission(candidate_type: &'static str, priority: HealChannelPriority, result: HealAdmissionResult) {
-    counter!(
-        "rustfs_heal_candidate_enqueue_total",
-        "type" => candidate_type.to_string(),
-        "priority" => heal_priority_label(priority).to_string(),
-        "result" => result.result_label().to_string()
-    )
-    .increment(1);
-
-    if matches!(result, HealAdmissionResult::Merged) {
-        counter!(
-            "rustfs_heal_candidate_merge_total",
-            "type" => candidate_type.to_string()
-        )
-        .increment(1);
-    }
-
-    if let HealAdmissionResult::Dropped(reason) = result {
-        counter!(
-            "rustfs_heal_candidate_drop_total",
-            "type" => candidate_type.to_string(),
-            "reason" => reason.as_str().to_string()
-        )
-        .increment(1);
-    }
-}
-
-async fn send_scanner_heal_request(
-    candidate_type: &'static str,
-    request: HealChannelRequest,
-) -> Result<HealAdmissionResult, ScannerError> {
-    let priority = request.priority;
-    match send_heal_request_with_admission(request).await {
-        Ok(result) => {
-            record_heal_candidate_admission(candidate_type, priority, result);
-            Ok(result)
-        }
-        Err(err) => {
-            counter!(
-                "rustfs_heal_candidate_enqueue_total",
-                "type" => candidate_type.to_string(),
-                "priority" => heal_priority_label(priority).to_string(),
-                "result" => "channel_error".to_string()
-            )
-            .increment(1);
-            Err(ScannerError::Other(err))
-        }
-    }
-}
-
-/// Scanner item representing a file during scanning
-#[derive(Clone, Debug)]
-pub struct ScannerItem {
-    pub path: String,
-    pub bucket: String,
-    pub prefix: String,
-    pub object_name: String,
-    pub file_type: FileType,
-    pub lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
-    pub object_lock: Option<Arc<ObjectLockConfiguration>>,
-    pub replication: Option<Arc<ReplicationConfig>>,
-    pub heal_enabled: bool,
-    pub heal_bitrot: bool,
-    pub debug: bool,
-}
-
-impl ScannerItem {
-    /// Get the object path (prefix + object_name)
-    pub fn object_path(&self) -> String {
-        if self.prefix.is_empty() {
-            self.object_name.clone()
-        } else {
-            path_join_buf(&[&self.prefix, &self.object_name])
-        }
-    }
-
-    /// Transform meta directory by splitting prefix and extracting object name
-    /// This converts a directory path like "bucket/dir1/dir2/file" to prefix="bucket/dir1/dir2" and object_name="file"
-    pub fn transform_meta_dir(&mut self) {
-        let prefix = self.prefix.clone(); // Clone to avoid borrow checker issues
-        let split: Vec<&str> = prefix.split(SLASH_SEPARATOR).collect();
-
-        if split.len() > 1 {
-            let prefix_parts: Vec<&str> = split[..split.len() - 1].to_vec();
-            self.prefix = path_join_buf(&prefix_parts);
-        } else {
-            self.prefix = String::new();
-        }
-
-        // Object name is the last element
-        self.object_name = split.last().unwrap_or(&"").to_string();
-    }
-
-    fn metadata_object_path(&self) -> String {
-        let mut item = self.clone();
-        item.transform_meta_dir();
-        item.object_path()
-    }
-
-    pub async fn apply_actions(
-        &mut self,
-        object_infos: Vec<ObjectInfo>,
-        lock_retention: Option<Arc<ObjectLockConfiguration>>,
-        size_summary: &mut SizeSummary,
-    ) {
-        if object_infos.is_empty() {
-            debug!(
-                target: "rustfs::scanner::folder",
-                event = EVENT_SCANNER_LIFECYCLE_ACTION,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                object_path = %self.object_path(),
-                state = "no_object_versions",
-                "Scanner lifecycle action skipped"
-            );
-            return;
-        }
-        debug!(
-            target: "rustfs::scanner::folder",
-            event = EVENT_SCANNER_LIFECYCLE_ACTION,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-            object_path = %self.object_path(),
-            state = "started",
-            "Scanner lifecycle evaluation started"
-        );
-
-        let versioning_config = match BucketVersioningSys::get(&self.bucket).await {
-            Ok(versioning_config) => versioning_config,
-            Err(_) => {
-                warn!(
-                    target: "rustfs::scanner::folder",
-                    event = EVENT_SCANNER_LIFECYCLE_ACTION,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    bucket = %self.bucket,
-                    state = "versioning_lookup_failed_defaulting",
-                    "Scanner lifecycle action falling back to default bucket versioning"
-                );
-                Default::default()
-            }
-        };
-
-        let Some(lifecycle) = self.lifecycle.as_ref() else {
-            let mut cumulative_size = 0;
-            for oi in object_infos.iter() {
-                let actual_size = match oi.get_actual_size() {
-                    Ok(size) => size,
-                    Err(_) => {
-                        warn!(
-                            target: "rustfs::scanner::folder",
-                            event = EVENT_SCANNER_LIFECYCLE_ACTION,
-                            component = LOG_COMPONENT_SCANNER,
-                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                            bucket = %self.bucket,
-                            object = %oi.name,
-                            state = "size_lookup_failed",
-                            "Scanner lifecycle action used fallback size"
-                        );
-                        continue;
-                    }
-                };
-
-                let size = self.heal_actions(oi, actual_size, size_summary).await;
-
-                size_summary.actions_accounting(oi, size, actual_size);
-
-                cumulative_size += size;
-            }
-
-            self.alert_excessive_versions(object_infos.len(), cumulative_size);
-
-            debug!(
-                target: "rustfs::scanner::folder",
-                event = EVENT_SCANNER_LIFECYCLE_ACTION,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                object_path = %self.object_path(),
-                state = "no_lifecycle_config",
-                "Scanner lifecycle action finished without lifecycle rules"
-            );
-            return;
-        };
-
-        let object_opts = object_infos
-            .iter()
-            .map(crate::ecstore_object_opts_from_object_info)
-            .collect::<Vec<ObjectOpts>>();
-
-        let events = match Evaluator::new(lifecycle.clone())
-            .with_lock_retention(lock_retention)
-            .with_replication_config(scanner_replication_config_for_lifecycle_eval(self.replication.clone()))
-            .eval(&object_opts)
-            .await
-        {
-            Ok(events) => events,
-            Err(e) => {
-                warn!(
-                    target: "rustfs::scanner::folder",
-                    event = EVENT_SCANNER_LIFECYCLE_ACTION,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    object_path = %self.object_path(),
-                    state = "evaluate_failed",
-                    error = %e,
-                    "Scanner lifecycle action evaluation failed"
-                );
-                return;
-            }
-        };
-
-        // Every version handed to the evaluator counts as an ILM-checked
-        // version, whether or not a rule matched (NoneAction included). This is
-        // reached only for buckets with lifecycle rules; it feeds
-        // rustfs_ilm_versions_scanned_total via the Lifecycle source's checked
-        // counter.
-        global_metrics().record_scanner_source_checked(ScannerWorkSource::Lifecycle, object_opts.len() as u64);
-
-        let mut to_delete_objs: Vec<ObjectToDelete> = Vec::new();
-        let mut noncurrent_events: Vec<Event> = Vec::new();
-        let mut noncurrent_accounting: Vec<PendingScannerAccounting<'_>> = Vec::new();
-        let mut cumulative_size = 0;
-        let mut remaining_versions = object_infos.len();
-        'eventLoop: {
-            for (i, event) in events.iter().enumerate() {
-                let oi = &object_infos[i];
-                let actual_size = match oi.get_actual_size() {
-                    Ok(size) => size,
-                    Err(_) => {
-                        warn!(
-                            target: "rustfs::scanner::folder",
-                            event = EVENT_SCANNER_LIFECYCLE_ACTION,
-                            component = LOG_COMPONENT_SCANNER,
-                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                            bucket = %self.bucket,
-                            object = %oi.name,
-                            state = "size_lookup_failed",
-                            "Scanner lifecycle action used fallback size"
-                        );
-                        0
-                    }
-                };
-
-                let mut size = actual_size;
-                let mut account_now = true;
-
-                match event.action {
-                    IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => {
-                        debug!(
-                            target: "rustfs::scanner::folder",
-                            event = EVENT_SCANNER_LIFECYCLE_ACTION,
-                            component = LOG_COMPONENT_SCANNER,
-                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                            bucket = %self.bucket,
-                            object = %oi.name,
-                            action = %event.action,
-                            state = "apply_expiry_rule",
-                            "Scanner lifecycle action dispatched"
-                        );
-                        let done_ilm = Metrics::time_ilm(event.action);
-                        let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
-                        if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
-                            done_ilm(1)();
-                            remaining_versions = 0;
-                        } else {
-                            PendingScannerAccounting {
-                                object: oi,
-                                retained_size: actual_size,
-                                expired_size: 0,
-                            }
-                            .apply(size_summary, &mut cumulative_size, false);
-                            for retained in object_infos.iter().skip(i + 1) {
-                                let retained_size = match retained.get_actual_size() {
-                                    Ok(size) => size,
-                                    Err(_) => {
-                                        warn!(
-                                            target: "rustfs::scanner::folder",
-                                            event = EVENT_SCANNER_LIFECYCLE_ACTION,
-                                            component = LOG_COMPONENT_SCANNER,
-                                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                                            bucket = %self.bucket,
-                                            object = %retained.name,
-                                            state = "size_lookup_failed",
-                                            "Scanner lifecycle action used fallback size"
-                                        );
-                                        0
-                                    }
-                                };
-                                PendingScannerAccounting {
-                                    object: retained,
-                                    retained_size,
-                                    expired_size: 0,
-                                }
-                                .apply(size_summary, &mut cumulative_size, false);
-                            }
-                        }
-                        break 'eventLoop;
-                    }
-
-                    IlmAction::DeleteAction | IlmAction::DeleteRestoredAction | IlmAction::DeleteRestoredVersionAction => {
-                        debug!(
-                            target: "rustfs::scanner::folder",
-                            event = EVENT_SCANNER_LIFECYCLE_ACTION,
-                            component = LOG_COMPONENT_SCANNER,
-                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                            bucket = %self.bucket,
-                            object = %oi.name,
-                            action = %event.action,
-                            state = "apply_expiry_rule",
-                            "Scanner lifecycle action dispatched"
-                        );
-                        let done_ilm = Metrics::time_ilm(event.action);
-                        let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
-                        if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
-                            done_ilm(1)();
-                            if !versioning_config.prefix_enabled(&self.object_path()) && event.action == IlmAction::DeleteAction {
-                                remaining_versions -= 1;
-                                size = 0;
-                            }
-                        }
-                    }
-                    IlmAction::DeleteVersionAction => {
-                        if let Some(opt) = object_opts.get(i) {
-                            to_delete_objs.push(ObjectToDelete {
-                                object_name: opt.name.clone(),
-                                version_id: opt.version_id,
-                                ..Default::default()
-                            });
-                            noncurrent_accounting.push(PendingScannerAccounting {
-                                object: oi,
-                                retained_size: actual_size,
-                                expired_size: 0,
-                            });
-                            account_now = false;
-                        }
-                        noncurrent_events.push(event.clone());
-                    }
-                    IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
-                        debug!(
-                            target: "rustfs::scanner::folder",
-                            event = EVENT_SCANNER_LIFECYCLE_ACTION,
-                            component = LOG_COMPONENT_SCANNER,
-                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                            bucket = %self.bucket,
-                            object = %oi.name,
-                            action = %event.action,
-                            state = "apply_transition_rule",
-                            "Scanner lifecycle action dispatched"
-                        );
-                        let done_ilm = Metrics::time_ilm(event.action);
-                        let queued = apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
-                        if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
-                            done_ilm(1)();
-                        }
-                    }
-
-                    IlmAction::NoneAction | IlmAction::ActionCount => {
-                        size = self.heal_actions(oi, actual_size, size_summary).await;
-                    }
-                }
-
-                if account_now {
-                    size_summary.actions_accounting(oi, size, actual_size);
-                    cumulative_size += size;
-                }
-            }
-        }
-
-        if !to_delete_objs.is_empty()
-            && let Some(event) = noncurrent_events.first().cloned()
-        {
-            let action = event.action;
-            let count = u64::try_from(to_delete_objs.len()).unwrap_or(u64::MAX);
-            let done_ilm = Metrics::time_ilm(action);
-            let queued = enqueue_runtime_newer_noncurrent(&self.bucket, to_delete_objs, event, &LcEventSrc::Scanner).await;
-            if record_scanner_ilm_action_if_queued(global_metrics(), action, count, queued) {
-                done_ilm(count)();
-                remaining_versions = remaining_versions.saturating_sub(noncurrent_accounting.len());
-            }
-            for pending in noncurrent_accounting {
-                pending.apply(size_summary, &mut cumulative_size, queued);
-            }
-        }
-        self.alert_excessive_versions(remaining_versions, cumulative_size);
-    }
-
-    async fn heal_actions(&mut self, oi: &ObjectInfo, actual_size: i64, size_summary: &mut SizeSummary) -> i64 {
-        if self.heal_enabled {
-            warn_inline_heal_compat_requested();
-            self.enqueue_heal(oi).await;
-        }
-
-        self.heal_replication(oi, size_summary).await;
-
-        actual_size
-    }
-
-    async fn heal_replication(&mut self, oi: &ObjectInfo, size_summary: &mut SizeSummary) {
-        if oi.version_id.is_none_or(|version| version.is_nil()) && !oi.delete_marker && oi.version_purge_status.is_empty() {
-            return;
-        }
-
-        let Some(replication) = self.replication.clone() else {
-            return;
-        };
-
-        let done_replication = Metrics::time(Metric::CheckReplication);
-        let replication_result = queue_replication_heal(&oi.bucket, oi.clone(), (*replication).clone(), 0).await;
-        done_replication();
-        let roi = replication_result.object_info;
-        record_scanner_replication_admission(global_metrics(), &roi, replication_result.admission);
-        if !Self::should_account_replication_stats(oi) {
-            return;
-        }
-
-        for (arn, target_status) in roi.target_statuses.iter() {
-            if !size_summary.repl_target_stats.contains_key(arn.as_str()) {
-                size_summary
-                    .repl_target_stats
-                    .insert(arn.clone(), ReplTargetSizeSummary::default());
-            }
-
-            if let Some(repl_target_size_summary) = size_summary.repl_target_stats.get_mut(arn.as_str()) {
-                match target_status {
-                    ReplicationStatusType::Pending => {
-                        repl_target_size_summary.pending_size = repl_target_size_summary.pending_size.saturating_add(roi.size);
-                        repl_target_size_summary.pending_count = repl_target_size_summary.pending_count.saturating_add(1);
-                        size_summary.pending_size = size_summary.pending_size.saturating_add(roi.size);
-                        size_summary.pending_count = size_summary.pending_count.saturating_add(1);
-                    }
-                    ReplicationStatusType::Failed => {
-                        repl_target_size_summary.failed_size = repl_target_size_summary.failed_size.saturating_add(roi.size);
-                        repl_target_size_summary.failed_count = repl_target_size_summary.failed_count.saturating_add(1);
-                        size_summary.failed_size = size_summary.failed_size.saturating_add(roi.size);
-                        size_summary.failed_count = size_summary.failed_count.saturating_add(1);
-                    }
-                    ReplicationStatusType::Completed | ReplicationStatusType::CompletedLegacy => {
-                        repl_target_size_summary.replicated_size =
-                            repl_target_size_summary.replicated_size.saturating_add(roi.size);
-                        repl_target_size_summary.replicated_count = repl_target_size_summary.replicated_count.saturating_add(1);
-                        size_summary.replicated_size = size_summary.replicated_size.saturating_add(roi.size);
-                        size_summary.replicated_count = size_summary.replicated_count.saturating_add(1);
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if oi.replication_status == ReplicationStatusType::Replica {
-            size_summary.replica_size = size_summary.replica_size.saturating_add(roi.size);
-            size_summary.replica_count = size_summary.replica_count.saturating_add(1);
-        }
-    }
-
-    fn should_account_replication_stats(oi: &ObjectInfo) -> bool {
-        !oi.delete_marker && oi.version_purge_status.is_empty()
-    }
-
-    async fn enqueue_heal(&mut self, oi: &ObjectInfo) {
-        let done_heal = Metrics::time(Metric::HealAbandonedObject);
-        let object = if oi.name.is_empty() {
-            self.object_path()
-        } else {
-            oi.name.clone()
-        };
-        debug!(
-            target: "rustfs::scanner::folder",
-            event = EVENT_SCANNER_HEAL_ADMISSION,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_HEAL,
-            bucket = %self.bucket,
-            object = %object,
-            version_id = %oi.version_id.unwrap_or_default(),
-            state = "request_started",
-            "Scanner heal admission started"
-        );
-
-        let now = OffsetDateTime::now_utc();
-        let scan_mode = effective_object_heal_scan_mode(self.heal_bitrot, oi.mod_time, now);
-        if self.heal_bitrot && scan_mode != HealScanMode::Deep {
-            let cooldown = deep_verify_cooldown();
-            let age_secs = oi.mod_time.map(|mod_time| {
-                let age = now - mod_time;
-                age.whole_seconds().max(0)
-            });
-            debug!(
-                target: "rustfs::scanner::folder",
-                event = EVENT_SCANNER_HEAL_ADMISSION,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_HEAL,
-                bucket = %self.bucket,
-                object = %object,
-                version_id = %oi.version_id.unwrap_or_default(),
-                object_age_secs = age_secs.unwrap_or_default(),
-                cooldown_secs = cooldown.as_secs(),
-                original_scan_mode = %HealScanMode::Deep.as_str(),
-                effective_scan_mode = %scan_mode.as_str(),
-                state = "downgraded_to_normal",
-                "Scanner heal deep scan downgraded"
-            );
-        }
-
-        let result = send_scanner_heal_request(
-            "object",
-            build_object_heal_request(
-                self.bucket.clone(),
-                object.clone(),
-                oi.version_id
-                    .and_then(|v| if v.is_nil() { None } else { Some(v.to_string()) }),
-                scan_mode,
-                HealChannelPriority::Low,
-            ),
-        )
-        .await;
-
-        let admission = result.as_ref().copied().map_err(|_| ());
-        let admitted = record_scanner_heal_admission(global_metrics(), scan_mode, admission);
-        match result {
-            Ok(HealAdmissionResult::Accepted | HealAdmissionResult::Merged) => {}
-            Ok(result @ (HealAdmissionResult::Full | HealAdmissionResult::Dropped(_))) => {
-                warn!(
-                    target: "rustfs::scanner::folder",
-                    event = EVENT_SCANNER_HEAL_ADMISSION,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_HEAL,
-                    bucket = %self.bucket,
-                    object = %object,
-                    admission = %describe_heal_admission(result),
-                    state = "not_admitted",
-                    "Scanner heal admission rejected low-priority request"
-                );
-            }
-            Err(e) => warn!(
-                target: "rustfs::scanner::folder",
-                event = EVENT_SCANNER_HEAL_ADMISSION,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_HEAL,
-                bucket = %self.bucket,
-                object = %object,
-                state = "submit_failed",
-                error = %e,
-                "Scanner heal admission submission failed"
-            ),
-        }
-        if admitted {
-            done_heal();
-        }
-    }
-
-    fn alert_excessive_versions(&self, remaining_versions: usize, cumulative_size: i64) {
-        ensure_scanner_alert_metrics_registered();
-        let (too_many_versions, too_large_versions) = should_alert_excessive_versions(remaining_versions, cumulative_size);
-        if too_many_versions {
-            global_metrics().record_scanner_source_executed(ScannerWorkSource::Alerts, 1);
-            counter!(
-                METRIC_SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL,
-                "bucket" => self.bucket.clone()
-            )
-            .increment(1);
-            warn!(
-                target: "rustfs::scanner::folder",
-                event = EVENT_SCANNER_ALERT_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_FOLDER,
-                bucket = %self.bucket,
-                object = %self.object_path(),
-                versions = remaining_versions,
-                threshold = scanner_excess_versions_threshold(),
-                state = "excess_versions",
-                "Scanner alert recorded excessive retained versions"
-            );
-        }
-        if too_large_versions {
-            global_metrics().record_scanner_source_executed(ScannerWorkSource::Alerts, 1);
-            counter!(
-                METRIC_SCANNER_EXCESS_OBJECT_VERSION_SIZE_TOTAL,
-                "bucket" => self.bucket.clone()
-            )
-            .increment(1);
-            warn!(
-                target: "rustfs::scanner::folder",
-                event = EVENT_SCANNER_ALERT_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_FOLDER,
-                bucket = %self.bucket,
-                object = %self.object_path(),
-                versions = remaining_versions,
-                cumulative_size,
-                threshold = scanner_excess_version_size_threshold(),
-                state = "excess_version_size",
-                "Scanner alert recorded excessive retained version size"
-            );
-        }
-    }
-}
-
-fn classify_get_size_failure(item: &ScannerItem, err: &StorageError) -> GetSizeFailureAction {
-    if matches!(err, StorageError::Io(io) if io.to_string() == SCANNER_SKIP_FILE_ERROR) {
-        return GetSizeFailureAction::Skip;
-    }
-
-    if is_scanner_metadata_corrupt_error(err) {
-        return GetSizeFailureAction::HealMetadata {
-            object: item.metadata_object_path(),
-        };
-    }
-
-    if is_scanner_metadata_transient_error(err) {
-        return GetSizeFailureAction::RecordFailed;
-    }
-
-    GetSizeFailureAction::RecordFailed
-}
-
-async fn contains_erasure_part_file(path: &str) -> Result<bool, ScannerError> {
-    let mut entries = match tokio::fs::read_dir(path).await {
-        Ok(entries) => entries,
-        Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => return Ok(false),
-        Err(err) => return Err(ScannerError::Io(err)),
-    };
-
-    for _ in 0..ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT {
-        let entry = match entries.next_entry().await {
-            Ok(Some(entry)) => entry,
-            Ok(None) => return Ok(false),
-            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => return Ok(false),
-            Err(err) => return Err(ScannerError::Io(err)),
-        };
-        let file_name = entry.file_name();
-        let Some(part_number) = file_name
-            .to_str()
-            .and_then(|name| name.strip_prefix("part."))
-            .and_then(|number| number.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if part_number == 0 {
-            continue;
-        }
-
-        match entry.file_type().await {
-            Ok(file_type) if file_type.is_file() => return Ok(true),
-            Ok(_) => {}
-            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::TooManyLinks) => {}
-            Err(err) => return Err(ScannerError::Io(err)),
-        }
-    }
-
-    Ok(false)
 }
 
 fn data_usage_root_has_progress(root: &DataUsageEntry) -> bool {
@@ -1338,8 +683,63 @@ pub struct FolderScanner {
     skip_heal: Arc<std::sync::atomic::AtomicBool>,
     local_disk: Arc<Disk>,
     pending_heals_changed: bool,
+    pending_size_reconciliation_keys: HashSet<String>,
+    pending_size_reconciliation_scopes: HashSet<String>,
+    pending_size_reconciliation_truncated: bool,
     #[cfg(test)]
     list_path_raw_options_observer: Option<mpsc::UnboundedSender<ListPathRawTimeoutSnapshot>>,
+}
+
+fn size_reconciliation_entry_bytes(entry: &SizeReconciliationEntry) -> usize {
+    entry.key.len()
+        + entry.bucket.len()
+        + entry.object.len()
+        + entry.version_id.as_deref().map_or(0, str::len)
+        + entry.generation.as_deref().map_or(0, str::len)
+        + entry.reason.len()
+        + std::mem::size_of::<u64>()
+        + std::mem::size_of::<u32>()
+}
+
+fn size_reconciliation_scope_key(bucket: &str, object: &str) -> String {
+    format!("{}:{}|{}:{}", bucket.len(), bucket, object.len(), object)
+}
+
+fn prune_size_reconciliation(info: &mut DataUsageCacheInfo, now: u64) {
+    info.size_reconciliation.retain(|key, entry| {
+        if entry.first_seen == 0 || entry.first_seen > now {
+            entry.first_seen = now;
+        }
+        key == &entry.key
+            && entry.key.len() <= 4096
+            && entry.bucket.len() <= 512
+            && entry.object.len() <= 512
+            && entry.version_id.as_deref().is_none_or(|value| value.len() <= 64)
+            && entry.generation.as_deref().is_none_or(|value| value.len() <= 64)
+            && entry.reason.len() <= 64
+            && now.saturating_sub(entry.first_seen) <= MAX_SIZE_RECONCILIATION_AGE_SECS
+    });
+
+    while info.size_reconciliation.len() > MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET
+        || info
+            .size_reconciliation
+            .values()
+            .map(size_reconciliation_entry_bytes)
+            .sum::<usize>()
+            > MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET
+    {
+        let oldest = info
+            .size_reconciliation
+            .iter()
+            .min_by(|(left_key, left), (right_key, right)| {
+                left.first_seen.cmp(&right.first_seen).then_with(|| left_key.cmp(right_key))
+            })
+            .map(|(key, _)| key.clone());
+        let Some(oldest) = oldest else {
+            break;
+        };
+        info.size_reconciliation.remove(&oldest);
+    }
 }
 
 impl FolderScanner {
@@ -1379,118 +779,6 @@ impl FolderScanner {
         }
     }
 
-    fn sync_pending_heals(&mut self) {
-        self.update_cache.info.pending_heals = self.new_cache.info.pending_heals.clone();
-        self.pending_heals_changed = true;
-    }
-
-    fn clear_pending_scanner_heal(
-        &mut self,
-        kind: PendingScannerHealKind,
-        bucket: &str,
-        object: Option<&str>,
-        version_id: Option<&str>,
-    ) {
-        let before = self.new_cache.info.pending_heals.len();
-        self.new_cache
-            .info
-            .pending_heals
-            .retain(|entry| !pending_scanner_heal_matches(entry, kind, bucket, object, version_id));
-        if self.new_cache.info.pending_heals.len() != before {
-            self.sync_pending_heals();
-        }
-    }
-
-    fn record_pending_scanner_heal(
-        &mut self,
-        kind: PendingScannerHealKind,
-        bucket: &str,
-        object: Option<&str>,
-        version_id: Option<&str>,
-        scan_mode: HealScanMode,
-        result: HealAdmissionResult,
-    ) {
-        let now = Self::now_secs();
-        if let Some(entry) = self
-            .new_cache
-            .info
-            .pending_heals
-            .iter_mut()
-            .find(|entry| pending_scanner_heal_matches(entry, kind, bucket, object, version_id))
-        {
-            entry.last_attempt = now;
-            entry.attempts = entry.attempts.saturating_add(1);
-            entry.last_admission_result = result.result_label().to_string();
-            entry.last_admission_reason = result.reason_label().to_string();
-            self.sync_pending_heals();
-            return;
-        }
-
-        self.new_cache.info.pending_heals.push(PendingScannerHeal {
-            kind,
-            bucket: bucket.to_string(),
-            object: object.map(ToOwned::to_owned),
-            version_id: version_id.map(ToOwned::to_owned),
-            scan_mode,
-            first_seen: now,
-            last_attempt: now,
-            attempts: 1,
-            last_admission_result: result.result_label().to_string(),
-            last_admission_reason: result.reason_label().to_string(),
-        });
-        self.prune_pending_scanner_heals();
-        self.sync_pending_heals();
-    }
-
-    fn prune_pending_scanner_heals(&mut self) {
-        let len = self.new_cache.info.pending_heals.len();
-        if len <= MAX_PENDING_SCANNER_HEALS_PER_BUCKET {
-            return;
-        }
-
-        sort_pending_scanner_heals_for_retry(&mut self.new_cache.info.pending_heals);
-        let remove_count = len.saturating_sub(MAX_PENDING_SCANNER_HEALS_PER_BUCKET);
-        self.new_cache.info.pending_heals.drain(..remove_count);
-        counter!(
-            METRIC_SCANNER_PENDING_HEAL_PRUNE_TOTAL,
-            "bucket" => self.new_cache.info.name.clone()
-        )
-        .increment(u64::try_from(remove_count).unwrap_or(u64::MAX));
-        warn!(
-            target: "rustfs::scanner::folder",
-            event = EVENT_SCANNER_HEAL_ADMISSION,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_HEAL,
-            bucket = %self.new_cache.info.name,
-            pruned = remove_count,
-            remaining = self.new_cache.info.pending_heals.len(),
-            state = "pending_heal_pruned",
-            "Scanner pending heal ledger pruned oldest entries"
-        );
-    }
-
-    fn update_pending_scanner_heal_after_admission(
-        &mut self,
-        kind: PendingScannerHealKind,
-        bucket: &str,
-        object: Option<&str>,
-        version_id: Option<&str>,
-        scan_mode: HealScanMode,
-        result: HealAdmissionResult,
-    ) {
-        match result {
-            HealAdmissionResult::Accepted | HealAdmissionResult::Merged => {
-                self.clear_pending_scanner_heal(kind, bucket, object, version_id);
-            }
-            HealAdmissionResult::Full | HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull) => {
-                self.record_pending_scanner_heal(kind, bucket, object, version_id, scan_mode, result);
-            }
-            HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped) => {
-                self.clear_pending_scanner_heal(kind, bucket, object, version_id);
-            }
-        }
-    }
-
     fn prune_failed_objects_cache(&mut self) {
         let ttl = self.failed_object_ttl_secs;
         if ttl == 0 {
@@ -1524,6 +812,60 @@ impl FolderScanner {
         let remove_count = failed.len().saturating_sub(max_entries);
         for (key, _) in entries.into_iter().take(remove_count) {
             failed.remove(&key);
+        }
+    }
+
+    /// Apply the per-object size-resolution ledger updates in one place. The
+    /// scanner cache is the durable boundary; both working copies are updated
+    /// so an incremental publication cannot lose a debt or its resolution.
+    fn apply_size_reconciliation(&mut self, summary: &SizeSummary) {
+        let now = Self::now_secs();
+        self.pending_size_reconciliation_keys
+            .extend(summary.size_reconciliation.iter().map(|entry| entry.key.clone()));
+        self.pending_size_reconciliation_scopes.extend(
+            summary
+                .reconciliation_scopes
+                .iter()
+                .map(|scope| size_reconciliation_scope_key(&scope.bucket, &scope.object)),
+        );
+        self.pending_size_reconciliation_truncated |= summary.size_reconciliation_truncated;
+
+        for info in [&mut self.new_cache.info, &mut self.update_cache.info] {
+            for incoming in &summary.size_reconciliation {
+                if let Some(existing) = info.size_reconciliation.get_mut(&incoming.key) {
+                    existing.reason = incoming.reason.clone();
+                    existing.physical_size = incoming.physical_size;
+                    existing.generation = incoming.generation.clone();
+                    existing.version_id = incoming.version_id.clone();
+                    existing.attempts = existing.attempts.saturating_add(1);
+                    continue;
+                }
+
+                if size_reconciliation_entry_bytes(incoming) > MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET {
+                    continue;
+                }
+
+                let mut entry = incoming.clone();
+                entry.first_seen = now;
+                entry.attempts = 1;
+                info.size_reconciliation.insert(entry.key.clone(), entry);
+            }
+        }
+    }
+
+    fn finish_size_reconciliation_batch(&mut self) {
+        let now = Self::now_secs();
+        let current_keys = std::mem::take(&mut self.pending_size_reconciliation_keys);
+        let scopes = std::mem::take(&mut self.pending_size_reconciliation_scopes);
+        let truncated = std::mem::replace(&mut self.pending_size_reconciliation_truncated, false);
+
+        for info in [&mut self.new_cache.info, &mut self.update_cache.info] {
+            if !truncated {
+                info.size_reconciliation.retain(|key, entry| {
+                    !scopes.contains(&size_reconciliation_scope_key(&entry.bucket, &entry.object)) || current_keys.contains(key)
+                });
+            }
+            prune_size_reconciliation(info, now);
         }
     }
 
@@ -1610,6 +952,15 @@ impl FolderScanner {
             "root" => self.root.clone()
         )
         .increment(1);
+        if scanner_alert_emission_allows(ScannerAlertKind::BigPrefix, &self.root, folder, scanner_alert_cooldown()) {
+            emit_scanner_alert_event(
+                EVENT_SCANNER_BIG_PREFIX,
+                &self.root,
+                folder,
+                0,
+                &[("folders", total_folders.to_string()), ("threshold", threshold.to_string())],
+            );
+        }
         warn!(
             target: "rustfs::scanner::folder",
             event = EVENT_SCANNER_ALERT_STATE,
@@ -1653,7 +1004,7 @@ impl FolderScanner {
         object: Option<String>,
         version_id: Option<String>,
         request: HealChannelRequest,
-    ) -> Result<(), ScannerError> {
+    ) -> Result<HealAdmissionResult, ScannerError> {
         let candidate_type = pending_scanner_heal_candidate_type(kind);
         let priority = request.priority;
         let scan_mode = request.scan_mode.unwrap_or(self.scan_mode);
@@ -1681,7 +1032,7 @@ impl FolderScanner {
                     error = %err,
                     "Scanner deferred heal request after channel error"
                 );
-                return Ok(());
+                return Ok(HealAdmissionResult::Full);
             }
         };
         self.update_pending_scanner_heal_after_admission(
@@ -1693,7 +1044,7 @@ impl FolderScanner {
             result,
         );
         if result.is_admitted() {
-            return Ok(());
+            return Ok(result);
         }
 
         record_high_priority_heal_escalation(candidate_type, priority, result);
@@ -1714,54 +1065,9 @@ impl FolderScanner {
             state = "high_priority_not_admitted",
             "Scanner high-priority heal admission failed"
         );
-        Ok(())
+        Ok(result)
     }
 
-    async fn retry_pending_scanner_heals(&mut self) -> Result<(), ScannerError> {
-        if !self.should_heal().await {
-            return Ok(());
-        }
-
-        let bucket = self.new_cache.info.name.clone();
-        for pending in pending_scanner_heal_retry_candidates(&self.new_cache.info.pending_heals, &bucket) {
-            if !self.should_heal().await {
-                break;
-            }
-
-            let Some(request) = build_pending_scanner_heal_request(&pending) else {
-                self.clear_pending_scanner_heal(pending.kind, &pending.bucket, None, pending.version_id.as_deref());
-                counter!(
-                    METRIC_SCANNER_PENDING_HEAL_MALFORMED_TOTAL,
-                    "bucket" => pending.bucket.clone(),
-                    "type" => pending_scanner_heal_candidate_type(pending.kind).to_string()
-                )
-                .increment(1);
-                warn!(
-                    target: "rustfs::scanner::folder",
-                    event = EVENT_SCANNER_HEAL_ADMISSION,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_HEAL,
-                    bucket = %pending.bucket,
-                    state = "pending_heal_malformed",
-                    "Scanner dropped malformed pending heal entry"
-                );
-                continue;
-            };
-
-            self.send_required_scanner_heal_request(
-                pending.kind,
-                pending.bucket.clone(),
-                pending.object.clone(),
-                pending.version_id.clone(),
-                request,
-            )
-            .await?;
-        }
-
-        Ok(())
-    }
-
-    /// Set heal object select probability
     pub fn set_heal_object_select(&mut self, prob: u32) {
         self.heal_object_select = prob;
     }
@@ -1829,6 +1135,7 @@ impl FolderScanner {
         into: &mut DataUsageEntry,
     ) -> Result<(), ScannerError> {
         let done_folder = Metrics::time(Metric::ScanFolder);
+        let trace_started_at = trace_start_instant();
 
         if ctx.is_cancelled() {
             return Err(ScannerError::Other("Operation cancelled".to_string()));
@@ -2154,35 +1461,79 @@ impl FolderScanner {
                             self.record_failed(&item.path);
 
                             if should_log_failed_object(into.failed_objects) {
-                                warn!(
-                                    target: "rustfs::scanner::folder",
-                                    event = EVENT_SCANNER_FOLDER_STATE,
-                                    component = LOG_COMPONENT_SCANNER,
-                                    subsystem = LOG_SUBSYSTEM_FOLDER,
-                                    path = %item.path,
-                                    failed_objects = into.failed_objects,
-                                    state = "get_size_failed",
-                                    error = %e,
-                                    "Scanner folder failed to get object size"
-                                );
+                                if let GetSizeFailureAction::HealMetadata { object } = &failure_action {
+                                    error!(
+                                        target: "rustfs::scanner::folder",
+                                        event = EVENT_SCANNER_METADATA_CORRUPT,
+                                        component = LOG_COMPONENT_SCANNER,
+                                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                                        drive = %self.local_disk.path().display(),
+                                        bucket = %item.bucket,
+                                        object = %object,
+                                        metadata_path = %item.path,
+                                        failed_objects = into.failed_objects,
+                                        state = "metadata_corrupt",
+                                        error = %e,
+                                        "Scanner detected corrupt object metadata"
+                                    );
+                                } else {
+                                    warn!(
+                                        target: "rustfs::scanner::folder",
+                                        event = EVENT_SCANNER_FOLDER_STATE,
+                                        component = LOG_COMPONENT_SCANNER,
+                                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                                        path = %item.path,
+                                        failed_objects = into.failed_objects,
+                                        state = "get_size_failed",
+                                        error = %e,
+                                        "Scanner folder failed to get object size"
+                                    );
+                                }
                             }
                         }
 
                         if let GetSizeFailureAction::HealMetadata { object } = failure_action {
-                            self.send_required_scanner_heal_request(
-                                PendingScannerHealKind::Object,
-                                item.bucket.clone(),
-                                Some(object.clone()),
+                            // Single-flight (backlog#1894 axis A) — the
+                            // recording mode and its guarantees are pinned by
+                            // corrupt_metadata_recording below.
+                            let mrf_result = rustfs_common::mrf_channel::try_send_mrf_intent_typed(
+                                rustfs_common::mrf_channel::MrfKind::MetadataCorruption,
+                                &item.bucket,
+                                &object,
                                 None,
-                                build_object_heal_request(
-                                    item.bucket.clone(),
-                                    object.clone(),
-                                    None,
-                                    self.scan_mode,
-                                    HealChannelPriority::High,
-                                ),
-                            )
-                            .await?;
+                                None,
+                            );
+                            match corrupt_metadata_recording(mrf_result) {
+                                CorruptMetadataRecording::LedgerOnly => {
+                                    // Recorded as Full (retry-later): admission
+                                    // for this target happens in the MRF
+                                    // consumer, not in the manager's queue here.
+                                    self.update_pending_scanner_heal_after_admission(
+                                        PendingScannerHealKind::Object,
+                                        &item.bucket,
+                                        Some(&object),
+                                        None,
+                                        self.scan_mode,
+                                        HealAdmissionResult::Full,
+                                    );
+                                }
+                                CorruptMetadataRecording::ImmediateAndLedger => {
+                                    self.send_required_scanner_heal_request(
+                                        PendingScannerHealKind::Object,
+                                        item.bucket.clone(),
+                                        Some(object.clone()),
+                                        None,
+                                        build_object_heal_request(
+                                            item.bucket.clone(),
+                                            object.clone(),
+                                            None,
+                                            self.scan_mode,
+                                            HealChannelPriority::High,
+                                        ),
+                                    )
+                                    .await?;
+                                }
+                            }
                         }
 
                         timer.sleep().await;
@@ -2197,6 +1548,7 @@ impl FolderScanner {
                 abandoned_children.remove(&path_join_buf(&[&item.bucket, &item.object_path()]));
 
                 apply_scanner_size_summary(into, &sz);
+                self.apply_size_reconciliation(&sz);
                 into.objects += 1;
                 object_count += 1;
                 self.budget.record_object_scanned();
@@ -2507,14 +1859,7 @@ impl FolderScanner {
                 break;
             }
 
-            let mut resolver = MetadataResolutionParams {
-                dir_quorum: self.disks_quorum,
-                obj_quorum: self.disks_quorum,
-                bucket: "".to_string(),
-                strict: false,
-                ..Default::default()
-            };
-
+            let mut previous_bucket = String::new();
             for name in abandoned_children {
                 if !self.should_heal().await {
                     break;
@@ -2522,7 +1867,7 @@ impl FolderScanner {
 
                 let (bucket, prefix) = path2_bucket_object(name.as_str());
 
-                if bucket != resolver.bucket {
+                if bucket != previous_bucket {
                     self.send_required_scanner_heal_request(
                         PendingScannerHealKind::Bucket,
                         bucket.clone(),
@@ -2531,9 +1876,8 @@ impl FolderScanner {
                         build_bucket_heal_request(bucket.clone(), HealChannelPriority::High),
                     )
                     .await?;
+                    previous_bucket = bucket.clone();
                 }
-
-                resolver.bucket = bucket.clone();
 
                 let child_ctx = ctx.child_token();
 
@@ -2651,6 +1995,8 @@ impl FolderScanner {
                 let mut agreed_closed = false;
                 let mut partial_closed = false;
                 let mut finished_closed = false;
+                let mut seen_heal_candidates: HashSet<(String, Option<String>, MetaCacheHealCandidateKind)> = HashSet::new();
+                let mut seen_truncated_objects: HashSet<String> = HashSet::new();
 
                 loop {
                     if agreed_closed && partial_closed && finished_closed {
@@ -2675,65 +2021,112 @@ impl FolderScanner {
                                 break;
                             }
 
-                            let Some(entry) = resolve_object_heal_entry(&entries, resolver.clone()) else {
-                                continue;
-                            };
-
-                            (self.update_current_path)(&entry.name).await;
-
-                            if entry.is_dir() {
-                                continue;
+                            let discovery = entries.discover_heal_candidates(&bucket, MAX_META_CACHE_HEAL_CANDIDATES);
+                            counter!(METRIC_SCANNER_HEAL_DISCOVERY_CANDIDATES_TOTAL)
+                                .increment(u64::try_from(discovery.candidates.len()).unwrap_or(u64::MAX));
+                            counter!(METRIC_SCANNER_HEAL_DISCOVERY_SUB_QUORUM_TOTAL).increment(
+                                u64::try_from(
+                                    discovery
+                                        .candidates
+                                        .iter()
+                                        .filter(|candidate| candidate.replica_count < disks_quorum)
+                                        .count(),
+                                )
+                                .unwrap_or(u64::MAX),
+                            );
+                            counter!(METRIC_SCANNER_HEAL_DISCOVERY_UNVERIFIED_TOTAL).increment(
+                                u64::try_from(discovery.unverified_count).unwrap_or(u64::MAX),
+                            );
+                            if discovery.truncated {
+                                counter!(METRIC_SCANNER_HEAL_DISCOVERY_TRUNCATED_TOTAL).increment(1);
                             }
 
-                            let fivs = match entry.file_info_versions(&bucket) {
-                                Ok(fivs) => fivs,
-                                Err(e) => {
-                                    error!(
-                                        target: "rustfs::scanner::folder",
-                                        event = EVENT_SCANNER_FOLDER_STATE,
-                                        component = LOG_COMPONENT_SCANNER,
-                                        subsystem = LOG_SUBSYSTEM_FOLDER,
-                                        bucket = %bucket,
-                                        entry = %entry.name,
-                                        state = "file_info_versions_failed",
-                                        error = %e,
-                                        "Scanner list_path_raw failed to resolve file versions"
-                                    );
-                                    self.send_required_scanner_heal_request(
-                                        PendingScannerHealKind::Object,
-                                        bucket.clone(),
-                                        Some(entry.name.clone()),
-                                        None,
-                                        build_object_heal_request(
-                                            bucket.clone(),
-                                            entry.name.clone(),
-                                            None,
-                                            self.scan_mode,
-                                            HealChannelPriority::High,
-                                        ),
-                                    )
-                                    .await?;
-                                    found_objects = true;
+                            for candidate in discovery.candidates {
+                                let sub_quorum_candidate = candidate.replica_count < disks_quorum;
+                                let version_id = candidate.validated_version().map(|id| id.to_string());
+                                let identity = (candidate.object.clone(), version_id.clone(), candidate.kind.clone());
+                                if seen_heal_candidates.len() >= MAX_META_CACHE_HEAL_CANDIDATES
+                                    && !seen_heal_candidates.contains(&identity)
+                                {
                                     continue;
                                 }
-                            };
-
-                            for fiv in fivs.versions {
-                                let version_id = fiv.version_id.and_then(|v| if v.is_nil() { None } else { Some(v.to_string()) });
-                                self.send_required_scanner_heal_request(
-                                    PendingScannerHealKind::Object,
-                                    bucket.clone(),
-                                    Some(entry.name.clone()),
-                                    version_id.clone(),
-                                    build_object_heal_request(
+                                if !seen_heal_candidates.insert(identity) {
+                                    continue;
+                                }
+                                let request = if candidate.is_unversioned() {
+                                    build_non_destructive_object_heal_request(
                                         bucket.clone(),
-                                        entry.name.clone(),
-                                        version_id,
+                                        candidate.object.clone(),
                                         self.scan_mode,
                                         HealChannelPriority::High,
-                                    ),
+                                    )
+                                } else {
+                                    build_object_heal_request(
+                                        bucket.clone(),
+                                        candidate.object.clone(),
+                                        version_id.clone(),
+                                        self.scan_mode,
+                                        HealChannelPriority::High,
+                                    )
+                                };
+                                (self.update_current_path)(&candidate.object).await;
+                                let admission = self.send_required_scanner_heal_request(
+                                    PendingScannerHealKind::Object,
+                                    bucket.clone(),
+                                    Some(candidate.object.clone()),
+                                    version_id.clone(),
+                                    request,
                                 )
                                 .await?;
+                                if admission.is_admitted() {
+                                    counter!(METRIC_SCANNER_HEAL_DISCOVERY_QUEUED_TOTAL).increment(1);
+                                } else if sub_quorum_candidate {
+                                    self.mark_pending_scanner_heal_reason(
+                                        PendingScannerHealKind::Object,
+                                        &bucket,
+                                        Some(&candidate.object),
+                                        version_id.as_deref(),
+                                        "sub_quorum_metadata",
+                                    );
+                                }
+                                found_objects = true;
+                            }
+
+                            // Candidates beyond the main cap remain exact
+                            // version requests; never downgrade them to a
+                            // latest-version (version_id=None) heal.
+                            for candidate in discovery.truncated_candidates {
+                                let version_id = candidate.validated_version().map(|id| id.to_string());
+                                let identity = (candidate.object.clone(), version_id.clone(), candidate.kind.clone());
+                                if seen_truncated_objects.len() >= MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS
+                                    && !seen_truncated_objects.contains(&candidate.object)
+                                {
+                                    continue;
+                                }
+                                seen_truncated_objects.insert(candidate.object.clone());
+                                if !seen_heal_candidates.insert(identity) {
+                                    continue;
+                                }
+                                let request = build_object_heal_request(
+                                    bucket.clone(),
+                                    candidate.object.clone(),
+                                    version_id.clone(),
+                                    self.scan_mode,
+                                    HealChannelPriority::High,
+                                );
+                                (self.update_current_path)(&candidate.object).await;
+                                let admission = self
+                                    .send_required_scanner_heal_request(
+                                        PendingScannerHealKind::Object,
+                                        bucket.clone(),
+                                        Some(candidate.object.clone()),
+                                        version_id,
+                                        request,
+                                    )
+                                    .await?;
+                                if admission.is_admitted() {
+                                    counter!(METRIC_SCANNER_HEAL_DISCOVERY_QUEUED_TOTAL).increment(1);
+                                }
                                 found_objects = true;
                             }
 
@@ -2876,7 +2269,10 @@ impl FolderScanner {
             }
         }
 
+        self.finish_size_reconciliation_batch();
         done_folder();
+        let scanned_objects = u64::try_from(into.objects).unwrap_or(u64::MAX);
+        emit_scanner_folder_trace(&self.root, &folder.name, scanned_objects, trace_started_at, "completed");
 
         Ok(())
     }
@@ -2903,8 +2299,6 @@ pub async fn scan_data_folder(
     sleeper: DynamicSleeper,
 ) -> Result<DataUsageCache, ScannerError> {
     use crate::data_usage_define::DATA_USAGE_ROOT;
-
-    ensure_scanner_inline_heal_metric_registered();
 
     // Check that we're not trying to scan the root
     if cache.info.name.is_empty() || cache.info.name == DATA_USAGE_ROOT {
@@ -2961,9 +2355,16 @@ pub async fn scan_data_folder(
         skip_heal,
         local_disk,
         pending_heals_changed: false,
+        pending_size_reconciliation_keys: HashSet::new(),
+        pending_size_reconciliation_scopes: HashSet::new(),
+        pending_size_reconciliation_truncated: false,
         #[cfg(test)]
         list_path_raw_options_observer: None,
     };
+
+    let now = FolderScanner::now_secs();
+    prune_size_reconciliation(&mut scanner.new_cache.info, now);
+    prune_size_reconciliation(&mut scanner.update_cache.info, now);
 
     // Check if context is cancelled
     if ctx.is_cancelled() {
@@ -2988,7 +2389,9 @@ pub async fn scan_data_folder(
             new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
             new_cache.info.last_update = Some(SystemTime::now());
             new_cache.info.next_cycle = cache.info.next_cycle;
-            let unresolved_objects = root.failed_objects > 0 || !new_cache.info.failed_objects.is_empty();
+            let unresolved_objects = root.failed_objects > 0
+                || !new_cache.info.failed_objects.is_empty()
+                || !new_cache.info.size_reconciliation.is_empty();
             new_cache.info.snapshot_complete = !unresolved_objects;
             let had_scan_checkpoint = cache.info.scan_checkpoint.is_some() || new_cache.info.scan_checkpoint.is_some();
             new_cache.info.scan_resume_after = None;
@@ -3016,7 +2419,7 @@ pub async fn scan_data_folder(
                 if root_has_progress {
                     new_cache.replace_hashed(&root_hash, &None, &root);
                 }
-                if partial_cache_is_useful(&root, pending_heals_changed) {
+                if partial_cache_is_useful(&root, pending_heals_changed) || !new_cache.info.size_reconciliation.is_empty() {
                     if new_cache.root().is_some() {
                         new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
                     }
@@ -3045,2597 +2448,12 @@ pub async fn scan_data_folder(
     }
 }
 
+mod item_actions;
+mod ledger;
+
+use item_actions::*;
+pub use item_actions::{GetSizeFn, ScannerItem};
+use ledger::*;
+
 #[cfg(test)]
-mod tests {
-    use crate::SCANNER_SLEEPER;
-
-    use super::*;
-    use crate::storage_api::VersionPurgeStatusType;
-    use crate::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, TierStats, new_disk, storageclass};
-    use rustfs_filemeta::{FileInfo, FileMeta};
-    use serial_test::serial;
-    #[cfg(unix)]
-    use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use temp_env::{with_var, with_var_unset};
-    use uuid::Uuid;
-
-    #[test]
-    fn scanner_size_summary_application_saturates_usage_counters() {
-        let target = "arn:minio:replication::target".to_string();
-        let mut entry = DataUsageEntry {
-            size: usize::MAX,
-            versions: usize::MAX,
-            delete_markers: usize::MAX,
-            replication_stats: Some(Default::default()),
-            ..Default::default()
-        };
-        let replication_stats = entry
-            .replication_stats
-            .as_mut()
-            .expect("replication statistics should be initialized");
-        replication_stats.replica_size = u64::MAX;
-        replication_stats.replica_count = u64::MAX;
-        let target_stats = replication_stats.targets.entry(target.clone()).or_default();
-        target_stats.pending_size = u64::MAX;
-        target_stats.failed_size = u64::MAX;
-        target_stats.replicated_size = u64::MAX;
-        target_stats.replicated_count = u64::MAX;
-        target_stats.failed_count = u64::MAX;
-        target_stats.pending_count = u64::MAX;
-
-        let mut summary = SizeSummary {
-            total_size: 1,
-            versions: 1,
-            delete_markers: 1,
-            replica_size: 1,
-            replica_count: 1,
-            ..Default::default()
-        };
-        summary.repl_target_stats.insert(
-            target.clone(),
-            ReplTargetSizeSummary {
-                replicated_size: 1,
-                replicated_count: 1,
-                pending_size: 1,
-                failed_size: 1,
-                pending_count: 1,
-                failed_count: 1,
-            },
-        );
-
-        apply_scanner_size_summary(&mut entry, &summary);
-
-        assert_eq!(entry.size, usize::MAX);
-        assert_eq!(entry.versions, usize::MAX);
-        assert_eq!(entry.delete_markers, usize::MAX);
-        assert_eq!(entry.obj_sizes.to_map()["LESS_THAN_1024_B"], 1);
-        assert_eq!(entry.obj_versions.to_map()["SINGLE_VERSION"], 1);
-
-        let replication_stats = entry
-            .replication_stats
-            .as_ref()
-            .expect("replication statistics should remain present");
-        assert_eq!(replication_stats.replica_size, u64::MAX);
-        assert_eq!(replication_stats.replica_count, u64::MAX);
-        let target_stats = replication_stats
-            .targets
-            .get(&target)
-            .expect("replication target statistics should remain present");
-        assert_eq!(target_stats.pending_size, u64::MAX);
-        assert_eq!(target_stats.failed_size, u64::MAX);
-        assert_eq!(target_stats.replicated_size, u64::MAX);
-        assert_eq!(target_stats.replicated_count, u64::MAX);
-        assert_eq!(target_stats.failed_count, u64::MAX);
-        assert_eq!(target_stats.pending_count, u64::MAX);
-    }
-
-    #[test]
-    fn scanner_size_summary_application_accumulates_tier_stats() {
-        let mut entry = DataUsageEntry::default();
-        let mut summary = SizeSummary::default();
-        summary.tier_stats.insert(
-            "WARM".to_string(),
-            TierStats {
-                total_size: 100,
-                num_versions: 2,
-                num_objects: 1,
-            },
-        );
-        // Scanners seed a zeroed entry for every configured tier; those must not
-        // reach the cache as empty keys.
-        summary
-            .tier_stats
-            .insert(storageclass::STANDARD.to_string(), TierStats::default());
-
-        apply_scanner_size_summary(&mut entry, &summary);
-        apply_scanner_size_summary(&mut entry, &summary);
-
-        let tiers = entry.all_tier_stats.as_ref().expect("tier stats should be recorded");
-        assert_eq!(
-            tiers.tiers.get("WARM"),
-            Some(&TierStats {
-                total_size: 200,
-                num_versions: 4,
-                num_objects: 2,
-            })
-        );
-        assert!(!tiers.tiers.contains_key(storageclass::STANDARD));
-    }
-
-    #[test]
-    fn scanner_size_summary_application_skips_untiered_summaries() {
-        let mut entry = DataUsageEntry::default();
-        let mut summary = SizeSummary {
-            total_size: 10,
-            ..Default::default()
-        };
-        summary
-            .tier_stats
-            .insert(storageclass::STANDARD.to_string(), TierStats::default());
-        summary.tier_stats.insert(storageclass::RRS.to_string(), TierStats::default());
-
-        apply_scanner_size_summary(&mut entry, &summary);
-
-        assert!(entry.all_tier_stats.is_none(), "zero-only tier maps must not allocate cache state");
-    }
-
-    async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
-        let temp_dir = std::env::temp_dir().join(format!("rustfs-scanner-test-{}", Uuid::new_v4()));
-        tokio::fs::create_dir_all(&temp_dir)
-            .await
-            .expect("failed to create test directory");
-
-        let endpoint = Endpoint::try_from(temp_dir.to_string_lossy().as_ref()).expect("failed to create endpoint");
-        let disk = new_disk(
-            &endpoint,
-            &DiskOption {
-                cleanup: false,
-                health_check: false,
-            },
-        )
-        .await
-        .expect("failed to create disk");
-
-        let update_current_path: UpdateCurrentPathFn = Arc::new(|_: &str| Box::pin(async {}));
-
-        let scanner = FolderScanner {
-            root: temp_dir.to_string_lossy().to_string(),
-            old_cache: DataUsageCache::default(),
-            new_cache: DataUsageCache::default(),
-            update_cache: DataUsageCache::default(),
-            data_usage_scanner_debug: false,
-            heal_object_select: 0,
-            scan_mode: HealScanMode::Normal,
-            is_erasure_mode: false,
-            failed_object_ttl_secs: u64::MAX,
-            failed_objects_max: usize::MAX,
-            sleeper: SCANNER_SLEEPER.clone(),
-            disks: Vec::new(),
-            disks_quorum: 0,
-            updates: None,
-            last_update: SystemTime::UNIX_EPOCH,
-            update_current_path,
-            budget: ScannerCycleBudget::new(&CancellationToken::new(), Default::default()),
-            skip_heal: Arc::new(AtomicBool::new(false)),
-            local_disk: disk,
-            pending_heals_changed: false,
-            list_path_raw_options_observer: None,
-        };
-
-        (scanner, temp_dir)
-    }
-
-    struct TestGuard {
-        temp_dir: Option<std::path::PathBuf>,
-    }
-
-    impl TestGuard {
-        fn new(ttl: u64, max: usize, scanner: &mut FolderScanner, temp_dir: std::path::PathBuf) -> Self {
-            scanner.failed_object_ttl_secs = ttl;
-            scanner.failed_objects_max = max;
-            Self {
-                temp_dir: Some(temp_dir),
-            }
-        }
-    }
-
-    impl Drop for TestGuard {
-        fn drop(&mut self) {
-            if let Some(temp_dir) = self.temp_dir.take() {
-                let _ = std::fs::remove_dir_all(&temp_dir);
-            }
-        }
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_should_skip_failed_respects_ttl() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir);
-        let now = FolderScanner::now_secs();
-
-        scanner
-            .new_cache
-            .info
-            .failed_objects
-            .insert("recent".to_string(), now.saturating_sub(10));
-        scanner
-            .new_cache
-            .info
-            .failed_objects
-            .insert("expired".to_string(), now.saturating_sub(120));
-
-        assert!(scanner.should_skip_failed("recent"));
-        assert!(!scanner.should_skip_failed("expired"));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_record_failed_ttl_zero_noop() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(0, 100, &mut scanner, temp_dir);
-
-        scanner.record_failed("path1");
-        assert!(scanner.new_cache.info.failed_objects.is_empty());
-
-        let now = FolderScanner::now_secs();
-        scanner.new_cache.info.failed_objects.insert("path2".to_string(), now);
-        assert!(!scanner.should_skip_failed("path2"));
-    }
-
-    #[test]
-    fn test_classify_get_size_failure_marks_metadata_heal_object_path() {
-        let temp_dir = std::env::temp_dir();
-        let file_type = std::fs::metadata(&temp_dir)
-            .expect("temp dir metadata should be readable")
-            .file_type();
-        let item = ScannerItem {
-            path: temp_dir.join("bucket/dir/object/xl.meta").to_string_lossy().to_string(),
-            bucket: "bucket".to_string(),
-            prefix: "dir/object".to_string(),
-            object_name: "xl.meta".to_string(),
-            file_type,
-            lifecycle: None,
-            object_lock: None,
-            replication: None,
-            heal_enabled: false,
-            heal_bitrot: false,
-            debug: false,
-        };
-        let err = StorageError::other(format!("{}: corrupt metadata", crate::scanner_io::SCANNER_METADATA_CORRUPT_ERROR));
-
-        let action = classify_get_size_failure(&item, &err);
-
-        assert_eq!(
-            action,
-            GetSizeFailureAction::HealMetadata {
-                object: "dir/object".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn test_classify_get_size_failure_records_transient_metadata_error_without_heal() {
-        let temp_dir = std::env::temp_dir();
-        let file_type = std::fs::metadata(&temp_dir)
-            .expect("temp dir metadata should be readable")
-            .file_type();
-        let item = ScannerItem {
-            path: temp_dir.join("bucket/dir/object/xl.meta").to_string_lossy().to_string(),
-            bucket: "bucket".to_string(),
-            prefix: "dir/object".to_string(),
-            object_name: "xl.meta".to_string(),
-            file_type,
-            lifecycle: None,
-            object_lock: None,
-            replication: None,
-            heal_enabled: false,
-            heal_bitrot: false,
-            debug: false,
-        };
-        let err = StorageError::other(format!("{}: temporary read failure", crate::scanner_io::SCANNER_METADATA_TRANSIENT_ERROR));
-
-        let action = classify_get_size_failure(&item, &err);
-
-        assert_eq!(action, GetSizeFailureAction::RecordFailed);
-    }
-
-    #[test]
-    fn test_should_account_replication_stats_only_for_live_object_versions() {
-        let live = ObjectInfo::default();
-        assert!(ScannerItem::should_account_replication_stats(&live));
-
-        let delete_marker = ObjectInfo {
-            delete_marker: true,
-            ..Default::default()
-        };
-        assert!(!ScannerItem::should_account_replication_stats(&delete_marker));
-
-        let purge_version = ObjectInfo {
-            version_purge_status: VersionPurgeStatusType::Pending,
-            ..Default::default()
-        };
-        assert!(!ScannerItem::should_account_replication_stats(&purge_version));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_heal_replication_only_queues_pending_null_deletes() {
-        async fn replication_skipped_count() -> u64 {
-            global_metrics()
-                .report()
-                .await
-                .source_work
-                .iter()
-                .find(|work| work.source == ScannerWorkSource::BucketReplication.as_str())
-                .map(|work| work.skipped)
-                .unwrap_or_default()
-        }
-
-        let temp_dir = std::env::temp_dir();
-        let file_type = std::fs::metadata(&temp_dir)
-            .expect("temp dir metadata should be readable")
-            .file_type();
-        let mut item = ScannerItem {
-            path: temp_dir.join("object").to_string_lossy().to_string(),
-            bucket: "bucket".to_string(),
-            prefix: String::new(),
-            object_name: "object".to_string(),
-            file_type,
-            lifecycle: None,
-            object_lock: None,
-            replication: Some(Arc::new(ReplicationConfig::new(None, None))),
-            heal_enabled: false,
-            heal_bitrot: false,
-            debug: false,
-        };
-        let null_object = ObjectInfo {
-            bucket: "bucket".to_string(),
-            name: "object".to_string(),
-            version_id: Some(Uuid::nil()),
-            mod_time: Some(OffsetDateTime::now_utc()),
-            ..Default::default()
-        };
-        let mut size_summary = SizeSummary::default();
-        let before = replication_skipped_count().await;
-
-        item.heal_replication(&null_object, &mut size_summary).await;
-        assert_eq!(replication_skipped_count().await, before);
-
-        item.heal_replication(
-            &ObjectInfo {
-                version_purge_status: VersionPurgeStatusType::Pending,
-                ..null_object
-            },
-            &mut size_summary,
-        )
-        .await;
-        assert_eq!(replication_skipped_count().await, before + 1);
-    }
-
-    #[tokio::test]
-    async fn test_scanner_ilm_action_accounting_requires_enqueue_success() {
-        let metrics = Metrics::new();
-        let _start = metrics.start_scan_cycle_work();
-
-        record_scanner_ilm_action_if_queued(&metrics, IlmAction::DeleteAction, 2, false);
-        let report = metrics.report().await;
-        let lifecycle = report
-            .source_work
-            .iter()
-            .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
-            .expect("lifecycle source work should be visible");
-        assert_eq!(lifecycle.executed, 0);
-        assert_eq!(report.current_cycle_lifecycle_expiry_actions, 0);
-
-        record_scanner_ilm_action_if_queued(&metrics, IlmAction::DeleteAction, 3, true);
-        let report = metrics.report().await;
-        let lifecycle = report
-            .source_work
-            .iter()
-            .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
-            .expect("lifecycle source work should be visible");
-        assert_eq!(lifecycle.executed, 3);
-        assert_eq!(report.current_cycle_lifecycle_expiry_actions, 3);
-        assert_eq!(report.current_cycle_lifecycle_transition_actions, 0);
-
-        record_scanner_ilm_action_if_queued(&metrics, IlmAction::TransitionAction, 4, true);
-        let report = metrics.report().await;
-        let lifecycle = report
-            .source_work
-            .iter()
-            .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
-            .expect("lifecycle source work should be visible");
-        assert_eq!(lifecycle.executed, 7);
-        assert_eq!(report.current_cycle_lifecycle_expiry_actions, 3);
-        assert_eq!(report.current_cycle_lifecycle_transition_actions, 4);
-    }
-
-    #[test]
-    fn test_pending_scanner_accounting_requires_enqueue_success() {
-        let object = ObjectInfo {
-            size: 10,
-            version_id: Some(uuid::Uuid::new_v4()),
-            ..Default::default()
-        };
-        let pending = PendingScannerAccounting {
-            object: &object,
-            retained_size: 10,
-            expired_size: 0,
-        };
-
-        let mut failed_summary = SizeSummary::default();
-        let mut failed_cumulative_size = 0;
-        pending.apply(&mut failed_summary, &mut failed_cumulative_size, false);
-        assert_eq!(failed_summary.versions, 1);
-        assert_eq!(failed_summary.total_size, 10);
-        assert_eq!(failed_cumulative_size, 10);
-
-        let mut queued_summary = SizeSummary::default();
-        let mut queued_cumulative_size = 0;
-        pending.apply(&mut queued_summary, &mut queued_cumulative_size, true);
-        assert_eq!(queued_summary.versions, 0);
-        assert_eq!(queued_summary.total_size, 0);
-        assert_eq!(queued_cumulative_size, 0);
-    }
-
-    #[tokio::test]
-    async fn test_scanner_replication_admission_accounting_maps_source_work() {
-        let metrics = Metrics::new();
-        let object = ReplicationHealObject::new("bucket-a", "object-a");
-
-        record_scanner_replication_admission(&metrics, &object, ReplicationQueueAdmission::Skipped);
-        record_scanner_replication_admission(&metrics, &object, ReplicationQueueAdmission::Queued);
-        record_scanner_replication_admission(&metrics, &object, ReplicationQueueAdmission::Missed);
-
-        let report = metrics.report().await;
-        let replication = report
-            .source_work
-            .iter()
-            .find(|work| work.source == ScannerWorkSource::BucketReplication.as_str())
-            .expect("bucket replication source work should be visible");
-
-        assert_eq!(replication.skipped, 1);
-        assert_eq!(replication.queued, 1);
-        assert_eq!(replication.missed, 1);
-
-        let object_repair = report
-            .replication_repair
-            .iter()
-            .find(|repair| repair.source == ScannerWorkSource::BucketReplication.as_str() && repair.kind == "object")
-            .expect("bucket object repair work should be visible");
-        assert_eq!(object_repair.scanner_role, "repair_admission");
-        assert_eq!(object_repair.execution_owner, "bucket_replication_queue");
-        assert_eq!(object_repair.skipped, 1);
-        assert_eq!(object_repair.queued, 1);
-        assert_eq!(object_repair.missed, 1);
-    }
-
-    #[test]
-    fn test_scanner_replication_repair_kind_maps_bucket_variants() {
-        let object = ReplicationHealObject::new("bucket-a", "object-a");
-        assert_eq!(scanner_replication_repair_kind(&object), Some(ScannerReplicationRepairKind::BucketObject));
-
-        let delete_marker = ReplicationHealObject::new("bucket-a", "delete-marker-a").with_delete_marker();
-        assert_eq!(
-            scanner_replication_repair_kind(&delete_marker),
-            Some(ScannerReplicationRepairKind::BucketDeleteMarker)
-        );
-
-        let version_purge = ReplicationHealObject::new("bucket-a", "version-purge-a").with_pending_version_purge();
-        assert_eq!(
-            scanner_replication_repair_kind(&version_purge),
-            Some(ScannerReplicationRepairKind::BucketVersionPurge)
-        );
-
-        let existing_object = ReplicationHealObject::new("bucket-a", "existing-object-a").with_existing_object();
-        assert_eq!(
-            scanner_replication_repair_kind(&existing_object),
-            Some(ScannerReplicationRepairKind::BucketExistingObject)
-        );
-
-        let existing_delete_marker = ReplicationHealObject::new("bucket-a", "existing-delete-marker-a")
-            .with_delete_marker()
-            .with_existing_object_resync();
-        assert_eq!(
-            scanner_replication_repair_kind(&existing_delete_marker),
-            Some(ScannerReplicationRepairKind::BucketExistingObject)
-        );
-
-        assert_eq!(scanner_replication_repair_kind(&ReplicationHealObject::default()), None);
-    }
-
-    #[tokio::test]
-    async fn test_scanner_heal_admission_accounting_maps_normal_scan_to_heal() {
-        let metrics = Metrics::new();
-
-        record_scanner_heal_admission(&metrics, HealScanMode::Normal, Ok(HealAdmissionResult::Accepted));
-        record_scanner_heal_admission(&metrics, HealScanMode::Normal, Ok(HealAdmissionResult::Merged));
-        record_scanner_heal_admission(&metrics, HealScanMode::Normal, Ok(HealAdmissionResult::Full));
-        record_scanner_heal_admission(
-            &metrics,
-            HealScanMode::Normal,
-            Ok(HealAdmissionResult::Dropped(
-                rustfs_common::heal_channel::HealAdmissionDropReason::QueueFull,
-            )),
-        );
-        record_scanner_heal_admission(&metrics, HealScanMode::Normal, Err(()));
-
-        let report = metrics.report().await;
-        let heal = report
-            .source_work
-            .iter()
-            .find(|work| work.source == ScannerWorkSource::Heal.as_str())
-            .expect("heal source work should be visible");
-        let bitrot = report
-            .source_work
-            .iter()
-            .find(|work| work.source == ScannerWorkSource::Bitrot.as_str())
-            .expect("bitrot source work should be visible");
-
-        assert_eq!(heal.queued, 1);
-        assert_eq!(heal.skipped, 1);
-        assert_eq!(heal.missed, 3);
-        assert_eq!(heal.executed, 0);
-        assert_eq!(bitrot.queued + bitrot.skipped + bitrot.missed + bitrot.executed, 0);
-    }
-
-    #[tokio::test]
-    async fn test_scanner_heal_admission_accounting_maps_deep_scan_to_bitrot() {
-        let metrics = Metrics::new();
-
-        record_scanner_heal_admission(&metrics, HealScanMode::Deep, Ok(HealAdmissionResult::Accepted));
-        record_scanner_heal_admission(&metrics, HealScanMode::Deep, Ok(HealAdmissionResult::Merged));
-        record_scanner_heal_admission(&metrics, HealScanMode::Deep, Ok(HealAdmissionResult::Full));
-
-        let report = metrics.report().await;
-        let heal = report
-            .source_work
-            .iter()
-            .find(|work| work.source == ScannerWorkSource::Heal.as_str())
-            .expect("heal source work should be visible");
-        let bitrot = report
-            .source_work
-            .iter()
-            .find(|work| work.source == ScannerWorkSource::Bitrot.as_str())
-            .expect("bitrot source work should be visible");
-
-        assert_eq!(bitrot.queued, 1);
-        assert_eq!(bitrot.skipped, 1);
-        assert_eq!(bitrot.missed, 1);
-        assert_eq!(bitrot.executed, 0);
-        assert_eq!(heal.queued + heal.skipped + heal.missed + heal.executed, 0);
-    }
-
-    #[test]
-    #[serial]
-    fn test_excessive_version_alert_thresholds_use_env() {
-        with_var(rustfs_config::ENV_SCANNER_ALERT_EXCESS_VERSIONS, Some("3"), || {
-            with_var(rustfs_config::ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE, Some("100"), || {
-                crate::runtime_config::refresh_scanner_runtime_config_for_tests();
-                assert_eq!(should_alert_excessive_versions(2, 99), (false, false));
-                assert_eq!(should_alert_excessive_versions(3, 99), (true, false));
-                assert_eq!(should_alert_excessive_versions(2, 100), (false, true));
-                assert_eq!(should_alert_excessive_versions(3, 100), (true, true));
-            });
-        });
-        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
-    }
-
-    #[test]
-    #[serial]
-    fn test_excessive_folders_threshold_uses_env() {
-        with_var(rustfs_config::ENV_SCANNER_ALERT_EXCESS_FOLDERS, Some("3"), || {
-            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
-            assert_eq!(scanner_excess_folders_threshold(), 3);
-        });
-        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
-    }
-
-    #[test]
-    #[serial]
-    fn test_excessive_folders_threshold_default_supports_pbs_layout() {
-        with_var_unset(rustfs_config::ENV_SCANNER_ALERT_EXCESS_FOLDERS, || {
-            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
-            assert_eq!(scanner_excess_folders_threshold(), 65_538);
-        });
-        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
-    }
-
-    #[test]
-    #[serial]
-    fn test_scanner_yield_every_n_objects_uses_env() {
-        with_var(rustfs_config::ENV_SCANNER_YIELD_EVERY_N_OBJECTS, Some("32"), || {
-            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
-            assert_eq!(scanner_yield_every_n_objects(), 32);
-        });
-        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
-    }
-
-    #[test]
-    #[serial]
-    fn test_scanner_yield_every_n_objects_uses_default() {
-        with_var_unset(rustfs_config::ENV_SCANNER_YIELD_EVERY_N_OBJECTS, || {
-            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
-            assert_eq!(scanner_yield_every_n_objects(), rustfs_config::DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS);
-        });
-        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
-    }
-
-    #[test]
-    fn test_should_yield_after_object_respects_interval_and_disable() {
-        assert!(!should_yield_after_object(127, 128));
-        assert!(should_yield_after_object(128, 128));
-        assert!(!should_yield_after_object(128, 0));
-    }
-
-    #[test]
-    fn test_checkpoint_reason_from_budget_maps_all_budget_reasons() {
-        assert_eq!(
-            checkpoint_reason_from_budget(Some(crate::scanner_budget::ScannerCycleBudgetReason::Runtime)),
-            crate::data_usage_define::DataUsageScanCheckpointReason::Runtime
-        );
-        assert_eq!(
-            checkpoint_reason_from_budget(Some(crate::scanner_budget::ScannerCycleBudgetReason::Objects)),
-            crate::data_usage_define::DataUsageScanCheckpointReason::Objects
-        );
-        assert_eq!(
-            checkpoint_reason_from_budget(Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories)),
-            crate::data_usage_define::DataUsageScanCheckpointReason::Directories
-        );
-        assert_eq!(
-            checkpoint_reason_from_budget(None),
-            crate::data_usage_define::DataUsageScanCheckpointReason::Unknown
-        );
-    }
-
-    #[test]
-    fn test_order_folders_for_resume_rotates_after_exact_resume_hint() {
-        let mut folders = vec![
-            CachedFolder {
-                name: "bucket/child-c".to_string(),
-                parent: None,
-                object_heal_prob_div: 1,
-            },
-            CachedFolder {
-                name: "bucket/child-a".to_string(),
-                parent: None,
-                object_heal_prob_div: 1,
-            },
-            CachedFolder {
-                name: "bucket/child-b".to_string(),
-                parent: None,
-                object_heal_prob_div: 1,
-            },
-        ];
-
-        let outcome = order_folders_for_resume(&mut folders, Some("bucket/child-b"));
-
-        let names = folders.into_iter().map(|folder| folder.name).collect::<Vec<_>>();
-        assert_eq!(outcome, FolderResumeOrder::Used);
-        assert_eq!(
-            names,
-            vec![
-                "bucket/child-c".to_string(),
-                "bucket/child-a".to_string(),
-                "bucket/child-b".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn test_order_folders_for_resume_prioritizes_descendant_resume_hint() {
-        let mut folders = vec![
-            CachedFolder {
-                name: "bucket/child-c".to_string(),
-                parent: None,
-                object_heal_prob_div: 1,
-            },
-            CachedFolder {
-                name: "bucket/child-a".to_string(),
-                parent: None,
-                object_heal_prob_div: 1,
-            },
-            CachedFolder {
-                name: "bucket/child-b".to_string(),
-                parent: None,
-                object_heal_prob_div: 1,
-            },
-        ];
-
-        let outcome = order_folders_for_resume(&mut folders, Some("bucket/child-b/grandchild"));
-
-        let names = folders.into_iter().map(|folder| folder.name).collect::<Vec<_>>();
-        assert_eq!(outcome, FolderResumeOrder::Used);
-        assert_eq!(
-            names,
-            vec![
-                "bucket/child-b".to_string(),
-                "bucket/child-c".to_string(),
-                "bucket/child-a".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn test_order_folders_for_resume_reports_stale_hint() {
-        let mut folders = vec![
-            CachedFolder {
-                name: "bucket/child-c".to_string(),
-                parent: None,
-                object_heal_prob_div: 1,
-            },
-            CachedFolder {
-                name: "bucket/child-a".to_string(),
-                parent: None,
-                object_heal_prob_div: 1,
-            },
-        ];
-
-        let outcome = order_folders_for_resume(&mut folders, Some("bucket/child-b"));
-
-        let names = folders.into_iter().map(|folder| folder.name).collect::<Vec<_>>();
-        assert_eq!(outcome, FolderResumeOrder::Stale);
-        assert_eq!(names, vec!["bucket/child-a".to_string(), "bucket/child-c".to_string()]);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_record_failed_prunes_to_max_entries() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(1000, 2, &mut scanner, temp_dir);
-        let now = FolderScanner::now_secs();
-
-        scanner
-            .new_cache
-            .info
-            .failed_objects
-            .insert("old1".to_string(), now.saturating_sub(50));
-        scanner
-            .new_cache
-            .info
-            .failed_objects
-            .insert("old2".to_string(), now.saturating_sub(40));
-        scanner
-            .new_cache
-            .info
-            .failed_objects
-            .insert("old3".to_string(), now.saturating_sub(30));
-
-        scanner.record_failed("new");
-
-        assert_eq!(scanner.new_cache.info.failed_objects.len(), 2);
-        assert!(scanner.new_cache.info.failed_objects.contains_key("new"));
-        assert!(scanner.new_cache.info.failed_objects.contains_key("old3"));
-        assert!(!scanner.new_cache.info.failed_objects.contains_key("old1"));
-        assert!(!scanner.new_cache.info.failed_objects.contains_key("old2"));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_prune_failed_objects_cache_drops_expired() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(5, 10, &mut scanner, temp_dir);
-        let now = FolderScanner::now_secs();
-
-        scanner
-            .new_cache
-            .info
-            .failed_objects
-            .insert("expired".to_string(), now.saturating_sub(10));
-        scanner
-            .new_cache
-            .info
-            .failed_objects
-            .insert("fresh".to_string(), now.saturating_sub(2));
-
-        scanner.prune_failed_objects_cache();
-
-        assert_eq!(scanner.new_cache.info.failed_objects.len(), 1);
-        assert!(scanner.new_cache.info.failed_objects.contains_key("fresh"));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_prune_failed_objects_max_zero_keeps_fresh() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir);
-        let now = FolderScanner::now_secs();
-
-        scanner
-            .new_cache
-            .info
-            .failed_objects
-            .insert("fresh1".to_string(), now.saturating_sub(5));
-        scanner
-            .new_cache
-            .info
-            .failed_objects
-            .insert("fresh2".to_string(), now.saturating_sub(10));
-        scanner
-            .new_cache
-            .info
-            .failed_objects
-            .insert("expired".to_string(), now.saturating_sub(120));
-
-        scanner.prune_failed_objects_cache();
-
-        assert_eq!(scanner.new_cache.info.failed_objects.len(), 2);
-        assert!(scanner.new_cache.info.failed_objects.contains_key("fresh1"));
-        assert!(scanner.new_cache.info.failed_objects.contains_key("fresh2"));
-        assert!(!scanner.new_cache.info.failed_objects.contains_key("expired"));
-    }
-
-    #[test]
-    fn test_scanner_inline_heal_enabled_defaults_to_false() {
-        assert!(!scanner_inline_heal_enabled_from_value(None));
-    }
-
-    #[test]
-    fn test_scanner_inline_heal_enabled_reads_env_override() {
-        assert!(scanner_inline_heal_enabled_from_value(Some("true")));
-        assert!(scanner_inline_heal_enabled_from_value(Some("YES")));
-        assert!(scanner_inline_heal_enabled_from_value(Some("1")));
-        assert!(!scanner_inline_heal_enabled_from_value(Some("false")));
-    }
-
-    #[test]
-    fn test_build_object_heal_request_omits_nil_version_id() {
-        let request = build_object_heal_request(
-            "bucket".to_string(),
-            "path/to/object".to_string(),
-            None,
-            HealScanMode::Deep,
-            HealChannelPriority::Low,
-        );
-
-        assert_eq!(request.bucket, "bucket");
-        assert_eq!(request.object_prefix.as_deref(), Some("path/to/object"));
-        assert!(request.object_version_id.is_none());
-        assert_eq!(request.scan_mode, Some(HealScanMode::Deep));
-        assert_eq!(request.priority, HealChannelPriority::Low);
-        assert_eq!(request.source, HealRequestSource::Scanner);
-        assert_eq!(request.remove_corrupted, Some(HEAL_DELETE_DANGLING));
-        assert_eq!(request.recreate_missing, Some(false));
-    }
-
-    #[test]
-    fn test_build_bucket_heal_request_disables_recreate_for_scanner() {
-        let request = build_bucket_heal_request("bucket".to_string(), HealChannelPriority::Low);
-
-        assert_eq!(request.bucket, "bucket");
-        assert_eq!(request.priority, HealChannelPriority::Low);
-        assert_eq!(request.source, HealRequestSource::Scanner);
-        assert_eq!(request.recreate_missing, Some(false));
-    }
-
-    fn pending_heal(
-        kind: PendingScannerHealKind,
-        bucket: &str,
-        object: Option<&str>,
-        version_id: Option<&str>,
-        last_attempt: u64,
-        attempts: u32,
-    ) -> PendingScannerHeal {
-        PendingScannerHeal {
-            kind,
-            bucket: bucket.to_string(),
-            object: object.map(ToOwned::to_owned),
-            version_id: version_id.map(ToOwned::to_owned),
-            scan_mode: HealScanMode::Deep,
-            first_seen: 1,
-            last_attempt,
-            attempts,
-            last_admission_result: "full".to_string(),
-            last_admission_reason: "none".to_string(),
-        }
-    }
-
-    #[test]
-    fn test_pending_heal_reconstructs_bucket_request() {
-        let pending = pending_heal(PendingScannerHealKind::Bucket, "bucket", None, None, 1, 1);
-
-        let request = build_pending_scanner_heal_request(&pending).expect("bucket request should rebuild");
-
-        assert_eq!(request.bucket, "bucket");
-        assert_eq!(request.priority, HealChannelPriority::High);
-        assert_eq!(request.source, HealRequestSource::Scanner);
-        assert_eq!(request.recreate_missing, Some(false));
-        assert!(request.object_prefix.is_none());
-    }
-
-    #[test]
-    fn test_pending_heal_reconstructs_object_request_with_version() {
-        let pending = pending_heal(PendingScannerHealKind::Object, "bucket", Some("path/to/object"), Some("version-a"), 1, 1);
-
-        let request = build_pending_scanner_heal_request(&pending).expect("object request should rebuild");
-
-        assert_eq!(request.bucket, "bucket");
-        assert_eq!(request.object_prefix.as_deref(), Some("path/to/object"));
-        assert_eq!(request.object_version_id.as_deref(), Some("version-a"));
-        assert_eq!(request.scan_mode, Some(HealScanMode::Deep));
-        assert_eq!(request.priority, HealChannelPriority::High);
-        assert_eq!(request.source, HealRequestSource::Scanner);
-    }
-
-    #[test]
-    fn test_pending_heal_retry_candidates_respect_cap_and_order() {
-        let pending: Vec<PendingScannerHeal> = (0..(MAX_PENDING_SCANNER_HEAL_RETRIES_PER_BUCKET + 2))
-            .map(|idx| {
-                pending_heal(
-                    PendingScannerHealKind::Object,
-                    "bucket",
-                    Some(&format!("object-{idx:03}")),
-                    None,
-                    idx as u64,
-                    1,
-                )
-            })
-            .collect();
-
-        let candidates = pending_scanner_heal_retry_candidates(&pending, "bucket");
-
-        assert_eq!(candidates.len(), MAX_PENDING_SCANNER_HEAL_RETRIES_PER_BUCKET);
-        assert_eq!(candidates.first().and_then(|entry| entry.object.as_deref()), Some("object-000"));
-        assert_eq!(candidates.last().and_then(|entry| entry.object.as_deref()), Some("object-127"));
-    }
-
-    #[tokio::test]
-    async fn test_pending_heal_queue_full_deduplicates_object_entry() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
-        scanner.new_cache.info.name = "bucket".to_string();
-        scanner.update_cache.info.name = "bucket".to_string();
-
-        scanner.update_pending_scanner_heal_after_admission(
-            PendingScannerHealKind::Object,
-            "bucket",
-            Some("object"),
-            Some("version-a"),
-            HealScanMode::Deep,
-            HealAdmissionResult::Full,
-        );
-        scanner.update_pending_scanner_heal_after_admission(
-            PendingScannerHealKind::Object,
-            "bucket",
-            Some("object"),
-            Some("version-a"),
-            HealScanMode::Deep,
-            HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull),
-        );
-
-        assert_eq!(scanner.new_cache.info.pending_heals.len(), 1);
-        let pending = &scanner.new_cache.info.pending_heals[0];
-        assert_eq!(pending.object.as_deref(), Some("object"));
-        assert_eq!(pending.version_id.as_deref(), Some("version-a"));
-        assert_eq!(pending.attempts, 2);
-        assert_eq!(pending.last_admission_result, "dropped");
-        assert_eq!(pending.last_admission_reason, "queue_full");
-        assert_eq!(scanner.update_cache.info.pending_heals, scanner.new_cache.info.pending_heals);
-        assert!(scanner.pending_heals_changed);
-    }
-
-    #[tokio::test]
-    async fn test_pending_heal_admitted_results_clear_matching_entry() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
-
-        scanner.update_pending_scanner_heal_after_admission(
-            PendingScannerHealKind::Object,
-            "bucket",
-            Some("object"),
-            None,
-            HealScanMode::Normal,
-            HealAdmissionResult::Full,
-        );
-        scanner.update_pending_scanner_heal_after_admission(
-            PendingScannerHealKind::Object,
-            "bucket",
-            Some("object"),
-            None,
-            HealScanMode::Normal,
-            HealAdmissionResult::Accepted,
-        );
-
-        assert!(scanner.new_cache.info.pending_heals.is_empty());
-
-        scanner.update_pending_scanner_heal_after_admission(
-            PendingScannerHealKind::Bucket,
-            "bucket",
-            None,
-            None,
-            HealScanMode::Normal,
-            HealAdmissionResult::Full,
-        );
-        scanner.update_pending_scanner_heal_after_admission(
-            PendingScannerHealKind::Bucket,
-            "bucket",
-            None,
-            None,
-            HealScanMode::Normal,
-            HealAdmissionResult::Merged,
-        );
-
-        assert!(scanner.new_cache.info.pending_heals.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_pending_heal_policy_dropped_clears_without_creating_entry() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
-
-        scanner.update_pending_scanner_heal_after_admission(
-            PendingScannerHealKind::Object,
-            "bucket",
-            Some("object"),
-            None,
-            HealScanMode::Normal,
-            HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped),
-        );
-        assert!(scanner.new_cache.info.pending_heals.is_empty());
-
-        scanner.update_pending_scanner_heal_after_admission(
-            PendingScannerHealKind::Object,
-            "bucket",
-            Some("object"),
-            None,
-            HealScanMode::Normal,
-            HealAdmissionResult::Full,
-        );
-        scanner.update_pending_scanner_heal_after_admission(
-            PendingScannerHealKind::Object,
-            "bucket",
-            Some("object"),
-            None,
-            HealScanMode::Normal,
-            HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped),
-        );
-
-        assert!(scanner.new_cache.info.pending_heals.is_empty());
-    }
-
-    #[test]
-    fn test_partial_cache_is_useful_when_pending_heals_changed() {
-        let root = DataUsageEntry::default();
-
-        assert!(!partial_cache_is_useful(&root, false));
-        assert!(partial_cache_is_useful(&root, true));
-    }
-
-    fn metadata_for_object(bucket: &str, object: &str) -> Vec<u8> {
-        let mut meta = FileMeta::new();
-        meta.add_version(FileInfo {
-            volume: bucket.to_string(),
-            name: object.to_string(),
-            mod_time: Some(OffsetDateTime::now_utc()),
-            ..Default::default()
-        })
-        .expect("test metadata version should be accepted");
-        meta.marshal_msg().expect("test metadata should marshal")
-    }
-
-    async fn write_test_object_metadata(root: &std::path::Path, bucket: &str, object: &str) {
-        write_test_object_metadata_bytes(root, bucket, object, &metadata_for_object(bucket, object)).await;
-    }
-
-    async fn write_test_object_metadata_bytes(root: &std::path::Path, bucket: &str, object: &str, metadata: &[u8]) {
-        let object_dir = root.join(bucket).join(object);
-        tokio::fs::create_dir_all(&object_dir)
-            .await
-            .expect("failed to create test object directory");
-        tokio::fs::write(object_dir.join("xl.meta"), metadata)
-            .await
-            .expect("failed to write test object metadata");
-    }
-
-    fn test_metadata_resolver(bucket: &str) -> MetadataResolutionParams {
-        MetadataResolutionParams {
-            bucket: bucket.to_string(),
-            dir_quorum: 2,
-            obj_quorum: 2,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn test_resolve_object_heal_entry_allows_plain_unresolved_fallback() {
-        let entries = MetaCacheEntries(vec![Some(MetaCacheEntry {
-            name: "object".to_string(),
-            metadata: vec![1, 2, 3],
-            ..Default::default()
-        })]);
-
-        let entry = resolve_object_heal_entry(&entries, test_metadata_resolver("bucket"))
-            .expect("plain object fallback should be eligible for heal");
-
-        assert_eq!(entry.name, "object");
-    }
-
-    #[test]
-    fn test_resolve_object_heal_entry_skips_unresolved_trailing_slash_fallback() {
-        let entries = MetaCacheEntries(vec![Some(MetaCacheEntry {
-            name: "object/".to_string(),
-            metadata: vec![1, 2, 3],
-            ..Default::default()
-        })]);
-
-        assert!(
-            resolve_object_heal_entry(&entries, test_metadata_resolver("bucket")).is_none(),
-            "unresolved trailing-slash fallback must not be submitted as an object heal"
-        );
-    }
-
-    #[test]
-    fn test_resolve_object_heal_entry_skips_resolved_empty_directory_candidate() {
-        let entries = MetaCacheEntries(vec![
-            Some(MetaCacheEntry {
-                name: "object/".to_string(),
-                metadata: Vec::new(),
-                ..Default::default()
-            }),
-            Some(MetaCacheEntry {
-                name: "object/".to_string(),
-                metadata: Vec::new(),
-                ..Default::default()
-            }),
-        ]);
-
-        assert!(
-            resolve_object_heal_entry(&entries, test_metadata_resolver("bucket")).is_none(),
-            "resolved empty directory candidates must not be submitted as object heals"
-        );
-    }
-
-    #[test]
-    fn test_resolve_object_heal_entry_skips_only_empty_directory_fallback_candidates() {
-        let entries = MetaCacheEntries(vec![
-            Some(MetaCacheEntry {
-                name: "object/".to_string(),
-                metadata: Vec::new(),
-                ..Default::default()
-            }),
-            Some(MetaCacheEntry {
-                name: "prefix/".to_string(),
-                metadata: Vec::new(),
-                ..Default::default()
-            }),
-        ]);
-
-        assert!(
-            resolve_object_heal_entry(&entries, test_metadata_resolver("bucket")).is_none(),
-            "unresolved fallback must ignore empty directory candidates"
-        );
-    }
-
-    #[test]
-    fn test_resolve_object_heal_entry_uses_plain_fallback_after_trailing_slash() {
-        let entries = MetaCacheEntries(vec![
-            Some(MetaCacheEntry {
-                name: "object/".to_string(),
-                metadata: vec![1, 2, 3],
-                ..Default::default()
-            }),
-            Some(MetaCacheEntry {
-                name: "object".to_string(),
-                metadata: vec![1, 2, 3],
-                ..Default::default()
-            }),
-        ]);
-
-        let entry = resolve_object_heal_entry(&entries, test_metadata_resolver("bucket"))
-            .expect("plain object fallback should remain eligible after a trailing-slash candidate");
-
-        assert_eq!(entry.name, "object");
-    }
-
-    #[test]
-    fn test_resolve_object_heal_entry_uses_plain_fallback_after_empty_directory_candidate() {
-        let entries = MetaCacheEntries(vec![
-            Some(MetaCacheEntry {
-                name: "object/".to_string(),
-                metadata: Vec::new(),
-                ..Default::default()
-            }),
-            Some(MetaCacheEntry {
-                name: "object".to_string(),
-                metadata: vec![1, 2, 3],
-                ..Default::default()
-            }),
-        ]);
-
-        let entry = resolve_object_heal_entry(&entries, test_metadata_resolver("bucket"))
-            .expect("plain object fallback should remain eligible after an empty directory candidate");
-
-        assert_eq!(entry.name, "object");
-    }
-
-    #[test]
-    fn test_resolve_object_heal_entry_preserves_resolved_trailing_slash_object() {
-        let metadata = metadata_for_object("bucket", "object/");
-        let entries = MetaCacheEntries(vec![
-            Some(MetaCacheEntry {
-                name: "object/".to_string(),
-                metadata: metadata.clone(),
-                ..Default::default()
-            }),
-            Some(MetaCacheEntry {
-                name: "object/".to_string(),
-                metadata,
-                ..Default::default()
-            }),
-        ]);
-
-        let entry = resolve_object_heal_entry(&entries, test_metadata_resolver("bucket"))
-            .expect("resolved trailing-slash object should remain eligible");
-
-        assert_eq!(entry.name, "object/");
-        assert!(entry.is_object_dir());
-    }
-
-    #[test]
-    fn test_disk_errors_are_only_missing_paths_accepts_missing_mix() {
-        let errs = vec![
-            Some(DiskError::FileNotFound),
-            None,
-            Some(DiskError::FileVersionNotFound),
-            Some(DiskError::VolumeNotFound),
-        ];
-
-        assert!(disk_errors_are_only_missing_paths(&errs));
-    }
-
-    #[test]
-    fn test_disk_errors_are_only_missing_paths_rejects_empty_or_actionable_errors() {
-        assert!(!disk_errors_are_only_missing_paths(&[None, None]));
-        assert!(!disk_errors_are_only_missing_paths(&[
-            Some(DiskError::FileNotFound),
-            Some(DiskError::Timeout),
-        ]));
-    }
-
-    #[test]
-    fn test_effective_object_heal_scan_mode_keeps_normal_when_bitrot_disabled() {
-        let now = OffsetDateTime::now_utc();
-        assert_eq!(effective_object_heal_scan_mode(false, Some(now), now), HealScanMode::Normal);
-    }
-
-    #[test]
-    fn test_effective_object_heal_scan_mode_downgrades_recent_object_to_normal() {
-        let now = OffsetDateTime::now_utc();
-        let recent = now - time::Duration::seconds(5);
-        assert_eq!(effective_object_heal_scan_mode(true, Some(recent), now), HealScanMode::Normal);
-    }
-
-    #[test]
-    fn test_effective_object_heal_scan_mode_keeps_old_object_deep() {
-        let now = OffsetDateTime::now_utc();
-        let old = now - time::Duration::seconds((DEFAULT_SCANNER_DEEP_VERIFY_COOLDOWN_SECS as i64) + 5);
-        assert_eq!(effective_object_heal_scan_mode(true, Some(old), now), HealScanMode::Deep);
-    }
-
-    #[test]
-    fn test_heal_priority_label_matches_priority_names() {
-        assert_eq!(heal_priority_label(HealChannelPriority::Low), "low");
-        assert_eq!(heal_priority_label(HealChannelPriority::Normal), "normal");
-        assert_eq!(heal_priority_label(HealChannelPriority::High), "high");
-        assert_eq!(heal_priority_label(HealChannelPriority::Critical), "critical");
-    }
-
-    #[test]
-    fn test_describe_heal_admission_formats_unadmitted_results() {
-        assert_eq!(describe_heal_admission(HealAdmissionResult::Accepted), "accepted");
-        assert_eq!(describe_heal_admission(HealAdmissionResult::Merged), "merged");
-        assert_eq!(describe_heal_admission(HealAdmissionResult::Full), "queue_full");
-        assert_eq!(
-            describe_heal_admission(HealAdmissionResult::Dropped(
-                rustfs_common::heal_channel::HealAdmissionDropReason::QueueFull
-            )),
-            "dropped:queue_full"
-        );
-    }
-
-    #[test]
-    fn test_build_high_priority_heal_admission_error_contains_context() {
-        let err = build_high_priority_heal_admission_error(
-            "object",
-            "bucket-a",
-            Some("path/to/object"),
-            HealChannelPriority::High,
-            HealAdmissionResult::Full,
-        );
-
-        let err_text = err.to_string();
-        assert!(err_text.contains("type=object"));
-        assert!(err_text.contains("bucket='bucket-a'"));
-        assert!(err_text.contains("object='path/to/object'"));
-        assert!(err_text.contains("priority=high"));
-        assert!(err_text.contains("admission=queue_full"));
-    }
-
-    #[tokio::test]
-    async fn test_heal_actions_returns_actual_size_without_inline_heal() {
-        let temp_dir = std::env::temp_dir();
-        let file_type = std::fs::metadata(&temp_dir).unwrap().file_type();
-
-        let mut item = ScannerItem {
-            path: temp_dir.join("object").to_string_lossy().to_string(),
-            bucket: "bucket".to_string(),
-            prefix: "".to_string(),
-            object_name: "object".to_string(),
-            file_type,
-            lifecycle: None,
-            object_lock: None,
-            replication: None,
-            heal_enabled: true,
-            heal_bitrot: true,
-            debug: false,
-        };
-        let object_info = ObjectInfo {
-            bucket: "bucket".to_string(),
-            name: "object".to_string(),
-            ..Default::default()
-        };
-        let mut size_summary = SizeSummary::default();
-
-        let size = item.heal_actions(&object_info, 123, &mut size_summary).await;
-        assert_eq!(size, 123);
-    }
-
-    #[tokio::test]
-    #[serial]
-    #[cfg(unix)]
-    async fn test_scan_folder_skips_unreadable_child_directory() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir.clone());
-
-        let bucket_dir = temp_dir.join("bucket");
-        let good_dir = bucket_dir.join("good");
-        let bad_dir = bucket_dir.join("bad");
-
-        std::fs::create_dir_all(&good_dir).expect("failed to create good dir");
-        std::fs::create_dir_all(&bad_dir).expect("failed to create bad dir");
-        std::fs::set_permissions(&bad_dir, std::fs::Permissions::from_mode(0o000)).expect("failed to remove bad dir permissions");
-
-        scanner.old_cache.info.name = "bucket".to_string();
-        scanner.new_cache.info.name = "bucket".to_string();
-        scanner.update_cache.info.name = "bucket".to_string();
-
-        let folder = CachedFolder {
-            name: "bucket".to_string(),
-            parent: None,
-            object_heal_prob_div: 1,
-        };
-
-        let mut into = DataUsageEntry::default();
-        let result = scanner.scan_folder(CancellationToken::new(), folder, &mut into).await;
-
-        std::fs::set_permissions(&bad_dir, std::fs::Permissions::from_mode(0o755))
-            .expect("failed to restore bad dir permissions");
-
-        assert!(result.is_ok(), "expected unreadable child directory to be skipped");
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
-        let heal_starts = Arc::new(AtomicUsize::new(0));
-        let heal_starts_clone = heal_starts.clone();
-        let mut heal_rx =
-            rustfs_common::heal_channel::init_heal_channel().expect("heal channel should initialize once for scanner tests");
-        let _heal_responder = tokio::spawn(async move {
-            while let Some(command) = heal_rx.recv().await {
-                if let rustfs_common::heal_channel::HealChannelCommand::Start { response_tx, .. } = command {
-                    heal_starts_clone.fetch_add(1, Ordering::Relaxed);
-                    let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
-                }
-            }
-        });
-
-        let bucket = "src-archive";
-        let object = "snapshots/37b3f20d941e2f5e6d99114d9bb2f3e67a8a2e5c9c4c5a1b0d6e7f8091a2b3c4";
-        let metadata = metadata_for_object(bucket, object);
-        write_test_object_metadata_bytes(&temp_dir, bucket, object, &metadata).await;
-
-        let mut disks = vec![scanner.local_disk.clone()];
-        for disk_name in ["disk2", "disk3", "disk4"] {
-            let disk_root = temp_dir.join(disk_name);
-            write_test_object_metadata_bytes(&disk_root, bucket, object, &metadata).await;
-            let endpoint =
-                Endpoint::try_from(disk_root.to_string_lossy().as_ref()).expect("failed to create extra disk endpoint");
-            let disk = new_disk(
-                &endpoint,
-                &DiskOption {
-                    cleanup: false,
-                    health_check: false,
-                },
-            )
-            .await
-            .expect("failed to create extra disk");
-            disks.push(disk);
-        }
-
-        scanner.heal_object_select = 1;
-        scanner.disks = disks;
-        scanner.disks_quorum = 2;
-        let (options_tx, mut options_rx) = mpsc::unbounded_channel();
-        scanner.list_path_raw_options_observer = Some(options_tx);
-        scanner.old_cache.replace(
-            &format!("{bucket}/{object}"),
-            bucket,
-            DataUsageEntry {
-                objects: 1,
-                ..Default::default()
-            },
-        );
-
-        let mut into = DataUsageEntry::default();
-        let folder = CachedFolder {
-            name: bucket.to_string(),
-            parent: None,
-            object_heal_prob_div: 1,
-        };
-
-        tokio::time::timeout(Duration::from_secs(2), scanner.scan_folder(CancellationToken::new(), folder, &mut into))
-            .await
-            .expect("scan_folder should not hang after list_path_raw finishes")
-            .expect("scan_folder should finish successfully");
-
-        let observed_options = tokio::time::timeout(Duration::from_secs(1), options_rx.recv())
-            .await
-            .expect("abandoned-child listing options should be observed promptly")
-            .expect("abandoned-child listing options channel should remain open");
-        assert_eq!(observed_options, (true, None, Some(SCANNER_LIST_PATH_RAW_STALL_TIMEOUT)));
-        let root = scanner
-            .new_cache
-            .checked_flatten(bucket)
-            .expect("healed cache must contain canonical child links");
-        assert_eq!(root.objects, 1);
-        assert!(heal_starts.load(Ordering::Relaxed) > 0, "test must execute the heal child-link path");
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_scan_folder_xl_meta_named_directory_uses_namespace_descent() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
-
-        let bucket_dir = temp_dir.join("bucket");
-        tokio::fs::create_dir_all(bucket_dir.join(STORAGE_FORMAT_FILE))
-            .await
-            .expect("failed to create xl.meta namespace directory");
-
-        scanner.old_cache.info.name = "bucket".to_string();
-        scanner.new_cache.info.name = "bucket".to_string();
-        scanner.update_cache.info.name = "bucket".to_string();
-        scanner.is_erasure_mode = true;
-
-        let parent = CancellationToken::new();
-        let budget = ScannerCycleBudget::new_with_progress_tracking(
-            &parent,
-            crate::scanner_budget::ScannerCycleBudgetConfig {
-                max_directories: Some(1),
-                ..Default::default()
-            },
-        );
-        let ctx = budget.token();
-        scanner.budget = budget.clone();
-
-        let folder = CachedFolder {
-            name: "bucket".to_string(),
-            parent: None,
-            object_heal_prob_div: 1,
-        };
-
-        let mut into = DataUsageEntry::default();
-        let result = scanner.scan_folder(ctx, folder, &mut into).await;
-
-        assert!(
-            result.is_err(),
-            "an xl.meta namespace directory must be traversed instead of treated as object metadata"
-        );
-        assert!(budget.budget_elapsed());
-        assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
-        assert!(budget.token().is_cancelled());
-        assert!(budget.entries_visited() >= 1);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_scan_folder_corrupt_xl_meta_stops_erasure_data_dir_descent() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
-
-        let object_dir = temp_dir.join("bucket").join("object");
-        let data_dir = object_dir.join(Uuid::new_v4().to_string());
-        tokio::fs::create_dir_all(&data_dir)
-            .await
-            .expect("failed to create erasure data directory");
-        let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
-        tokio::fs::write(&metadata_path, b"")
-            .await
-            .expect("failed to create corrupt object metadata");
-
-        scanner.old_cache.info.name = "bucket".to_string();
-        scanner.new_cache.info.name = "bucket".to_string();
-        scanner.update_cache.info.name = "bucket".to_string();
-        scanner.is_erasure_mode = true;
-
-        let parent = CancellationToken::new();
-        let budget = ScannerCycleBudget::new_with_progress_tracking(
-            &parent,
-            crate::scanner_budget::ScannerCycleBudgetConfig {
-                max_directories: Some(1),
-                ..Default::default()
-            },
-        );
-        scanner.budget = budget.clone();
-
-        let folder = CachedFolder {
-            name: "bucket/object".to_string(),
-            parent: None,
-            object_heal_prob_div: 1,
-        };
-        let mut into = DataUsageEntry::default();
-
-        scanner
-            .scan_folder(budget.token(), folder, &mut into)
-            .await
-            .expect("failed metadata must not make scanner descend into erasure data directories");
-
-        assert_eq!(into.failed_objects, 1);
-        assert!(
-            scanner
-                .new_cache
-                .info
-                .failed_objects
-                .contains_key(metadata_path.to_string_lossy().as_ref())
-        );
-        assert!(!budget.budget_elapsed());
-        assert_eq!(budget.reason(), None);
-
-        let retry_budget = ScannerCycleBudget::new_with_progress_tracking(
-            &parent,
-            crate::scanner_budget::ScannerCycleBudgetConfig {
-                max_directories: Some(1),
-                ..Default::default()
-            },
-        );
-        scanner.budget = retry_budget.clone();
-        let retry_folder = CachedFolder {
-            name: "bucket/object".to_string(),
-            parent: None,
-            object_heal_prob_div: 1,
-        };
-        let mut retry_into = DataUsageEntry::default();
-
-        scanner
-            .scan_folder(retry_budget.token(), retry_folder, &mut retry_into)
-            .await
-            .expect("cached metadata failure must still stop erasure data directory descent");
-
-        assert_eq!(retry_into.failed_objects, 0, "cached failure should not be counted twice");
-        assert!(!retry_budget.budget_elapsed());
-        assert_eq!(retry_budget.reason(), None);
-
-        #[cfg(unix)]
-        {
-            tokio::fs::remove_file(&metadata_path)
-                .await
-                .expect("failed to remove corrupt object metadata");
-            tokio::fs::write(data_dir.join("part.1"), b"shard")
-                .await
-                .expect("failed to create erasure shard");
-            scanner.new_cache.info.failed_objects.clear();
-            let metadata_target = temp_dir.join("metadata-target");
-            tokio::fs::create_dir(&metadata_target)
-                .await
-                .expect("failed to create metadata symlink target");
-            std::os::unix::fs::symlink(&metadata_target, &metadata_path).expect("failed to create metadata directory symlink");
-
-            let symlink_budget = ScannerCycleBudget::new_with_progress_tracking(
-                &parent,
-                crate::scanner_budget::ScannerCycleBudgetConfig {
-                    max_directories: Some(1),
-                    ..Default::default()
-                },
-            );
-            scanner.budget = symlink_budget.clone();
-            let symlink_folder = CachedFolder {
-                name: "bucket/object".to_string(),
-                parent: None,
-                object_heal_prob_div: 1,
-            };
-            let mut symlink_into = DataUsageEntry::default();
-
-            scanner
-                .scan_folder(symlink_budget.token(), symlink_folder, &mut symlink_into)
-                .await
-                .expect("metadata symlink must still stop erasure data directory descent");
-
-            assert_eq!(symlink_into.failed_objects, 1);
-            assert!(
-                scanner
-                    .new_cache
-                    .info
-                    .failed_objects
-                    .contains_key(metadata_path.to_string_lossy().as_ref())
-            );
-            assert!(!symlink_budget.budget_elapsed());
-            assert_eq!(symlink_budget.reason(), None);
-        }
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_scan_folder_missing_xl_meta_stops_erasure_data_dir_descent() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
-
-        let object_dir = temp_dir.join("bucket").join("object");
-        let data_dir = object_dir.join(Uuid::new_v4().to_string());
-        tokio::fs::create_dir_all(&data_dir)
-            .await
-            .expect("failed to create erasure data directory");
-        tokio::fs::write(data_dir.join("part.1"), b"shard")
-            .await
-            .expect("failed to create erasure shard");
-        let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
-
-        scanner.old_cache.info.name = "bucket".to_string();
-        scanner.new_cache.info.name = "bucket".to_string();
-        scanner.update_cache.info.name = "bucket".to_string();
-        scanner.is_erasure_mode = true;
-
-        let parent = CancellationToken::new();
-        let budget = ScannerCycleBudget::new_with_progress_tracking(
-            &parent,
-            crate::scanner_budget::ScannerCycleBudgetConfig {
-                max_directories: Some(1),
-                ..Default::default()
-            },
-        );
-        scanner.budget = budget.clone();
-        let folder = CachedFolder {
-            name: "bucket/object".to_string(),
-            parent: None,
-            object_heal_prob_div: 1,
-        };
-        let mut into = DataUsageEntry::default();
-
-        scanner
-            .scan_folder(budget.token(), folder, &mut into)
-            .await
-            .expect("missing metadata must not make scanner descend into erasure data directories");
-
-        assert_eq!(into.failed_objects, 1);
-        assert!(
-            scanner
-                .new_cache
-                .info
-                .failed_objects
-                .contains_key(metadata_path.to_string_lossy().as_ref())
-        );
-        assert!(!budget.budget_elapsed());
-        assert_eq!(budget.reason(), None);
-
-        let retry_budget = ScannerCycleBudget::new_with_progress_tracking(
-            &parent,
-            crate::scanner_budget::ScannerCycleBudgetConfig {
-                max_directories: Some(1),
-                ..Default::default()
-            },
-        );
-        scanner.budget = retry_budget.clone();
-        let retry_folder = CachedFolder {
-            name: "bucket/object".to_string(),
-            parent: None,
-            object_heal_prob_div: 1,
-        };
-        let mut retry_into = DataUsageEntry::default();
-
-        scanner
-            .scan_folder(retry_budget.token(), retry_folder, &mut retry_into)
-            .await
-            .expect("cached missing metadata must still stop erasure data directory descent");
-
-        assert_eq!(retry_into.failed_objects, 0, "cached failure should not be counted twice");
-        assert!(!retry_budget.budget_elapsed());
-        assert_eq!(retry_budget.reason(), None);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_scan_folder_uuid_namespace_part_name_directory_is_not_data_dir() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
-
-        let namespace_name = Uuid::new_v4().to_string();
-        let namespace = temp_dir.join("bucket").join(&namespace_name);
-        tokio::fs::create_dir_all(namespace.join("part.1"))
-            .await
-            .expect("failed to create UUID namespace with part-like child directory");
-        let nil_uuid_namespace = temp_dir.join("bucket").join(Uuid::nil().to_string());
-        tokio::fs::create_dir_all(&nil_uuid_namespace)
-            .await
-            .expect("failed to create nil UUID namespace");
-        tokio::fs::write(nil_uuid_namespace.join("part.1"), b"namespace object")
-            .await
-            .expect("failed to create object in nil UUID namespace");
-
-        scanner.old_cache.info.name = "bucket".to_string();
-        scanner.new_cache.info.name = "bucket".to_string();
-        scanner.update_cache.info.name = "bucket".to_string();
-        scanner.is_erasure_mode = true;
-        let namespace_hash = hash_path(&format!("bucket/{namespace_name}"));
-        scanner.old_cache.replace_hashed(
-            &namespace_hash,
-            &Some(hash_path("bucket")),
-            &DataUsageEntry {
-                objects: 1,
-                size: 16,
-                ..Default::default()
-            },
-        );
-
-        let parent = CancellationToken::new();
-        let budget = ScannerCycleBudget::new_with_progress_tracking(
-            &parent,
-            crate::scanner_budget::ScannerCycleBudgetConfig {
-                max_directories: Some(1),
-                ..Default::default()
-            },
-        );
-        scanner.budget = budget.clone();
-        let folder = CachedFolder {
-            name: "bucket".to_string(),
-            parent: None,
-            object_heal_prob_div: 1,
-        };
-        let mut into = DataUsageEntry::default();
-
-        let result = scanner.scan_folder(budget.token(), folder, &mut into).await;
-
-        assert!(result.is_err(), "part.N directories and nil UUID namespaces must remain traversable");
-        assert!(budget.budget_elapsed());
-        assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
-        assert!(scanner.new_cache.info.failed_objects.is_empty());
-        assert!(
-            scanner.update_cache.find(&namespace_hash.key()).is_some(),
-            "an existing UUID namespace must retain its cached subtree"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_scan_folder_non_erasure_metadata_keeps_namespace_descent() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
-
-        let folder_path = temp_dir.join("bucket").join("object");
-        tokio::fs::create_dir_all(folder_path.join("child"))
-            .await
-            .expect("failed to create child namespace");
-        tokio::fs::write(folder_path.join(STORAGE_FORMAT_FILE), b"")
-            .await
-            .expect("failed to create metadata-shaped file");
-
-        scanner.old_cache.info.name = "bucket".to_string();
-        scanner.new_cache.info.name = "bucket".to_string();
-        scanner.update_cache.info.name = "bucket".to_string();
-        scanner.is_erasure_mode = false;
-
-        let parent = CancellationToken::new();
-        let budget = ScannerCycleBudget::new_with_progress_tracking(
-            &parent,
-            crate::scanner_budget::ScannerCycleBudgetConfig {
-                max_directories: Some(1),
-                ..Default::default()
-            },
-        );
-        scanner.budget = budget.clone();
-        let folder = CachedFolder {
-            name: "bucket/object".to_string(),
-            parent: None,
-            object_heal_prob_div: 1,
-        };
-        let mut into = DataUsageEntry::default();
-
-        let result = scanner.scan_folder(budget.token(), folder, &mut into).await;
-
-        assert!(result.is_err(), "non-erasure scans must not stop at metadata-shaped files");
-        assert!(budget.budget_elapsed());
-        assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_scan_folder_compacted_parent_sends_partial_update() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
-
-        let bucket_dir = temp_dir.join("bucket");
-        tokio::fs::create_dir_all(bucket_dir.join("child"))
-            .await
-            .expect("failed to create child directory");
-
-        scanner.old_cache.info.name = "bucket".to_string();
-        scanner.new_cache.info.name = "bucket".to_string();
-        scanner.update_cache.info.name = "bucket".to_string();
-        scanner.last_update = SystemTime::UNIX_EPOCH;
-
-        let (tx, mut rx) = mpsc::channel(1);
-        scanner.updates = Some(tx);
-
-        let folder = CachedFolder {
-            name: "bucket".to_string(),
-            parent: None,
-            object_heal_prob_div: 1,
-        };
-        let mut into = DataUsageEntry {
-            compacted: true,
-            ..Default::default()
-        };
-
-        scanner
-            .scan_folder(CancellationToken::new(), folder, &mut into)
-            .await
-            .expect("compacted scan should finish successfully");
-
-        let update = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("compacted scan should send a partial update")
-            .expect("partial update channel should remain open");
-
-        assert!(update.compacted, "partial update should preserve compacted state");
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_scan_data_folder_cancelled_before_scan_clears_current_path() {
-        let (scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard {
-            temp_dir: Some(temp_dir),
-        };
-        let parent = CancellationToken::new();
-        parent.cancel();
-        let budget = ScannerCycleBudget::new(&parent, Default::default());
-        let cache = DataUsageCache {
-            info: crate::data_usage_define::DataUsageCacheInfo {
-                name: "bucket".to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let disk_path = scanner.local_disk.path().to_string_lossy().to_string();
-
-        let result = scan_data_folder(
-            budget.token(),
-            budget,
-            vec![scanner.local_disk.clone()],
-            scanner.local_disk,
-            cache,
-            None,
-            HealScanMode::Normal,
-            SCANNER_SLEEPER.clone(),
-        )
-        .await;
-
-        assert!(matches!(result, Err(ScannerError::Other(message)) if message == "Operation cancelled"));
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let report = global_metrics().report().await;
-                if report.active_paths.iter().all(|path| !path.starts_with(&disk_path)) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancelled scan should deregister its active path");
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_scan_data_folder_returns_partial_cache_on_budget_cancel() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
-
-        let bucket_dir = temp_dir.join("bucket");
-        tokio::fs::create_dir_all(bucket_dir.join("child-a"))
-            .await
-            .expect("failed to create first child directory");
-        tokio::fs::create_dir_all(bucket_dir.join("child-b"))
-            .await
-            .expect("failed to create second child directory");
-
-        let parent = CancellationToken::new();
-        let budget = ScannerCycleBudget::new(
-            &parent,
-            crate::scanner_budget::ScannerCycleBudgetConfig {
-                max_directories: Some(2),
-                ..Default::default()
-            },
-        );
-        let cache = DataUsageCache {
-            info: crate::data_usage_define::DataUsageCacheInfo {
-                name: "bucket".to_string(),
-                next_cycle: 7,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let result = scan_data_folder(
-            budget.token(),
-            budget.clone(),
-            vec![scanner.local_disk.clone()],
-            scanner.local_disk.clone(),
-            cache,
-            None,
-            HealScanMode::Normal,
-            SCANNER_SLEEPER.clone(),
-        )
-        .await;
-
-        let partial_cache = match result {
-            Err(ScannerError::PartialCache(partial_cache)) => partial_cache,
-            other => panic!("expected partial cache after directory budget cancellation, got {other:?}"),
-        };
-
-        assert!(partial_cache.info.last_update.is_some());
-        assert_eq!(partial_cache.info.next_cycle, 7);
-        assert!(!partial_cache.info.snapshot_complete);
-        assert!(partial_cache.root().is_some(), "partial cache should keep completed scan progress");
-        assert!(budget.budget_elapsed());
-        assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_scan_data_folder_reports_invalid_checkpoint_ignored_once() {
-        let (scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard {
-            temp_dir: Some(temp_dir.clone()),
-        };
-
-        tokio::fs::create_dir_all(temp_dir.join("bucket").join("child-a").join("grandchild"))
-            .await
-            .expect("failed to create nested child directory");
-
-        let before = global_metrics().report().await.scan_checkpoint_ignored;
-        let parent = CancellationToken::new();
-        let budget = ScannerCycleBudget::new(&parent, Default::default());
-        let cache = DataUsageCache {
-            info: crate::data_usage_define::DataUsageCacheInfo {
-                name: "bucket".to_string(),
-                scan_checkpoint: Some(crate::data_usage_define::DataUsageScanCheckpoint {
-                    version: crate::data_usage_define::DATA_USAGE_SCAN_CHECKPOINT_VERSION + 1,
-                    resume_after: "bucket/child-a".to_string(),
-                    reason: crate::data_usage_define::DataUsageScanCheckpointReason::Unknown,
-                }),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let result = scan_data_folder(
-            budget.token(),
-            budget.clone(),
-            vec![scanner.local_disk.clone()],
-            scanner.local_disk.clone(),
-            cache,
-            None,
-            HealScanMode::Normal,
-            SCANNER_SLEEPER.clone(),
-        )
-        .await;
-
-        assert!(result.is_ok(), "scan should complete with an ignored checkpoint");
-        let after = global_metrics().report().await.scan_checkpoint_ignored;
-        assert_eq!(after.saturating_sub(before), 1);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_scan_data_folder_resume_hint_prioritizes_next_existing_folder() {
-        let (scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard {
-            temp_dir: Some(temp_dir.clone()),
-        };
-
-        let bucket_dir = temp_dir.join("bucket");
-        for child in ["child-a", "child-b", "child-c"] {
-            tokio::fs::create_dir_all(bucket_dir.join(child))
-                .await
-                .expect("failed to create child directory");
-        }
-
-        let root_hash = hash_path("bucket");
-        let mut cache = DataUsageCache {
-            info: crate::data_usage_define::DataUsageCacheInfo {
-                name: "bucket".to_string(),
-                next_cycle: 9,
-                scan_resume_after: Some("bucket/child-a".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        cache.replace_hashed(&root_hash, &None, &DataUsageEntry::default());
-        for child in ["child-a", "child-b", "child-c"] {
-            cache.replace_hashed(
-                &hash_path(&format!("bucket/{child}")),
-                &Some(root_hash.clone()),
-                &DataUsageEntry::default(),
-            );
-        }
-
-        let parent = CancellationToken::new();
-        let budget = ScannerCycleBudget::new(
-            &parent,
-            crate::scanner_budget::ScannerCycleBudgetConfig {
-                max_directories: Some(2),
-                ..Default::default()
-            },
-        );
-
-        let result = scan_data_folder(
-            budget.token(),
-            budget.clone(),
-            vec![scanner.local_disk.clone()],
-            scanner.local_disk.clone(),
-            cache,
-            None,
-            HealScanMode::Normal,
-            SCANNER_SLEEPER.clone(),
-        )
-        .await;
-
-        let partial_cache = match result {
-            Err(ScannerError::PartialCache(partial_cache)) => partial_cache,
-            other => panic!("expected partial cache after directory budget cancellation, got {other:?}"),
-        };
-
-        assert_eq!(partial_cache.info.scan_resume_after.as_deref(), Some("bucket/child-b"));
-        let checkpoint = partial_cache.info.scan_checkpoint.as_ref().expect("partial scan checkpoint");
-        assert_eq!(checkpoint.version, crate::data_usage_define::DATA_USAGE_SCAN_CHECKPOINT_VERSION);
-        assert_eq!(checkpoint.resume_after, "bucket/child-b");
-        assert_eq!(checkpoint.reason, crate::data_usage_define::DataUsageScanCheckpointReason::Directories);
-        assert!(
-            partial_cache
-                .root()
-                .is_some_and(|root| root.children.contains(&hash_path("bucket/child-b").key()))
-        );
-        assert_eq!(partial_cache.info.next_cycle, 9);
-        assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn scan_data_folder_missing_bucket_returns_partial() {
-        let (scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard {
-            temp_dir: Some(temp_dir),
-        };
-        let parent = CancellationToken::new();
-        let budget = ScannerCycleBudget::new(&parent, Default::default());
-        let mut cache = DataUsageCache {
-            info: crate::data_usage_define::DataUsageCacheInfo {
-                name: "missing-bucket".to_string(),
-                next_cycle: 9,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        cache.replace(
-            "missing-bucket",
-            crate::data_usage_define::DATA_USAGE_ROOT,
-            DataUsageEntry {
-                objects: 7,
-                size: 70,
-                ..Default::default()
-            },
-        );
-
-        let result = scan_data_folder(
-            budget.token(),
-            budget,
-            vec![scanner.local_disk.clone()],
-            scanner.local_disk,
-            cache,
-            None,
-            HealScanMode::Normal,
-            SCANNER_SLEEPER.clone(),
-        )
-        .await;
-
-        let partial = match result {
-            Err(ScannerError::NamespaceNotFoundCache(partial)) => partial,
-            other => panic!("missing bucket should keep the scan incomplete, got {other:?}"),
-        };
-        assert!(!partial.info.snapshot_complete);
-        assert_eq!(partial.info.next_cycle, 9);
-        let root = partial
-            .checked_flatten("missing-bucket")
-            .expect("missing bucket partial must retain the last durable usage");
-        assert_eq!(root.objects, 7);
-        assert_eq!(root.size, 70);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn scan_data_folder_missing_scan_root_returns_partial() {
-        let (scanner, temp_dir) = build_test_scanner().await;
-        tokio::fs::remove_dir_all(&temp_dir)
-            .await
-            .expect("failed to remove scanner root");
-        let _guard = TestGuard {
-            temp_dir: Some(temp_dir),
-        };
-        let parent = CancellationToken::new();
-        let budget = ScannerCycleBudget::new(&parent, Default::default());
-        let cache = DataUsageCache {
-            info: crate::data_usage_define::DataUsageCacheInfo {
-                name: "missing-bucket".to_string(),
-                next_cycle: 9,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let result = scan_data_folder(
-            budget.token(),
-            budget,
-            vec![scanner.local_disk.clone()],
-            scanner.local_disk,
-            cache,
-            None,
-            HealScanMode::Normal,
-            SCANNER_SLEEPER.clone(),
-        )
-        .await;
-
-        let partial = match result {
-            Err(ScannerError::NamespaceNotFoundCache(partial)) => partial,
-            other => panic!("missing scan root should keep the scan incomplete, got {other:?}"),
-        };
-        assert!(!partial.info.snapshot_complete);
-        assert_eq!(partial.info.next_cycle, 9);
-        let root = partial
-            .checked_flatten("missing-bucket")
-            .expect("missing scan root partial should retain a non-publishable root");
-        assert_eq!(root.objects, 0);
-        assert_eq!(root.size, 0);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_scan_data_folder_resume_hint_orders_across_new_and_existing_folders() {
-        let (scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard {
-            temp_dir: Some(temp_dir.clone()),
-        };
-
-        let bucket_dir = temp_dir.join("bucket");
-        for child in ["child-a", "child-b", "child-c", "child-d"] {
-            tokio::fs::create_dir_all(bucket_dir.join(child))
-                .await
-                .expect("failed to create child directory");
-        }
-
-        let root_hash = hash_path("bucket");
-        let mut cache = DataUsageCache {
-            info: crate::data_usage_define::DataUsageCacheInfo {
-                name: "bucket".to_string(),
-                next_cycle: 9,
-                scan_resume_after: Some("bucket/child-b".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        cache.replace_hashed(&root_hash, &None, &DataUsageEntry::default());
-        for child in ["child-b", "child-c"] {
-            cache.replace_hashed(
-                &hash_path(&format!("bucket/{child}")),
-                &Some(root_hash.clone()),
-                &DataUsageEntry::default(),
-            );
-        }
-
-        let parent = CancellationToken::new();
-        let budget = ScannerCycleBudget::new(
-            &parent,
-            crate::scanner_budget::ScannerCycleBudgetConfig {
-                max_directories: Some(2),
-                ..Default::default()
-            },
-        );
-
-        let result = scan_data_folder(
-            budget.token(),
-            budget.clone(),
-            vec![scanner.local_disk.clone()],
-            scanner.local_disk.clone(),
-            cache,
-            None,
-            HealScanMode::Normal,
-            SCANNER_SLEEPER.clone(),
-        )
-        .await;
-
-        let partial_cache = match result {
-            Err(ScannerError::PartialCache(partial_cache)) => partial_cache,
-            other => panic!("expected partial cache after directory budget cancellation, got {other:?}"),
-        };
-
-        assert_eq!(partial_cache.info.scan_resume_after.as_deref(), Some("bucket/child-c"));
-        assert!(
-            partial_cache
-                .root()
-                .is_some_and(|root| root.children.contains(&hash_path("bucket/child-c").key()))
-        );
-        assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_scan_data_folder_partial_object_budget_accumulates_progress() {
-        let (scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard {
-            temp_dir: Some(temp_dir.clone()),
-        };
-
-        for index in 0..5 {
-            write_test_object_metadata(&temp_dir, "bucket", &format!("obj/{index:04}")).await;
-        }
-
-        let mut cache = DataUsageCache {
-            info: crate::data_usage_define::DataUsageCacheInfo {
-                name: "bucket".to_string(),
-                next_cycle: 9,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        for expected_min_objects in [2, 4] {
-            let parent = CancellationToken::new();
-            let budget = ScannerCycleBudget::new(
-                &parent,
-                crate::scanner_budget::ScannerCycleBudgetConfig {
-                    max_objects: Some(2),
-                    ..Default::default()
-                },
-            );
-
-            let result = scan_data_folder(
-                budget.token(),
-                budget.clone(),
-                vec![scanner.local_disk.clone()],
-                scanner.local_disk.clone(),
-                cache,
-                None,
-                HealScanMode::Normal,
-                SCANNER_SLEEPER.clone(),
-            )
-            .await;
-
-            cache = match result {
-                Err(ScannerError::PartialCache(partial_cache)) => *partial_cache,
-                other => panic!("expected partial cache after object budget cancellation, got {other:?}"),
-            };
-
-            let root = cache
-                .size_recursive("bucket")
-                .expect("partial cache should retain bucket progress");
-            assert!(
-                root.objects >= expected_min_objects,
-                "partial scan progress should accumulate across cycles; expected at least {expected_min_objects}, got {}",
-                root.objects
-            );
-            assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Objects));
-        }
-
-        let parent = CancellationToken::new();
-        let budget = ScannerCycleBudget::new(&parent, Default::default());
-        let result = scan_data_folder(
-            budget.token(),
-            budget,
-            vec![scanner.local_disk.clone()],
-            scanner.local_disk.clone(),
-            cache,
-            None,
-            HealScanMode::Normal,
-            SCANNER_SLEEPER.clone(),
-        )
-        .await
-        .expect("unbounded scan should finish after partial progress");
-
-        let root = result
-            .checked_flatten("bucket")
-            .expect("completed cache should retain bucket usage");
-        assert_eq!(root.objects, 5);
-        assert!(result.info.snapshot_complete);
-        assert!(result.info.scan_resume_after.is_none());
-        assert!(result.info.scan_checkpoint.is_none());
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_partial_compacted_entry_does_not_carry_children() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard {
-            temp_dir: Some(temp_dir),
-        };
-
-        let child_hash = hash_path("bucket/child");
-        let old_leaf_hash = hash_path("bucket/child/old");
-        let mut old_child = DataUsageEntry::default();
-        old_child.add_child(&old_leaf_hash);
-
-        scanner
-            .old_cache
-            .replace_hashed(&child_hash, &Some(hash_path("bucket")), &old_child);
-        scanner.old_cache.replace_hashed(
-            &old_leaf_hash,
-            &Some(child_hash.clone()),
-            &DataUsageEntry {
-                objects: 7,
-                size: 7,
-                ..Default::default()
-            },
-        );
-
-        let mut compacted_partial = DataUsageEntry {
-            objects: 2,
-            size: 2,
-            compacted: true,
-            ..Default::default()
-        };
-
-        scanner.carry_forward_old_children(&child_hash, &mut compacted_partial);
-
-        assert!(
-            compacted_partial.children.is_empty(),
-            "compacted entries already contain flattened totals and must not retain child entries"
-        );
-        assert_eq!(compacted_partial.objects, 2);
-        assert!(
-            scanner.new_cache.find(&old_leaf_hash.key()).is_none(),
-            "carried children would be flattened again by size_recursive"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_partial_entry_does_not_carry_missing_old_child() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard {
-            temp_dir: Some(temp_dir),
-        };
-        let root_hash = hash_path("bucket");
-        scanner.old_cache.cache.insert(
-            root_hash.key(),
-            DataUsageEntry {
-                children: HashSet::from([hash_path("bucket/missing").key()]),
-                ..Default::default()
-            },
-        );
-
-        let mut partial = DataUsageEntry {
-            objects: 2,
-            size: 2,
-            ..Default::default()
-        };
-        scanner.carry_forward_old_children(&root_hash, &mut partial);
-        scanner.new_cache.replace_hashed(&root_hash, &None, &partial);
-
-        assert!(partial.children.is_empty());
-        let flattened = scanner
-            .new_cache
-            .checked_flatten("bucket")
-            .expect("a partial cache must not retain dangling child links");
-        assert_eq!(flattened.objects, 2);
-        assert_eq!(flattened.size, 2);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_legacy_windows_cache_rebuilds_and_round_trips_portable_keys() {
-        let (scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard {
-            temp_dir: Some(temp_dir.clone()),
-        };
-        write_test_object_metadata(&temp_dir, "bucket", "prefix/object").await;
-
-        let source = crate::data_usage_define::DataUsageCacheSource::new(0, 0);
-        let scan_plan_digest = crate::data_usage_define::DataUsageScanPlanDigest([9; 32]);
-        let mut legacy = DataUsageCache {
-            info: crate::data_usage_define::DataUsageCacheInfo {
-                name: "bucket".to_string(),
-                next_cycle: 7,
-                source: Some(source),
-                scan_plan_digest: Some(scan_plan_digest),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        legacy.cache.insert(
-            "bucket".to_string(),
-            DataUsageEntry {
-                children: HashSet::from(["bucket\\prefix".to_string()]),
-                ..Default::default()
-            },
-        );
-        legacy.cache.insert(
-            "bucket\\prefix".to_string(),
-            DataUsageEntry {
-                objects: 1,
-                ..Default::default()
-            },
-        );
-        let encoded = legacy.marshal_msg().expect("legacy cache should serialize");
-        let mut migrated = DataUsageCache::unmarshal(&encoded).expect("legacy cache should deserialize");
-        assert_eq!(
-            migrated.prepare_for_scan("bucket", 8, 0, source, scan_plan_digest, true),
-            crate::data_usage_define::DataUsageCachePrepareOutcome::Reset
-        );
-
-        let parent = CancellationToken::new();
-        let budget = ScannerCycleBudget::new(&parent, Default::default());
-        let rebuilt = scan_data_folder(
-            budget.token(),
-            budget,
-            vec![scanner.local_disk.clone()],
-            scanner.local_disk,
-            migrated,
-            None,
-            HealScanMode::Normal,
-            SCANNER_SLEEPER.clone(),
-        )
-        .await
-        .expect("portable cache rebuild should complete");
-        let persisted = rebuilt.marshal_msg().expect("rebuilt cache should serialize");
-        let decoded = DataUsageCache::unmarshal(&persisted).expect("rebuilt cache should deserialize");
-
-        assert_eq!(decoded.info.cache_key_format, crate::data_usage_define::DATA_USAGE_CACHE_KEY_FORMAT);
-        assert!(decoded.cache.keys().all(|key| !key.contains('\\')));
-        let root = decoded
-            .checked_flatten("bucket")
-            .expect("rebuilt persisted cache should have a complete root");
-        assert_eq!(root.objects, 1);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_scan_data_folder_success_clears_resume_hint() {
-        let (scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard {
-            temp_dir: Some(temp_dir.clone()),
-        };
-
-        tokio::fs::create_dir_all(temp_dir.join("bucket").join("child-a"))
-            .await
-            .expect("failed to create child directory");
-
-        let cache = DataUsageCache {
-            info: crate::data_usage_define::DataUsageCacheInfo {
-                name: "bucket".to_string(),
-                next_cycle: 11,
-                scan_resume_after: Some("bucket/child-a".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let parent = CancellationToken::new();
-        let budget = ScannerCycleBudget::new(&parent, Default::default());
-
-        let result = scan_data_folder(
-            budget.token(),
-            budget,
-            vec![scanner.local_disk.clone()],
-            scanner.local_disk.clone(),
-            cache,
-            None,
-            HealScanMode::Normal,
-            SCANNER_SLEEPER.clone(),
-        )
-        .await
-        .expect("scan should complete successfully");
-
-        assert!(result.info.scan_resume_after.is_none());
-        assert!(result.info.scan_checkpoint.is_none());
-        assert_eq!(result.info.next_cycle, 11);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_scan_data_folder_keeps_unresolved_objects_partial() {
-        let (scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard {
-            temp_dir: Some(temp_dir.clone()),
-        };
-        write_test_object_metadata(&temp_dir, "bucket", "object").await;
-
-        let failed_path = temp_dir
-            .join("bucket")
-            .join("object")
-            .join(STORAGE_FORMAT_FILE)
-            .to_string_lossy()
-            .into_owned();
-        let mut cache = DataUsageCache {
-            info: crate::data_usage_define::DataUsageCacheInfo {
-                name: "bucket".to_string(),
-                next_cycle: 12,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        cache.info.failed_objects.insert(failed_path, FolderScanner::now_secs());
-
-        let parent = CancellationToken::new();
-        let budget = ScannerCycleBudget::new(&parent, Default::default());
-        let result = scan_data_folder(
-            budget.token(),
-            budget,
-            vec![scanner.local_disk.clone()],
-            scanner.local_disk.clone(),
-            cache,
-            None,
-            HealScanMode::Normal,
-            SCANNER_SLEEPER.clone(),
-        )
-        .await;
-
-        let partial = match result {
-            Err(ScannerError::PartialCache(partial)) => partial,
-            other => panic!("expected unresolved object to keep the cache partial, got {other:?}"),
-        };
-        assert!(!partial.info.snapshot_complete);
-        assert!(!partial.info.failed_objects.is_empty());
-    }
-
-    #[tokio::test]
-    #[serial]
-    #[cfg(unix)]
-    async fn test_scan_folder_ignores_symlinked_child_directory() {
-        let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir.clone());
-
-        let bucket_dir = temp_dir.join("bucket");
-        let target_dir = bucket_dir.join("target");
-        let link_dir = bucket_dir.join("link");
-
-        std::fs::create_dir_all(&target_dir).expect("failed to create target dir");
-        symlink(&target_dir, &link_dir).expect("failed to create symlinked dir");
-
-        scanner.old_cache.info.name = "bucket".to_string();
-        scanner.new_cache.info.name = "bucket".to_string();
-        scanner.update_cache.info.name = "bucket".to_string();
-
-        let folder = CachedFolder {
-            name: "bucket".to_string(),
-            parent: None,
-            object_heal_prob_div: 1,
-        };
-
-        let mut into = DataUsageEntry::default();
-        let result = scanner.scan_folder(CancellationToken::new(), folder, &mut into).await;
-
-        assert!(result.is_ok(), "expected symlinked child directory to be ignored");
-        assert_eq!(into.failed_objects, 0, "expected ignored symlink not to count as a failed object");
-    }
-
-    #[test]
-    fn test_should_log_failed_object_samples_after_initial_limit() {
-        assert!(should_log_failed_object(1));
-        assert!(should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_INITIAL_LIMIT));
-        assert!(!should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_INITIAL_LIMIT + 1));
-        assert!(should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_EVERY));
-        assert!(!should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_EVERY + 1));
-        assert!(should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_EVERY * 2));
-    }
-}
+mod tests;

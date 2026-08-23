@@ -153,9 +153,7 @@ fn remove_heal_control_replay(
 
 static HEAL_CONTROL_REPLAY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<HealControlReplayEntry>>>> = OnceLock::new();
 static NODE_CAPABILITY_SERVER_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
-// RUSTFS_COMPAT_TODO(cross-pool-fence-v1): advertise unsupported during predeployment. Remove after composite acquisition,
-// activation fencing, fleet proof, commit-time proof revalidation, and fail-closed revocation ship together.
-const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 0;
+const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 1;
 
 fn admit_heal_control_replay(
     replay_cache: &mut HashMap<String, Arc<HealControlReplayEntry>>,
@@ -573,8 +571,12 @@ async fn execute_heal_control_envelope_with_manager(
                 admission: receipt.result.into(),
             }
         }
-        rustfs_protos::heal_control::ExecutableCommand::Query { heal_path, client_token } => {
-            let response = timeout(remaining, processor.execute_query_request(heal_path, client_token))
+        rustfs_protos::heal_control::ExecutableCommand::Query {
+            heal_path,
+            client_token,
+            since_seq,
+        } => {
+            let response = timeout(remaining, processor.execute_query_request_since(heal_path, client_token, since_seq))
                 .await
                 .map_err(|_| Status::deadline_exceeded("heal control query expired before execution"))?
                 .map_err(|_| Status::internal("heal control query failed"))?;
@@ -1910,7 +1912,7 @@ impl Node for NodeService {
 
     async fn background_heal_status(
         &self,
-        _request: Request<BackgroundHealStatusRequest>,
+        request: Request<BackgroundHealStatusRequest>,
     ) -> Result<Response<BackgroundHealStatusResponse>, Status> {
         if self.resolve_object_store().is_none() {
             return Ok(Response::new(BackgroundHealStatusResponse {
@@ -1920,7 +1922,7 @@ impl Node for NodeService {
             }));
         }
         let snapshot = heal::capture_node_heal_status(rustfs_scanner::scanner::BackgroundHealInfo::default()).await;
-        match heal::encode_node_heal_status(&snapshot) {
+        match heal::encode_node_heal_status(&snapshot, request.into_inner().protocol_version) {
             Ok(bg_heal_state) => Ok(Response::new(BackgroundHealStatusResponse {
                 success: true,
                 bg_heal_state: bg_heal_state.into(),
@@ -1929,6 +1931,32 @@ impl Node for NodeService {
             Err(err) => Ok(Response::new(BackgroundHealStatusResponse {
                 success: false,
                 bg_heal_state: Bytes::new(),
+                error_info: Some(err),
+            })),
+        }
+    }
+
+    async fn replacement_recovery_status(
+        &self,
+        _request: Request<ReplacementRecoveryStatusRequest>,
+    ) -> Result<Response<ReplacementRecoveryStatusResponse>, Status> {
+        if self.resolve_object_store().is_none() {
+            return Ok(Response::new(ReplacementRecoveryStatusResponse {
+                success: false,
+                recovery_status: Bytes::new(),
+                error_info: Some("storage layer not initialized".to_string()),
+            }));
+        }
+        let snapshot = heal::capture_node_replacement_recovery_status().await;
+        match heal::encode_node_replacement_recovery_status(&snapshot) {
+            Ok(recovery_status) => Ok(Response::new(ReplacementRecoveryStatusResponse {
+                success: true,
+                recovery_status: recovery_status.into(),
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(ReplacementRecoveryStatusResponse {
+                success: false,
+                recovery_status: Bytes::new(),
                 error_info: Some(err),
             })),
         }
@@ -1959,8 +1987,10 @@ impl Node for NodeService {
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
+        // Recover missing workers only after the reload merged newer state; a
+        // stale or duplicate reload must not spawn workers for an older generation.
         match store.reload_pool_meta().await {
-            Ok(_) => match store.spawn_missing_local_decommission_routines().await {
+            Ok(true) => match store.spawn_missing_local_decommission_routines().await {
                 Ok(_) => Ok(Response::new(ReloadPoolMetaResponse {
                     success: true,
                     error_info: None,
@@ -1970,6 +2000,10 @@ impl Node for NodeService {
                     error_info: Some(err.to_string()),
                 })),
             },
+            Ok(false) => Ok(Response::new(ReloadPoolMetaResponse {
+                success: true,
+                error_info: None,
+            })),
             Err(err) => Ok(Response::new(ReloadPoolMetaResponse {
                 success: false,
                 error_info: Some(err.to_string()),
@@ -2178,7 +2212,7 @@ mod tests {
         previous_scanner_activity_response, remove_heal_control_replay, scanner_activity_response, stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
-    use crate::storage::storage_api::rpc_consumer::node_service::{DiskError, HealBucketInfo, HealEndpoint};
+    use crate::storage::storage_api::rpc_consumer::node_service::{DiskError, HealBucketInfo};
     use crate::storage::storage_api::set_tonic_canonical_body_digest;
     use crate::storage::storage_api::{
         Endpoint,
@@ -2306,40 +2340,12 @@ mod tests {
             Ok(None)
         }
 
-        async fn get_object_data(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
-
-        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> rustfs_heal::Result<()> {
-            Ok(())
-        }
-
-        async fn delete_object(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<()> {
-            Ok(())
-        }
-
-        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<bool> {
-            Ok(true)
-        }
-
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Vec<u8>> {
             Ok(Vec::new())
         }
 
-        async fn get_disk_status(&self, _endpoint: &HealEndpoint) -> rustfs_heal::Result<rustfs_heal::heal::storage::DiskStatus> {
-            Ok(rustfs_heal::heal::storage::DiskStatus::Ok)
-        }
-
-        async fn format_disk(&self, _endpoint: &HealEndpoint) -> rustfs_heal::Result<()> {
-            Ok(())
-        }
-
         async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<HealBucketInfo>> {
             Ok(None)
-        }
-
-        async fn heal_bucket_metadata(&self, _bucket: &str) -> rustfs_heal::Result<()> {
-            Ok(())
         }
 
         async fn list_buckets(&self) -> rustfs_heal::Result<Vec<HealBucketInfo>> {
@@ -2348,14 +2354,6 @@ mod tests {
 
         async fn object_exists(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<bool> {
             Ok(false)
-        }
-
-        async fn get_object_size(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<u64>> {
-            Ok(None)
-        }
-
-        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<String>> {
-            Ok(None)
         }
 
         async fn heal_object(
@@ -2383,19 +2381,12 @@ mod tests {
             Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
         }
 
-        async fn list_objects_for_heal(
-            &self,
-            _bucket: &str,
-            _prefix: &str,
-        ) -> rustfs_heal::Result<Vec<rustfs_heal::heal::storage::HealListItem>> {
-            Ok(Vec::new())
-        }
-
         async fn list_objects_for_heal_page(
             &self,
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> rustfs_heal::Result<(Vec<rustfs_heal::heal::storage::HealListItem>, Option<String>, bool)> {
             Ok((Vec::new(), None, false))
         }
@@ -2492,6 +2483,7 @@ mod tests {
             metadata(),
             "bucket/prefix".to_string(),
             canonical_token.clone(),
+            None,
         )
         .unwrap();
         let query_result = execute_heal_control_envelope_with_manager(query, coordinator_epoch, Some(Arc::clone(&manager)))
@@ -2530,6 +2522,7 @@ mod tests {
             metadata(),
             "bucket/prefix".to_string(),
             canonical_token,
+            None,
         )
         .unwrap();
         let stopped_result = execute_heal_control_envelope_with_manager(stopped_query, coordinator_epoch, Some(manager))
@@ -2919,7 +2912,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_lease_acquire_and_renew_handlers_fail_closed() {
+    async fn snapshot_lease_acquire_and_renew_handlers_fail_closed_for_missing_disk() {
         let service = make_server();
         let disk = "http://node-a:9000/data/rustfs0".to_string();
 
@@ -2936,7 +2929,7 @@ mod tests {
         let acquire = service
             .acquire_snapshot_lease(acquire)
             .await
-            .expect("disabled acquire should return a protocol response")
+            .expect("missing-disk acquire should return a protocol response")
             .into_inner();
 
         let mut renew = Request::new(SnapshotLeaseRenewRequest {
@@ -2953,14 +2946,14 @@ mod tests {
         let renew = service
             .renew_snapshot_lease(renew)
             .await
-            .expect("disabled renew should return a protocol response")
+            .expect("missing-disk renew should return a protocol response")
             .into_inner();
 
         for response in [acquire, renew] {
             assert!(!response.success);
             assert!(response.token.is_empty());
             assert_eq!(response.protocol_version, 1);
-            assert_eq!(response.error, Some(DiskError::UnsupportedDisk.into()));
+            assert_eq!(response.error, Some(DiskError::other("cannot find disk").into()));
         }
     }
 
@@ -3316,7 +3309,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_pool_fence_probe_authenticates_unsupported_rollout_state() {
+    async fn cross_pool_fence_probe_authenticates_supported_v1_state() {
         let _ = rustfs_credentials::set_global_rpc_secret("cross-pool-fence-node-service-test-secret".to_string());
         let endpoints = heal_control_test_endpoints_with_coordinator("node-0", true);
         assert!(
@@ -3381,7 +3374,7 @@ mod tests {
 
         assert!(response.success);
         assert_eq!(response.error_info, None);
-        assert_eq!(&response.result[..4], &0_u32.to_be_bytes());
+        assert_eq!(&response.result[..4], &1_u32.to_be_bytes());
         let (topology_member, process_epoch) = rustfs_protos::decode_remote_version_state_capability(&response.result[4..])
             .expect("capability identity should decode");
         assert_eq!(topology_member, "node-a:9000");
@@ -4466,9 +4459,27 @@ mod tests {
         assert!(refresh_response.error_info.is_some());
     }
 
+    /// Premise guard for the no-object-layer RPC tests (backlog#1830): they
+    /// assert the error surface returned while the global object layer is
+    /// absent. Under nextest — the authoritative runner — every test owns its
+    /// process, so the premise always holds and the assertion always runs.
+    /// Under the documented shared-process `cargo test` fallback a sibling test
+    /// may have initialized the store first; the premise is then unattainable,
+    /// so the test skips instead of asserting against a scenario it does not
+    /// describe.
+    fn no_object_layer_premise_holds() -> bool {
+        if crate::runtime_sources::current_object_store_handle().is_some() {
+            eprintln!("skipping no-object-layer assertion: a sibling test already initialized the global object layer");
+            return false;
+        }
+        true
+    }
+
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_local_storage_info() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(LocalStorageInfoRequest { metrics: false });
@@ -4773,8 +4784,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_reload_pool_meta() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(ReloadPoolMetaRequest {});
@@ -4789,8 +4802,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_stop_rebalance() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(StopRebalanceRequest {
@@ -4807,8 +4822,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_load_rebalance_meta() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(LoadRebalanceMetaRequest { start_rebalance: false });
@@ -4903,8 +4920,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_load_bucket_metadata_no_object_layer() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(LoadBucketMetadataRequest {
@@ -4922,8 +4941,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_load_transition_tier_config_no_object_layer() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let response = service
@@ -5143,8 +5164,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_reload_site_replication_config() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(ReloadSiteReplicationConfigRequest {});
@@ -5604,7 +5627,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     #[serial_test::serial]
     async fn test_signal_service_refresh_config_requires_object_layer() {
         let service = create_test_node_service();
@@ -5626,7 +5648,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     #[serial_test::serial]
     async fn test_signal_service_reload_dynamic_requires_object_layer() {
         let service = create_test_node_service();

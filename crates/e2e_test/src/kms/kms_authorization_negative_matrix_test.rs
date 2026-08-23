@@ -35,11 +35,11 @@ use aws_sdk_s3::config::{Config, Credentials, Region};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ServerSideEncryption;
-use serial_test::serial;
 use std::time::Duration;
 use tracing::info;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+type S3OperationResult<T> = Result<T, Box<aws_sdk_s3::Error>>;
 
 const ALLOWED_KEY: &str = "kms-matrix-allowed-key";
 const OTHER_KEY: &str = "kms-matrix-other-key";
@@ -131,7 +131,7 @@ fn policy_document(statements: Vec<serde_json::Value>) -> String {
     serde_json::json!({ "Version": "2012-10-17", "Statement": statements }).to_string()
 }
 
-async fn put_sse_kms(client: &Client, key: &str, kms_key_id: &str) -> Result<(), aws_sdk_s3::Error> {
+async fn put_sse_kms(client: &Client, key: &str, kms_key_id: &str) -> S3OperationResult<()> {
     client
         .put_object()
         .bucket(BUCKET)
@@ -142,16 +142,23 @@ async fn put_sse_kms(client: &Client, key: &str, kms_key_id: &str) -> Result<(),
         .send()
         .await
         .map(|_| ())
-        .map_err(aws_sdk_s3::Error::from)
+        .map_err(|error| Box::new(aws_sdk_s3::Error::from(error)))
 }
 
 /// Assert the operation failed with `AccessDenied` rather than any other error.
 ///
 /// A bare `is_err` would also accept `KMSKeyDisabled` or an internal error, which
 /// would hide both a leak of key state and an outage masquerading as a denial.
-fn assert_access_denied<T: std::fmt::Debug>(result: Result<T, aws_sdk_s3::Error>, what: &str) {
+fn assert_access_denied<T: std::fmt::Debug, E: std::fmt::Debug + std::borrow::Borrow<aws_sdk_s3::Error>>(
+    result: Result<T, E>,
+    what: &str,
+) {
     let error = result.expect_err(&format!("{what} must be denied"));
-    assert_eq!(error.code(), Some("AccessDenied"), "{what} must fail with AccessDenied: {error:?}");
+    assert_eq!(
+        error.borrow().code(),
+        Some("AccessDenied"),
+        "{what} must fail with AccessDenied: {error:?}"
+    );
 }
 
 /// Retry an SSE-KMS write until the identity's policy has reached the request path.
@@ -209,7 +216,6 @@ fn disable_body(key_id: &str) -> String {
 
 /// Data-path matrix: SSE-KMS writes and reads are authorized against the resolved key.
 #[tokio::test]
-#[serial]
 async fn sse_kms_per_key_authorization_negative_matrix() -> TestResult {
     init_logging();
 
@@ -298,7 +304,7 @@ async fn sse_kms_per_key_authorization_negative_matrix() -> TestResult {
             .send()
             .await
             .map(|_| ())
-            .map_err(aws_sdk_s3::Error::from),
+            .map_err(|err| Box::new(aws_sdk_s3::Error::from(err))),
         "SSE-KMS read by an identity holding no kms grant",
     );
 
@@ -312,7 +318,7 @@ async fn sse_kms_per_key_authorization_negative_matrix() -> TestResult {
             .send()
             .await
             .map(|_| ())
-            .map_err(aws_sdk_s3::Error::from),
+            .map_err(|err| Box::new(aws_sdk_s3::Error::from(err))),
         "SSE-KMS read by an identity holding kms:GenerateDataKey but not kms:Decrypt",
     );
 
@@ -355,7 +361,6 @@ async fn sse_kms_per_key_authorization_negative_matrix() -> TestResult {
 /// Runs without the SSE enforcement switch: admin scoping is unconditional, and
 /// leaving the switch off proves the two planes are independent.
 #[tokio::test]
-#[serial]
 async fn kms_admin_per_key_authorization_negative_matrix() -> TestResult {
     init_logging();
 

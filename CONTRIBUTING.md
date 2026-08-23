@@ -70,6 +70,8 @@ make pre-pr
 
 > For the full test-layer taxonomy (unit / ecstore black-box / e2e / s3s-e2e / S3 compatibility / chaos / fuzz / bench), each layer's entry command, the naming conventions the migration gate depends on, and the serial/nextest rules, see [docs/testing/README.md](docs/testing/README.md).
 
+> For the event, timeout, required-status, and local reproduction matrix, see [docs/testing/ci-gates.md](docs/testing/ci-gates.md).
+
 ### 🔒 Automated Pre-commit Hooks
 #### What `make pre-commit` and `make pre-pr` actually run
 
@@ -91,8 +93,9 @@ A green `make pre-commit` is not enough to open a pull request.
 `make pre-pr` is the **full** gate: it runs all of the guard checks above,
 then `clippy-check` (`cargo clippy --all-targets --all-features -- -D warnings`)
 and `test` (shell script tests, workspace tests excluding `e2e_test`, and doc
-tests). Run `make pre-pr` before opening or updating a pull request — this is
-what CI enforces.
+tests). Complete the applicable multi-role adversarial review described in
+`AGENTS.md` before running `make pre-pr`; then run the gate before opening or
+updating a pull request. This is what CI enforces.
 
 ### 🔒 Git Pre-commit Hooks (optional)
 
@@ -150,8 +153,9 @@ Example output when formatting fails:
 2. **Format your code**: `make fmt` or `cargo fmt --all`
 3. **Run the fast gate**: `make pre-commit` (no clippy, no tests)
 4. **Commit your changes**: `git commit -m "your message"`
-5. **Run the full gate before opening/updating a PR**: `make pre-pr` (clippy + tests)
-6. **Push to your branch**: `git push`
+5. **Complete the applicable multi-role adversarial review** for non-exempt changes (see `AGENTS.md`)
+6. **Run the full gate before opening/updating a PR**: `make pre-pr` (clippy + tests)
+7. **Push to your branch**: `git push`
 
 ### 🛠️ IDE Integration
 

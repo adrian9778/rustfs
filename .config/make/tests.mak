@@ -25,6 +25,7 @@ TEST_THREADS ?= 1
 script-tests: ## Run shell script tests
 	@echo "Running script tests..."
 	./scripts/test_build_rustfs_options.sh
+	./scripts/test_docker_runtime_timezone.sh
 	./scripts/test_entrypoint_credentials.sh
 	./scripts/test_internode_grpc_ab_bench.sh
 	./scripts/test_object_batch_bench_enhanced.sh
@@ -33,6 +34,10 @@ script-tests: ## Run shell script tests
 	./scripts/test_exact_1mib_handoff_abba.sh
 	./scripts/test_pinned_paired_abba_bench.sh
 	./scripts/test_manual_transition_runbooks.sh
+	./scripts/check_embedded_secrets.sh --self-test
+	python3 ./scripts/check_test_wiring.py --self-test
+	python3 ./scripts/check_scheduled_validation_freshness.py --self-test
+	python3 ./scripts/s3-tests/test_report_compat.py
 	bash -n ./scripts/validate_object_data_cache_cold_stampede.sh
 	python3 ./scripts/check_object_data_cache_follower_samples.py --self-test
 	./scripts/validate_object_data_cache_cold_stampede.sh --self-test

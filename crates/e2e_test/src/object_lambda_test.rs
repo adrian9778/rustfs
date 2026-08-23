@@ -12,15 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{RustFSTestClusterEnvironment, RustFSTestEnvironment, init_logging, local_http_client};
+use crate::common::{RustFSTestClusterEnvironment, RustFSTestEnvironment, init_logging, local_http_client, signed_request};
 use aws_sdk_s3::primitives::ByteStream;
 use http::header::{CONTENT_TYPE, HOST};
 use reqwest::StatusCode;
-use rustfs_signer::constants::UNSIGNED_PAYLOAD;
-use rustfs_signer::{pre_sign_v4, sign_v4};
+use rustfs_config::{ENV_DRIVE_ACTIVE_CHECK_INTERVAL_SECS, ENV_NOTIFY_ENABLE};
+use rustfs_signer::pre_sign_v4;
 use rustfs_utils::egress::ENV_OUTBOUND_ALLOW_ORIGINS;
 use s3s::Body;
-use serial_test::serial;
 use std::collections::HashMap;
 use std::error::Error;
 use time::OffsetDateTime;
@@ -226,39 +225,6 @@ async fn presigned_get_request(
     );
 
     Ok(local_http_client().get(signed.uri().to_string()).send().await?)
-}
-
-async fn signed_request(
-    method: http::Method,
-    url: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: Option<Vec<u8>>,
-    content_type: Option<&str>,
-) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
-    let mut request = http::Request::builder().method(method.clone()).uri(uri);
-    request = request.header(HOST, authority);
-    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    if let Some(content_type) = content_type {
-        request = request.header(CONTENT_TYPE, content_type);
-    }
-
-    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
-    let signed = sign_v4(request.body(Body::empty())?, content_len, access_key, secret_key, "", "us-east-1");
-
-    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
-    let client = local_http_client();
-    let mut request_builder = client.request(reqwest_method, url);
-    for (name, value) in signed.headers() {
-        request_builder = request_builder.header(name, value);
-    }
-    if let Some(body) = body {
-        request_builder = request_builder.body(body);
-    }
-
-    Ok(request_builder.send().await?)
 }
 
 async fn configure_webhook_target(
@@ -548,7 +514,6 @@ async fn read_listen_notification_event(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_notification_target_persists_across_restart_and_delete() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -608,7 +573,6 @@ async fn test_notification_target_persists_across_restart_and_delete() -> Result
 }
 
 #[tokio::test]
-#[serial]
 async fn test_notification_target_with_path_is_online_via_transport_probe() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -641,7 +605,6 @@ async fn test_notification_target_with_path_is_online_via_transport_probe() -> R
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_accepts_presigned_requests() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -682,7 +645,6 @@ async fn test_get_object_lambda_accepts_presigned_requests() -> Result<(), Box<d
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_accepts_named_webhook_target_arn() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -722,7 +684,6 @@ async fn test_get_object_lambda_accepts_named_webhook_target_arn() -> Result<(),
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_invokes_runtime_webhook_target() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -790,7 +751,6 @@ async fn test_get_object_lambda_invokes_runtime_webhook_target() -> Result<(), B
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_passthroughs_non_success_webhook_response() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -850,7 +810,6 @@ async fn test_get_object_lambda_passthroughs_non_success_webhook_response() -> R
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_rejects_success_response_without_auth_headers() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -896,7 +855,6 @@ async fn test_get_object_lambda_rejects_success_response_without_auth_headers() 
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_rejects_success_response_with_mismatched_auth_headers() -> Result<(), Box<dyn Error + Send + Sync>>
 {
     init_logging();
@@ -943,7 +901,6 @@ async fn test_get_object_lambda_rejects_success_response_with_mismatched_auth_he
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_rejects_unsupported_target_type() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -980,7 +937,6 @@ async fn test_get_object_lambda_rejects_unsupported_target_type() -> Result<(), 
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_rejects_unconfigured_target() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -1017,12 +973,12 @@ async fn test_get_object_lambda_rejects_unconfigured_target() -> Result<(), Box<
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_rejects_disabled_target() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], &[(ENV_NOTIFY_ENABLE, "true")])
+        .await?;
 
     let bucket = "object-lambda-e2e-disabled-target";
     let key = "input.txt";
@@ -1038,17 +994,24 @@ async fn test_get_object_lambda_rejects_disabled_target() -> Result<(), Box<dyn 
         .send()
         .await?;
 
-    configure_webhook_target_with_key_values(
-        &env,
-        "transformer",
-        vec![
-            ("endpoint", "http://127.0.0.1:9/transform".to_string()),
-            ("auth_token", "secret-token".to_string()),
-            ("enable", "off".to_string()),
-        ],
+    let queue_dir = format!("{}/disabled-target-queue", env.temp_dir);
+    tokio::fs::create_dir_all(&queue_dir).await?;
+    let config_url = format!("{}/rustfs/admin/v3/set-config-kv", env.url);
+    let directive = format!(
+        "notify_webhook:transformer enable=off endpoint=\"http://127.0.0.1:9/transform\" auth_token=\"secret-token\" queue_dir=\"{queue_dir}\""
+    );
+    let disable_response = signed_request(
+        http::Method::PUT,
+        &config_url,
+        &env.access_key,
+        &env.secret_key,
+        Some(directive.into_bytes()),
+        Some("text/plain"),
     )
     .await?;
-    wait_for_target_visibility(&env, "transformer").await?;
+    let disable_status = disable_response.status();
+    let disable_body = disable_response.text().await?;
+    assert_eq!(disable_status, StatusCode::OK, "failed to disable target: {disable_body}");
 
     let lambda_url = format!("{}/{}/{}?lambdaArn={}", env.url, bucket, key, urlencoding::encode(lambda_arn));
     let response = signed_request(http::Method::GET, &lambda_url, &env.access_key, &env.secret_key, None, None).await?;
@@ -1063,12 +1026,12 @@ async fn test_get_object_lambda_rejects_disabled_target() -> Result<(), Box<dyn 
 }
 
 #[tokio::test]
-#[serial]
 async fn test_configure_object_lambda_target_rejects_invalid_endpoint() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], &[(ENV_NOTIFY_ENABLE, "true")])
+        .await?;
 
     let bucket = "object-lambda-e2e-invalid-endpoint";
 
@@ -1106,13 +1069,13 @@ async fn test_configure_object_lambda_target_rejects_invalid_endpoint() -> Resul
 }
 
 #[tokio::test]
-#[serial]
 async fn test_configure_object_lambda_notify_webhook_rejects_response_header_timeout_key()
 -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], &[(ENV_NOTIFY_ENABLE, "true")])
+        .await?;
 
     let response = send_configure_webhook_target_request(
         &env,
@@ -1140,7 +1103,6 @@ async fn test_configure_object_lambda_notify_webhook_rejects_response_header_tim
 }
 
 #[tokio::test]
-#[serial]
 async fn test_listen_notification_emits_after_put_object() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -1184,7 +1146,6 @@ async fn test_listen_notification_emits_after_put_object() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
-#[serial]
 async fn test_listen_notification_emits_on_empty_bucket_when_notify_disabled() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -1219,11 +1180,12 @@ async fn test_listen_notification_emits_on_empty_bucket_when_notify_disabled() -
 }
 
 #[tokio::test]
-#[serial]
 async fn test_listen_notification_fans_in_remote_node_events() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
     let mut cluster = RustFSTestClusterEnvironment::new(2).await?;
+    cluster.set_env(ENV_NOTIFY_ENABLE, "true");
+    cluster.set_env(ENV_DRIVE_ACTIVE_CHECK_INTERVAL_SECS, "1");
     cluster.start().await?;
 
     let bucket = "listen-notification-cluster";

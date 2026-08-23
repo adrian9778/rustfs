@@ -842,6 +842,36 @@ for file in "${disk_logging_files[@]}"; do
   fi
 done
 
+# `set_disks` expands every Disk through Debug, including raw format bytes and
+# the full per-operation metrics ring. Keep it out of the INFO scanner span.
+scanner_disk_skip_pattern='#\[(tracing::)?instrument\([^]]*skip\([^)]*\bset_disks\b[^)]*\)[^]]*\)\][[:space:]]*async fn nsscanner_disk\b'
+# nsscanner_disk lives in the scanner_io/io_disk.rs child module since the
+# scanner_io module-tree split.
+if ! rg -U "$scanner_disk_skip_pattern" crates/scanner/src/scanner_io/io_disk.rs >/dev/null; then
+  echo "❌ logging guardrail violation: nsscanner_disk must skip set_disks in its tracing instrumentation" >&2
+  exit 1
+fi
+
+for fixture in \
+  $'#[tracing::instrument(skip(self, budget, updates, cache, set_disks))]\nasync fn nsscanner_disk('; do
+  if ! printf '%s\n' "$fixture" | rg -U "$scanner_disk_skip_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: safe nsscanner_disk span was rejected" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
+for fixture in \
+  $'#[tracing::instrument(skip(self, budget, updates, cache))]\nasync fn nsscanner_disk(' \
+  $'#[tracing::instrument(skip(self, budget, updates, cache), fields(set_disks = set_disks.len()))]\nasync fn nsscanner_disk(' \
+  $'#[tracing::instrument(skip(self, budget, updates, cache, set_disks_count))]\nasync fn nsscanner_disk('; do
+  if printf '%s\n' "$fixture" | rg -U "$scanner_disk_skip_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: unsafe nsscanner_disk span was accepted" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
 # `forbidden_patterns` above only retires log lines that already shipped, so a
 # newly written sentence-style log passes every check in this script — which is
 # how one reaches review in the first place (PR #5822 added
@@ -933,9 +963,11 @@ if [[ "$demoted_task_sites" -lt 4 ]]; then
   exit 1
 fi
 
-demoted_task_total_sites="$(rg -c -F 'demote_to_debug_when!(' crates/heal/src/heal/task.rs || echo 0)"
+# task.rs and its task/ child modules are one logical module tree since the
+# per-heal-kind split; count the demoted sites across the whole tree.
+demoted_task_total_sites="$(cat crates/heal/src/heal/task.rs crates/heal/src/heal/task/*.rs 2>/dev/null | rg -c -F 'demote_to_debug_when!(' || echo 0)"
 if [[ "$demoted_task_total_sites" -lt 5 ]]; then
-  echo "❌ logging guardrail violation: the background-source missing-object warn in crates/heal/src/heal/task.rs must stay level-split via demote_to_debug_when! (expected >= 5 total sites, found $demoted_task_total_sites)" >&2
+  echo "❌ logging guardrail violation: the background-source missing-object warn in crates/heal/src/heal/task.rs must stay level-split via demote_to_debug_when! (expected >= 5 total sites in the task module tree, found $demoted_task_total_sites)" >&2
   exit 1
 fi
 
@@ -956,10 +988,13 @@ trace_hot_spans=(
   "crates/ecstore/src/store/object.rs:handle_get_object_info"
   "crates/ecstore/src/set_disk/ops/object.rs:get_object_info"
   "crates/ecstore/src/store/mod.rs:list_objects_v2"
-  "crates/ecstore/src/store/list.rs:handle_list_objects_v2"
+  # The ECStore handle_list_objects_v2 forwarder was folded into the trait impl
+  # above, so store/mod.rs now carries this hot path's TRACE requirement
+  # directly (backlog#1821).
   "crates/ecstore/src/core/sets.rs:list_objects_v2"
   "crates/ecstore/src/set_disk/ops/list.rs:list_objects_v2"
   "rustfs/src/app/bucket_usecase.rs:execute_list_objects_v2"
+  "rustfs/src/app/object_usecase.rs:execute_get_object"
 )
 
 for hot_span in "${trace_hot_spans[@]}"; do
@@ -982,9 +1017,11 @@ if rg -n -F 'target: "rustfs::server::http"' rustfs/src/server/layer.rs >/dev/nu
   exit 1
 fi
 
-demoted_admission_sites="$(rg -c -F 'demote_to_debug_when!(' crates/heal/src/heal/manager.rs || echo 0)"
+# manager.rs and its manager/ child modules are one logical module tree since
+# the queue/scheduler split; count the demoted sites across the whole tree.
+demoted_admission_sites="$(cat crates/heal/src/heal/manager.rs crates/heal/src/heal/manager/*.rs 2>/dev/null | rg -c -F 'demote_to_debug_when!(' || echo 0)"
 if [[ "$demoted_admission_sites" -lt 6 ]]; then
-  echo "❌ logging guardrail violation: heal queue admission/scheduler warns for per-object requests must stay level-split via demote_to_debug_when! (expected >= 6 sites in crates/heal/src/heal/manager.rs, found $demoted_admission_sites)" >&2
+  echo "❌ logging guardrail violation: heal queue admission/scheduler warns for per-object requests must stay level-split via demote_to_debug_when! (expected >= 6 total sites in the manager module tree, found $demoted_admission_sites)" >&2
   exit 1
 fi
 

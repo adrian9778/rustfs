@@ -15,7 +15,6 @@
 use crate::common::{RustFSTestEnvironment, admin_request, awscurl_delete, awscurl_get, awscurl_post, awscurl_put, init_logging};
 use aws_sdk_s3::Client;
 use http::{Method, StatusCode};
-use serial_test::serial;
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, info};
 
@@ -170,6 +169,42 @@ impl QuotaTestEnv {
         bucket: &str,
         quota_bytes: u64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.wait_for_quota_usage_for(bucket).await?;
+
+        let quota_path = format!("/rustfs/admin/v3/quota/{bucket}");
+        let quota_config = serde_json::json!({
+            "quota": quota_bytes,
+            "quota_type": "HARD"
+        })
+        .to_string();
+        let readiness = async {
+            loop {
+                let (status, response) = admin_request(
+                    &self.env.url,
+                    Method::PUT,
+                    &quota_path,
+                    Some(quota_config.clone()),
+                    &self.env.access_key,
+                    &self.env.secret_key,
+                )
+                .await?;
+                if status.is_success() {
+                    return Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
+                }
+                if status != StatusCode::SERVICE_UNAVAILABLE {
+                    return Err(format!("failed to set quota for {bucket}: {status} {response}").into());
+                }
+
+                sleep(Duration::from_secs(1)).await;
+            }
+        };
+        match timeout(Duration::from_secs(30), readiness).await {
+            Ok(result) => result,
+            Err(_) => Err(format!("quota readiness did not converge for {bucket} within 30 seconds").into()),
+        }
+    }
+
+    pub async fn wait_for_quota_usage_for(&self, bucket: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let stats_path = format!("/rustfs/admin/v3/quota-stats/{bucket}");
         let readiness = async {
             loop {
@@ -182,28 +217,12 @@ impl QuotaTestEnv {
                 if status != StatusCode::SERVICE_UNAVAILABLE {
                     return Err(format!("quota usage readiness failed for {bucket}: {status} {response}").into());
                 }
-
                 sleep(Duration::from_secs(1)).await;
             }
         };
         match timeout(Duration::from_secs(30), readiness).await {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(format!("quota usage did not become authoritative for {bucket} within 30 seconds").into());
-            }
-        }
-
-        let url = format!("{}/rustfs/admin/v3/quota/{}", self.env.url, bucket);
-        let quota_config = serde_json::json!({
-            "quota": quota_bytes,
-            "quota_type": "HARD"
-        });
-
-        let response = awscurl_put(&url, &quota_config.to_string(), &self.env.access_key, &self.env.secret_key).await?;
-        if response.contains("error") {
-            Err(format!("Failed to set quota: {}", response).into())
-        } else {
-            Ok(())
+            Ok(result) => result,
+            Err(_) => Err(format!("quota usage did not become authoritative for {bucket} within 30 seconds").into()),
         }
     }
 
@@ -252,9 +271,9 @@ impl QuotaTestEnv {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use aws_sdk_s3::error::ProvideErrorMetadata;
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_basic_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -299,7 +318,6 @@ mod integration_tests {
     /// with 400 UnexpectedContent, and an over-quota aws-chunked PUT must still get the quota
     /// rejection.
     #[tokio::test]
-    #[serial]
     async fn test_quota_admission_aws_chunked_declared_encoding() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -351,7 +369,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_update_and_clear() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -387,7 +404,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_delete_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -424,7 +440,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_usage_tracking() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -463,7 +478,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_statistics() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -497,7 +511,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_check_api() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -538,7 +551,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_multiple_buckets() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -579,7 +591,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_error_handling() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -615,7 +626,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_http_endpoints() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -624,6 +634,7 @@ mod integration_tests {
         let env = QuotaTestEnv::new().await?;
 
         env.create_bucket().await?;
+        env.wait_for_quota_usage_for(&env.bucket_name).await?;
 
         // Test 1: GET quota for bucket without quota config
         let url = format!("{}/rustfs/admin/v3/quota/{}", env.env.url, env.bucket_name);
@@ -631,12 +642,7 @@ mod integration_tests {
         assert!(response.contains("quota") && response.contains("null"));
 
         // Test 2: PUT quota - valid config
-        let quota_config = serde_json::json!({
-            "quota": 1048576,
-            "quota_type": "HARD"
-        });
-        let response = awscurl_put(&url, &quota_config.to_string(), &env.env.access_key, &env.env.secret_key).await?;
-        assert!(response.contains("success") || !response.contains("error"));
+        env.set_bucket_quota(1048576).await?;
 
         // Test 3: GET quota after setting
         let response = awscurl_get(&url, &env.env.access_key, &env.env.secret_key).await?;
@@ -681,7 +687,6 @@ mod integration_tests {
 
     /// Test that a normal user with `readwrite` policy can read quota but cannot set/clear quota.
     #[tokio::test]
-    #[serial]
     async fn test_quota_normal_user_permissions() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -737,7 +742,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_copy_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -783,7 +787,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_batch_delete() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -842,7 +845,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_multipart_upload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -963,8 +965,26 @@ mod integration_tests {
             .send()
             .await;
 
-        assert!(complete_result.is_err());
+        let complete_error = complete_result.expect_err("multipart completion above quota must be rejected");
+        assert_eq!(complete_error.as_service_error().and_then(|error| error.code()), Some("InvalidRequest"));
         assert!(!env.object_exists("over_quota.txt").await?);
+
+        let staged_parts = env
+            .client
+            .list_parts()
+            .bucket(&env.bucket_name)
+            .key("over_quota.txt")
+            .upload_id(upload_id2)
+            .send()
+            .await?;
+        assert_eq!(staged_parts.parts().len(), 2, "quota rejection must preserve the multipart upload");
+        env.client
+            .abort_multipart_upload()
+            .bucket(&env.bucket_name)
+            .key("over_quota.txt")
+            .upload_id(upload_id2)
+            .send()
+            .await?;
 
         env.cleanup_bucket().await?;
 

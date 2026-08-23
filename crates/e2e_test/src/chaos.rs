@@ -40,6 +40,8 @@ use http::header::{CONTENT_TYPE, HOST};
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -47,6 +49,62 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 type ChaosResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+/// Physical `xl.meta` and shard-file census for one object version on one disk.
+///
+/// A successful S3 GET only proves that a quorum can serve an object. Replacement
+/// tests need this lower-level record to prove that the rebuilt target holds the
+/// `xl.meta` selected for a specific version and every `part.N` it declares.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VersionShardCensus {
+    pub version_id: Option<String>,
+    pub has_xl_meta: bool,
+    pub data_dir: Option<String>,
+    pub erasure_index: Option<usize>,
+    pub expected_part_numbers: BTreeSet<usize>,
+    pub present_part_fingerprints: BTreeMap<usize, PartShardFingerprint>,
+    pub inline_data_fingerprint: Option<PartShardFingerprint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PartShardFingerprint {
+    pub size: u64,
+    pub sha256: String,
+}
+
+impl VersionShardCensus {
+    pub(crate) fn is_complete(&self) -> bool {
+        self.has_xl_meta
+            && self.expected_part_numbers.len() == self.present_part_fingerprints.len()
+            && self
+                .expected_part_numbers
+                .iter()
+                .all(|part_number| self.present_part_fingerprints.contains_key(part_number))
+    }
+
+    pub(crate) fn matches_manifest(&self, manifest: &Self) -> bool {
+        self.version_id == manifest.version_id
+            && self.is_complete()
+            && manifest.is_complete()
+            && self.data_dir == manifest.data_dir
+            && self.erasure_index == manifest.erasure_index
+            && self.expected_part_numbers == manifest.expected_part_numbers
+            && self.present_part_fingerprints == manifest.present_part_fingerprints
+            && self.inline_data_fingerprint == manifest.inline_data_fingerprint
+    }
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn shard_fingerprint(data: &[u8]) -> ChaosResult<PartShardFingerprint> {
+    Ok(PartShardFingerprint {
+        size: u64::try_from(data.len())?,
+        sha256: sha256_hex(data),
+    })
+}
 
 /// Single-node RustFS server with `disk_count` local volume directories that
 /// can be faulted individually while the server is running.
@@ -219,6 +277,93 @@ impl DiskFaultHarness {
     pub fn object_metadata_exists_on_disk(&self, disk_index: usize, bucket: &str, key: &str) -> bool {
         self.disks[disk_index].join(bucket).join(key).join("xl.meta").is_file()
     }
+
+    /// Census the physical files selected by `version_id` on one disk.
+    ///
+    /// Missing metadata and missing shard files are represented in the returned
+    /// census rather than as an error so callers can poll replacement progress.
+    /// Invalid metadata or an unknown requested version remains an error: treating
+    /// either as an incomplete rebuild would hide corruption or a wrong-version
+    /// recovery result.
+    pub(crate) fn census_object_version(
+        &self,
+        disk_index: usize,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> ChaosResult<VersionShardCensus> {
+        census_object_version_on_disk(&self.disks[disk_index], bucket, key, version_id)
+    }
+}
+
+/// Census one physical object version without requiring a single-node harness.
+/// Cluster replacement tests use the same evidence as the disk-fault tests.
+pub(crate) fn census_object_version_on_disk(
+    disk: &Path,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> ChaosResult<VersionShardCensus> {
+    let version_id = version_id.map(str::to_owned);
+    let object_dir = disk.join(bucket).join(key);
+    let meta_path = object_dir.join("xl.meta");
+    if !meta_path.is_file() {
+        return Ok(VersionShardCensus {
+            version_id,
+            has_xl_meta: false,
+            data_dir: None,
+            erasure_index: None,
+            expected_part_numbers: BTreeSet::new(),
+            present_part_fingerprints: BTreeMap::new(),
+            inline_data_fingerprint: None,
+        });
+    }
+
+    let metadata = rustfs_filemeta::FileMeta::load(&std::fs::read(&meta_path)?)?;
+    let file_info = metadata.into_fileinfo(bucket, key, version_id.as_deref().unwrap_or_default(), true, false, true)?;
+    let expected_part_numbers = if file_info.inline_data() {
+        BTreeSet::new()
+    } else {
+        file_info.parts.iter().map(|part| part.number).collect()
+    };
+    let data_dir = file_info.data_dir.map(|id| id.to_string());
+    let erasure_index = Some(file_info.erasure.index);
+    let inline_data_fingerprint = file_info.data.as_deref().map(shard_fingerprint).transpose()?;
+    let part_dir = data_dir.as_ref().map_or_else(|| object_dir.clone(), |id| object_dir.join(id));
+    let present_part_fingerprints = match std::fs::read_dir(&part_dir) {
+        Ok(entries) => {
+            let mut fingerprints = BTreeMap::new();
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let file_name = entry.file_name();
+                let Some(part_number) = file_name
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("part."))
+                    .and_then(|number| number.parse::<usize>().ok())
+                else {
+                    continue;
+                };
+                let data = std::fs::read(entry.path())?;
+                fingerprints.insert(part_number, shard_fingerprint(&data)?);
+            }
+            fingerprints
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(error) => return Err(error.into()),
+    };
+
+    Ok(VersionShardCensus {
+        version_id,
+        has_xl_meta: true,
+        data_dir,
+        erasure_index,
+        expected_part_numbers,
+        present_part_fingerprints,
+        inline_data_fingerprint,
+    })
 }
 
 /// `POST` a signed (SigV4, service `s3`) admin request without relying on the
@@ -256,4 +401,44 @@ pub async fn signed_admin_post(url: &str, body: Option<&str>, access_key: &str, 
     }
 
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn complete_census() -> VersionShardCensus {
+        VersionShardCensus {
+            version_id: Some("version".to_string()),
+            has_xl_meta: true,
+            data_dir: Some("data-dir".to_string()),
+            erasure_index: Some(3),
+            expected_part_numbers: BTreeSet::from([1]),
+            present_part_fingerprints: BTreeMap::from([(1, shard_fingerprint(b"part").unwrap())]),
+            inline_data_fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn shard_fingerprint_uses_physical_length_and_sha256() {
+        assert_eq!(
+            shard_fingerprint(b"abc").unwrap(),
+            PartShardFingerprint {
+                size: 3,
+                sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn manifest_requires_matching_inline_payload() {
+        let mut expected = complete_census();
+        expected.expected_part_numbers.clear();
+        expected.present_part_fingerprints.clear();
+        expected.inline_data_fingerprint = Some(shard_fingerprint(b"expected").unwrap());
+        let mut changed = expected.clone();
+        changed.inline_data_fingerprint = Some(shard_fingerprint(b"changed").unwrap());
+        assert!(expected.matches_manifest(&expected));
+        assert!(!changed.matches_manifest(&expected));
+    }
 }

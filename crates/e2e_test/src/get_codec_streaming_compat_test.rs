@@ -66,7 +66,6 @@ mod tests {
     use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-    use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use std::error::Error;
@@ -189,8 +188,6 @@ mod tests {
             ("RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT", "100"),
             ("RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED", "true"),
             ("RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED", "true"),
-            // Lower the min-size floor so every non-inline object below is eligible.
-            ("RUSTFS_GET_CODEC_STREAMING_MIN_SIZE", "4096"),
             // Route multipart objects through per-part codec streaming too.
             ("RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE", "true"),
             // Lock optimization is on by default, but pin it so the gate's
@@ -279,7 +276,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn codec_streaming_matches_legacy_duplex_body_and_headers() -> TestResult {
         init_logging();
 
@@ -314,6 +310,13 @@ mod tests {
                     expect_large: false,
                 },
                 payload(64 * 1024, 2),
+            ),
+            (
+                Shape {
+                    key: "small-non-inline-256kib-plus",
+                    expect_large: true,
+                },
+                payload(256 * 1024 + 1, 6),
             ),
             (
                 Shape {

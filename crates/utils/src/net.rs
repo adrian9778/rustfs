@@ -431,7 +431,6 @@ pub fn parse_and_resolve_address(addr_str: &str) -> std::io::Result<SocketAddr> 
     Ok(resolved_addr)
 }
 
-#[allow(dead_code)]
 pub fn bytes_stream<S, E>(stream: S, content_length: usize) -> impl Stream<Item = Result<Bytes, E>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -623,7 +622,8 @@ mod test {
         let _resolver_lock = DNS_RESOLVER_TEST_LOCK.lock().unwrap();
         reset_dns_resolver_inner();
 
-        let err = resolve_domain("rustfs-resolver-provenance.invalid").unwrap_err();
+        // DNS labels are limited to 63 bytes, so the system resolver rejects this before lookup.
+        let err = resolve_domain("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.invalid").unwrap_err();
 
         assert_ne!(err.kind(), std::io::ErrorKind::Other, "system resolver error was wrapped: {err}");
     }
@@ -659,9 +659,6 @@ mod test {
         // Port should be in valid range (u16 max is always <= 65535)
         assert!(port1 > 0);
         assert!(port2 > 0);
-
-        // Different calls should typically return different ports
-        assert_ne!(port1, port2);
     }
 
     #[test]

@@ -19,7 +19,6 @@ mod tests {
     use crate::chaos::signed_admin_post;
     use crate::common::{RustFSTestClusterEnvironment, RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::primitives::ByteStream;
-    use serial_test::serial;
     use std::collections::HashSet;
     use std::error::Error;
     use std::path::{Path, PathBuf};
@@ -63,7 +62,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_auto_heal_rebuilds_runtime_wiped_disk_without_restart() {
         init_logging();
         info!("Issue #1533: auto heal should rebuild a runtime-wiped disk in a 4-disk single-node erasure set without restart");
@@ -182,7 +180,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_admin_deep_heal_rebuilds_cleared_disk_in_single_node_erasure_set() {
         init_logging();
         info!("Discussion #2964: admin deep heal should rebuild a wiped disk in a 4-disk single-node erasure set");
@@ -332,7 +329,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[serial]
     async fn test_cluster_root_heal_rebuilds_replaced_remote_disk() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         info!("Root recursive heal should rebuild data on a remote node after its disk is replaced and the node rejoins");
@@ -384,10 +380,24 @@ mod tests {
         cluster.start_node(1).await?;
 
         let status_url = format!("{}/rustfs/admin/v3/background-heal/status", cluster.nodes[0].url);
-        let status_body = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key).await?;
-        assert!(
-            !status_body.contains("MissingContentLength"),
-            "background heal status should not fail without an explicit Content-Length: {status_body}"
+        let mut recovered = serde_json::Value::Null;
+        for _ in 0..60 {
+            let status_body = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key).await?;
+            assert!(
+                !status_body.contains("MissingContentLength"),
+                "background heal status should not fail without an explicit Content-Length: {status_body}"
+            );
+            recovered = serde_json::from_str(&status_body)
+                .map_err(|err| format!("background heal status is not JSON ({err}): {status_body}"))?;
+            if recovered["clusterStatusComplete"] == serde_json::Value::Bool(true) {
+                break;
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+        assert_eq!(
+            recovered["clusterStatusComplete"],
+            serde_json::Value::Bool(true),
+            "cluster heal status should recover before root heal starts: {recovered}"
         );
 
         let heal_body = r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#;
@@ -430,5 +440,104 @@ mod tests {
             "admin deep heal did not rebuild replaced remote disk metadata for {remaining_rebuild_keys:?} within timeout"
         )
         .into())
+    }
+
+    /// Issue #5850: `background-heal/status` must answer while a peer is down.
+    ///
+    /// Exercises the production path in `read_cluster_heal_status` end to end,
+    /// which the unit tests around `merge_peer_heal_statuses` cannot: with one
+    /// node stopped, the endpoint must return 200 with
+    /// `clusterStatusComplete: false` and an explicit `degraded` (or, when
+    /// heal work is known active, `active`) state — never the previous
+    /// cluster-wide 500 — and must return to a complete, non-degraded answer
+    /// once the node rejoins. Reverting either all-or-nothing gate (the
+    /// topology early-return or the merge hard-fail) turns the down-window
+    /// response into a 500 and fails this test.
+    #[tokio::test]
+    async fn test_background_heal_status_degrades_while_peer_down_and_recovers_after_rejoin()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        info!("Issue #5850: background-heal/status must degrade, not 500, while a peer is down");
+
+        let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
+        cluster.set_env("RUSTFS_UNSAFE_BYPASS_DISK_CHECK", "true");
+        cluster.start().await?;
+
+        let status_url = format!("{}/rustfs/admin/v3/background-heal/status", cluster.nodes[0].url);
+        // Owned copies: the closure must not borrow `cluster`, which
+        // stop_node/start_node need mutably between polls.
+        let access_key = cluster.access_key.clone();
+        let secret_key = cluster.secret_key.clone();
+        let fetch_status = || async {
+            let body = signed_admin_post(&status_url, None, &access_key, &secret_key).await?;
+            let json: serde_json::Value =
+                serde_json::from_str(&body).map_err(|err| format!("heal status response is not JSON ({err}): {body}"))?;
+            Ok::<serde_json::Value, Box<dyn Error + Send + Sync>>(json)
+        };
+
+        // Healthy cluster: the answer must be definitive. Poll briefly — the
+        // peer grid may still be settling right after start().
+        let mut healthy = fetch_status().await?;
+        for _ in 0..30 {
+            if healthy["clusterStatusComplete"] == serde_json::Value::Bool(true) {
+                break;
+            }
+            sleep(Duration::from_secs(1)).await;
+            healthy = fetch_status().await?;
+        }
+        assert_eq!(
+            healthy["clusterStatusComplete"],
+            serde_json::Value::Bool(true),
+            "healthy cluster should report a complete heal status: {healthy}"
+        );
+
+        cluster.stop_node(1)?;
+
+        // While the peer is down every response must stay 200 (signed_admin_post
+        // fails on any non-2xx, so the old 500 fails the test immediately) and
+        // must degrade to an explicitly-partial answer. The peer query timeout
+        // is 5 s, so a couple of polls are enough for the dead peer to surface.
+        let mut degraded = serde_json::Value::Null;
+        for _ in 0..30 {
+            degraded = fetch_status().await?;
+            if degraded["clusterStatusComplete"] == serde_json::Value::Bool(false) {
+                break;
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+        assert_eq!(
+            degraded["clusterStatusComplete"],
+            serde_json::Value::Bool(false),
+            "heal status must mark itself partial while a peer is down: {degraded}"
+        );
+        let state = degraded["state"].as_str().unwrap_or_default();
+        assert!(
+            state == "degraded" || state == "active",
+            "a partial answer must be labeled degraded (or active for known work), got {state:?}: {degraded}"
+        );
+
+        cluster.start_node(1).await?;
+
+        // After the rejoin the endpoint must return to a definitive answer.
+        let mut recovered = serde_json::Value::Null;
+        for _ in 0..60 {
+            recovered = fetch_status().await?;
+            if recovered["clusterStatusComplete"] == serde_json::Value::Bool(true) {
+                break;
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+        assert_eq!(
+            recovered["clusterStatusComplete"],
+            serde_json::Value::Bool(true),
+            "heal status should be complete again after the node rejoined: {recovered}"
+        );
+        assert_ne!(
+            recovered["state"].as_str().unwrap_or_default(),
+            "degraded",
+            "a complete answer must not be labeled degraded: {recovered}"
+        );
+
+        Ok(())
     }
 }

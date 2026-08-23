@@ -143,9 +143,12 @@ pub const ENV_SCANNER_MAX_WAIT_SECS: &str = "RUSTFS_SCANNER_MAX_WAIT_SECS";
 /// Default scanner speed preset.
 pub const DEFAULT_SCANNER_SPEED: &str = "default";
 
-/// Default scanner cycle runtime budget.
-/// `0` keeps the existing unbounded per-cycle behavior.
-pub const DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS: u64 = 0;
+/// Default scanner cycle runtime budget when no override is configured.
+///
+/// An explicit `0` remains the compatibility escape hatch for an unbounded
+/// cycle. Keeping the unset default finite prevents a stalled scanner I/O
+/// operation from holding the leader lease forever.
+pub const DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS: u64 = 30 * 60;
 
 /// Default scanner per-cycle object budget.
 /// `0` keeps the existing unbounded per-cycle behavior.
@@ -227,15 +230,6 @@ pub const DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS: usize = 4;
 
 /// Default object interval for cooperative scanner yields.
 pub const DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS: u64 = 128;
-
-/// Compatibility flag kept for Patch 3 rollback windows.
-///
-/// Inline scanner heal execution has been removed in favor of heal-candidate enqueue.
-/// When this flag is enabled, RustFS logs a warning and continues to use enqueue-based heal.
-pub const ENV_SCANNER_INLINE_HEAL_ENABLE: &str = "RUSTFS_SCANNER_INLINE_HEAL_ENABLE";
-
-/// Default inline scanner heal compatibility mode.
-pub const DEFAULT_SCANNER_INLINE_HEAL_ENABLE: bool = false;
 
 /// Scanner speed preset controlling throttling behavior.
 ///
