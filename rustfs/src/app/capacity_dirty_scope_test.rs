@@ -17,7 +17,7 @@ use super::storage_api::test::contract::bucket::{BucketOperations, BucketOptions
 use super::storage_api::test::contract::heal::HealOperations as _;
 use super::storage_api::test::contract::object::ObjectIO as _;
 use super::storage_api::test::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
-use rustfs_common::heal_channel::{HealOpts, HealScanMode};
+use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use serial_test::serial;
 use std::{
@@ -193,8 +193,13 @@ async fn heal_object_marks_missing_shard_disk_dirty_for_capacity_manager() {
 
     let _ = manager.get_dirty_disks().await;
 
-    let object_root = disk_paths[0].join(&bucket_name).join("test").join("heal.bin");
-    let missing_part = find_part_file(&object_root, "part.1").expect("part file on first disk");
+    let (missing_disk, missing_part) = disk_paths
+        .iter()
+        .find_map(|disk_path| {
+            let object_root = disk_path.join(&bucket_name).join("test").join("heal.bin");
+            find_part_file(&object_root, "part.1").map(|part| (disk_path, part))
+        })
+        .expect("part file on an erasure disk");
     fs::remove_file(&missing_part).await.expect("remove shard to force heal");
 
     let heal_opts = HealOpts {
@@ -205,6 +210,7 @@ async fn heal_object_marks_missing_shard_disk_dirty_for_capacity_manager() {
         scan_mode: HealScanMode::Deep,
         update_parity: true,
         no_lock: false,
+        read_repair: false,
         pool: None,
         set: None,
     };
@@ -219,7 +225,7 @@ async fn heal_object_marks_missing_shard_disk_dirty_for_capacity_manager() {
         .into_iter()
         .map(|disk| stdfs::canonicalize(&disk.drive_path).unwrap().to_string_lossy().into_owned())
         .collect();
-    let expected_missing_disk = stdfs::canonicalize(&disk_paths[0]).unwrap().to_string_lossy().into_owned();
+    let expected_missing_disk = stdfs::canonicalize(missing_disk).unwrap().to_string_lossy().into_owned();
 
     assert!(
         error.is_none() || actual_paths.contains(&expected_missing_disk),

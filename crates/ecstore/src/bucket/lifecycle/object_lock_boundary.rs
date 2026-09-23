@@ -26,7 +26,8 @@ pub(crate) fn check_object_lock_for_deletion_with_config(
     obj_info: &ObjectInfo,
     bypass_governance: bool,
 ) -> crate::error::Result<Option<ObjectLockBlockReason>> {
-    objectlock_sys::check_object_lock_for_deletion_with_config(config, obj_info, bypass_governance)
+    let default_retention = config.and_then(crate::bucket::metadata_sys::default_retention_from_object_lock_config);
+    objectlock_sys::check_object_lock_for_deletion_with_default_retention(default_retention.as_ref(), obj_info, bypass_governance)
 }
 
 #[cfg(test)]
@@ -36,7 +37,7 @@ mod tests {
     #[test]
     fn is_object_locked_by_metadata_preserves_object_lock_parser_behavior() {
         let mut user_defined = HashMap::new();
-        user_defined.insert("x-amz-object-lock-legal-hold".to_string(), "ON".to_string());
+        user_defined.insert(rustfs_filemeta::metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string());
 
         assert!(is_object_locked_by_metadata(&user_defined, false));
         assert!(!is_object_locked_by_metadata(&user_defined, true));

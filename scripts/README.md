@@ -46,6 +46,10 @@ their issue closes.
 
 | Entry | Status | Purpose | Wiring / docs |
 |---|---|---|---|
+| `diagnose_scanner_enumeration_restart.py` | dev-tool | Strict fixed raw-entry-budget scanner-worker restart diagnostic | [Checkpoint fixture](../docs/testing/scanner-checkpoint-fixture.md) |
+| `prepare_replacement_migration.py` | dev-tool | Prepares digest-bound schema 5/6 replacement maintenance approvals | [Replacement recovery](../docs/operations/replacement-generation-recovery.md) |
+| `test_prepare_replacement_migration.py` | dev-tool | Verifies maintenance approval scope, publication, and stopped-writer assertion | Python unittest; same runbook |
+| `test_diagnose_scanner_enumeration_restart.py` | dev-tool | Driver report validation and positive convergence oracle tests | Python unittest; same guide |
 | `e2e-run.sh` | ci-gate | Boots a rustfs server and runs the `s3s-e2e` black-box conformance tool against it | ci.yml `e2e-tests` jobs; `docs/testing/README.md` |
 | `run_ecstore_validation_suite.sh` | dev-tool | ecstore black-box validation suite (`quick`/`full`/`destructive`/`fuzz` profiles) | `docs/testing/README.md`, `docs/testing/ecstore-validation-suite-design.md` |
 | `run_e2e_tests.sh` | dev-tool | Local `e2e_test` crate runner (starts a server, applies filters, cleans up) | `crates/e2e_test/README.md` |
@@ -53,17 +57,49 @@ their issue closes.
 | `run.ps1` | dev-tool | Windows counterpart of `run.sh` | — |
 | `probe.sh` | dev-tool | Probe-style e2e run | `make probe-e2e` |
 | `run_scanner_validation_harness.sh` | dev-tool | Scanner validation harness | `docs/operations/scanner-benchmark-runbook.md` |
+| `check_test_wiring.py` | dev-tool | Validates test wiring and assembles one or more measured Scanner/Heal release descriptors into a single release evidence bundle | `.config/scanner-heal-required-tests.json`; `check_test_wiring.py --self-test` |
+| `run_scanner_heal_evidence_case.sh` | dev-tool | Runs one Scanner/Heal release-evidence registry case and checks the produced receipt/oracle | `.config/scanner-heal-required-tests.json`; `check_test_wiring.py --check-scanner-heal` |
+| `run_scanner_heal_authority_evidence.py` | dev-tool | Assembles measured Scanner/Heal G01 root/quota authority release descriptors from operator-collected authority artifacts | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_authority_evidence.sh` |
+| `run_scanner_heal_checkpoint_crash_evidence.py` | dev-tool | Assembles measured Scanner/Heal G02/R-E checkpoint and restart release descriptors from scanner restart diagnostic reports | `diagnose_scanner_enumeration_restart.py`; `test_scanner_heal_checkpoint_crash_evidence.sh` |
+| `run_scanner_heal_g14_multiset_evidence.py` | dev-tool | Assembles measured Scanner/Heal G14 same-window EC8+4 multi-set/multi-pool release descriptors from e2e case directories or an operator-collected proof | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_g14_multiset_evidence.sh` |
+| `run_scanner_heal_g09_upgrade_evidence.sh` | dev-tool | Runs the G09 mixed-version and rollback upgrade E2E lanes against a pinned previous release and verifies the raw evidence artifacts | `docs/testing/ci-gates.md`; `.github/workflows/e2e-upgrade.yml`; `test_scanner_heal_g09_upgrade_evidence.sh` |
+| `run_scanner_heal_linux_evidence_plan.py` | dev-tool | Writes the unified Scanner/Heal Linux release-evidence execution manifest and can run lightweight preflight checks without producing measured evidence | `docs/testing/ci-gates.md`; `test_scanner_heal_linux_evidence_plan.sh` |
+| `run_scanner_heal_scoped_ack_evidence.py` | dev-tool | Assembles measured Scanner/Heal G03 scoped ACK publication and mixed-peer fallback release descriptors | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_scoped_ack_evidence.sh` |
+| `run_scanner_heal_legacy_rollback_evidence.py` | dev-tool | Assembles measured Scanner/Heal R-L legacy source-conflict, migration-gap, and source-retirement release descriptors | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_legacy_rollback_evidence.sh` |
+| `run_scanner_heal_mrf_evidence.py` | dev-tool | Assembles measured Scanner/Heal G07/G08/P4 MRF release descriptors from W13 raw artifacts | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_w13_mrf_evidence.sh` |
+| `run_scanner_heal_scheduler_pressure_evidence.py` | dev-tool | Assembles measured Scanner/Heal G10/P1/P3 scheduler-pressure release descriptors from a completed measured ABBA run, recovery-window proof, and profile artifacts | `docs/operations/scanner-benchmark-runbook.md`; `test_scanner_heal_scheduler_pressure_evidence.sh` |
+| `run_scanner_heal_status_outcome_probe.py` | dev-tool | Normalizes live Scanner/Heal status/outcome observations into the measured G05/G06/R-D raw artifacts consumed by the descriptor producer | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_status_outcome_evidence.sh` |
+| `run_scanner_heal_status_outcome_evidence.py` | dev-tool | Assembles measured Scanner/Heal G05/G06/R-D status-and-outcome release descriptors from same-run status, compatibility, and disposition artifacts | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_status_outcome_evidence.sh` |
+| `run_scanner_heal_maintenance_evidence.py` | dev-tool | Assembles measured Scanner/Heal G11/G13 maintenance-producer release descriptors from operator-collected proof JSON | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_maintenance_evidence.sh` |
+| `run_scanner_heal_w13_mrf_evidence.sh` | dev-tool | Runs the W13 durable MRF replay lanes and writes G07/G08/P4 bundle-ready evidence descriptors | `docs/testing/ci-gates.md`; `test_scanner_heal_w13_mrf_evidence.sh` |
+| `run_scanner_heal_w16_recovery_evidence.sh` | dev-tool | Runs the W16 recovery-intent and quota authority lanes and writes G04/G12 bundle-ready evidence descriptors | `docs/testing/ci-gates.md`; `test_scanner_heal_w16_recovery_evidence.sh` |
 | `test_scanner_validation_harness.sh` | dev-tool | Self-test for the scanner validation harness | — |
+| `test_scanner_heal_checkpoint_crash_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal checkpoint/crash evidence assembler | — |
+| `test_scanner_heal_authority_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal G01 authority evidence assembler | — |
+| `test_scanner_heal_scoped_ack_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal G03 scoped ACK evidence assembler | — |
+| `test_scanner_heal_legacy_rollback_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal R-L legacy rollback evidence assembler | — |
+| `test_scanner_heal_g14_multiset_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal G14 multi-set/multi-pool evidence assembler | — |
+| `test_scanner_heal_scheduler_pressure_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal scheduler-pressure evidence assembler | — |
+| `test_scanner_heal_status_outcome_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal status-and-outcome evidence assembler | — |
+| `test_scanner_heal_maintenance_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal G11/G13 maintenance evidence assembler | — |
+| `test_scanner_heal_g09_upgrade_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal G09 upgrade evidence runner | — |
+| `test_scanner_heal_w16_recovery_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal W16 recovery evidence runner | — |
+| `test_scanner_heal_w13_mrf_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal W13 MRF evidence runner | — |
+| `scanner_abba.py` | dev-tool | Scanner/heal ABBA orchestration and evidence gates via `run_scanner_validation_harness.sh --abba` | `docs/operations/scanner-benchmark-runbook.md` |
+| `test_scanner_abba.py` | dev-tool | Synthetic ABBA adapter and failure-path tests | `test_scanner_validation_harness.sh` |
 | `test_build_rustfs_options.sh` | dev-tool | Shell test for rustfs build-option wiring | `make test` (script-tests) |
 | `test_entrypoint_credentials.sh` | dev-tool | Container entrypoint credential-handling test | `make test` (script-tests) |
 | `test_helm_chart_version.sh` | dev-tool | Test for `helm_chart_version.sh` | — |
+| `test_package_service_scripts.sh` | ci-gate | Verifies DEB/RPM install, upgrade, removal, and service restart scriptlets | audit.yml `workflow-pin-report` |
+| `test_package_versions.sh` | ci-gate | Exact-output and fail-closed tests for DEB/RPM package version normalization | audit.yml `workflow-pin-report`; package.yml RPM build |
 | `windows-sftp-listener-smoke.sh` | dev-tool | Confirms `rustfs.exe --features sftp` binds an SFTP listener on Windows | — |
 
 ## Benchmark & performance harnesses
 
 | Entry | Status | Purpose | Wiring / docs |
 |---|---|---|---|
-| `run_hotpath_warp_ab.sh` | ci-gate | Linux warp A/B rig for the hotpath series | performance-ab.yml (scheduled); `docs/operations/hotpath-warp-ab-runbook.md` |
+| `run_hotpath_warp_ab.sh` | dev-tool | Linux warp A/B rig for the hotpath series (quick local A/B) | `docs/operations/hotpath-warp-ab-runbook.md` |
+| `run_hotpath_warp_abba.sh` | ci-gate | Formal ABBA warp runner (baseline/candidate interleaved, `--rounds >= 3`); the runner performance-ab.yml executes | performance-ab.yml (scheduled); `docs/operations/hotpath-warp-ab-runbook.md` |
 | `hotpath_warp_ab_gate.sh` | dev-tool | Relative-budget gate evaluated over the warp A/B results | used by `run_hotpath_warp_ab.sh`; hotpath runbook |
 | `run_internode_grpc_ab_bench.sh` | dev-tool | One-click A/B driver for the internode gRPC optimization stages | `docs/operations/internode-grpc-benchmark-runbook.md` |
 | `run_internode_transport_baseline.sh` | dev-tool | Internode transport baseline runner | internode runbook; `crates/io-metrics/README.md` |
@@ -73,6 +109,8 @@ their issue closes.
 | `run_pinned_paired_abba_bench.sh` | dev-tool | Pinned RustFS/MinIO paired ABBA benchmark orchestrator for backlog#1432 | `test_pinned_paired_abba_bench.sh` |
 | `run_get_codec_streaming_smoke.sh` | dev-tool | Local GET benchmark harness for the codec streaming read path | `docs/testing/ecstore-validation-suite-design.md` |
 | `run_get_1mib_abba_stage_metrics.sh` | dev-tool | Exact-1MiB isolated-host GET ABBA/stage-metrics harness for backlog#1434 | `test_get_1mib_abba_stage_metrics.sh` |
+| `issue_2007_coalescer_prometheus_report.py` | dev-tool | Read-only Prometheus report for GET metadata coalescer delay cost validation; usage in the module docstring | `test_issue_2007_coalescer_prometheus_report.sh` |
+| `prometheus_metrics_1649_smoke.py` | dev-tool | Read-only Prometheus instant-query smoke check for the backlog#1649 metric dimensions, required labels, and retired series; usage in the module docstring | `--self-test` |
 | `run_gt1g_get_http_matrix.sh` | dev-tool | >1 GiB GET HTTP matrix | `docs/testing/ecstore-validation-suite-design.md` |
 | `run_gt1g_multipart_put_matrix.sh` | dev-tool | >1 GiB multipart PUT matrix | `docs/testing/ecstore-validation-suite-design.md` |
 | `sample_remote_rustfs_rss.sh` | dev-tool | Remote RustFS PID CPU/RSS TSV sampler for hotpath profiling runs | `test_sample_remote_rustfs_rss.sh`; backlog#1647 |
@@ -100,6 +138,7 @@ their issue closes.
 | `manual_transition_nightly_stress_runbook.sh` | dev-tool | Nightly stress entrypoint with failure snapshot templates | — |
 | `install-flatc.sh` | dev-tool | Local flatc installer (macOS) | — |
 | `install-protoc.sh` | dev-tool | Local protoc installer (macOS/Linux) | — |
+| `cargo_publish_workspace.sh` | dev-tool | Generates the workspace crate publish order, checks existing registry versions, and optionally runs ordered `cargo publish` dry-runs or publication | `docs/operations/cargo-publish-workspace.md` |
 | `makefile-header.sh` | dev-tool | Generates the `## —— section ——` header lines used in `.config/make/*.mak` | — |
 | `tls_gen.md` | dev-tool (doc) | Notes on generating local TLS certificates | — |
 
@@ -108,6 +147,7 @@ their issue closes.
 | Entry | Status | Purpose | Wiring / docs |
 |---|---|---|---|
 | `fuzz/` | ci-gate | Unified cargo-fuzz runner and helpers for the `fuzz/` sub-workspace | fuzz.yml; `fuzz/README.md` |
+| `release/` | ci-gate | Release creation and DEB/RPM version-normalization helpers | build.yml; package.yml |
 | `s3-tests/` | ci-gate | ceph/s3-tests compatibility harness (allow-lists, patches, report tooling) | ci.yml; e2e-s3tests.yml; `scripts/s3-tests/README.md` |
 | `security/` | ci-gate | Workflow-pin enforcement and release supply-chain asset generation | audit.yml; build.yml |
 | `table-catalog/` | dev-tool | S3-Tables / pyiceberg validation suite | `docs/architecture/s3-tables-support-matrix.md` |

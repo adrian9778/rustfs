@@ -42,7 +42,7 @@ allow-git = [
     "https://github.com/s3s-project/s3s.git",
     # RustFS fork carrying presigned expiry and constant-time authentication fixes.
     # owner: rustfs-maintainers  review: 2026-10
-    "https://github.com/rustfs/s3s.git",
+    # "https://github.com/rustfs/s3s.git",
 ]
 
 [bans]

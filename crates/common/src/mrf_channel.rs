@@ -16,12 +16,15 @@
 //!
 //! Producers on error paths (read decode failure, scanner metadata
 //! corruption, partial-write recovery) hand a lightweight [`MrfIntent`] to the
-//! heal crate through a global bounded channel. Delivery is strictly
+//! heal crate through a global bounded channel. Hint delivery is strictly
 //! non-blocking: `try_send_mrf_intent` never awaits and drops the intent
 //! (counting it) when the channel is full or uninitialized — losing one heal
 //! hint is always preferred over stalling an IO path. Durable replay of
 //! unconsumed intents is the consumer's job (see `rustfs-heal`
-//! `heal::mrf_queue`), mirroring MinIO's `.heal/mrf/list.bin`.
+//! `heal::mrf_queue`), mirroring MinIO's `.heal/mrf/list.bin`. Committed partial
+//! writes and committed partial delete-marker purges use a separate bounded
+//! channel and await a checkpoint receipt; ordinary complete writes do not use
+//! it.
 
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
@@ -33,7 +36,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 /// Bounded capacity of the global MRF channel. Backpressure is resolved by
@@ -44,10 +47,10 @@ const MRF_COALESCER_MAX_KEYS: usize = 8192;
 const MRF_COALESCER_MAX_BYTES: usize = 16 * 1024 * 1024;
 const MRF_COALESCER_TTL: Duration = Duration::from_secs(60);
 const MRF_MAX_IDENTITY_COMPONENT: usize = 1024;
+pub const MRF_MAX_DELETE_MARKER_BYTES: usize = 1024 * 1024;
 
 /// Why an intent was produced. Drives the heal priority mapping on the
-/// consumer side (DecodeFailure -> Urgent, MetadataCorruption -> High,
-/// PartialWrite -> Normal).
+/// consumer side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MrfKind {
     /// Erasure decode failed while serving a read (read path).
@@ -56,6 +59,8 @@ pub enum MrfKind {
     MetadataCorruption,
     /// A write left the object with fewer committed shards than the set size.
     PartialWrite,
+    /// A committed explicit delete-marker purge missed at least one member.
+    DeleteMarkerPurge,
 }
 
 impl MrfKind {
@@ -64,7 +69,59 @@ impl MrfKind {
             MrfKind::DecodeFailure => "decode-failure",
             MrfKind::MetadataCorruption => "metadata-corruption",
             MrfKind::PartialWrite => "partial-write",
+            MrfKind::DeleteMarkerPurge => "delete-marker-purge",
         }
+    }
+
+    pub const fn is_durable(self) -> bool {
+        matches!(self, Self::PartialWrite | Self::DeleteMarkerPurge)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MrfDeleteMarkerPurgeIdentity {
+    pub bucket_incarnation_id: Uuid,
+    pub marker_incarnation_id: Uuid,
+    pub marker_identity: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MrfDeleteMarkerPurge {
+    pub bucket_incarnation_id: Uuid,
+    pub marker_incarnation_id: Uuid,
+    pub marker_identity: [u8; 32],
+    pub marker: Arc<[u8]>,
+}
+
+impl MrfDeleteMarkerPurge {
+    pub fn new(
+        bucket_incarnation_id: Uuid,
+        marker_incarnation_id: Uuid,
+        marker_identity: [u8; 32],
+        marker: Vec<u8>,
+    ) -> Option<Self> {
+        let payload = Self {
+            bucket_incarnation_id,
+            marker_incarnation_id,
+            marker_identity,
+            marker: Arc::from(marker),
+        };
+        payload.is_valid().then_some(payload)
+    }
+
+    pub const fn identity(&self) -> MrfDeleteMarkerPurgeIdentity {
+        MrfDeleteMarkerPurgeIdentity {
+            bucket_incarnation_id: self.bucket_incarnation_id,
+            marker_incarnation_id: self.marker_incarnation_id,
+            marker_identity: self.marker_identity,
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !self.bucket_incarnation_id.is_nil()
+            && self.marker_incarnation_id == self.bucket_incarnation_id
+            && !self.marker.is_empty()
+            && self.marker.len() <= MRF_MAX_DELETE_MARKER_BYTES
     }
 }
 
@@ -78,6 +135,10 @@ pub struct MrfIntent {
     /// Version the intent targets, as raw UUID bytes.
     pub version_id: Option<[u8; 16]>,
     pub kind: MrfKind,
+    /// Present only for [`MrfKind::DeleteMarkerPurge`]. The encoded marker is a
+    /// destructive-operation precondition, while `marker_identity` is its
+    /// deterministic queue and proof identity.
+    pub delete_marker_purge: Option<MrfDeleteMarkerPurge>,
     /// Stable erasure-set scope when the producer has it. Kept optional so
     /// metadata corruption and legacy producers do not invent a scope.
     pub scope: Option<MrfScope>,
@@ -88,6 +149,100 @@ pub struct MrfIntent {
     /// Times this intent has already been offered to the heal manager.
     /// Dropped by the consumer once it reaches `MRF_MAX_ATTEMPTS`.
     pub attempts: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MrfDurableRepairAnchor {
+    pub kind: MrfKind,
+    pub bucket: Arc<str>,
+    pub object: Arc<str>,
+    pub version_id: Option<[u8; 16]>,
+    pub scope: Option<MrfScope>,
+    pub delete_marker_purge: Option<MrfDeleteMarkerPurgeIdentity>,
+    pub lease: MrfIngressLease,
+    pub bucket_incarnation_id: Uuid,
+}
+
+impl MrfDurableRepairAnchor {
+    /// Build a dischargeable anchor only when the caller supplies the storage
+    /// incarnation and the original ingress lease. Legacy replay records lack
+    /// both pieces and therefore remain fail-closed.
+    pub fn from_intent(intent: &MrfIntent, bucket_incarnation_id: Uuid) -> Option<Self> {
+        let lease = intent.lease?;
+        let (version_id, scope) = canonical_identity(intent.kind, intent.version_id, intent.scope);
+        let delete_marker_purge = canonical_delete_marker_purge_identity(intent)?;
+        let bucket_incarnation_id = delete_marker_purge
+            .map(|identity| identity.bucket_incarnation_id)
+            .unwrap_or(bucket_incarnation_id);
+        if bucket_incarnation_id.is_nil() {
+            return None;
+        }
+        Some(Self {
+            kind: intent.kind,
+            bucket: intent.bucket.clone(),
+            object: intent.object.clone(),
+            version_id,
+            scope,
+            delete_marker_purge,
+            lease,
+            bucket_incarnation_id,
+        })
+    }
+
+    pub fn is_proven_by(&self, event: &MrfVerifiedRepairEvent) -> bool {
+        let Some(lease) = event.lease else {
+            return false;
+        };
+        self.kind == event.kind
+            && self.bucket == event.bucket
+            && self.object == event.object
+            && self.version_id == event.version_id
+            && self.scope == event.scope
+            && self.delete_marker_purge == event.delete_marker_purge
+            && self.lease == lease
+            && self.bucket_incarnation_id == event.bucket_incarnation_id
+    }
+}
+
+/// Consume only anchors proven by a complete verified-repair identity. The
+/// caller remains responsible for persisting the resulting anchor set before
+/// deleting older replay files.
+pub fn consume_verified_mrf_repair_events(anchors: &mut Vec<MrfDurableRepairAnchor>, events: &[MrfVerifiedRepairEvent]) -> usize {
+    let before = anchors.len();
+    anchors.retain(|anchor| !events.iter().any(|event| anchor.is_proven_by(event)));
+    before.saturating_sub(anchors.len())
+}
+
+/// Consume recorded verified repairs for one bucket without draining
+/// unrelated or still-unmatched proofs. If the caller crashes before
+/// persisting the retained anchor set, the proof may be replayed by repair
+/// instead of silently deleting the old responsibility.
+pub fn consume_recorded_verified_mrf_repair_events_for(bucket: &str, anchors: &mut Vec<MrfDurableRepairAnchor>) -> usize {
+    let Some(registry) = MRF_VERIFIED_REPAIR_EVENTS.get() else {
+        return 0;
+    };
+    let Ok(mut events) = registry.lock() else {
+        return 0;
+    };
+    let before = anchors.len();
+    let mut retained = std::collections::VecDeque::with_capacity(events.len());
+    while let Some(event) = events.pop_front() {
+        if event.bucket.as_ref() != bucket {
+            retained.push_back(event);
+            continue;
+        }
+        let mut matched = false;
+        anchors.retain(|anchor| {
+            let proven = anchor.is_proven_by(&event);
+            matched |= proven;
+            !proven
+        });
+        if !matched {
+            retained.push_back(event);
+        }
+    }
+    *events = retained;
+    before.saturating_sub(anchors.len())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -114,6 +269,7 @@ pub enum MrfDropReason {
     Uninitialized,
     Full,
     OversizedIdentity,
+    InvalidPayload,
     CoalescerFull,
 }
 
@@ -132,11 +288,132 @@ impl MrfIntent {
     pub fn estimated_bytes(&self) -> usize {
         // Struct + strings + version bytes; buckets and objects are usually
         // far below this bound, so rounding up keeps the budget conservative.
-        64 + self.bucket.len() + self.object.len()
+        64usize
+            .saturating_add(self.bucket.len())
+            .saturating_add(self.object.len())
+            .saturating_add(
+                self.delete_marker_purge
+                    .as_ref()
+                    .map_or(0, |purge| std::mem::size_of::<MrfDeleteMarkerPurge>().saturating_add(purge.marker.len())),
+            )
     }
 }
 
 static GLOBAL_MRF_SENDER: OnceLock<mpsc::Sender<MrfIntent>> = OnceLock::new();
+
+static GLOBAL_DURABLE_MRF_SENDER: OnceLock<mpsc::Sender<MrfDurableSubmission>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MrfDurableAdmissionError {
+    #[error("MRF delivery is disabled")]
+    Disabled,
+    #[error("MRF durable consumer is unavailable")]
+    Unavailable,
+    #[error("MRF responsibility capacity is exhausted")]
+    Full,
+    #[error("MRF responsibility identity is invalid or oversized")]
+    InvalidIdentity,
+    #[error("MRF responsibility checkpoint could not be persisted")]
+    Persistence,
+    #[error("MRF durable admission timed out; responsibility may still be retained")]
+    Timeout,
+}
+
+/// A committed storage responsibility awaiting a durable checkpoint, separate
+/// from the best-effort read/scanner channel. Dropping the reply does not
+/// cancel repair.
+pub struct MrfDurableSubmission {
+    pub intent: MrfIntent,
+    pub response: oneshot::Sender<Result<(), MrfDurableAdmissionError>>,
+}
+
+pub fn init_durable_mrf_channel() -> Result<mpsc::Receiver<MrfDurableSubmission>, &'static str> {
+    let (sender, receiver) = mpsc::channel(MRF_CHANNEL_CAPACITY);
+    GLOBAL_DURABLE_MRF_SENDER
+        .set(sender)
+        .map_err(|_| "MRF durable channel sender already initialized")?;
+    Ok(receiver)
+}
+
+/// Wait for checkpoint publication on a committed partial-write path. Every
+/// write gets a fresh lease: a previous repair of the same unversioned key
+/// cannot discharge a later overwrite. An error is not durable admission.
+pub async fn persist_partial_write_intent(
+    bucket: &str,
+    object: &str,
+    version_id: Option<Uuid>,
+    scope: MrfScope,
+) -> Result<(), MrfDurableAdmissionError> {
+    let intent = MrfIntent {
+        bucket: Arc::from(bucket),
+        object: Arc::from(object),
+        version_id: canonical_version(version_id),
+        kind: MrfKind::PartialWrite,
+        delete_marker_purge: None,
+        scope: Some(scope),
+        lease: None,
+        enqueued_at_ms: unix_now_ms(),
+        attempts: 0,
+    };
+    persist_durable_intent(intent).await
+}
+
+pub async fn persist_delete_marker_purge_intent(
+    bucket: &str,
+    object: &str,
+    version_id: Uuid,
+    scope: MrfScope,
+    delete_marker_purge: MrfDeleteMarkerPurge,
+) -> Result<(), MrfDurableAdmissionError> {
+    if version_id.is_nil() {
+        return Err(MrfDurableAdmissionError::InvalidIdentity);
+    }
+    let intent = MrfIntent {
+        bucket: Arc::from(bucket),
+        object: Arc::from(object),
+        version_id: canonical_version(Some(version_id)),
+        kind: MrfKind::DeleteMarkerPurge,
+        delete_marker_purge: Some(delete_marker_purge),
+        scope: Some(scope),
+        lease: None,
+        enqueued_at_ms: unix_now_ms(),
+        attempts: 0,
+    };
+    persist_durable_intent_unconditionally(intent).await
+}
+
+async fn persist_durable_intent(intent: MrfIntent) -> Result<(), MrfDurableAdmissionError> {
+    if !mrf_delivery_enabled() {
+        return Err(MrfDurableAdmissionError::Disabled);
+    }
+    persist_durable_intent_unconditionally(intent).await
+}
+
+async fn persist_durable_intent_unconditionally(mut intent: MrfIntent) -> Result<(), MrfDurableAdmissionError> {
+    if intent.bucket.is_empty()
+        || intent.object.is_empty()
+        || intent.bucket.len() > MRF_MAX_IDENTITY_COMPONENT
+        || intent.object.len() > MRF_MAX_IDENTITY_COMPONENT
+        || !valid_intent_payload(&intent)
+    {
+        return Err(MrfDurableAdmissionError::InvalidIdentity);
+    }
+    let sender = GLOBAL_DURABLE_MRF_SENDER.get().ok_or(MrfDurableAdmissionError::Unavailable)?;
+    if try_rearm_mrf_replay_intent(&mut intent) != MrfIngressResult::Enqueued {
+        return Err(MrfDurableAdmissionError::InvalidIdentity);
+    }
+    let (response, receipt) = oneshot::channel();
+    sender
+        .try_send(MrfDurableSubmission { intent, response })
+        .map_err(|err| match err {
+            mpsc::error::TrySendError::Full(_) => MrfDurableAdmissionError::Full,
+            mpsc::error::TrySendError::Closed(_) => MrfDurableAdmissionError::Unavailable,
+        })?;
+    tokio::time::timeout(Duration::from_secs(10), receipt)
+        .await
+        .map_err(|_| MrfDurableAdmissionError::Timeout)?
+        .map_err(|_| MrfDurableAdmissionError::Unavailable)?
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct MrfIdentityKey {
@@ -191,8 +468,25 @@ fn canonical_identity(
     let version_id = version_id.filter(|bytes| *bytes != [0; 16]);
     match kind {
         MrfKind::MetadataCorruption => (None, None),
-        MrfKind::DecodeFailure | MrfKind::PartialWrite => (version_id, scope),
+        MrfKind::DecodeFailure | MrfKind::PartialWrite | MrfKind::DeleteMarkerPurge => (version_id, scope),
     }
+}
+
+fn canonical_delete_marker_purge_identity(intent: &MrfIntent) -> Option<Option<MrfDeleteMarkerPurgeIdentity>> {
+    match intent.kind {
+        MrfKind::DeleteMarkerPurge => intent
+            .delete_marker_purge
+            .as_ref()
+            .filter(|payload| payload.is_valid())
+            .map(|payload| Some(payload.identity())),
+        _ if intent.delete_marker_purge.is_none() => Some(None),
+        _ => None,
+    }
+}
+
+fn valid_intent_payload(intent: &MrfIntent) -> bool {
+    canonical_delete_marker_purge_identity(intent).is_some()
+        && (intent.kind != MrfKind::DeleteMarkerPurge || (intent.version_id.is_some() && intent.scope.is_some()))
 }
 
 fn identity_estimated_bytes(key: &MrfIdentityKey) -> usize {
@@ -344,6 +638,9 @@ pub fn try_send_mrf_intent_typed(
     if !mrf_delivery_enabled() {
         return MrfIngressResult::Dropped(MrfDropReason::Disabled);
     }
+    if kind == MrfKind::DeleteMarkerPurge {
+        return MrfIngressResult::Dropped(MrfDropReason::InvalidPayload);
+    }
     let Some(sender) = GLOBAL_MRF_SENDER.get() else {
         return MrfIngressResult::Dropped(MrfDropReason::Uninitialized);
     };
@@ -367,6 +664,7 @@ pub fn try_send_mrf_intent_typed(
         object: key.object.clone(),
         version_id: key.version_id,
         kind,
+        delete_marker_purge: None,
         scope,
         lease: Some(lease),
         enqueued_at_ms: unix_now_ms(),
@@ -384,6 +682,30 @@ pub fn try_send_mrf_intent_typed(
             MrfIngressResult::Dropped(MrfDropReason::Uninitialized)
         }
     }
+}
+
+/// Acquire a fresh process-local lease for one durable replay record.
+///
+/// Journal records deliberately do not persist leases. A replay consumer must
+/// call this before submitting the record so a later verified repair event can
+/// identify the exact replay admission. Replay does not reserve the live
+/// producer coalescer key: the replay queue first deduplicates legacy records,
+/// then manager admission owns task-level deduplication with live producers.
+pub fn try_rearm_mrf_replay_intent(intent: &mut MrfIntent) -> MrfIngressResult {
+    if intent.bucket.len() > MRF_MAX_IDENTITY_COMPONENT || intent.object.len() > MRF_MAX_IDENTITY_COMPONENT {
+        return MrfIngressResult::Dropped(MrfDropReason::OversizedIdentity);
+    }
+    let (version_id, scope) = canonical_identity(intent.kind, intent.version_id, intent.scope);
+    intent.version_id = version_id;
+    intent.scope = scope;
+    if !valid_intent_payload(intent) {
+        return MrfIngressResult::Dropped(MrfDropReason::InvalidPayload);
+    }
+    if intent.lease.is_some() {
+        return MrfIngressResult::Enqueued;
+    }
+    intent.lease = Some(MrfIngressLease::new(NEXT_MRF_LEASE.fetch_add(1, Ordering::Relaxed)));
+    MrfIngressResult::Enqueued
 }
 
 /// Release the ingress key once the consumer owns the intent.
@@ -422,14 +744,34 @@ fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// A repair the MRF consumer landed, fanned out so retry ledgers can drop
-/// entries the journal no longer tracks (backlog#1894 axis B). The payload
-/// mirrors the intent identity so consumers match without re-parsing.
+/// Legacy, unverified repair notice. Its identity lacks kind, set scope,
+/// bucket incarnation and responsibility generation. Consumers must not use
+/// it to discharge persisted repair responsibility.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MrfRepairedEvent {
     pub bucket: Arc<str>,
     pub object: Arc<str>,
     pub version_id: Option<[u8; 16]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MrfVerifiedRepairDisposition {
+    Repaired,
+    VerifiedHealthy,
+    AuthoritativelyAbsent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MrfVerifiedRepairEvent {
+    pub kind: MrfKind,
+    pub bucket: Arc<str>,
+    pub object: Arc<str>,
+    pub version_id: Option<[u8; 16]>,
+    pub scope: Option<MrfScope>,
+    pub delete_marker_purge: Option<MrfDeleteMarkerPurgeIdentity>,
+    pub lease: Option<MrfIngressLease>,
+    pub bucket_incarnation_id: Uuid,
+    pub disposition: MrfVerifiedRepairDisposition,
 }
 
 /// Bound on the repaired-event backlog. Notices are best-effort hints; when
@@ -438,9 +780,11 @@ pub struct MrfRepairedEvent {
 const MRF_REPAIRED_EVENT_CAP: usize = 4096;
 
 static MRF_REPAIRED_EVENTS: OnceLock<std::sync::Mutex<std::collections::VecDeque<MrfRepairedEvent>>> = OnceLock::new();
+static MRF_VERIFIED_REPAIR_EVENTS: OnceLock<std::sync::Mutex<std::collections::VecDeque<MrfVerifiedRepairEvent>>> =
+    OnceLock::new();
 
-/// Record that the MRF consumer landed a repair. Never blocks: the critical
-/// section is a deque push under a std mutex.
+/// Record a legacy notification for compatibility. This is not an
+/// acknowledgement of storage verification or durable repair completion.
 pub fn note_mrf_repaired(bucket: &str, object: &str, version_id: Option<[u8; 16]>) {
     let registry = MRF_REPAIRED_EVENTS.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
     let Ok(mut events) = registry.lock() else {
@@ -478,6 +822,43 @@ pub fn take_mrf_repaired_events_for(bucket: &str) -> Vec<MrfRepairedEvent> {
     taken
 }
 
+/// Record a storage-owned MRF completion proof. Unlike the legacy repaired
+/// event, this identity is complete enough for future durable ledgers to make
+/// an exact responsibility decision.
+pub fn note_mrf_verified_repair(event: MrfVerifiedRepairEvent) {
+    let registry = MRF_VERIFIED_REPAIR_EVENTS.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let Ok(mut events) = registry.lock() else {
+        return;
+    };
+    if events.len() >= MRF_REPAIRED_EVENT_CAP {
+        events.pop_front();
+    }
+    events.push_back(event);
+}
+
+/// Take verified repair events recorded for `bucket`, leaving other buckets'
+/// proofs in place. Consumers still have to match kind, object, version, scope
+/// lease and incarnation before discharging durable responsibility.
+pub fn take_mrf_verified_repair_events_for(bucket: &str) -> Vec<MrfVerifiedRepairEvent> {
+    let Some(registry) = MRF_VERIFIED_REPAIR_EVENTS.get() else {
+        return Vec::new();
+    };
+    let Ok(mut events) = registry.lock() else {
+        return Vec::new();
+    };
+    let mut taken = Vec::new();
+    let mut retained = std::collections::VecDeque::with_capacity(events.len());
+    while let Some(event) = events.pop_front() {
+        if event.bucket.as_ref() == bucket {
+            taken.push(event);
+        } else {
+            retained.push_back(event);
+        }
+    }
+    *events = retained;
+    taken
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +870,7 @@ mod tests {
             object: Arc::from("object"),
             version_id: Some([0u8; 16]),
             kind: MrfKind::DecodeFailure,
+            delete_marker_purge: None,
             scope: None,
             lease: None,
             enqueued_at_ms: 0,
@@ -515,6 +897,9 @@ mod tests {
         }
         coalescer_release(&key, Some(lease));
         let retry_lease = coalescer_admit(key.clone()).expect("released identity must admit a retry");
+        assert_ne!(lease, retry_lease);
+        coalescer_release(&key, Some(lease));
+        assert_eq!(coalescer_admit(key.clone()), Err(MrfIngressResult::Coalesced));
         coalescer_release(&key, Some(retry_lease));
     }
 
@@ -541,6 +926,218 @@ mod tests {
         );
         assert_eq!(metadata_version, None);
         assert_eq!(metadata_scope, None);
+    }
+
+    #[test]
+    fn durable_repair_anchor_requires_lease_and_bucket_incarnation() {
+        let mut intent = MrfIntent {
+            bucket: Arc::from("durable-anchor-bucket"),
+            object: Arc::from("object"),
+            version_id: Some([0; 16]),
+            kind: MrfKind::PartialWrite,
+            delete_marker_purge: None,
+            scope: Some(MrfScope {
+                pool_index: 1,
+                set_index: 2,
+            }),
+            lease: None,
+            enqueued_at_ms: 0,
+            attempts: 0,
+        };
+        assert!(
+            MrfDurableRepairAnchor::from_intent(&intent, Uuid::new_v4()).is_none(),
+            "legacy replay records without the ingress lease must remain anchored"
+        );
+
+        intent.lease = Some(MrfIngressLease::new(7));
+        assert!(
+            MrfDurableRepairAnchor::from_intent(&intent, Uuid::nil()).is_none(),
+            "nil bucket incarnation cannot prove durable successor ownership"
+        );
+
+        let anchor = MrfDurableRepairAnchor::from_intent(&intent, Uuid::new_v4())
+            .expect("complete identity should create a durable repair anchor");
+        assert_eq!(anchor.version_id, None, "nil UUID is canonicalized before matching");
+        assert_eq!(
+            anchor.scope,
+            Some(MrfScope {
+                pool_index: 1,
+                set_index: 2
+            })
+        );
+    }
+
+    #[test]
+    fn durable_replay_rearm_assigns_a_fresh_dischargeable_lease() {
+        let unique = Uuid::new_v4();
+        let mut intent = MrfIntent {
+            bucket: Arc::from(format!("replay-{unique}")),
+            object: Arc::from("object"),
+            version_id: Some([0; 16]),
+            kind: MrfKind::PartialWrite,
+            delete_marker_purge: None,
+            scope: Some(MrfScope {
+                pool_index: 2,
+                set_index: 3,
+            }),
+            lease: None,
+            enqueued_at_ms: 1,
+            attempts: 0,
+        };
+
+        assert_eq!(try_rearm_mrf_replay_intent(&mut intent), MrfIngressResult::Enqueued);
+        assert_eq!(intent.version_id, None, "nil versions remain canonical during replay");
+        assert!(intent.lease.is_some(), "replay admission must carry a fresh lease");
+        assert!(
+            MrfDurableRepairAnchor::from_intent(&intent, Uuid::new_v4()).is_some(),
+            "a rearmed replay record can participate in exact durable proof matching"
+        );
+        release_mrf_intent(&intent);
+    }
+
+    #[test]
+    fn verified_repair_events_consume_only_exact_durable_anchors() {
+        let bucket = Arc::<str>::from("proof-bucket");
+        let object = Arc::<str>::from("object");
+        let incarnation = Uuid::new_v4();
+        let lease = MrfIngressLease::new(11);
+        let anchor = MrfDurableRepairAnchor {
+            kind: MrfKind::PartialWrite,
+            bucket: bucket.clone(),
+            object: object.clone(),
+            version_id: Some([3; 16]),
+            scope: Some(MrfScope {
+                pool_index: 4,
+                set_index: 5,
+            }),
+            delete_marker_purge: None,
+            lease,
+            bucket_incarnation_id: incarnation,
+        };
+        let event = MrfVerifiedRepairEvent {
+            kind: anchor.kind,
+            bucket,
+            object,
+            version_id: anchor.version_id,
+            scope: anchor.scope,
+            delete_marker_purge: None,
+            lease: Some(lease),
+            bucket_incarnation_id: incarnation,
+            disposition: MrfVerifiedRepairDisposition::Repaired,
+        };
+
+        for rejected in [
+            MrfVerifiedRepairEvent {
+                lease: None,
+                ..event.clone()
+            },
+            MrfVerifiedRepairEvent {
+                lease: Some(MrfIngressLease::new(12)),
+                ..event.clone()
+            },
+            MrfVerifiedRepairEvent {
+                bucket_incarnation_id: Uuid::new_v4(),
+                ..event.clone()
+            },
+            MrfVerifiedRepairEvent {
+                version_id: Some([4; 16]),
+                ..event.clone()
+            },
+            MrfVerifiedRepairEvent {
+                scope: Some(MrfScope {
+                    pool_index: 4,
+                    set_index: 6,
+                }),
+                ..event.clone()
+            },
+            MrfVerifiedRepairEvent {
+                kind: MrfKind::DecodeFailure,
+                ..event.clone()
+            },
+            MrfVerifiedRepairEvent {
+                bucket: Arc::from("other-bucket"),
+                ..event.clone()
+            },
+            MrfVerifiedRepairEvent {
+                object: Arc::from("other"),
+                ..event.clone()
+            },
+        ] {
+            let mut retained = vec![anchor.clone()];
+            assert_eq!(consume_verified_mrf_repair_events(&mut retained, &[rejected]), 0);
+            assert_eq!(retained, vec![anchor.clone()]);
+        }
+
+        let mut retained = vec![anchor];
+        assert_eq!(consume_verified_mrf_repair_events(&mut retained, &[event]), 1);
+        assert!(retained.is_empty());
+    }
+
+    #[test]
+    fn recorded_verified_repair_consumer_retains_unmatched_proofs() {
+        let bucket = Arc::<str>::from(format!("recorded-proof-{}", Uuid::new_v4()));
+        let other_bucket = Arc::<str>::from(format!("recorded-proof-other-{}", Uuid::new_v4()));
+        let incarnation = Uuid::new_v4();
+        let lease = MrfIngressLease::new(21);
+        let retained_anchor = MrfDurableRepairAnchor {
+            kind: MrfKind::PartialWrite,
+            bucket: bucket.clone(),
+            object: Arc::from("retained"),
+            version_id: Some([7; 16]),
+            scope: Some(MrfScope {
+                pool_index: 1,
+                set_index: 2,
+            }),
+            delete_marker_purge: None,
+            lease,
+            bucket_incarnation_id: incarnation,
+        };
+        let waiting_anchor = MrfDurableRepairAnchor {
+            object: Arc::from("waiting"),
+            lease: MrfIngressLease::new(22),
+            ..retained_anchor.clone()
+        };
+        let matched_event = MrfVerifiedRepairEvent {
+            kind: retained_anchor.kind,
+            bucket: bucket.clone(),
+            object: retained_anchor.object.clone(),
+            version_id: retained_anchor.version_id,
+            scope: retained_anchor.scope,
+            delete_marker_purge: None,
+            lease: Some(retained_anchor.lease),
+            bucket_incarnation_id: retained_anchor.bucket_incarnation_id,
+            disposition: MrfVerifiedRepairDisposition::Repaired,
+        };
+        let same_bucket_unmatched = MrfVerifiedRepairEvent {
+            object: Arc::from("future"),
+            lease: Some(MrfIngressLease::new(23)),
+            ..matched_event.clone()
+        };
+        let other_bucket_event = MrfVerifiedRepairEvent {
+            bucket: other_bucket.clone(),
+            ..matched_event.clone()
+        };
+
+        note_mrf_verified_repair(matched_event);
+        note_mrf_verified_repair(same_bucket_unmatched.clone());
+        note_mrf_verified_repair(other_bucket_event.clone());
+
+        let mut anchors = vec![retained_anchor, waiting_anchor.clone()];
+        assert_eq!(consume_recorded_verified_mrf_repair_events_for(&bucket, &mut anchors), 1);
+        assert_eq!(anchors, vec![waiting_anchor]);
+
+        let remaining_bucket_events = take_mrf_verified_repair_events_for(&bucket);
+        assert_eq!(
+            remaining_bucket_events,
+            vec![same_bucket_unmatched],
+            "same-bucket proofs without a retained anchor must remain available"
+        );
+        let remaining_other_events = take_mrf_verified_repair_events_for(&other_bucket);
+        assert_eq!(
+            remaining_other_events,
+            vec![other_bucket_event],
+            "proofs for other buckets must not be drained by this consumer"
+        );
     }
 
     #[tokio::test]
@@ -607,4 +1204,100 @@ mod tests {
         assert_eq!(flooded.len(), MRF_REPAIRED_EVENT_CAP);
         assert_eq!(flooded[0].object.as_ref(), "object-9", "the oldest notices past the cap are dropped");
     }
+
+    #[test]
+    fn verified_repair_events_preserve_full_identity_and_bucket_scope() {
+        let bucket_incarnation_id = Uuid::new_v4();
+        let event = MrfVerifiedRepairEvent {
+            kind: MrfKind::PartialWrite,
+            bucket: Arc::from("verified-bucket-a"),
+            object: Arc::from("object-a"),
+            version_id: Some([4u8; 16]),
+            scope: Some(MrfScope {
+                pool_index: 2,
+                set_index: 3,
+            }),
+            delete_marker_purge: None,
+            lease: Some(MrfIngressLease::new(42)),
+            bucket_incarnation_id,
+            disposition: MrfVerifiedRepairDisposition::Repaired,
+        };
+        note_mrf_verified_repair(event.clone());
+        note_mrf_verified_repair(MrfVerifiedRepairEvent {
+            bucket: Arc::from("verified-bucket-b"),
+            ..event.clone()
+        });
+
+        let taken = take_mrf_verified_repair_events_for("verified-bucket-a");
+        assert_eq!(taken, vec![event]);
+        assert!(take_mrf_verified_repair_events_for("verified-bucket-a").is_empty());
+        assert_eq!(take_mrf_verified_repair_events_for("verified-bucket-b").len(), 1);
+    }
+}
+#[tokio::test]
+async fn partial_write_durable_admission_waits_for_persistence_and_renews_lease() {
+    let mut receiver = init_durable_mrf_channel().expect("isolated test should initialize durable channel");
+    let scope = MrfScope {
+        pool_index: 2,
+        set_index: 3,
+    };
+    let first = tokio::spawn(async move { persist_partial_write_intent("bucket", "object", None, scope).await });
+    let submission = receiver.recv().await.expect("first submission should arrive");
+    let first_lease = submission.intent.lease;
+    assert!(!first.is_finished(), "channel delivery alone must not acknowledge durable ownership");
+    submission
+        .response
+        .send(Err(MrfDurableAdmissionError::Persistence))
+        .expect("producer should await receipt");
+    assert_eq!(first.await.expect("producer should complete"), Err(MrfDurableAdmissionError::Persistence));
+    let second = tokio::spawn(async move { persist_partial_write_intent("bucket", "object", None, scope).await });
+    let submission = receiver.recv().await.expect("replacement submission should arrive");
+    assert_ne!(
+        first_lease, submission.intent.lease,
+        "an overwrite must not reuse the previous proof identity"
+    );
+    assert_eq!(submission.intent.scope, Some(scope));
+    submission
+        .response
+        .send(Ok(()))
+        .expect("second producer should await receipt");
+    assert_eq!(second.await.expect("second producer should complete"), Ok(()));
+
+    let bucket_incarnation_id = Uuid::new_v4();
+    let marker_identity = [7; 32];
+    let purge = MrfDeleteMarkerPurge::new(bucket_incarnation_id, bucket_incarnation_id, marker_identity, vec![1, 2, 3])
+        .expect("valid purge payload");
+    let version_id = Uuid::new_v4();
+    let purge_submit =
+        tokio::spawn(async move { persist_delete_marker_purge_intent("bucket", "marker", version_id, scope, purge).await });
+    let submission = receiver.recv().await.expect("purge submission should arrive");
+    assert_eq!(submission.intent.kind, MrfKind::DeleteMarkerPurge);
+    assert_eq!(submission.intent.version_id, Some(*version_id.as_bytes()));
+    assert_eq!(submission.intent.scope, Some(scope));
+    assert_eq!(
+        submission
+            .intent
+            .delete_marker_purge
+            .as_ref()
+            .map(MrfDeleteMarkerPurge::identity),
+        Some(MrfDeleteMarkerPurgeIdentity {
+            bucket_incarnation_id,
+            marker_incarnation_id: bucket_incarnation_id,
+            marker_identity,
+        })
+    );
+    assert!(submission.intent.lease.is_some());
+    submission.response.send(Ok(())).expect("purge producer should await receipt");
+    assert_eq!(purge_submit.await.expect("purge producer should complete"), Ok(()));
+
+    let invalid = MrfDeleteMarkerPurge {
+        bucket_incarnation_id,
+        marker_incarnation_id: Uuid::new_v4(),
+        marker_identity,
+        marker: Arc::from([1u8]),
+    };
+    assert_eq!(
+        persist_delete_marker_purge_intent("bucket", "marker", version_id, scope, invalid).await,
+        Err(MrfDurableAdmissionError::InvalidIdentity)
+    );
 }

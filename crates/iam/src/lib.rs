@@ -31,6 +31,7 @@ pub mod error;
 pub mod federation;
 pub mod keyring;
 pub mod manager;
+pub mod mfa;
 pub mod oidc;
 pub mod oidc_state;
 mod root_credentials;
@@ -130,7 +131,7 @@ pub(crate) async fn notify_iam_load_user(access_key: &str, temp: bool) -> Vec<Ia
         assert!(!probe.panic, "notification probe panic");
         let should_fail = probe
             .remaining_failures
-            .fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |remaining| {
+            .try_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok();

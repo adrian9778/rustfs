@@ -15,13 +15,19 @@
 use crate::SCANNER_SLEEPER;
 
 use super::*;
+
+mod mrf_ownership;
 use crate::storage_api::VersionPurgeStatusType;
 use crate::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, TierStats, new_disk, storageclass};
 use rustfs_filemeta::{FileInfo, FileMeta, MetadataResolutionParams};
+use serial_test::serial;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::sync::Mutex;
+
+mod checkpoint_fixture;
+pub(super) mod enumeration_restart;
 
 /// Reset the process-global alert cooldown map; test-only.
 fn reset_alert_cooldowns() {
@@ -326,18 +332,35 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         heal_object_select: 0,
         scan_mode: HealScanMode::Normal,
         is_erasure_mode: false,
+        prefix_scan_scope: None,
         failed_object_ttl_secs: u64::MAX,
         failed_objects_max: usize::MAX,
         sleeper: SCANNER_SLEEPER.clone(),
         disks: Vec::new(),
         disks_quorum: 0,
         updates: None,
+        checkpoint_tx: None,
         last_update: SystemTime::UNIX_EPOCH,
+        checkpoint_objects: 0,
+        last_checkpoint_objects: 0,
+        last_checkpoint_at: Instant::now(),
         update_current_path,
         budget: ScannerCycleBudget::new(&CancellationToken::new(), Default::default()),
         skip_heal: Arc::new(AtomicBool::new(false)),
         local_disk: disk,
+        tier_registry: crate::TierRegistrySnapshot {
+            generation: 0,
+            names: Arc::new([]),
+            refresh_failed: false,
+        },
         pending_heals_changed: false,
+        coverage_frontier: None,
+        resume_frontier: None,
+        coverage_gap: false,
+        raw_enumeration_progress: Vec::new(),
+        pending_heal_sync_deferred: false,
+        pending_heal_batch_dirty: false,
+        pending_heal_sync_count: 0,
         pending_size_reconciliation_keys: HashSet::new(),
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,
@@ -345,6 +368,55 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
     };
 
     (scanner, temp_dir)
+}
+
+#[tokio::test]
+async fn periodic_checkpoint_emits_at_object_threshold_without_wall_clock_wait() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel(1);
+    scanner.checkpoint_tx = Some(checkpoint_tx);
+    scanner.checkpoint_objects = SCANNER_CHECKPOINT_OBJECT_INTERVAL;
+    scanner.last_checkpoint_at = Instant::now()
+        .checked_sub(SCANNER_CHECKPOINT_MIN_INTERVAL)
+        .expect("test instant subtraction");
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.new_cache.info.scan_progress = Some(crate::DataUsageScanProgress {
+        started_plan: crate::DataUsageScanPlanDigest([1; 32]),
+        requested_plan: crate::DataUsageScanPlanDigest([1; 32]),
+    });
+    scanner.new_cache.info.source = Some(crate::DataUsageCacheSource::new(0, 0));
+    scanner.new_cache.info.scan_identity = Some(crate::DataUsageScanIdentity {
+        version: 1,
+        bucket_incarnation: Uuid::from_u128(1),
+        set_layout: crate::DataUsageScanPlanDigest([2; 32]),
+        publication_epoch: 1,
+        tier_registry_generation: 0,
+        scan_mode: HealScanMode::Normal,
+    });
+    scanner.new_cache.replace("bucket", "", DataUsageEntry::default());
+    scanner.new_cache.replace("bucket/a", "bucket", DataUsageEntry::default());
+    scanner.coverage_frontier = Some("bucket/a".to_string());
+    scanner.new_cache.info.scan_checkpoint = Some(crate::DataUsageScanCheckpoint::new(
+        "bucket/a".to_string(),
+        crate::DataUsageScanCheckpointReason::Objects,
+    ));
+    scanner.new_cache.info.scan_resume_after = Some("bucket/a".to_string());
+    scanner
+        .new_cache
+        .seal_scan_frontier(Some("bucket/a"))
+        .expect("fixture frontier");
+    assert_eq!(scanner.new_cache.validated_scan_frontier(), Some("bucket/a"));
+
+    scanner.maybe_send_checkpoint();
+
+    let checkpoint = checkpoint_rx.try_recv().expect("object threshold emits a bounded checkpoint");
+    assert_eq!(checkpoint.info.name, "bucket");
+    assert!(!checkpoint.info.snapshot_complete);
+    assert_eq!(scanner.last_checkpoint_objects, SCANNER_CHECKPOINT_OBJECT_INTERVAL);
+    assert!(checkpoint_rx.try_recv().is_err(), "checkpoint queue remains bounded");
+    tokio::fs::remove_dir_all(temp_dir)
+        .await
+        .expect("remove test scanner directory");
 }
 
 struct TestGuard {
@@ -370,6 +442,7 @@ impl Drop for TestGuard {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_should_skip_failed_respects_ttl() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir);
@@ -391,6 +464,7 @@ async fn test_should_skip_failed_respects_ttl() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_record_failed_ttl_zero_noop() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(0, 100, &mut scanner, temp_dir);
@@ -420,7 +494,9 @@ async fn malformed_size_reconciliation_replays_after_restart() {
     summary.record_size_reconciliation(entry.clone());
     summary.record_reconciliation_scope("b", "object");
     scanner.apply_size_reconciliation(&summary);
+    scanner.finish_size_reconciliation_batch();
     scanner.apply_size_reconciliation(&summary);
+    scanner.finish_size_reconciliation_batch();
 
     assert_eq!(scanner.new_cache.info.size_reconciliation.len(), 1);
     assert_eq!(scanner.update_cache.info.size_reconciliation.len(), 1);
@@ -435,6 +511,7 @@ async fn malformed_size_reconciliation_replays_after_restart() {
     let mut resolved = SizeSummary::default();
     resolved.record_reconciliation_scope("b", "object");
     scanner.apply_size_reconciliation(&resolved);
+    scanner.finish_size_reconciliation_batch();
     assert!(scanner.new_cache.info.size_reconciliation.is_empty());
     assert!(scanner.update_cache.info.size_reconciliation.is_empty());
 }
@@ -448,18 +525,20 @@ async fn malformed_size_reconciliation_clears_bounded_long_object_scope() {
     let entry = SizeReconciliationEntry {
         key: "long-object-key".to_string(),
         bucket: "b".to_string(),
-        object: bounded_object,
+        object: bounded_object.clone(),
         reason: "invalid_declared_size".to_string(),
         ..Default::default()
     };
     let mut summary = SizeSummary::default();
     summary.record_size_reconciliation(entry);
     scanner.apply_size_reconciliation(&summary);
+    scanner.finish_size_reconciliation_batch();
     assert_eq!(scanner.new_cache.info.size_reconciliation.len(), 1);
 
     let mut resolved = SizeSummary::default();
-    resolved.record_reconciliation_scope("b", &long_object);
+    resolved.record_reconciliation_scope("b", &bounded_object);
     scanner.apply_size_reconciliation(&resolved);
+    scanner.finish_size_reconciliation_batch();
     assert!(scanner.new_cache.info.size_reconciliation.is_empty());
 }
 
@@ -539,6 +618,7 @@ fn test_should_account_replication_stats_only_for_live_object_versions() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_heal_replication_only_queues_pending_null_deletes() {
     async fn replication_skipped_count() -> u64 {
         global_metrics()
@@ -735,7 +815,7 @@ async fn test_scanner_heal_admission_accounting_maps_normal_scan_to_heal() {
         &metrics,
         HealScanMode::Normal,
         Ok(HealAdmissionResult::Dropped(
-            rustfs_common::heal_channel::HealAdmissionDropReason::QueueFull,
+            rustfs_heal_contracts::heal_channel::HealAdmissionDropReason::QueueFull,
         )),
     );
     record_scanner_heal_admission(&metrics, HealScanMode::Normal, Err(()));
@@ -787,6 +867,7 @@ async fn test_scanner_heal_admission_accounting_maps_deep_scan_to_bitrot() {
 }
 
 #[test]
+#[serial]
 fn test_excessive_version_alert_thresholds_use_env() {
     with_var(rustfs_config::ENV_SCANNER_ALERT_EXCESS_VERSIONS, Some("3"), || {
         with_var(rustfs_config::ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE, Some("100"), || {
@@ -801,6 +882,7 @@ fn test_excessive_version_alert_thresholds_use_env() {
 }
 
 #[test]
+#[serial]
 fn test_excessive_folders_threshold_uses_env() {
     with_var(rustfs_config::ENV_SCANNER_ALERT_EXCESS_FOLDERS, Some("3"), || {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
@@ -810,6 +892,7 @@ fn test_excessive_folders_threshold_uses_env() {
 }
 
 #[test]
+#[serial]
 fn test_excessive_folders_threshold_default_supports_pbs_layout() {
     with_var_unset(rustfs_config::ENV_SCANNER_ALERT_EXCESS_FOLDERS, || {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
@@ -819,6 +902,7 @@ fn test_excessive_folders_threshold_default_supports_pbs_layout() {
 }
 
 #[test]
+#[serial]
 fn test_scanner_yield_every_n_objects_uses_env() {
     with_var(rustfs_config::ENV_SCANNER_YIELD_EVERY_N_OBJECTS, Some("32"), || {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
@@ -828,6 +912,7 @@ fn test_scanner_yield_every_n_objects_uses_env() {
 }
 
 #[test]
+#[serial]
 fn test_scanner_yield_every_n_objects_uses_default() {
     with_var_unset(rustfs_config::ENV_SCANNER_YIELD_EVERY_N_OBJECTS, || {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
@@ -954,6 +1039,7 @@ fn test_order_folders_for_resume_reports_stale_hint() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_record_failed_prunes_to_max_entries() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(1000, 2, &mut scanner, temp_dir);
@@ -985,6 +1071,7 @@ async fn test_record_failed_prunes_to_max_entries() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_prune_failed_objects_cache_drops_expired() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(5, 10, &mut scanner, temp_dir);
@@ -1008,6 +1095,7 @@ async fn test_prune_failed_objects_cache_drops_expired() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_prune_failed_objects_max_zero_keeps_fresh() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir);
@@ -1035,6 +1123,41 @@ async fn test_prune_failed_objects_max_zero_keeps_fresh() {
     assert!(scanner.new_cache.info.failed_objects.contains_key("fresh1"));
     assert!(scanner.new_cache.info.failed_objects.contains_key("fresh2"));
     assert!(!scanner.new_cache.info.failed_objects.contains_key("expired"));
+}
+
+#[test]
+fn scanner_heal_request_builders_assign_distinct_identities() {
+    let requests = [
+        build_bucket_heal_request("bucket".to_string(), HealChannelPriority::Low),
+        build_object_heal_request(
+            "bucket".to_string(),
+            "first".to_string(),
+            None,
+            HealScanMode::Deep,
+            HealChannelPriority::Low,
+        ),
+        build_object_heal_request(
+            "bucket".to_string(),
+            "second".to_string(),
+            Some(uuid::Uuid::new_v4().to_string()),
+            HealScanMode::Deep,
+            HealChannelPriority::Low,
+        ),
+        build_non_destructive_object_heal_request(
+            "bucket".to_string(),
+            "third".to_string(),
+            HealScanMode::Deep,
+            HealChannelPriority::Low,
+        ),
+    ];
+    let mut ids = std::collections::HashSet::new();
+    for request in requests {
+        let id = uuid::Uuid::parse_str(&request.id).expect("scanner must assign an ID before publishing its request");
+        assert!(!id.is_nil());
+        assert!(ids.insert(id), "independent scanner requests must not share an identity");
+        assert_eq!(request.clone().id, request.id, "replaying a captured request must preserve its identity");
+        assert_eq!(request.source, HealRequestSource::Scanner);
+    }
 }
 
 #[test]
@@ -1104,23 +1227,8 @@ fn pending_heal(
     }
 }
 
-/// The nil-UUID branch of the defensive-UUID invariant: a nil version in
-/// a repaired notice means "no value" and must match unversioned ledger
-/// entries only.
-#[test]
-fn test_mrf_repaired_version_id_maps_nil_to_none() {
-    assert_eq!(mrf_repaired_version_id(None), None);
-    assert_eq!(mrf_repaired_version_id(Some([0u8; 16])), None);
-    let uuid = Uuid::new_v4();
-    assert_eq!(mrf_repaired_version_id(Some(*uuid.as_bytes())), Some(uuid.to_string()));
-}
-
-/// Full wiring of backlog#1894 axis B: notes taken for the scanned bucket
-/// clear exactly the matching Object ledger entries — bucket-level
-/// entries, other buckets' entries, and version-mismatched entries
-/// survive; a real (non-nil) version matches only the same version.
 #[tokio::test]
-async fn test_mrf_repaired_notices_clear_matching_ledger_entries() {
+async fn mrf_ownership_legacy_notices_preserve_pending_entries() {
     use rustfs_common::mrf_channel::note_mrf_repaired;
 
     let (mut scanner, temp_dir) = build_test_scanner().await;
@@ -1148,8 +1256,7 @@ async fn test_mrf_repaired_notices_clear_matching_ledger_entries() {
 
     note_mrf_repaired("bucket", "object-a", None);
     note_mrf_repaired("bucket", "object-b", Some(*Uuid::parse_str(&version).unwrap().as_bytes()));
-    // A nil-UUID notice for object-c means "no value": it clears the
-    // unversioned entry but must not touch the versioned one.
+    // Neither nil nor a matching version proves incarnation, scope or owner.
     note_mrf_repaired("bucket", "object-c", Some([0u8; 16]));
     // A notice for a target the ledger does not track must be a no-op.
     note_mrf_repaired("bucket", "object-untracked", None);
@@ -1166,12 +1273,12 @@ async fn test_mrf_repaired_notices_clear_matching_ledger_entries() {
         .iter()
         .map(|entry| (entry.kind, entry.bucket.as_str(), entry.object.as_deref(), entry.version_id.as_deref()))
         .collect();
-    // Cleared: object-a (no version), object-b (exact version match), and
-    // object-c's unversioned entry (the nil branch matched no-version
-    // only — the versioned object-c entry survives).
     assert_eq!(
         survivors,
         vec![
+            (PendingScannerHealKind::Object, "bucket", Some("object-a"), None),
+            (PendingScannerHealKind::Object, "bucket", Some("object-b"), Some(version.as_str())),
+            (PendingScannerHealKind::Object, "bucket", Some("object-c"), None),
             (
                 PendingScannerHealKind::Object,
                 "bucket",
@@ -1310,7 +1417,7 @@ async fn test_pending_heal_update_keeps_stale_entry_until_retry_prune() {
     );
 
     assert_eq!(scanner.new_cache.info.pending_heals.len(), 1);
-    assert_eq!(scanner.new_cache.info.pending_heals[0].attempts, 2);
+    assert_eq!(scanner.new_cache.info.pending_heals[0].attempts, 1);
     assert_eq!(scanner.new_cache.info.pending_heals[0].object.as_deref(), Some("object"));
     assert_eq!(scanner.update_cache.info.pending_heals, scanner.new_cache.info.pending_heals);
 }
@@ -1343,7 +1450,7 @@ async fn test_pending_heal_queue_full_deduplicates_object_entry() {
     let pending = &scanner.new_cache.info.pending_heals[0];
     assert_eq!(pending.object.as_deref(), Some("object"));
     assert_eq!(pending.version_id.as_deref(), Some("version-a"));
-    assert_eq!(pending.attempts, 2);
+    assert_eq!(pending.attempts, 1);
     assert_eq!(pending.last_admission_result, "dropped");
     assert_eq!(pending.last_admission_reason, "queue_full");
     assert_eq!(scanner.update_cache.info.pending_heals, scanner.new_cache.info.pending_heals);
@@ -1351,7 +1458,7 @@ async fn test_pending_heal_queue_full_deduplicates_object_entry() {
 }
 
 #[tokio::test]
-async fn test_pending_heal_admitted_results_clear_matching_entry() {
+async fn mrf_ownership_admission_preserves_existing_pending() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
 
@@ -1372,7 +1479,8 @@ async fn test_pending_heal_admitted_results_clear_matching_entry() {
         HealAdmissionResult::Accepted,
     );
 
-    assert!(scanner.new_cache.info.pending_heals.is_empty());
+    assert_eq!(scanner.new_cache.info.pending_heals.len(), 1);
+    assert_eq!(scanner.new_cache.info.pending_heals[0].last_admission_result, "accepted");
 
     scanner.update_pending_scanner_heal_after_admission(
         PendingScannerHealKind::Bucket,
@@ -1391,11 +1499,12 @@ async fn test_pending_heal_admitted_results_clear_matching_entry() {
         HealAdmissionResult::Merged,
     );
 
-    assert!(scanner.new_cache.info.pending_heals.is_empty());
+    assert_eq!(scanner.new_cache.info.pending_heals.len(), 2);
+    assert_eq!(scanner.new_cache.info.pending_heals[1].last_admission_result, "merged");
 }
 
 #[tokio::test]
-async fn test_pending_heal_policy_dropped_clears_without_creating_entry() {
+async fn mrf_ownership_policy_drop_does_not_discharge_existing_pending() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
 
@@ -1426,7 +1535,7 @@ async fn test_pending_heal_policy_dropped_clears_without_creating_entry() {
         HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped),
     );
 
-    assert!(scanner.new_cache.info.pending_heals.is_empty());
+    assert_eq!(scanner.new_cache.info.pending_heals.len(), 1);
 }
 
 #[test]
@@ -1677,7 +1786,7 @@ fn test_describe_heal_admission_formats_unadmitted_results() {
     assert_eq!(describe_heal_admission(HealAdmissionResult::Full), "queue_full");
     assert_eq!(
         describe_heal_admission(HealAdmissionResult::Dropped(
-            rustfs_common::heal_channel::HealAdmissionDropReason::QueueFull
+            rustfs_heal_contracts::heal_channel::HealAdmissionDropReason::QueueFull
         )),
         "dropped:queue_full"
     );
@@ -1830,6 +1939,7 @@ async fn test_heal_actions_returns_actual_size_without_inline_heal() {
 
 #[tokio::test]
 #[cfg(unix)]
+#[serial]
 async fn test_scan_folder_skips_unreadable_child_directory() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir.clone());
@@ -1861,6 +1971,7 @@ async fn test_scan_folder_skips_unreadable_child_directory() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -1869,10 +1980,10 @@ async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
     let healed_versions = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
     let healed_versions_clone = healed_versions.clone();
     let mut heal_rx =
-        rustfs_common::heal_channel::init_heal_channel().expect("heal channel should initialize once for scanner tests");
+        rustfs_heal_contracts::heal_channel::init_heal_channel().expect("heal channel should initialize once for scanner tests");
     let _heal_responder = tokio::spawn(async move {
         while let Some(command) = heal_rx.recv().await {
-            if let rustfs_common::heal_channel::HealChannelCommand::Start {
+            if let rustfs_heal_contracts::heal_channel::HealChannelCommand::Start {
                 request, response_tx, ..
             } = command
             {
@@ -1974,6 +2085,7 @@ async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_scan_folder_xl_meta_named_directory_uses_namespace_descent() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -2019,6 +2131,7 @@ async fn test_scan_folder_xl_meta_named_directory_uses_namespace_descent() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[serial]
 async fn test_scan_folder_corrupt_xl_meta_stops_erasure_data_dir_descent() {
     let logs = CapturedLogs::default();
     let subscriber = tracing_subscriber::fmt()
@@ -2180,6 +2293,7 @@ async fn test_scan_folder_corrupt_xl_meta_stops_erasure_data_dir_descent() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_scan_folder_missing_xl_meta_stops_erasure_data_dir_descent() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -2257,6 +2371,7 @@ async fn test_scan_folder_missing_xl_meta_stops_erasure_data_dir_descent() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_scan_folder_uuid_namespace_part_name_directory_is_not_data_dir() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -2318,6 +2433,7 @@ async fn test_scan_folder_uuid_namespace_part_name_directory_is_not_data_dir() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_scan_folder_non_erasure_metadata_keeps_namespace_descent() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -2359,6 +2475,192 @@ async fn test_scan_folder_non_erasure_metadata_keeps_namespace_descent() {
 }
 
 #[tokio::test]
+#[serial]
+async fn scoped_root_scan_reuses_clean_top_level_entries_and_rescans_dirty_entries() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+    let bucket_dir = temp_dir.join("bucket");
+    tokio::fs::create_dir_all(bucket_dir.join("clean"))
+        .await
+        .expect("failed to create clean top-level directory");
+    tokio::fs::create_dir_all(bucket_dir.join("dirty"))
+        .await
+        .expect("failed to create dirty top-level directory");
+
+    scanner.old_cache.info.name = "bucket".to_string();
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.update_cache.info.name = "bucket".to_string();
+    scanner.old_cache.replace("bucket", "", DataUsageEntry::default());
+    scanner.old_cache.replace(
+        "bucket/clean",
+        "bucket",
+        DataUsageEntry {
+            size: 17,
+            objects: 3,
+            ..Default::default()
+        },
+    );
+    scanner.old_cache.replace(
+        "bucket/dirty",
+        "bucket",
+        DataUsageEntry {
+            size: 23,
+            objects: 4,
+            ..Default::default()
+        },
+    );
+    scanner.prefix_scan_scope = ScannerBucketPrefixScanScope::from_dirty_top_level_entries(HashSet::from(["dirty".to_string()]));
+
+    let folder = CachedFolder {
+        name: "bucket".to_string(),
+        parent: None,
+        object_heal_prob_div: 1,
+    };
+    let mut root = DataUsageEntry::default();
+    scanner
+        .scan_folder(CancellationToken::new(), folder, &mut root)
+        .await
+        .expect("scoped root scan should finish successfully");
+
+    let clean = scanner
+        .new_cache
+        .size_recursive("bucket/clean")
+        .expect("clean entry should be copied from the complete cache");
+    assert_eq!((clean.size, clean.objects), (17, 3));
+    let dirty = scanner
+        .new_cache
+        .size_recursive("bucket/dirty")
+        .expect("dirty entry should be rescanned");
+    assert_eq!((dirty.size, dirty.objects), (0, 0));
+    let bucket = scanner
+        .new_cache
+        .size_recursive("bucket")
+        .expect("bucket root should include reused and rescanned entries");
+    assert_eq!((bucket.size, bucket.objects), (17, 3));
+}
+
+async fn scan_hot_cold_segment_fixture(scoped: bool) -> (DataUsageEntry, Vec<String>) {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+    write_test_object_metadata(&temp_dir, "bucket", "cold/object").await;
+    write_test_object_metadata(&temp_dir, "bucket", "hot/object").await;
+
+    scanner.old_cache.info.name = "bucket".to_string();
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.update_cache.info.name = "bucket".to_string();
+    if scoped {
+        scanner.old_cache.replace("bucket", "", DataUsageEntry::default());
+        scanner.old_cache.replace(
+            "bucket/cold",
+            "bucket",
+            DataUsageEntry {
+                size: 0,
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        scanner.prefix_scan_scope =
+            ScannerBucketPrefixScanScope::from_dirty_top_level_entries(HashSet::from(["hot".to_string()]));
+    }
+
+    let walked = Arc::new(Mutex::new(Vec::<String>::new()));
+    scanner.update_current_path = Arc::new({
+        let walked = walked.clone();
+        move |path: &str| {
+            walked.lock().expect("lock observed scanner paths").push(path.to_string());
+            Box::pin(async {})
+        }
+    });
+
+    let folder = CachedFolder {
+        name: "bucket".to_string(),
+        parent: None,
+        object_heal_prob_div: 1,
+    };
+    let mut root = DataUsageEntry::default();
+    scanner
+        .scan_folder(CancellationToken::new(), folder, &mut root)
+        .await
+        .expect("segment fixture scan should finish");
+    let root = scanner
+        .new_cache
+        .size_recursive("bucket")
+        .expect("segment fixture should produce a bucket cache root");
+    let walked = walked.lock().expect("read observed scanner paths").clone();
+    (root, walked)
+}
+
+fn walked_path_in(paths: &[String], subtree: &str) -> bool {
+    paths
+        .iter()
+        .any(|path| path == subtree || path.strip_prefix(subtree).is_some_and(|rest| rest.starts_with('/')))
+}
+
+#[tokio::test]
+#[serial]
+async fn scoped_root_scan_zero_walks_clean_cold_segment_with_full_oracle_equivalence() {
+    let (full, full_walked) = scan_hot_cold_segment_fixture(false).await;
+    let (scoped, scoped_walked) = scan_hot_cold_segment_fixture(true).await;
+
+    assert_eq!((scoped.size, scoped.objects), (full.size, full.objects));
+    assert_eq!((scoped.size, scoped.objects), (0, 2));
+    assert!(
+        walked_path_in(&full_walked, "bucket/cold"),
+        "the full oracle must prove the cold segment would be walked without scoped reuse"
+    );
+    assert!(walked_path_in(&scoped_walked, "bucket/hot"), "the dirty hot segment must still be walked");
+    assert!(
+        !walked_path_in(&scoped_walked, "bucket/cold"),
+        "a clean cold segment must be copied from the durable baseline without walker callbacks"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn scoped_root_scan_preserves_erasure_health_walks() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+    let bucket_dir = temp_dir.join("bucket");
+    tokio::fs::create_dir_all(bucket_dir.join("clean"))
+        .await
+        .expect("failed to create clean top-level directory");
+
+    scanner.is_erasure_mode = true;
+    scanner.old_cache.info.name = "bucket".to_string();
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.update_cache.info.name = "bucket".to_string();
+    scanner.old_cache.replace("bucket", "", DataUsageEntry::default());
+    scanner.old_cache.replace(
+        "bucket/clean",
+        "bucket",
+        DataUsageEntry {
+            size: 17,
+            objects: 3,
+            ..Default::default()
+        },
+    );
+    scanner.prefix_scan_scope = ScannerBucketPrefixScanScope::from_dirty_top_level_entries(HashSet::from(["dirty".to_string()]));
+
+    let folder = CachedFolder {
+        name: "bucket".to_string(),
+        parent: None,
+        object_heal_prob_div: 1,
+    };
+    let mut root = DataUsageEntry::default();
+    scanner
+        .scan_folder(CancellationToken::new(), folder, &mut root)
+        .await
+        .expect("erasure root scan should finish successfully");
+
+    let clean = scanner
+        .new_cache
+        .size_recursive("bucket/clean")
+        .expect("erasure scan should visit the clean entry");
+    assert_eq!((clean.size, clean.objects), (0, 0));
+}
+
+#[tokio::test]
+#[serial]
 async fn test_scan_folder_compacted_parent_sends_partial_update() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -2400,6 +2702,7 @@ async fn test_scan_folder_compacted_parent_sends_partial_update() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_scan_data_folder_cancelled_before_scan_clears_current_path() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2444,6 +2747,7 @@ async fn test_scan_data_folder_cancelled_before_scan_clears_current_path() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_scan_data_folder_returns_partial_cache_on_budget_cancel() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -2499,6 +2803,115 @@ async fn test_scan_data_folder_returns_partial_cache_on_budget_cancel() {
 }
 
 #[tokio::test]
+#[serial]
+async fn test_scan_data_folder_returns_raw_cursor_on_enumeration_cancel_without_root_progress() {
+    let (scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(temp_dir.clone()),
+    };
+
+    let bucket_dir = temp_dir.join("bucket");
+    tokio::fs::create_dir_all(&bucket_dir)
+        .await
+        .expect("failed to create bucket directory");
+    for entry in ["entry-a", "entry-b", "entry-c"] {
+        tokio::fs::write(bucket_dir.join(entry), b"data")
+            .await
+            .expect("failed to create raw directory entry");
+    }
+
+    let plan = crate::data_usage_define::DataUsageScanPlanDigest([11; 32]);
+    let source = crate::data_usage_define::DataUsageCacheSource::new(1, 0);
+    let identity = crate::data_usage_define::DataUsageScanIdentity {
+        version: 1,
+        bucket_incarnation: Uuid::from_u128(7),
+        set_layout: crate::data_usage_define::DataUsageScanPlanDigest([12; 32]),
+        publication_epoch: 3,
+        tier_registry_generation: 0,
+        scan_mode: HealScanMode::Normal,
+    };
+    let mut cache = DataUsageCache {
+        info: crate::data_usage_define::DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 7,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 7, 3, source, plan, identity),
+        crate::data_usage_define::DataUsageCachePrepareOutcome::Reset
+    );
+
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, Default::default());
+    let _raw_entry_budget = enumeration_restart::install_raw_entry_budget(scanner.local_disk.path(), 1);
+
+    let result = scan_data_folder(
+        budget.token(),
+        budget.clone(),
+        vec![scanner.local_disk.clone()],
+        scanner.local_disk.clone(),
+        cache,
+        None,
+        HealScanMode::Normal,
+        SCANNER_SLEEPER.clone(),
+    )
+    .await;
+
+    let partial_cache = match result {
+        Err(ScannerError::PartialCache(partial_cache)) => partial_cache,
+        other => panic!("expected raw enumeration partial cache after cancellation, got {other:?}"),
+    };
+
+    assert!(
+        partial_cache
+            .root()
+            .is_none_or(|root| root.objects == 0 && root.versions == 0 && root.size == 0),
+        "raw cursor writer must not invent object progress"
+    );
+    assert!(partial_cache.info.last_update.is_some());
+    assert_eq!(partial_cache.info.next_cycle, 7);
+    assert!(!partial_cache.info.snapshot_complete);
+    assert!(partial_cache.info.scan_checkpoint.is_none());
+    assert!(partial_cache.info.scan_resume_after.is_none());
+
+    let raw_cursor = partial_cache
+        .info
+        .scan_raw_enumeration_cursor
+        .as_ref()
+        .expect("raw enumeration cancellation should persist a cursor");
+    assert_eq!(raw_cursor.parent, "bucket");
+    assert_eq!(raw_cursor.entries_seen, 1);
+    assert!(raw_cursor.last_entry.is_some());
+    assert_ne!(raw_cursor.page_digest, [0; 32]);
+    assert_eq!(partial_cache.validated_raw_enumeration_cursor(), Some(raw_cursor));
+    let page_index = partial_cache
+        .validated_raw_enumeration_page_index()
+        .expect("raw enumeration cancellation should persist a validated page index");
+    assert_eq!(
+        page_index
+            .indexed_entries()
+            .expect("persisted raw page index entries should validate")
+            .len(),
+        1
+    );
+    assert_eq!(
+        page_index
+            .committed_entries()
+            .expect("checkpointed raw page should validate as committed coverage"),
+        vec![
+            raw_cursor
+                .last_entry
+                .clone()
+                .expect("checkpointed page should include the observed entry")
+        ]
+    );
+    assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Runtime));
+}
+
+#[tokio::test]
+#[serial]
 async fn test_scan_data_folder_reports_invalid_checkpoint_ignored_once() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2543,6 +2956,7 @@ async fn test_scan_data_folder_reports_invalid_checkpoint_ignored_once() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_scan_data_folder_resume_hint_prioritizes_next_existing_folder() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2616,6 +3030,7 @@ async fn test_scan_data_folder_resume_hint_prioritizes_next_existing_folder() {
 }
 
 #[tokio::test]
+#[serial]
 async fn scan_data_folder_missing_bucket_returns_partial() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2667,6 +3082,7 @@ async fn scan_data_folder_missing_bucket_returns_partial() {
 }
 
 #[tokio::test]
+#[serial]
 async fn scan_data_folder_missing_scan_root_returns_partial() {
     let (scanner, temp_dir) = build_test_scanner().await;
     tokio::fs::remove_dir_all(&temp_dir)
@@ -2712,6 +3128,7 @@ async fn scan_data_folder_missing_scan_root_returns_partial() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_scan_data_folder_resume_hint_orders_across_new_and_existing_folders() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2780,6 +3197,7 @@ async fn test_scan_data_folder_resume_hint_orders_across_new_and_existing_folder
 }
 
 #[tokio::test]
+#[serial]
 async fn test_scan_data_folder_partial_object_budget_accumulates_progress() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2862,6 +3280,7 @@ async fn test_scan_data_folder_partial_object_budget_accumulates_progress() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_partial_compacted_entry_does_not_carry_children() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2907,6 +3326,7 @@ async fn test_partial_compacted_entry_does_not_carry_children() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_partial_entry_does_not_carry_missing_old_child() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2939,6 +3359,7 @@ async fn test_partial_entry_does_not_carry_missing_old_child() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_legacy_windows_cache_rebuilds_and_round_trips_portable_keys() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -3005,6 +3426,7 @@ async fn test_legacy_windows_cache_rebuilds_and_round_trips_portable_keys() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_scan_data_folder_success_clears_resume_hint() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -3047,6 +3469,7 @@ async fn test_scan_data_folder_success_clears_resume_hint() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_scan_data_folder_keeps_unresolved_objects_partial() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -3094,6 +3517,7 @@ async fn test_scan_data_folder_keeps_unresolved_objects_partial() {
 
 #[tokio::test]
 #[cfg(unix)]
+#[serial]
 async fn test_scan_folder_ignores_symlinked_child_directory() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir.clone());
@@ -3130,4 +3554,149 @@ fn test_should_log_failed_object_samples_after_initial_limit() {
     assert!(should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_EVERY));
     assert!(!should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_EVERY + 1));
     assert!(should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_EVERY * 2));
+}
+
+#[test]
+fn raw_enumeration_progress_waits_for_resume_index_floor_before_revalidation() {
+    let mut index = RawEnumerationPageIndex::new("bucket", 2).expect("raw page index should initialize");
+    let generation = index.generation().expect("raw page index should expose generation");
+    index
+        .ingest_partial_owner_entries(["entry-a".to_string(), "entry-b".to_string()], 2, generation)
+        .expect("initial entries should build a page");
+    let generation = index.generation().expect("raw page index should expose next generation");
+    index.commit_building_page(generation).expect("initial page should commit");
+
+    let mut progress = RawEnumerationProgress::new("bucket", Some(index));
+    progress.record_entry("entry-b");
+    assert!(
+        progress.page_index.is_some(),
+        "resume index must not be dropped before the current run observes the old index floor"
+    );
+
+    progress.record_entry("entry-a");
+    assert!(
+        progress.page_index.is_some(),
+        "same entry identity after the observation floor should keep the resume index"
+    );
+}
+
+#[test]
+fn raw_enumeration_progress_checkpoint_commits_budgeted_page_for_oracle() {
+    let mut progress = RawEnumerationProgress::new("bucket", None);
+    progress.record_entry("entry-b");
+
+    let page_index = progress
+        .page_index()
+        .expect("checkpointed raw progress should retain a committed owner page");
+    let page_entries = page_index
+        .committed_entries()
+        .expect("checkpointed owner page should validate by digest");
+    assert_eq!(page_entries, vec!["entry-b".to_string()]);
+    assert_eq!(
+        page_index
+            .indexed_entries()
+            .expect("checkpointed owner index should validate"),
+        page_entries
+    );
+}
+
+#[tokio::test]
+async fn raw_enumeration_root_page_survives_child_partial_boundary() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(temp_dir),
+    };
+    scanner.old_cache.info.name = "bucket".to_string();
+
+    let mut root_progress = RawEnumerationProgress::new("bucket", None);
+    root_progress.record_entry("object-0000");
+    root_progress.record_entry("object-0001");
+    scanner.raw_enumeration_progress.push(root_progress);
+    scanner.finish_raw_enumeration_parent("bucket");
+
+    assert_eq!(scanner.raw_enumeration_progress.len(), 1);
+    let root_index = scanner.raw_enumeration_progress[0]
+        .page_index()
+        .expect("completed scan root should retain its raw-page oracle");
+    assert_eq!(
+        root_index
+            .committed_entries()
+            .expect("retained root raw-page oracle should validate"),
+        vec!["object-0000".to_string(), "object-0001".to_string()]
+    );
+
+    let mut child_progress = RawEnumerationProgress::new("bucket/object-0000", None);
+    child_progress.record_entry("xl.meta");
+    scanner.raw_enumeration_progress.push(child_progress);
+    scanner.finish_raw_enumeration_parent("bucket/object-0000");
+
+    assert_eq!(
+        scanner
+            .raw_enumeration_progress
+            .iter()
+            .map(|progress| progress.parent.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bucket"]
+    );
+}
+
+#[tokio::test]
+async fn raw_enumeration_resume_state_keeps_largest_durable_quantum() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(temp_dir),
+    };
+
+    let mut root_progress = RawEnumerationProgress::new("bucket", None);
+    root_progress.record_entry("object-0000");
+    scanner.raw_enumeration_progress.push(root_progress);
+
+    let mut child_progress = RawEnumerationProgress::new("bucket/object-0000", None);
+    child_progress.record_entry("part-0000");
+    child_progress.record_entry("part-0001");
+    child_progress.record_entry("part-0002");
+    scanner.raw_enumeration_progress.push(child_progress);
+
+    let (cursor, page_index) = scanner.take_raw_enumeration_resume_state();
+    assert_eq!(
+        cursor.as_ref().expect("largest raw quantum should include a cursor").parent,
+        "bucket/object-0000"
+    );
+    assert_eq!(
+        page_index
+            .as_ref()
+            .expect("largest raw quantum should include a page index")
+            .indexed_entries()
+            .expect("selected page index should validate")
+            .len(),
+        3
+    );
+    assert!(scanner.raw_enumeration_progress.is_empty());
+}
+
+#[test]
+fn raw_enumeration_progress_retains_resume_index_until_unordered_entries_reappear() {
+    let mut index = RawEnumerationPageIndex::new("bucket", 2).expect("raw page index should initialize");
+    let generation = index.generation().expect("raw page index should expose generation");
+    index
+        .ingest_partial_owner_entries(["entry-a".to_string(), "entry-b".to_string()], 2, generation)
+        .expect("initial entries should build a page");
+    let generation = index.generation().expect("raw page index should expose next generation");
+    index.commit_building_page(generation).expect("initial page should commit");
+
+    let mut progress = RawEnumerationProgress::new("bucket", Some(index));
+    progress.record_entry("entry-a");
+    assert!(progress.page_index.is_some());
+
+    progress.record_entry("entry-c");
+    assert!(
+        progress.page_index.is_some(),
+        "partial observations must not discard the resume index before an unordered old entry can reappear"
+    );
+
+    progress.record_entry("entry-b");
+    assert!(
+        progress.page_index.is_some(),
+        "same source identity should keep the resume index even when read_dir order changes"
+    );
 }

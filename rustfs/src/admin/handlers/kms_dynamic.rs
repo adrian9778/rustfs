@@ -18,11 +18,15 @@ use super::kms_audit::{KmsAdminAudit, KmsAdminOperation};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
-    current_app_context, current_kms_runtime_service_manager, current_notification_system_for_context,
-    current_object_store_handle_for_context, current_or_init_kms_runtime_service_manager,
+    AppContext, app_context_from_req, current_app_context, current_kms_runtime_service_manager,
+    current_notification_system_for_context, current_object_store_handle_for_context,
+    current_or_init_kms_runtime_service_manager,
 };
 use crate::admin::storage_api::config::{read_admin_config, save_admin_config};
+use crate::admin::storage_api::ecstore_topology::is_dist_erasure;
 use crate::admin::storage_api::error::StorageError;
+use crate::admin::storage_api::runtime::ECStore;
+use crate::admin::storage_api::s3::{S3ErrorCode, error as admin_s3_error};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use hyper::{Method, StatusCode};
@@ -35,6 +39,8 @@ use rustfs_kms::{
 use rustfs_policy::policy::action::{Action, KmsAction};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use sha2::{Digest, Sha256};
+use std::future::Future;
+use std::sync::Arc;
 use tracing::{error, info, instrument, warn};
 
 /// Path to store KMS configuration in the cluster metadata
@@ -178,7 +184,7 @@ async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
         return Err("Storage layer not initialized".to_string());
     };
 
-    let data = serde_json::to_vec(config).map_err(|e| format!("Failed to serialize KMS config: {e}"))?;
+    let data = seal_persisted_kms_config(config, rustfs_kms::config_secret::config_secret_from_env().as_deref())?;
 
     save_admin_config(store, KMS_CONFIG_PATH, data)
         .await
@@ -193,6 +199,46 @@ async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
         "admin kms dynamic state"
     );
     Ok(())
+}
+
+/// Serialize a config for persistence, sealing its secret fields when the
+/// per-node config secret is set.
+///
+/// Without a secret this is warn-only by contract: existing clusters persist
+/// plaintext exactly as before, and the warning names the exposed fields.
+fn seal_persisted_kms_config(config: &KmsConfig, config_secret: Option<&str>) -> Result<Vec<u8>, String> {
+    if let Some(secret) = config_secret {
+        rustfs_kms::config_secret::ensure_config_secret_is_independent(secret, config).map_err(|e| e.to_string())?;
+    }
+    let mut document = serde_json::to_value(config).map_err(|e| format!("Failed to serialize KMS config: {e}"))?;
+    let seal_outcome = rustfs_kms::config_secret::seal_config_secrets(&mut document, config_secret)
+        .map_err(|e| format!("Failed to seal KMS config secrets: {e}"))?;
+    if !seal_outcome.plaintext.is_empty() {
+        warn!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            event = "kms_config_secret_unset",
+            exposed_fields = ?seal_outcome.plaintext,
+            state = "persisting_plaintext_secrets",
+            "persisted KMS configuration carries cleartext secrets; set RUSTFS_KMS_CONFIG_SECRET on every node to seal them"
+        );
+    }
+    serde_json::to_vec(&document).map_err(|e| format!("Failed to serialize KMS config: {e}"))
+}
+
+/// Unseal any sealed secret fields of the persisted config document.
+///
+/// Returns the opened bytes plus the outcome (which fields were sealed vs
+/// still plaintext). Fails closed: a sealed field with a missing or wrong
+/// `RUSTFS_KMS_CONFIG_SECRET` is a load error, never treated as plaintext.
+fn open_persisted_kms_config(
+    data: &[u8],
+    config_secret: Option<&str>,
+) -> Result<(Vec<u8>, rustfs_kms::config_secret::ConfigSecretOutcome), String> {
+    let mut document: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    let outcome = rustfs_kms::config_secret::open_config_secrets(&mut document, config_secret).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec(&document).map_err(|e| e.to_string())?;
+    Ok((bytes, outcome))
 }
 
 fn decode_persisted_kms_config(data: &[u8]) -> serde_json::Result<(KmsConfig, bool)> {
@@ -226,58 +272,87 @@ fn decode_persisted_kms_config(data: &[u8]) -> serde_json::Result<(KmsConfig, bo
     Ok((config, uses_legacy_local_defaults))
 }
 
-/// Load KMS configuration from cluster storage
-#[instrument]
-pub async fn load_kms_config() -> Option<KmsConfig> {
-    let context = current_app_context();
-    let Some(store) = current_object_store_handle_for_context(context.as_deref()) else {
-        warn!(
-            component = LOG_COMPONENT_ADMIN,
-            subsystem = LOG_SUBSYSTEM_KMS,
-            event = "kms_config_load_skipped",
-            reason = "storage_uninitialized",
-            result = "config_load_skipped",
-            "admin kms dynamic state"
-        );
-        return None;
-    };
+#[derive(Debug, thiserror::Error)]
+pub enum KmsConfigLoadError {
+    #[error("storage layer is not initialized")]
+    StorageUnavailable,
+    #[error("failed to read persisted KMS configuration: {0}")]
+    StorageRead(#[source] StorageError),
+    #[error("failed to unseal persisted KMS configuration: {0}")]
+    Unseal(String),
+    #[error("failed to decode persisted KMS configuration: {0}")]
+    Decode(#[source] serde_json::Error),
+}
 
-    match read_admin_config(store, KMS_CONFIG_PATH).await {
-        Ok(data) => match decode_persisted_kms_config(&data) {
-            Ok((config, is_legacy_local)) => {
-                if is_legacy_local {
-                    warn!(
+async fn load_kms_config_with<Read, ReadFuture>(read: Read) -> Result<Option<KmsConfig>, KmsConfigLoadError>
+where
+    Read: FnOnce() -> ReadFuture,
+    ReadFuture: Future<Output = Result<Vec<u8>, StorageError>>,
+{
+    match read().await {
+        Ok(data) => {
+            let (data, unseal_outcome) =
+                match open_persisted_kms_config(&data, rustfs_kms::config_secret::config_secret_from_env().as_deref()) {
+                    Ok(opened) => opened,
+                    Err(e) => {
+                        error!(
+                            event = "kms_config_unseal_failed",
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_KMS,
+                            result = "config_unseal_failed",
+                            storage_path = KMS_CONFIG_PATH,
+                            error = %e,
+                            "admin kms dynamic state"
+                        );
+                        return Err(KmsConfigLoadError::Unseal(e));
+                    }
+                };
+            if !unseal_outcome.plaintext.is_empty() {
+                warn!(
+                    event = "kms_config_secret_unset",
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    state = "loaded_plaintext_secrets",
+                    exposed_fields = ?unseal_outcome.plaintext,
+                    "persisted KMS configuration carries cleartext secrets; set RUSTFS_KMS_CONFIG_SECRET on every node and re-save to seal them"
+                );
+            }
+            match decode_persisted_kms_config(&data) {
+                Ok((config, is_legacy_local)) => {
+                    if is_legacy_local {
+                        warn!(
+                            event = "kms_legacy_local_config_loaded",
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_KMS,
+                            state = "legacy_config_accepted",
+                            storage_path = KMS_CONFIG_PATH,
+                            "admin kms dynamic state"
+                        );
+                    }
+                    info!(
+                        event = "kms_config_loaded",
                         component = LOG_COMPONENT_ADMIN,
                         subsystem = LOG_SUBSYSTEM_KMS,
-                        event = "kms_legacy_local_config_loaded",
+                        state = "config_loaded",
                         storage_path = KMS_CONFIG_PATH,
-                        state = "legacy_config_accepted",
                         "admin kms dynamic state"
                     );
+                    Ok(Some(config))
                 }
-                info!(
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_KMS,
-                    event = "kms_config_loaded",
-                    storage_path = KMS_CONFIG_PATH,
-                    state = "config_loaded",
-                    "admin kms dynamic state"
-                );
-                Some(config)
+                Err(e) => {
+                    error!(
+                        event = "kms_config_deserialize_failed",
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_KMS,
+                        result = "config_deserialize_failed",
+                        storage_path = KMS_CONFIG_PATH,
+                        error = %e,
+                        "admin kms dynamic state"
+                    );
+                    Err(KmsConfigLoadError::Decode(e))
+                }
             }
-            Err(e) => {
-                error!(
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_KMS,
-                    event = "kms_config_deserialize_failed",
-                    storage_path = KMS_CONFIG_PATH,
-                    result = "config_deserialize_failed",
-                    error = %e,
-                    "admin kms dynamic state"
-                );
-                None
-            }
-        },
+        }
         Err(e) => {
             // Config not found is normal on first run: `read_config` maps a missing or
             // empty config object to `ConfigNotFound`, so that variant is the only
@@ -285,27 +360,53 @@ pub async fn load_kms_config() -> Option<KmsConfig> {
             // volume, bucket) means degraded storage and must stay a warning.
             if matches!(e, StorageError::ConfigNotFound) {
                 info!(
+                    event = "kms_config_loaded",
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_KMS,
-                    event = "kms_config_loaded",
                     state = "not_found",
                     storage_path = KMS_CONFIG_PATH,
                     "admin kms dynamic state"
                 );
+                Ok(None)
             } else {
                 warn!(
+                    event = "kms_config_load_failed",
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_KMS,
-                    event = "kms_config_load_failed",
-                    storage_path = KMS_CONFIG_PATH,
                     result = "config_load_failed",
+                    storage_path = KMS_CONFIG_PATH,
                     error = %e,
                     "admin kms dynamic state"
                 );
+                Err(KmsConfigLoadError::StorageRead(e))
             }
-            None
         }
     }
+}
+
+/// Load KMS configuration through an explicitly initialized cluster store.
+#[instrument(skip(store))]
+pub async fn load_kms_config_from_store(store: Arc<ECStore>) -> Result<Option<KmsConfig>, KmsConfigLoadError> {
+    load_kms_config_with(|| read_admin_config(store, KMS_CONFIG_PATH)).await
+}
+
+/// Load KMS configuration through the running server context.
+#[instrument]
+pub async fn load_kms_config() -> Option<KmsConfig> {
+    let context = current_app_context();
+    let Some(store) = current_object_store_handle_for_context(context.as_deref()) else {
+        warn!(
+            event = "kms_config_load_skipped",
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            result = "config_load_skipped",
+            reason = "storage_uninitialized",
+            "admin kms dynamic state"
+        );
+        return None;
+    };
+
+    load_kms_config_from_store(store).await.ok().flatten()
 }
 
 fn redact_config_secrets(value: &mut serde_json::Value) {
@@ -400,22 +501,57 @@ fn kms_config_is_unchanged(current: &KmsConfig, candidate: &KmsConfig) -> bool {
 /// request broadcasts, so that a runtime change reaches every node instead of
 /// only the one that served the admin request.
 pub async fn reload_persisted_kms_config() -> Result<(), String> {
-    let Some(config) = load_kms_config().await else {
+    let context = current_app_context();
+    let Some(store) = current_object_store_handle_for_context(context.as_deref()) else {
+        return Err(KmsConfigLoadError::StorageUnavailable.to_string());
+    };
+    reload_persisted_kms_config_from_store(store, kms_service_manager_from_context(), "peer_reload").await
+}
+
+/// Whether a reload may return early because this node is already serving
+/// exactly the persisted configuration.
+///
+/// Byte-identical configuration is not sufficient on its own. A node whose KMS
+/// failed to start keeps its configuration and sits in `Error`, so comparing
+/// only the bytes turned the documented recovery call
+/// (`POST /rustfs/admin/v3/kms/reload`) into a no-op that reported success and
+/// left the node down — including on every peer, which reaches this same
+/// function through the reload broadcast (backlog#2369 P1). Any state other
+/// than `Running` falls through to `reconfigure`, which starts the service when
+/// none is running.
+fn kms_reload_is_already_current(status: rustfs_kms::KmsServiceStatus, config_is_unchanged: bool) -> bool {
+    matches!(status, rustfs_kms::KmsServiceStatus::Running) && config_is_unchanged
+}
+
+async fn reload_persisted_kms_config_from_store(
+    store: Arc<ECStore>,
+    service_manager: Arc<rustfs_kms::KmsServiceManager>,
+    operation: &'static str,
+) -> Result<(), String> {
+    let config = match load_kms_config_from_store(store).await {
+        Ok(config) => config,
+        Err(err) => {
+            service_manager
+                .record_initialization_error(format!("Failed to load persisted KMS configuration: {err}"))
+                .await;
+            return Err(err.to_string());
+        }
+    };
+    let Some(config) = config else {
         return Err("no persisted KMS configuration is available".to_string());
     };
 
-    let service_manager = kms_service_manager_from_context();
-    if service_manager
+    let config_is_unchanged = service_manager
         .get_config()
         .await
-        .is_some_and(|current| kms_config_is_unchanged(&current, &config))
-    {
+        .is_some_and(|current| kms_config_is_unchanged(&current, &config));
+    if kms_reload_is_already_current(service_manager.get_status().await, config_is_unchanged) {
         info!(
+            event = "kms_service_state",
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_KMS,
-            event = "kms_service_state",
-            operation = "peer_reload",
             state = "already_current",
+            operation,
             "admin kms dynamic state"
         );
         return Ok(());
@@ -423,11 +559,11 @@ pub async fn reload_persisted_kms_config() -> Result<(), String> {
 
     service_manager.reconfigure(config).await.map_err(|err| {
         error!(
+            event = "kms_service_state",
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_KMS,
-            event = "kms_service_state",
-            operation = "peer_reload",
             state = "reload_failed",
+            operation,
             error = %err,
             "admin kms dynamic state"
         );
@@ -435,11 +571,11 @@ pub async fn reload_persisted_kms_config() -> Result<(), String> {
     })?;
 
     info!(
+        event = "kms_service_state",
         component = LOG_COMPONENT_ADMIN,
         subsystem = LOG_SUBSYSTEM_KMS,
-        event = "kms_service_state",
-        operation = "peer_reload",
         state = "reconfigured",
+        operation,
         "admin kms dynamic state"
     );
     Ok(())
@@ -453,7 +589,11 @@ pub async fn reload_persisted_kms_config() -> Result<(), String> {
 /// trade a bounded divergence window for an outage.
 async fn broadcast_kms_config_reload() -> Vec<String> {
     let context = current_app_context();
-    let Some(notification_sys) = current_notification_system_for_context(context.as_deref()) else {
+    broadcast_kms_config_reload_for_context(context.as_deref()).await
+}
+
+async fn broadcast_kms_config_reload_for_context(context: Option<&AppContext>) -> Vec<String> {
+    let Some(notification_sys) = current_notification_system_for_context(context) else {
         return Vec::new();
     };
 
@@ -500,6 +640,51 @@ fn local_success_with_peer_report(message: &str, unconverged: &[String]) -> (boo
     )
 }
 
+/// What a node-local KMS backend means for a multi-node deployment
+/// (backlog#2369 P7.4).
+///
+/// The Local backend keeps key material on each node's own disk and generates
+/// its KDF salt per node, so two nodes derive different keys from the same
+/// `master_key`. An object encrypted on node A cannot be decrypted on node B:
+/// behind a load balancer that shows up as intermittent 500s on reads that
+/// worked a moment earlier. The product decision to warn rather than refuse
+/// stands; the generic "development only" warning simply never said what
+/// actually goes wrong, so an operator had no way to connect the symptom to
+/// the cause.
+///
+/// Returns the sentence to append to the configure response, or `None` when the
+/// combination does not apply.
+async fn node_local_backend_warning(backend: &rustfs_kms::KmsBackend) -> Option<&'static str> {
+    if !matches!(backend, rustfs_kms::KmsBackend::Local) || !is_dist_erasure().await {
+        return None;
+    }
+
+    warn!(
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_KMS,
+        event = "kms_node_local_backend_in_distributed_deployment",
+        backend = rustfs_kms::KmsBackend::Local.as_str(),
+        "The Local KMS backend stores key material on each node's own disk with a per-node salt, so objects \
+         encrypted on one node cannot be decrypted on another. In a distributed deployment this surfaces as \
+         intermittent 500s on reads behind a load balancer. Use Vault Transit, Vault KV2 or AWS KMS for a \
+         multi-node deployment"
+    );
+
+    Some(
+        "Warning: the Local KMS backend is node-local. Key material and its salt live on each node's own disk, so \
+         objects encrypted on one node cannot be decrypted on another and reads behind a load balancer will fail \
+         intermittently. Use Vault Transit, Vault KV2 or AWS KMS for a distributed deployment",
+    )
+}
+
+/// Append the node-local backend warning to a successful configure message.
+fn with_node_local_backend_warning(message: String, warning: Option<&'static str>) -> String {
+    match warning {
+        Some(warning) => format!("{message}. {warning}"),
+        None => message,
+    }
+}
+
 pub fn register_kms_dynamic_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::POST,
@@ -529,6 +714,12 @@ pub fn register_kms_dynamic_route(r: &mut S3Router<AdminOperation>) -> std::io::
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/reconfigure").as_str(),
         AdminOperation(&ReconfigureKmsHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/reload").as_str(),
+        AdminOperation(&ReloadKmsHandler {}),
     )?;
 
     Ok(())
@@ -616,6 +807,7 @@ impl Operation for ConfigureKmsHandler {
         let kms_config = configure_request.to_kms_config();
 
         let persisted_config = kms_config.clone();
+        let node_local_warning = node_local_backend_warning(&kms_config.backend).await;
         let (success, message, status) = match service_manager
             .configure_with_persistence(kms_config, || async move {
                 save_kms_config(&persisted_config)
@@ -638,7 +830,7 @@ impl Operation for ConfigureKmsHandler {
                 let unconverged = broadcast_kms_config_reload().await;
                 let (success, message) = local_success_with_peer_report("KMS configured successfully", &unconverged);
                 audit.finish(KmsAdminOperation::Configure, None, None);
-                (success, message, status)
+                (success, with_node_local_backend_warning(message, node_local_warning), status)
             }
             Err(e) => {
                 let error_msg = format!("Failed to configure KMS: {e}");
@@ -944,6 +1136,104 @@ impl Operation for StopKmsHandler {
     }
 }
 
+/// Reload the cluster-persisted KMS configuration.
+pub struct ReloadKmsHandler;
+
+#[async_trait::async_trait]
+impl Operation for ReloadKmsHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let context = app_context_from_req(&req)
+            .ok_or_else(|| admin_s3_error(S3ErrorCode::ServiceUnavailable, "server context is not ready"))?;
+        let Some(cred) = req.credentials else {
+            return Err(admin_s3_error(S3ErrorCode::InvalidRequest, "authentication required"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+
+        audit.gate_admin(
+            validate_admin_request(
+                &req.headers,
+                &cred,
+                owner,
+                false,
+                kms_service_control_actions(),
+                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            )
+            .await,
+            KmsAdminOperation::Reload,
+            None,
+        )?;
+
+        info!(
+            event = "kms_service_state",
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            state = "requested",
+            operation = "reload",
+            "admin kms dynamic state"
+        );
+
+        let service_manager = context.kms().handle();
+        let (success, message, status) =
+            match reload_persisted_kms_config_from_store(context.object_store(), service_manager.clone(), "admin_reload").await {
+                Ok(()) => {
+                    let unconverged = broadcast_kms_config_reload_for_context(Some(context.as_ref())).await;
+                    let status = service_manager.get_status().await;
+                    let (success, message) =
+                        local_success_with_peer_report("Persisted KMS configuration reloaded successfully", &unconverged);
+                    info!(
+                        event = "kms_service_state",
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_KMS,
+                        state = "reloaded",
+                        operation = "reload",
+                        status = ?status,
+                        "admin kms dynamic state"
+                    );
+                    audit.finish(KmsAdminOperation::Reload, None, None);
+                    (success, message, status)
+                }
+                Err(err) => {
+                    let kms_error = rustfs_kms::KmsError::backend_error(&err);
+                    error!(
+                        event = "kms_service_state",
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_KMS,
+                        state = "reload_failed",
+                        operation = "reload",
+                        error = %err,
+                        "admin kms dynamic state"
+                    );
+                    audit.finish(KmsAdminOperation::Reload, None, Some(&kms_error));
+                    let status = service_manager.get_status().await;
+                    (false, format!("Failed to reload persisted KMS configuration: {err}"), status)
+                }
+            };
+
+        let response = ConfigureKmsResponse {
+            success,
+            message,
+            status,
+        };
+        let json_response = serde_json::to_string(&response).map_err(|err| {
+            error!(
+                event = EVENT_ADMIN_KMS_DYNAMIC_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_KMS,
+                result = "response_serialize_failed",
+                operation = "reload",
+                error = %err,
+                "admin kms dynamic state"
+            );
+            admin_s3_error(S3ErrorCode::InternalError, "failed to serialize KMS reload response")
+        })?;
+
+        Ok(S3Response::new((StatusCode::OK, Body::from(json_response))))
+    }
+}
+
 /// Get KMS status handler
 pub struct GetKmsStatusHandler;
 
@@ -1117,6 +1407,7 @@ impl Operation for ReconfigureKmsHandler {
         let kms_config = configure_request.to_kms_config();
 
         let persisted_config = kms_config.clone();
+        let node_local_warning = node_local_backend_warning(&kms_config.backend).await;
         let (success, message, status) = match service_manager
             .reconfigure_with_persistence(kms_config, || async move {
                 save_kms_config(&persisted_config)
@@ -1140,7 +1431,7 @@ impl Operation for ReconfigureKmsHandler {
                 let (success, message) =
                     local_success_with_peer_report("KMS reconfigured and restarted successfully", &unconverged);
                 audit.finish(KmsAdminOperation::Reconfigure, None, None);
-                (success, message, status)
+                (success, with_node_local_backend_warning(message, node_local_warning), status)
             }
             Err(e) => {
                 let error_msg = format!("Failed to reconfigure KMS: {e}");
@@ -1191,13 +1482,62 @@ impl Operation for ReconfigureKmsHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_persisted_kms_config, ensure_kms_config_persistable, ensure_kms_request_persistable, kms_config_fingerprint,
-        kms_config_is_unchanged, kms_configure_actions, kms_service_control_actions, local_success_with_peer_report,
-        normalize_configure_request_secrets, redacted_canonical_config,
+        KmsConfigLoadError, decode_persisted_kms_config, ensure_kms_config_persistable, ensure_kms_request_persistable,
+        kms_config_fingerprint, kms_config_is_unchanged, kms_configure_actions, kms_reload_is_already_current,
+        kms_service_control_actions, load_kms_config_with, local_success_with_peer_report, normalize_configure_request_secrets,
+        open_persisted_kms_config, redacted_canonical_config, register_kms_dynamic_route, seal_persisted_kms_config,
+        with_node_local_backend_warning,
     };
+    use crate::admin::router::{AdminOperation, S3Router};
+    use crate::admin::storage_api::error::StorageError;
+    use crate::server::ADMIN_PREFIX;
+    use hyper::Method;
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    /// backlog#2369 P1: a node whose KMS failed to start keeps its persisted
+    /// configuration, so an unchanged-bytes comparison made the documented
+    /// recovery call a no-op that still reported success.
+    #[test]
+    fn kms_reload_only_short_circuits_for_a_running_service() {
+        use rustfs_kms::KmsServiceStatus;
+
+        assert!(
+            kms_reload_is_already_current(KmsServiceStatus::Running, true),
+            "a running service on identical configuration has nothing to apply"
+        );
+        assert!(
+            !kms_reload_is_already_current(KmsServiceStatus::Running, false),
+            "changed configuration must always be applied"
+        );
+
+        for status in [
+            KmsServiceStatus::NotConfigured,
+            KmsServiceStatus::Configured,
+            KmsServiceStatus::Error("vault unreachable at startup".to_string()),
+        ] {
+            assert!(
+                !kms_reload_is_already_current(status.clone(), true),
+                "reload must reconfigure instead of reporting success from {status:?}"
+            );
+        }
+    }
+
+    /// backlog#2369 P7.4: the operator has to learn the consequence from the
+    /// response, not just from a log line the configuring client never sees.
+    #[test]
+    fn a_node_local_backend_warning_reaches_the_configure_response() {
+        let plain = with_node_local_backend_warning("KMS configured successfully".to_string(), None);
+        assert_eq!(plain, "KMS configured successfully");
+
+        let warned = with_node_local_backend_warning(
+            "KMS configured successfully".to_string(),
+            Some("Warning: the Local KMS backend is node-local"),
+        );
+        assert!(warned.starts_with("KMS configured successfully."), "{warned}");
+        assert!(warned.contains("node-local"), "{warned}");
+    }
 
     fn assert_has_action(actions: &[Action], action: Action) {
         assert!(actions.contains(&action), "expected action list to contain {action:?}");
@@ -1217,6 +1557,41 @@ mod tests {
     fn kms_dynamic_actions_reject_server_info_fallback() {
         assert_lacks_action(&kms_configure_actions(), Action::AdminAction(AdminAction::ServerInfoAdminAction));
         assert_lacks_action(&kms_service_control_actions(), Action::AdminAction(AdminAction::ServerInfoAdminAction));
+    }
+
+    #[test]
+    fn kms_reload_route_is_registered() {
+        let mut router: S3Router<AdminOperation> = S3Router::new(false);
+        register_kms_dynamic_route(&mut router).expect("register KMS dynamic routes");
+
+        assert!(router.contains_route(Method::POST, &format!("{ADMIN_PREFIX}/v3/kms/reload")));
+    }
+
+    #[tokio::test]
+    async fn persisted_config_loader_distinguishes_absence_from_storage_failure() {
+        let absent = load_kms_config_with(|| async { Err(StorageError::ConfigNotFound) })
+            .await
+            .expect("missing configuration is not a load failure");
+        assert!(absent.is_none());
+
+        let error = load_kms_config_with(|| async { Err(StorageError::FaultyDisk) })
+            .await
+            .expect_err("storage failure must not look like missing configuration");
+        assert!(matches!(error, KmsConfigLoadError::StorageRead(StorageError::FaultyDisk)));
+    }
+
+    #[tokio::test]
+    async fn persisted_config_loader_returns_decoded_configuration() {
+        let expected = aws_configure_request("us-east-1").to_kms_config();
+        let data = serde_json::to_vec(&expected).expect("serialize persisted KMS config");
+
+        let loaded = load_kms_config_with(|| async { Ok(data) })
+            .await
+            .expect("load persisted KMS config")
+            .expect("persisted KMS config exists");
+
+        assert_eq!(loaded.backend, expected.backend);
+        assert_eq!(loaded.default_key_id, expected.default_key_id);
     }
 
     #[test]
@@ -1258,6 +1633,76 @@ mod tests {
         assert!(decode_persisted_kms_config(duplicate.as_bytes()).is_err());
     }
 
+    fn vault_token_config(token: &str) -> rustfs_kms::KmsConfig {
+        rustfs_kms::KmsConfig {
+            backend: rustfs_kms::KmsBackend::VaultKv2,
+            backend_config: rustfs_kms::BackendConfig::VaultKv2(Box::new(rustfs_kms::VaultConfig {
+                auth_method: rustfs_kms::VaultAuthMethod::Token {
+                    token: token.to_string(),
+                },
+                ..rustfs_kms::VaultConfig::default()
+            })),
+            ..rustfs_kms::KmsConfig::default()
+        }
+    }
+
+    #[test]
+    fn persisted_config_secrets_seal_and_open_round_trip() {
+        let config = vault_token_config("s.vault-root-token");
+
+        let sealed_bytes = seal_persisted_kms_config(&config, Some("operator-secret")).expect("sealing succeeds");
+        let rendered = String::from_utf8(sealed_bytes.clone()).expect("persisted config is utf-8 JSON");
+        assert!(!rendered.contains("s.vault-root-token"), "sealed persistence must not carry the token");
+
+        // Fail closed without the secret, and with a wrong secret.
+        open_persisted_kms_config(&sealed_bytes, None).expect_err("sealed config must not load without the secret");
+        open_persisted_kms_config(&sealed_bytes, Some("wrong")).expect_err("sealed config must not load with a wrong secret");
+
+        // The right secret recovers the original configuration.
+        let (opened_bytes, outcome) =
+            open_persisted_kms_config(&sealed_bytes, Some("operator-secret")).expect("unsealing succeeds");
+        assert_eq!(outcome.sealed, vec!["kms.vault.token"]);
+        let (decoded, _) = decode_persisted_kms_config(&opened_bytes).expect("decode opened config");
+        match &decoded.backend_config {
+            rustfs_kms::BackendConfig::VaultKv2(vault) => match &vault.auth_method {
+                rustfs_kms::VaultAuthMethod::Token { token } => assert_eq!(token, "s.vault-root-token"),
+                other => panic!("unexpected auth method after unseal: {other:?}"),
+            },
+            other => panic!("unexpected backend after unseal: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn persisted_config_without_config_secret_stays_plaintext_and_loads() {
+        let config = vault_token_config("s.vault-root-token");
+
+        let bytes = seal_persisted_kms_config(&config, None).expect("warn-only persistence stays allowed");
+        let rendered = String::from_utf8(bytes.clone()).expect("persisted config is utf-8 JSON");
+        assert!(
+            rendered.contains("s.vault-root-token"),
+            "without a secret the legacy plaintext format is kept"
+        );
+
+        let (opened_bytes, outcome) = open_persisted_kms_config(&bytes, None).expect("plaintext config loads without a secret");
+        assert_eq!(outcome.plaintext, vec!["kms.vault.token"]);
+        assert!(outcome.sealed.is_empty());
+        let (decoded, _) = decode_persisted_kms_config(&opened_bytes).expect("decode plaintext config");
+        assert!(matches!(decoded.backend_config, rustfs_kms::BackendConfig::VaultKv2(_)));
+    }
+
+    #[test]
+    fn config_secret_reusing_a_backend_secret_is_refused() {
+        let temp_dir = TempDir::new().expect("create local KMS directory");
+        let mut config = rustfs_kms::KmsConfig::local(temp_dir.path().to_path_buf());
+        if let rustfs_kms::BackendConfig::Local(local) = &mut config.backend_config {
+            local.master_key = Some("shared-secret".to_string());
+        }
+
+        seal_persisted_kms_config(&config, Some("shared-secret"))
+            .expect_err("the config secret must be an independent trust root");
+        seal_persisted_kms_config(&config, Some("independent-secret")).expect("an independent secret seals");
+    }
+
     #[test]
     fn persisted_secure_local_config_without_legacy_field_stays_secure() {
         #[cfg(unix)]
@@ -1284,12 +1729,8 @@ mod tests {
 
     #[test]
     fn static_kms_config_is_not_persisted_with_cluster_configuration() {
-        use base64::Engine as _;
-
-        let config = rustfs_kms::KmsConfig::static_kms(
-            "static-key".to_string(),
-            base64::engine::general_purpose::STANDARD.encode([0x5au8; 32]),
-        );
+        let config =
+            rustfs_kms::KmsConfig::static_kms("static-key".to_string(), base64_simd::STANDARD.encode_to_string([0x5au8; 32]));
 
         assert!(ensure_kms_config_persistable(&config).is_err());
     }

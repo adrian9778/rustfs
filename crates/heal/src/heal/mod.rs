@@ -16,7 +16,10 @@ pub mod channel;
 pub mod erasure_healer;
 pub mod manager;
 pub mod mrf_queue;
+pub mod outcome;
+pub(crate) mod pacing;
 pub mod progress;
+mod replacement_execution;
 pub(crate) mod replacement_readiness;
 pub mod resume;
 pub mod storage;
@@ -25,22 +28,21 @@ pub mod task;
 pub mod utils;
 
 use storage_api::owner::{
-    ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_HEALING_MARKER_PATH, ECSTORE_RUSTFS_META_BUCKET,
-    EcstoreConditionalFileUpdate, EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskResult,
-    EcstoreDiskStore, EcstoreEndpoint, EcstoreErrorType, EcstoreStorageError, EcstoreStore, ObjectIO, ObjectOperations,
-    ecstore_local_disk_map_read,
+    ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_HEALING_MARKER_PATH, ECSTORE_POOL_META_NAME,
+    ECSTORE_RUSTFS_META_BUCKET, EcstoreConditionalFileUpdate, EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes,
+    EcstoreDiskError, EcstoreDiskOption, EcstoreDiskResult, EcstoreDiskStore, EcstoreEndpoint, EcstoreErrorType,
+    EcstoreStorageError, EcstoreStore, ObjectIO, ObjectOperations, ecstore_local_disk_map_read, ecstore_new_disk,
 };
-#[cfg(test)]
-use storage_api::owner::{EcstoreDiskOption, ecstore_new_disk};
 
 pub use erasure_healer::ErasureSetHealer;
-pub use manager::{HealManager, HealOperationsSnapshot, HealPriorityCounts, HealSourceCounts};
+pub use manager::{HealAdmissionTelemetry, HealManager, HealOperationsSnapshot, HealPriorityCounts, HealSourceCounts};
 pub use resume::{CheckpointManager, ResumeCheckpoint, ResumeManager, ResumeState, ResumeUtils};
 pub use task::{HealOptions, HealPriority, HealRequest, HealTask, HealType};
 
 pub(crate) const DATA_USAGE_CACHE_NAME: &str = ECSTORE_DATA_USAGE_CACHE_NAME;
 pub(crate) const BUCKET_META_PREFIX: &str = ECSTORE_BUCKET_META_PREFIX;
 pub(crate) const RUSTFS_META_BUCKET: &str = ECSTORE_RUSTFS_META_BUCKET;
+pub(crate) const POOL_META_NAME: &str = ECSTORE_POOL_META_NAME;
 
 /// Marker written to every local disk while the process runs; removed by
 /// [`clear_unclean_shutdown_markers`] on graceful shutdown. Finding it at
@@ -247,10 +249,8 @@ pub(crate) async fn local_disk_map_read() -> tokio::sync::OwnedRwLockReadGuard<L
     ecstore_local_disk_map_read().await
 }
 
-#[cfg(test)]
 pub(crate) type DiskOption = EcstoreDiskOption;
 
-#[cfg(test)]
 pub(crate) async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> DiskResult<DiskStore> {
     ecstore_new_disk(ep, opt).await
 }

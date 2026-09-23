@@ -497,7 +497,7 @@ async fn test_multipart_encryption_type(
     // Prepare SSE-C keys when required
     let (sse_c_key, sse_c_md5) = if matches!(encryption_type, EncryptionType::SSEC) {
         let key = "01234567890123456789012345678901";
-        let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key);
+        let key_b64 = base64_simd::STANDARD.encode_to_string(key);
         let key_md5 = sse_customer_key_md5_base64(key);
         (Some(key_b64), Some(key_md5))
     } else {
@@ -560,18 +560,12 @@ async fn test_multipart_encryption_type(
         .set_parts(Some(completed_parts))
         .build();
 
-    let mut complete_request = s3_client
+    let complete_request = s3_client
         .complete_multipart_upload()
         .bucket(bucket)
         .key(object_key)
         .upload_id(upload_id)
         .multipart_upload(completed_multipart_upload);
-    if matches!(encryption_type, EncryptionType::SSEC) {
-        complete_request = complete_request
-            .sse_customer_algorithm("AES256")
-            .sse_customer_key(sse_c_key.as_ref().unwrap())
-            .sse_customer_key_md5(sse_c_md5.as_ref().unwrap());
-    }
     let _complete_output = complete_request.send().await?;
 
     // Download and verify

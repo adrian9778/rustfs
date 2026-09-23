@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cluster::rpc::{PeerRestClient, ScannerPeerActivity, TierConfigReloadOutcome};
+use crate::bucket::lifecycle::tier_last_day_stats::DailyAllTierStats;
+use crate::cluster::rpc::{
+    PeerRestClient, ScannerDirtyUsageAcknowledgement, ScannerPeerActivity, ScannerPeerDirtyUsageSnapshot,
+    ScannerPublicationLease, TierConfigReloadOutcome,
+};
 use crate::diagnostics::admin_server_info::get_commit_id;
 use crate::disk::DiskAPI;
 use crate::error::{Error, Result};
@@ -27,13 +31,18 @@ use lazy_static::lazy_static;
 use rustfs_madmin::health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysServices};
 use rustfs_madmin::metrics::RealtimeMetrics;
 use rustfs_madmin::net::NetInfo;
-use rustfs_madmin::{ItemState, ServerProperties, StorageInfo};
+use rustfs_madmin::{ItemState, ServerProperties, StorageInfo, StorageInfoObservation, StorageInfoProbeStatus};
 use rustfs_utils::XHost;
-use std::collections::{BTreeMap, HashMap, hash_map::DefaultHasher};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::DefaultHasher};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    Arc, LazyLock, Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::Notify;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -45,17 +54,101 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_NOTIFICATION: &str = "notification";
 const EVENT_NOTIFICATION_PEER_PROPAGATION: &str = "notification_peer_propagation";
 const EVENT_NOTIFICATION_CAPABILITY_PROBE: &str = "notification_capability_probe";
+const EVENT_STORAGE_INFO_PROBE: &str = "storage_info_probe";
 const SCANNER_ACTIVITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const TIER_DAILY_STATS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const TIER_CONFIG_RELOAD_RETRY_BASE: Duration = Duration::from_millis(100);
 const TIER_CONFIG_RELOAD_RETRY_CAP: Duration = Duration::from_secs(5);
 const REMOTE_VERSION_STATE_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 const REMOTE_VERSION_STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_VERSION_STATE_PROOF_TTL: Duration = Duration::from_secs(30);
-const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 1;
+/// Fallback poll cadence while startup has not yet published the notification
+/// system. IAM finalization starts the probe before `init_notification_runtime`
+/// runs, so the first pass always fails closed; waiting a full probe interval
+/// there left a single node without its durable quota capability for ten
+/// seconds after `/health` reported ok (rustfs/rustfs#8014). Publication wakes
+/// the probe immediately through `NOTIFICATION_SYS_PUBLISHED`; this bound only
+/// covers a wakeup that races the availability check.
+const REMOTE_VERSION_STATE_PROBE_BOOTSTRAP_INTERVAL: Duration = Duration::from_millis(100);
+const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 2;
+const TIER_DELETE_JOURNAL_POLICY_SUPPORTED_VERSION: u32 = 3;
+const DECOMMISSION_TARGET_FENCE_POLICY_SUPPORTED_VERSION: u32 = 4;
+// Keep this synchronized with the version served by node_service. Including
+// the local member in the minimum prevents an older coordinator from
+// self-authorizing a policy implemented only by newer remote peers.
+const LOCAL_CROSS_POOL_FENCE_POLICY_SUPPORTED_VERSION: u32 = 5;
+/// Version 5 preserves explicit transition state/destination bindings and
+/// supports exact-generation metadata repair with strong all-copy readback.
+const LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION: u32 = 5;
+
+fn resolve_admin_peer_probe_timeout_secs(configured: Option<u64>) -> u64 {
+    configured
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(rustfs_config::DEFAULT_ADMIN_PEER_PROBE_TIMEOUT_SECS)
+        .min(rustfs_config::MAX_ADMIN_PEER_PROBE_TIMEOUT_SECS)
+}
+
+fn admin_peer_probe_timeout() -> Duration {
+    let configured = rustfs_utils::get_env_opt_u64_with_aliases(rustfs_config::ENV_ADMIN_PEER_PROBE_TIMEOUT_SECS, &[]);
+    let seconds = resolve_admin_peer_probe_timeout_secs(configured);
+    Duration::from_secs(seconds)
+}
+
+fn remaining_admin_peer_probe_timeout(deadline: Instant) -> Option<Duration> {
+    remaining_admin_peer_probe_timeout_at(deadline, Instant::now())
+}
+
+fn remaining_admin_peer_probe_timeout_at(deadline: Instant, now: Instant) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(now);
+    (!remaining.is_zero()).then_some(remaining)
+}
+
+type CrossPoolFencePolicyResult = Result<BTreeMap<String, Uuid>>;
+
+fn cross_pool_fence_policy_results(
+    peer_epochs: BTreeMap<String, Uuid>,
+    minimum_version: u32,
+) -> (
+    CrossPoolFencePolicyResult,
+    CrossPoolFencePolicyResult,
+    CrossPoolFencePolicyResult,
+    CrossPoolFencePolicyResult,
+) {
+    let journal_result = if minimum_version >= TIER_DELETE_JOURNAL_POLICY_SUPPORTED_VERSION {
+        Ok(peer_epochs.clone())
+    } else {
+        Err(Error::other("tier delete journal v6 policy capability version is unsupported"))
+    };
+    let decommission_target_fence_result = if minimum_version >= DECOMMISSION_TARGET_FENCE_POLICY_SUPPORTED_VERSION {
+        Ok(peer_epochs.clone())
+    } else {
+        Err(Error::other("decommission target fence policy capability version is unsupported"))
+    };
+    let legacy_transition_state_reconcile_result =
+        if minimum_version >= LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION {
+            Ok(peer_epochs.clone())
+        } else {
+            Err(Error::other("legacy transition state reconcile policy capability version is unsupported"))
+        };
+    (
+        Ok(peer_epochs),
+        journal_result,
+        decommission_target_fence_result,
+        legacy_transition_state_reconcile_result,
+    )
+}
+
+#[derive(Clone, Debug)]
+pub struct ScannerPublicationLeaseGrant {
+    pub host: String,
+    pub lease: ScannerPublicationLease,
+}
 
 /// Cached result from the last successful admin call to a peer.
 struct PeerAdminCache {
     last_storage_info: Option<StorageInfo>,
+    /// Wall time is for operators; the monotonic clock bounds cache reuse.
+    last_storage_success: Option<(SystemTime, Instant)>,
     last_server_info: Option<ServerProperties>,
     storage_failures: u32,
     server_failures: u32,
@@ -79,6 +172,7 @@ impl PeerAdminCache {
     fn new() -> Self {
         Self {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: None,
             storage_failures: 0,
             server_failures: 0,
@@ -91,6 +185,9 @@ impl PeerAdminCache {
 /// failure: rather than reporting a stale `online`, the member falls through to
 /// the live unknown/degraded/offline classification (rustfs/backlog#1049 P2).
 const SERVER_INFO_CACHE_MAX_AGE: Duration = Duration::from_secs(60);
+// Diagnostic inventory may bridge a short probe interruption, but never more
+// than one minute. Failed probes are marked unknown even within this budget.
+const STORAGE_INFO_CACHE_MAX_AGE: Duration = Duration::from_secs(60);
 
 lazy_static! {
     pub static ref GLOBAL_NOTIFICATION_SYS: OnceLock<Arc<NotificationSys>> = OnceLock::new();
@@ -101,14 +198,90 @@ struct FleetCapabilityProof {
     topology_fingerprint: String,
     peer_epochs: Arc<BTreeMap<String, Uuid>>,
     expires_at: Instant,
+    generation: Arc<FleetCapabilityProofGeneration>,
 }
 
 impl FleetCapabilityProof {
+    fn new(topology_fingerprint: String, peer_epochs: Arc<BTreeMap<String, Uuid>>, expires_at: Instant) -> Self {
+        Self {
+            topology_fingerprint,
+            peer_epochs,
+            expires_at,
+            generation: FleetCapabilityProofGeneration::fresh(),
+        }
+    }
+
     fn token(&self) -> FleetCapabilityProofToken {
         FleetCapabilityProofToken {
             topology_fingerprint: self.topology_fingerprint.clone(),
             peer_epochs: self.peer_epochs.clone(),
         }
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn with_fresh_generation(&self) -> Self {
+        Self::new(self.topology_fingerprint.clone(), Arc::clone(&self.peer_epochs), self.expires_at)
+    }
+}
+
+/// Admission generation for effects that must not straddle a fleet-proof
+/// replacement. Revocation is deliberately non-blocking: it closes admission
+/// immediately, while the proof slot withholds the successor generation until
+/// every admitted operation has drained.
+#[derive(Default)]
+struct FleetCapabilityProofGeneration {
+    accepting: AtomicBool,
+    active: AtomicUsize,
+}
+
+impl FleetCapabilityProofGeneration {
+    fn fresh() -> Arc<Self> {
+        Arc::new(Self {
+            accepting: AtomicBool::new(true),
+            active: AtomicUsize::new(0),
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<FleetCapabilityProofPermit> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return None;
+        }
+        self.active.fetch_add(1, Ordering::AcqRel);
+        if self.accepting.load(Ordering::Acquire) {
+            Some(FleetCapabilityProofPermit {
+                generation: Arc::clone(self),
+            })
+        } else {
+            self.release();
+            None
+        }
+    }
+
+    fn revoke(&self) {
+        self.accepting.store(false, Ordering::Release);
+    }
+
+    fn is_accepting(&self) -> bool {
+        self.accepting.load(Ordering::Acquire)
+    }
+
+    fn is_drained(&self) -> bool {
+        self.active.load(Ordering::Acquire) == 0
+    }
+
+    fn release(&self) {
+        let previous = self.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "fleet capability permit count underflow");
+    }
+}
+
+struct FleetCapabilityProofPermit {
+    generation: Arc<FleetCapabilityProofGeneration>,
+}
+
+impl Drop for FleetCapabilityProofPermit {
+    fn drop(&mut self) {
+        self.generation.release();
     }
 }
 
@@ -121,6 +294,7 @@ struct FleetCapabilityProofToken {
 #[derive(Default)]
 struct FleetCapabilityProofState {
     proof: Option<FleetCapabilityProof>,
+    draining_generation: Option<Arc<FleetCapabilityProofGeneration>>,
     topology_conflict: bool,
 }
 
@@ -130,9 +304,53 @@ pub(crate) struct RemoteVersionStateFleetProofToken(FleetCapabilityProofToken);
 #[derive(Clone, PartialEq, Eq)]
 pub struct CrossPoolFenceFleetProofToken(FleetCapabilityProofToken);
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DecommissionTargetFenceFleetProofToken(FleetCapabilityProofToken);
+
+/// A point-in-time proof that every current storage member implements the v6
+/// dispatch-manifest policy. It intentionally has no `Clone` implementation:
+/// one acquisition authorizes one manifest construction attempt.
+pub(crate) struct TierDeleteJournalFleetProofToken {
+    token: FleetCapabilityProofToken,
+    _permit: FleetCapabilityProofPermit,
+}
+
+/// Effect-window authority for one legacy transition-state reconciliation.
+///
+/// The token intentionally cannot be cloned. Its permit keeps the admitted
+/// fleet generation alive until the caller finishes the final strong
+/// readback, while revocation makes every later validation fail immediately.
+pub struct LegacyTransitionStateReconcileFleetProofToken {
+    token: FleetCapabilityProofToken,
+    _permit: FleetCapabilityProofPermit,
+}
+
+/// Effect-window authority for one immutable ILM recovery export.
+pub struct IlmRecoveryExportFleetProofToken {
+    token: FleetCapabilityProofToken,
+    _permit: FleetCapabilityProofPermit,
+}
+
+/// Effect-window authority for emitting the compact transition-transaction
+/// state sequence. The generation permit prevents a successor proof from
+/// being published until the admitted writer has finished.
+pub(crate) struct TransitionTransactionCompactionFleetProofToken {
+    token: FleetCapabilityProofToken,
+    _permit: FleetCapabilityProofPermit,
+}
+
 static REMOTE_VERSION_STATE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static CROSS_POOL_FENCE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
+static TIER_DELETE_JOURNAL_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
+static DECOMMISSION_TARGET_FENCE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
+static LEGACY_TRANSITION_STATE_RECONCILE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
+static ILM_RECOVERY_EXPORT_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
+static TRANSITION_TRANSACTION_COMPACTION_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static REMOTE_VERSION_STATE_PROBE_TOPOLOGY: OnceLock<String> = OnceLock::new();
+/// Signalled once `GLOBAL_NOTIFICATION_SYS` is published so the fleet probe can
+/// run its first real pass without waiting for the bootstrap poll.
+static NOTIFICATION_SYS_PUBLISHED: Notify = Notify::const_new();
+static ILM_RECOVERY_EXPORT_LOCAL_PROCESS_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
 
 fn cross_pool_fence_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
     CROSS_POOL_FENCE_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
@@ -142,8 +360,69 @@ fn remote_version_state_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCa
     REMOTE_VERSION_STATE_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
 }
 
-fn replace_fleet_capability_proof(slot: &std::sync::RwLock<FleetCapabilityProofState>, proof: Option<FleetCapabilityProof>) {
-    slot.write().unwrap_or_else(std::sync::PoisonError::into_inner).proof = proof;
+fn tier_delete_journal_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
+    TIER_DELETE_JOURNAL_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
+}
+
+fn decommission_target_fence_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
+    DECOMMISSION_TARGET_FENCE_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
+}
+
+fn legacy_transition_state_reconcile_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
+    LEGACY_TRANSITION_STATE_RECONCILE_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
+}
+
+fn ilm_recovery_export_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
+    ILM_RECOVERY_EXPORT_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
+}
+
+fn transition_transaction_compaction_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
+    TRANSITION_TRANSACTION_COMPACTION_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
+}
+
+fn all_fleet_capability_proof_slots() -> [&'static std::sync::RwLock<FleetCapabilityProofState>; 7] {
+    [
+        remote_version_state_fleet_proof_slot(),
+        cross_pool_fence_fleet_proof_slot(),
+        tier_delete_journal_fleet_proof_slot(),
+        decommission_target_fence_fleet_proof_slot(),
+        legacy_transition_state_reconcile_fleet_proof_slot(),
+        ilm_recovery_export_fleet_proof_slot(),
+        transition_transaction_compaction_fleet_proof_slot(),
+    ]
+}
+
+fn revoke_all_fleet_capability_proofs() {
+    for slot in all_fleet_capability_proof_slots() {
+        revoke_fleet_capability_proof(slot);
+    }
+}
+
+fn revoke_fleet_capability_proof_state(state: &mut FleetCapabilityProofState) {
+    if let Some(proof) = state.proof.take() {
+        proof.generation.revoke();
+        if !proof.generation.is_drained() {
+            state.draining_generation = Some(proof.generation);
+        }
+    }
+    if state
+        .draining_generation
+        .as_ref()
+        .is_some_and(|generation| generation.is_drained())
+    {
+        state.draining_generation = None;
+    }
+}
+
+fn revoke_fleet_capability_proof(slot: &std::sync::RwLock<FleetCapabilityProofState>) {
+    let mut state = slot.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    revoke_fleet_capability_proof_state(&mut state);
+}
+
+fn mark_fleet_capability_topology_conflict(slot: &std::sync::RwLock<FleetCapabilityProofState>) {
+    let mut state = slot.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.topology_conflict = true;
+    revoke_fleet_capability_proof_state(&mut state);
 }
 
 fn publish_fleet_capability_probe_result(
@@ -155,21 +434,42 @@ fn publish_fleet_capability_probe_result(
     match result {
         Ok(peer_epochs) => {
             let mut state = slot.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let peer_epochs = state
+            if let Some(current) = state
                 .proof
-                .as_ref()
+                .as_mut()
                 .filter(|proof| proof.topology_fingerprint == topology_fingerprint && proof.peer_epochs.as_ref() == &peer_epochs)
-                .map(|proof| Arc::clone(&proof.peer_epochs))
-                .unwrap_or_else(|| Arc::new(peer_epochs));
-            state.proof = Some(FleetCapabilityProof {
-                topology_fingerprint: topology_fingerprint.to_string(),
-                peer_epochs,
-                expires_at: observed_at + REMOTE_VERSION_STATE_PROOF_TTL,
-            });
+            {
+                current.expires_at = observed_at + REMOTE_VERSION_STATE_PROOF_TTL;
+                return None;
+            }
+
+            if let Some(previous) = state.proof.take() {
+                previous.generation.revoke();
+                if !previous.generation.is_drained() {
+                    state.draining_generation = Some(previous.generation);
+                }
+            }
+            if state
+                .draining_generation
+                .as_ref()
+                .is_some_and(|generation| generation.is_drained())
+            {
+                state.draining_generation = None;
+            }
+            if state.draining_generation.is_some() {
+                return Some(Error::other(
+                    "fleet capability proof successor waits for the previous generation to drain",
+                ));
+            }
+            state.proof = Some(FleetCapabilityProof::new(
+                topology_fingerprint.to_string(),
+                Arc::new(peer_epochs),
+                observed_at + REMOTE_VERSION_STATE_PROOF_TTL,
+            ));
             None
         }
         Err(err) => {
-            replace_fleet_capability_proof(slot, None);
+            revoke_fleet_capability_proof(slot);
             Some(err)
         }
     }
@@ -181,6 +481,20 @@ pub(crate) fn acquire_remote_version_state_fleet_proof() -> Option<RemoteVersion
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     acquire_fleet_capability_proof_from(&state, expected_topology, Instant::now()).map(RemoteVersionStateFleetProofToken)
+}
+
+pub(crate) fn acquire_remote_version_state_writer_fleet_proof() -> Option<RemoteVersionStateFleetProofToken> {
+    let requested = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_WRITE,
+        rustfs_config::DEFAULT_TIER_REMOTE_VERSION_STATE_WRITE,
+    );
+    let fleet_confirmed = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
+        rustfs_config::DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
+    );
+    (requested && fleet_confirmed)
+        .then(acquire_remote_version_state_fleet_proof)
+        .flatten()
 }
 
 fn acquire_fleet_capability_proof_from(
@@ -198,6 +512,33 @@ pub(crate) fn remote_version_state_fleet_proof_matches(proof: &RemoteVersionStat
     fleet_capability_proof_matches(remote_version_state_fleet_proof_slot(), &proof.0)
 }
 
+pub(crate) fn acquire_transition_transaction_compaction_fleet_proof() -> Option<TransitionTransactionCompactionFleetProofToken> {
+    let expected_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get()?;
+    let state = transition_transaction_compaction_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let token = acquire_fleet_capability_proof_from(&state, expected_topology, Instant::now())?;
+    let permit = state.proof.as_ref()?.generation.try_acquire()?;
+    Some(TransitionTransactionCompactionFleetProofToken { token, _permit: permit })
+}
+
+pub(crate) fn transition_transaction_compaction_fleet_proof_matches(
+    proof: &TransitionTransactionCompactionFleetProofToken,
+) -> bool {
+    let Some(expected_topology) = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() else {
+        return false;
+    };
+    let state = transition_transaction_compaction_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    proof._permit.generation.is_accepting()
+        && fleet_capability_proof_matches_at(&state, &proof.token, expected_topology, Instant::now())
+        && state
+            .proof
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.generation, &proof._permit.generation))
+}
+
 pub fn acquire_cross_pool_fence_fleet_proof() -> Option<CrossPoolFenceFleetProofToken> {
     let expected_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get()?;
     let state = cross_pool_fence_fleet_proof_slot()
@@ -210,6 +551,555 @@ pub fn cross_pool_fence_fleet_proof_matches(proof: &CrossPoolFenceFleetProofToke
     fleet_capability_proof_matches(cross_pool_fence_fleet_proof_slot(), &proof.0)
 }
 
+pub(crate) fn acquire_decommission_target_fence_fleet_proof() -> Option<DecommissionTargetFenceFleetProofToken> {
+    let expected_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get()?;
+    let state = decommission_target_fence_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    acquire_fleet_capability_proof_from(&state, expected_topology, Instant::now()).map(DecommissionTargetFenceFleetProofToken)
+}
+
+pub(crate) fn decommission_target_fence_fleet_proof_matches(proof: &DecommissionTargetFenceFleetProofToken) -> bool {
+    fleet_capability_proof_matches(decommission_target_fence_fleet_proof_slot(), &proof.0)
+}
+
+pub(crate) fn acquire_tier_delete_journal_fleet_proof() -> Option<TierDeleteJournalFleetProofToken> {
+    let expected_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get()?;
+    let state = tier_delete_journal_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    acquire_tier_delete_journal_fleet_proof_from(&state, expected_topology, Instant::now())
+}
+
+fn acquire_tier_delete_journal_fleet_proof_from(
+    state: &FleetCapabilityProofState,
+    expected_topology: &str,
+    now: Instant,
+) -> Option<TierDeleteJournalFleetProofToken> {
+    let token = acquire_fleet_capability_proof_from(state, expected_topology, now)?;
+    let permit = state.proof.as_ref()?.generation.try_acquire()?;
+    Some(TierDeleteJournalFleetProofToken { token, _permit: permit })
+}
+
+pub(crate) fn tier_delete_journal_fleet_proof_matches(proof: &TierDeleteJournalFleetProofToken) -> bool {
+    let Some(expected_topology) = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() else {
+        return false;
+    };
+    let state = tier_delete_journal_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    tier_delete_journal_fleet_proof_matches_at(&state, proof, expected_topology, Instant::now())
+}
+
+fn tier_delete_journal_fleet_proof_matches_at(
+    state: &FleetCapabilityProofState,
+    proof: &TierDeleteJournalFleetProofToken,
+    expected_topology: &str,
+    now: Instant,
+) -> bool {
+    proof._permit.generation.is_accepting()
+        && fleet_capability_proof_matches_at(state, &proof.token, expected_topology, now)
+        && state
+            .proof
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.generation, &proof._permit.generation))
+}
+
+pub(crate) fn tier_delete_journal_topology_generation(proof: &TierDeleteJournalFleetProofToken) -> String {
+    stable_tier_delete_journal_topology_generation(&proof.token.topology_fingerprint)
+}
+
+pub(crate) fn cross_pool_fence_topology_generation(proof: &CrossPoolFenceFleetProofToken) -> String {
+    stable_tier_delete_journal_topology_generation(&proof.0.topology_fingerprint)
+}
+
+/// Acquire one non-cloneable authority that must span the complete reconcile
+/// effect window, including its final strong readback.
+pub async fn acquire_legacy_transition_state_reconcile_fleet_proof() -> Option<LegacyTransitionStateReconcileFleetProofToken> {
+    let expected_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get()?;
+    let proof = {
+        let state = legacy_transition_state_reconcile_fleet_proof_slot()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, expected_topology, Instant::now())?
+    };
+    let observed_peer_epochs = observe_legacy_transition_state_reconcile_fleet(expected_topology).await?;
+    let state = legacy_transition_state_reconcile_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    legacy_transition_state_reconcile_fleet_proof_matches_observation_at(
+        &state,
+        &proof,
+        expected_topology,
+        &observed_peer_epochs,
+        Instant::now(),
+    )
+    .then_some(proof)
+}
+
+fn acquire_legacy_transition_state_reconcile_fleet_proof_from(
+    state: &FleetCapabilityProofState,
+    expected_topology: &str,
+    now: Instant,
+) -> Option<LegacyTransitionStateReconcileFleetProofToken> {
+    let token = acquire_fleet_capability_proof_from(state, expected_topology, now)?;
+    let permit = state.proof.as_ref()?.generation.try_acquire()?;
+    Some(LegacyTransitionStateReconcileFleetProofToken { token, _permit: permit })
+}
+
+async fn observe_legacy_transition_state_reconcile_fleet(expected_topology: &str) -> Option<BTreeMap<String, Uuid>> {
+    #[cfg(all(test, feature = "test-util"))]
+    if let Ok(observation) = LEGACY_RECONCILE_TEST_OBSERVATION.try_with(Clone::clone) {
+        return Some(observation);
+    }
+    let notification_sys = get_global_notification_sys()?;
+    let (peer_epochs, minimum_version) = timeout(
+        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+        notification_sys.probe_cross_pool_fence_fleet(expected_topology),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let (_, _, _, reconcile_result) = cross_pool_fence_policy_results(peer_epochs, minimum_version);
+    reconcile_result.ok()
+}
+
+#[cfg(all(test, feature = "test-util"))]
+tokio::task_local! {
+    static LEGACY_RECONCILE_TEST_OBSERVATION: BTreeMap<String, Uuid>;
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) async fn with_legacy_transition_state_fleet_proof_for_test<F: std::future::Future>(future: F) -> F::Output {
+    struct Revoke;
+    impl Drop for Revoke {
+        fn drop(&mut self) {
+            revoke_fleet_capability_proof(legacy_transition_state_reconcile_fleet_proof_slot());
+        }
+    }
+    let topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get().expect("test store topology");
+    assert!(
+        publish_fleet_capability_probe_result(
+            legacy_transition_state_reconcile_fleet_proof_slot(),
+            topology,
+            Ok(BTreeMap::new()),
+            Instant::now(),
+        )
+        .is_none()
+    );
+    let _revoke = Revoke;
+    let _remote_version = install_current_remote_version_state_fleet_proof_for_test();
+    LEGACY_RECONCILE_TEST_OBSERVATION.scope(BTreeMap::new(), future).await
+}
+
+/// Revalidate the exact fleet generation captured by a reconcile token with a
+/// fresh synchronous observation. Callers must await this before each
+/// conditional metadata write and after the final strong readback.
+pub async fn legacy_transition_state_reconcile_fleet_proof_matches(
+    proof: &LegacyTransitionStateReconcileFleetProofToken,
+) -> bool {
+    let Some(expected_topology) = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() else {
+        return false;
+    };
+    legacy_transition_state_reconcile_fleet_proof_matches_with_observer(
+        legacy_transition_state_reconcile_fleet_proof_slot(),
+        proof,
+        expected_topology,
+        || observe_legacy_transition_state_reconcile_fleet(expected_topology),
+    )
+    .await
+}
+
+/// Final local check in the disk publication executor. The corresponding
+/// counted permit remains owned until the filesystem operation has drained.
+pub(crate) fn legacy_transition_state_reconcile_fleet_proof_current(
+    proof: &LegacyTransitionStateReconcileFleetProofToken,
+) -> bool {
+    let Some(topology) = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() else { return false };
+    let state = legacy_transition_state_reconcile_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    legacy_transition_state_reconcile_fleet_proof_matches_at(&state, proof, topology, Instant::now())
+}
+
+pub async fn acquire_ilm_recovery_export_fleet_proof() -> Option<IlmRecoveryExportFleetProofToken> {
+    let expected_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get()?;
+    let proof = {
+        let state = ilm_recovery_export_fleet_proof_slot()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        acquire_ilm_recovery_export_fleet_proof_from(&state, expected_topology, Instant::now())?
+    };
+    let observed = observe_ilm_recovery_export_fleet(expected_topology).await?;
+    let state = ilm_recovery_export_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ilm_recovery_export_fleet_proof_matches_observation_at(&state, &proof, expected_topology, &observed, Instant::now())
+        .then_some(proof)
+}
+
+fn acquire_ilm_recovery_export_fleet_proof_from(
+    state: &FleetCapabilityProofState,
+    expected_topology: &str,
+    now: Instant,
+) -> Option<IlmRecoveryExportFleetProofToken> {
+    let token = acquire_fleet_capability_proof_from(state, expected_topology, now)?;
+    let permit = state.proof.as_ref()?.generation.try_acquire()?;
+    Some(IlmRecoveryExportFleetProofToken { token, _permit: permit })
+}
+
+pub async fn ilm_recovery_export_fleet_proof_matches(proof: &IlmRecoveryExportFleetProofToken) -> bool {
+    let Some(expected_topology) = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() else {
+        return false;
+    };
+    {
+        let state = ilm_recovery_export_fleet_proof_slot()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !ilm_recovery_export_fleet_proof_matches_at(&state, proof, expected_topology, Instant::now()) {
+            return false;
+        }
+    }
+    let Some(observed) = observe_ilm_recovery_export_fleet(expected_topology).await else {
+        return false;
+    };
+    let state = ilm_recovery_export_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ilm_recovery_export_fleet_proof_matches_observation_at(&state, proof, expected_topology, &observed, Instant::now())
+}
+
+pub fn ilm_recovery_export_topology_generation(proof: &IlmRecoveryExportFleetProofToken) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"rustfs-ilm-recovery-export-topology-v1\0");
+    hasher.update(proof.token.topology_fingerprint.as_bytes());
+    rustfs_utils::crypto::hex(hasher.finalize().as_slice())
+}
+
+pub fn ilm_recovery_export_member_epochs_sha256(proof: &IlmRecoveryExportFleetProofToken) -> String {
+    let encoded = serde_json::to_vec(proof.token.peer_epochs.as_ref()).expect("member epoch map is JSON encodable");
+    let mut hasher = Sha256::new();
+    hasher.update(b"rustfs-ilm-recovery-export-members-v1\0");
+    hasher.update(encoded);
+    rustfs_utils::crypto::hex(hasher.finalize().as_slice())
+}
+
+pub fn ilm_recovery_export_local_process_epoch() -> Uuid {
+    *ILM_RECOVERY_EXPORT_LOCAL_PROCESS_EPOCH
+}
+
+fn ilm_recovery_export_fleet_proof_matches_at(
+    state: &FleetCapabilityProofState,
+    proof: &IlmRecoveryExportFleetProofToken,
+    expected_topology: &str,
+    now: Instant,
+) -> bool {
+    proof._permit.generation.is_accepting()
+        && fleet_capability_proof_matches_at(state, &proof.token, expected_topology, now)
+        && state
+            .proof
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.generation, &proof._permit.generation))
+}
+
+fn ilm_recovery_export_fleet_proof_matches_observation_at(
+    state: &FleetCapabilityProofState,
+    proof: &IlmRecoveryExportFleetProofToken,
+    expected_topology: &str,
+    observed: &BTreeMap<String, Uuid>,
+    now: Instant,
+) -> bool {
+    ilm_recovery_export_fleet_proof_matches_at(state, proof, expected_topology, now)
+        && proof.token.peer_epochs.as_ref() == observed
+}
+
+async fn observe_ilm_recovery_export_fleet(expected_topology: &str) -> Option<BTreeMap<String, Uuid>> {
+    #[cfg(test)]
+    {
+        let state = ilm_recovery_export_fleet_proof_slot()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if fleet_capability_proof_valid_at(state.proof.as_ref(), expected_topology, Instant::now()) {
+            return state.proof.as_ref().map(|proof| proof.peer_epochs.as_ref().clone());
+        }
+    }
+    let notification_sys = get_global_notification_sys()?;
+    timeout(
+        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+        notification_sys.probe_ilm_recovery_export_fleet(expected_topology),
+    )
+    .await
+    .ok()?
+    .ok()
+}
+
+async fn legacy_transition_state_reconcile_fleet_proof_matches_with_observer<F, Fut>(
+    slot: &std::sync::RwLock<FleetCapabilityProofState>,
+    proof: &LegacyTransitionStateReconcileFleetProofToken,
+    expected_topology: &str,
+    observe: F,
+) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Option<BTreeMap<String, Uuid>>>,
+{
+    {
+        let state = slot.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !legacy_transition_state_reconcile_fleet_proof_matches_at(&state, proof, expected_topology, Instant::now()) {
+            return false;
+        }
+    }
+    let Some(observed_peer_epochs) = observe().await else {
+        return false;
+    };
+    let state = slot.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    legacy_transition_state_reconcile_fleet_proof_matches_observation_at(
+        &state,
+        proof,
+        expected_topology,
+        &observed_peer_epochs,
+        Instant::now(),
+    )
+}
+
+fn legacy_transition_state_reconcile_fleet_proof_matches_at(
+    state: &FleetCapabilityProofState,
+    proof: &LegacyTransitionStateReconcileFleetProofToken,
+    expected_topology: &str,
+    now: Instant,
+) -> bool {
+    proof._permit.generation.is_accepting()
+        && fleet_capability_proof_matches_at(state, &proof.token, expected_topology, now)
+        && state
+            .proof
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.generation, &proof._permit.generation))
+}
+
+fn legacy_transition_state_reconcile_fleet_proof_matches_observation_at(
+    state: &FleetCapabilityProofState,
+    proof: &LegacyTransitionStateReconcileFleetProofToken,
+    expected_topology: &str,
+    observed_peer_epochs: &BTreeMap<String, Uuid>,
+    now: Instant,
+) -> bool {
+    legacy_transition_state_reconcile_fleet_proof_matches_at(state, proof, expected_topology, now)
+        && proof.token.peer_epochs.as_ref() == observed_peer_epochs
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) fn tier_delete_journal_fleet_proof_has_inflight_for_test() -> bool {
+    let state = tier_delete_journal_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.proof.as_ref().is_some_and(|proof| !proof.generation.is_drained())
+        || state
+            .draining_generation
+            .as_ref()
+            .is_some_and(|generation| !generation.is_drained())
+}
+
+fn stable_tier_delete_journal_topology_generation(topology_fingerprint: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"rustfs-tier-delete-journal-topology-v1\0");
+    hasher.update(topology_fingerprint.as_bytes());
+    rustfs_utils::crypto::hex(hasher.finalize().as_slice())
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) fn install_cross_pool_fence_fleet_proof_for_test() {
+    let topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY
+        .get()
+        .cloned()
+        .unwrap_or_else(|| "pool-activation-test-topology".to_string());
+    let _ = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.set(topology.clone());
+    let mut state = cross_pool_fence_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = Instant::now();
+    let proof = if !state.topology_conflict && fleet_capability_proof_valid_at(state.proof.as_ref(), &topology, now) {
+        state.proof.clone()
+    } else {
+        Some(FleetCapabilityProof::new(
+            topology.clone(),
+            Arc::new(BTreeMap::new()),
+            now + Duration::from_secs(60 * 60),
+        ))
+    };
+    state.topology_conflict = false;
+    state.proof = proof.clone();
+    drop(state);
+    let mut journal_state = tier_delete_journal_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    debug_assert!(
+        journal_state
+            .proof
+            .as_ref()
+            .is_none_or(|current| current.generation.is_drained())
+    );
+    journal_state.topology_conflict = false;
+    journal_state.draining_generation = None;
+    journal_state.proof = proof.as_ref().map(FleetCapabilityProof::with_fresh_generation);
+    drop(journal_state);
+    let mut decommission_state = decommission_target_fence_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    debug_assert!(
+        decommission_state
+            .proof
+            .as_ref()
+            .is_none_or(|current| current.generation.is_drained())
+    );
+    decommission_state.topology_conflict = false;
+    decommission_state.draining_generation = None;
+    decommission_state.proof = proof.as_ref().map(FleetCapabilityProof::with_fresh_generation);
+    drop(decommission_state);
+    let mut export_state = ilm_recovery_export_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !fleet_capability_proof_valid_at(export_state.proof.as_ref(), &topology, now) {
+        debug_assert!(
+            export_state
+                .proof
+                .as_ref()
+                .is_none_or(|current| current.generation.is_drained())
+        );
+        export_state.topology_conflict = false;
+        export_state.draining_generation = None;
+        export_state.proof = proof.as_ref().map(FleetCapabilityProof::with_fresh_generation);
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct CrossPoolFenceFleetProofGuard {
+    previous_proof: Option<FleetCapabilityProof>,
+    previous_topology_conflict: bool,
+    previous_journal_proof: Option<FleetCapabilityProof>,
+    previous_journal_topology_conflict: bool,
+    previous_decommission_proof: Option<FleetCapabilityProof>,
+    previous_decommission_topology_conflict: bool,
+}
+
+#[cfg(test)]
+impl Drop for CrossPoolFenceFleetProofGuard {
+    fn drop(&mut self) {
+        let mut state = cross_pool_fence_fleet_proof_slot()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.proof = self
+            .previous_proof
+            .take()
+            .as_ref()
+            .map(FleetCapabilityProof::with_fresh_generation);
+        state.draining_generation = None;
+        state.topology_conflict = self.previous_topology_conflict;
+        drop(state);
+        let mut journal_state = tier_delete_journal_fleet_proof_slot()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        journal_state.proof = self
+            .previous_journal_proof
+            .take()
+            .as_ref()
+            .map(FleetCapabilityProof::with_fresh_generation);
+        journal_state.draining_generation = None;
+        journal_state.topology_conflict = self.previous_journal_topology_conflict;
+        drop(journal_state);
+        let mut decommission_state = decommission_target_fence_fleet_proof_slot()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        decommission_state.proof = self
+            .previous_decommission_proof
+            .take()
+            .as_ref()
+            .map(FleetCapabilityProof::with_fresh_generation);
+        decommission_state.draining_generation = None;
+        decommission_state.topology_conflict = self.previous_decommission_topology_conflict;
+    }
+}
+
+/// Temporarily revoke the test proof so activation paths can exercise their
+/// fail-closed behavior without changing the process-wide topology binding.
+#[cfg(test)]
+pub(crate) fn without_cross_pool_fence_fleet_proof_for_test() -> CrossPoolFenceFleetProofGuard {
+    let mut state = cross_pool_fence_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut journal_state = tier_delete_journal_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut decommission_state = decommission_target_fence_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = CrossPoolFenceFleetProofGuard {
+        previous_proof: state.proof.clone(),
+        previous_topology_conflict: state.topology_conflict,
+        previous_journal_proof: journal_state.proof.clone(),
+        previous_journal_topology_conflict: journal_state.topology_conflict,
+        previous_decommission_proof: decommission_state.proof.clone(),
+        previous_decommission_topology_conflict: decommission_state.topology_conflict,
+    };
+    if let Some(proof) = state.proof.take() {
+        proof.generation.revoke();
+        if !proof.generation.is_drained() {
+            state.draining_generation = Some(proof.generation);
+        }
+    }
+    state.topology_conflict = true;
+    if let Some(proof) = journal_state.proof.take() {
+        proof.generation.revoke();
+        if !proof.generation.is_drained() {
+            journal_state.draining_generation = Some(proof.generation);
+        }
+    }
+    journal_state.topology_conflict = true;
+    if let Some(proof) = decommission_state.proof.take() {
+        proof.generation.revoke();
+        if !proof.generation.is_drained() {
+            decommission_state.draining_generation = Some(proof.generation);
+        }
+    }
+    decommission_state.topology_conflict = true;
+    guard
+}
+
+#[cfg(test)]
+pub(crate) struct DecommissionTargetFenceFleetProofGuard {
+    previous_proof: Option<FleetCapabilityProof>,
+    previous_topology_conflict: bool,
+}
+
+#[cfg(test)]
+impl Drop for DecommissionTargetFenceFleetProofGuard {
+    fn drop(&mut self) {
+        let mut state = decommission_target_fence_fleet_proof_slot()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.proof = self
+            .previous_proof
+            .take()
+            .as_ref()
+            .map(FleetCapabilityProof::with_fresh_generation);
+        state.draining_generation = None;
+        state.topology_conflict = self.previous_topology_conflict;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn without_decommission_target_fence_fleet_proof_for_test() -> DecommissionTargetFenceFleetProofGuard {
+    let mut state = decommission_target_fence_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = DecommissionTargetFenceFleetProofGuard {
+        previous_proof: state.proof.clone(),
+        previous_topology_conflict: state.topology_conflict,
+    };
+    revoke_fleet_capability_proof_state(&mut state);
+    state.topology_conflict = true;
+    guard
+}
+
 #[cfg(any(test, feature = "test-util"))]
 pub fn rotate_cross_pool_fence_fleet_proof_for_test() -> bool {
     let mut state = cross_pool_fence_fleet_proof_slot()
@@ -218,11 +1108,42 @@ pub fn rotate_cross_pool_fence_fleet_proof_for_test() -> bool {
     let Some(current) = state.proof.as_ref() else {
         return false;
     };
-    state.proof = Some(FleetCapabilityProof {
-        topology_fingerprint: current.topology_fingerprint.clone(),
-        peer_epochs: Arc::new(current.peer_epochs.as_ref().clone()),
-        expires_at: current.expires_at,
-    });
+    let proof = FleetCapabilityProof::new(
+        current.topology_fingerprint.clone(),
+        Arc::new(current.peer_epochs.as_ref().clone()),
+        current.expires_at,
+    );
+    state.proof = Some(proof.clone());
+    drop(state);
+    let mut journal_state = tier_delete_journal_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    journal_state.topology_conflict = false;
+    if let Some(previous) = journal_state.proof.take() {
+        previous.generation.revoke();
+        if !previous.generation.is_drained() {
+            journal_state.draining_generation = Some(previous.generation);
+        }
+    }
+    if journal_state
+        .draining_generation
+        .as_ref()
+        .is_some_and(|generation| generation.is_drained())
+    {
+        journal_state.draining_generation = None;
+    }
+    if journal_state.draining_generation.is_none() {
+        journal_state.proof = Some(proof.with_fresh_generation());
+    }
+    drop(journal_state);
+    let mut decommission_state = decommission_target_fence_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    decommission_state.topology_conflict = false;
+    revoke_fleet_capability_proof_state(&mut decommission_state);
+    if decommission_state.draining_generation.is_none() {
+        decommission_state.proof = Some(proof.with_fresh_generation());
+    }
     true
 }
 
@@ -234,15 +1155,22 @@ fn fleet_capability_proof_matches(
         return false;
     };
     let state = slot.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if state.topology_conflict {
-        return false;
-    }
-    state.proof.as_ref().is_some_and(|current| {
-        current.topology_fingerprint == *expected_topology
-            && current.topology_fingerprint == proof.topology_fingerprint
-            && Arc::ptr_eq(&current.peer_epochs, &proof.peer_epochs)
-            && Instant::now() < current.expires_at
-    })
+    fleet_capability_proof_matches_at(&state, proof, expected_topology, Instant::now())
+}
+
+fn fleet_capability_proof_matches_at(
+    state: &FleetCapabilityProofState,
+    proof: &FleetCapabilityProofToken,
+    expected_topology: &str,
+    now: Instant,
+) -> bool {
+    !state.topology_conflict
+        && state.proof.as_ref().is_some_and(|current| {
+            current.topology_fingerprint == expected_topology
+                && current.topology_fingerprint == proof.topology_fingerprint
+                && Arc::ptr_eq(&current.peer_epochs, &proof.peer_epochs)
+                && now < current.expires_at
+        })
 }
 
 fn fleet_capability_proof_valid_at(proof: Option<&FleetCapabilityProof>, expected_topology: &str, now: Instant) -> bool {
@@ -255,7 +1183,7 @@ pub(crate) struct RemoteVersionStateFleetProofGuard;
 #[cfg(test)]
 impl Drop for RemoteVersionStateFleetProofGuard {
     fn drop(&mut self) {
-        replace_fleet_capability_proof(remote_version_state_fleet_proof_slot(), None);
+        revoke_fleet_capability_proof(remote_version_state_fleet_proof_slot());
     }
 }
 
@@ -281,6 +1209,43 @@ pub(crate) fn install_remote_version_state_fleet_proof_for_test(topology_fingerp
     RemoteVersionStateFleetProofGuard
 }
 
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) fn install_current_remote_version_state_fleet_proof_for_test() -> RemoteVersionStateFleetProofGuard {
+    let topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY
+        .get()
+        .expect("the test store must bind its fleet topology before installing a writer proof");
+    install_remote_version_state_fleet_proof_for_test(topology)
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) struct TransitionTransactionCompactionFleetProofGuard;
+
+#[cfg(all(test, feature = "test-util"))]
+impl Drop for TransitionTransactionCompactionFleetProofGuard {
+    fn drop(&mut self) {
+        revoke_fleet_capability_proof(transition_transaction_compaction_fleet_proof_slot());
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) fn install_transition_transaction_compaction_fleet_proof_for_test(
+    topology_fingerprint: &str,
+) -> TransitionTransactionCompactionFleetProofGuard {
+    let _ = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.set(topology_fingerprint.to_string());
+    let effective_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY
+        .get()
+        .expect("transition transaction compaction test topology should be initialized");
+    if let Some(err) = publish_fleet_capability_probe_result(
+        transition_transaction_compaction_fleet_proof_slot(),
+        effective_topology,
+        Ok(BTreeMap::new()),
+        Instant::now(),
+    ) {
+        panic!("test proof installation must not fail: {err}");
+    }
+    TransitionTransactionCompactionFleetProofGuard
+}
+
 fn insert_remote_version_state_peer(peer_epochs: &mut BTreeMap<String, Uuid>, peer: String, epoch: Uuid) -> Result<()> {
     if epoch.is_nil() || peer_epochs.values().any(|existing| *existing == epoch) || peer_epochs.insert(peer, epoch).is_some() {
         return Err(Error::other("remote version state capability peer identity is invalid"));
@@ -291,47 +1256,92 @@ fn insert_remote_version_state_peer(peer_epochs: &mut BTreeMap<String, Uuid>, pe
 pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
     if REMOTE_VERSION_STATE_PROBE_TOPOLOGY.set(topology_fingerprint.clone()).is_err() {
         if REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() != Some(&topology_fingerprint) {
-            for slot in [remote_version_state_fleet_proof_slot(), cross_pool_fence_fleet_proof_slot()] {
-                let mut state = slot.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.topology_conflict = true;
-                state.proof = None;
+            for slot in all_fleet_capability_proof_slots() {
+                mark_fleet_capability_topology_conflict(slot);
             }
         }
         return;
     }
 
     tokio::spawn(async move {
+        let mut notification_sys_unavailable_logged = false;
         loop {
-            let result = match get_global_notification_sys() {
-                Some(notification_sys) => {
-                    match timeout(
-                        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
-                        notification_sys.probe_remote_version_state_fleet(&topology_fingerprint),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => Err(Error::other("remote version state fleet capability probe timed out")),
-                    }
+            let Some(notification_sys) = get_global_notification_sys() else {
+                // Startup publishes the notification system after this probe
+                // is started. Stay failed closed, but retry on the bootstrap
+                // cadence so a single node gains its capabilities as soon as
+                // the system appears instead of one full probe interval later.
+                revoke_all_fleet_capability_proofs();
+                if !notification_sys_unavailable_logged {
+                    notification_sys_unavailable_logged = true;
+                    debug!(
+                        event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        state = "waiting_for_notification_system",
+                        "notification capability probe"
+                    );
                 }
-                None => Err(Error::other("remote version state fleet capability notification system is unavailable")),
+                let _ = timeout(REMOTE_VERSION_STATE_PROBE_BOOTSTRAP_INTERVAL, NOTIFICATION_SYS_PUBLISHED.notified()).await;
+                continue;
             };
-            let fence_result = match get_global_notification_sys() {
-                Some(notification_sys) => timeout(
+            notification_sys_unavailable_logged = false;
+            let remote_version_state_probe = async {
+                timeout(
+                    REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                    notification_sys.probe_remote_version_state_fleet(&topology_fingerprint),
+                )
+                .await
+                .unwrap_or_else(|_| Err(Error::other("remote version state fleet capability probe timed out")))
+            };
+            let cross_pool_fence_probe = async {
+                timeout(
                     REMOTE_VERSION_STATE_PROBE_TIMEOUT,
                     notification_sys.probe_cross_pool_fence_fleet(&topology_fingerprint),
                 )
                 .await
-                .unwrap_or_else(|_| Err(Error::other("cross-pool fence fleet capability probe timed out"))),
-                None => Err(Error::other("cross-pool fence fleet capability notification system is unavailable")),
+                .unwrap_or_else(|_| Err(Error::other("cross-pool fence fleet capability probe timed out")))
+            };
+            let recovery_export_probe = async {
+                timeout(
+                    REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                    notification_sys.probe_ilm_recovery_export_fleet(&topology_fingerprint),
+                )
+                .await
+                .unwrap_or_else(|_| Err(Error::other("ILM recovery export fleet capability probe timed out")))
+            };
+            let transition_transaction_compaction_probe = async {
+                timeout(
+                    REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                    notification_sys.probe_transition_transaction_compaction_fleet(&topology_fingerprint),
+                )
+                .await
+                .unwrap_or_else(|_| Err(Error::other("transition transaction compaction fleet capability probe timed out")))
+            };
+            let (result, fence_probe, recovery_export_result, transition_transaction_compaction_result) = tokio::join!(
+                remote_version_state_probe,
+                cross_pool_fence_probe,
+                recovery_export_probe,
+                transition_transaction_compaction_probe
+            );
+            let (fence_result, journal_result, decommission_target_fence_result, reconcile_result) = match fence_probe {
+                Ok((peer_epochs, minimum_version)) => cross_pool_fence_policy_results(peer_epochs, minimum_version),
+                Err(err) => {
+                    let message = err.to_string();
+                    (
+                        Err(Error::other(message.clone())),
+                        Err(Error::other(message.clone())),
+                        Err(Error::other(message.clone())),
+                        Err(Error::other(message)),
+                    )
+                }
             };
             let topology_conflict = remote_version_state_fleet_proof_slot()
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .topology_conflict;
             if topology_conflict {
-                replace_fleet_capability_proof(remote_version_state_fleet_proof_slot(), None);
-                replace_fleet_capability_proof(cross_pool_fence_fleet_proof_slot(), None);
+                revoke_all_fleet_capability_proofs();
             } else if let Some(err) = publish_fleet_capability_probe_result(
                 remote_version_state_fleet_proof_slot(),
                 &topology_fingerprint,
@@ -352,7 +1362,97 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                     event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_NOTIFICATION,
-                    capability = "cross_pool_fence_v1",
+                    capability = "cross_pool_fence",
+                    state = "failed_closed",
+                    error = %err,
+                    "notification capability probe"
+                );
+            }
+            if !topology_conflict
+                && let Some(err) = publish_fleet_capability_probe_result(
+                    ilm_recovery_export_fleet_proof_slot(),
+                    &topology_fingerprint,
+                    recovery_export_result,
+                    Instant::now(),
+                )
+            {
+                debug!(
+                    event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    capability = "ilm_recovery_export_v1",
+                    state = "failed_closed",
+                    error = %err,
+                    "notification capability probe"
+                );
+            }
+            if !topology_conflict
+                && let Some(err) = publish_fleet_capability_probe_result(
+                    transition_transaction_compaction_fleet_proof_slot(),
+                    &topology_fingerprint,
+                    transition_transaction_compaction_result,
+                    Instant::now(),
+                )
+            {
+                debug!(
+                    event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    capability = "transition_transaction_compaction_v1",
+                    state = "failed_closed",
+                    error = %err,
+                    "notification capability probe"
+                );
+            }
+            if !topology_conflict
+                && let Some(err) = publish_fleet_capability_probe_result(
+                    tier_delete_journal_fleet_proof_slot(),
+                    &topology_fingerprint,
+                    journal_result,
+                    Instant::now(),
+                )
+            {
+                debug!(
+                    event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    capability = "tier_delete_journal_v6_policy",
+                    state = "failed_closed",
+                    error = %err,
+                    "notification capability probe"
+                );
+            }
+            if !topology_conflict
+                && let Some(err) = publish_fleet_capability_probe_result(
+                    decommission_target_fence_fleet_proof_slot(),
+                    &topology_fingerprint,
+                    decommission_target_fence_result,
+                    Instant::now(),
+                )
+            {
+                debug!(
+                    event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    capability = "decommission_target_fence_v2",
+                    state = "failed_closed",
+                    error = %err,
+                    "notification capability probe"
+                );
+            }
+            if !topology_conflict
+                && let Some(err) = publish_fleet_capability_probe_result(
+                    legacy_transition_state_reconcile_fleet_proof_slot(),
+                    &topology_fingerprint,
+                    reconcile_result,
+                    Instant::now(),
+                )
+            {
+                debug!(
+                    event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    capability = "legacy_transition_state_reconcile_v1",
                     state = "failed_closed",
                     error = %err,
                     "notification capability probe"
@@ -364,9 +1464,11 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
 }
 
 pub async fn new_global_notification_sys(eps: EndpointServerPools) -> Result<()> {
-    let _ = GLOBAL_NOTIFICATION_SYS
-        .set(Arc::new(NotificationSys::new(eps).await))
-        .map_err(|_| Error::other("init notification_sys fail"));
+    if GLOBAL_NOTIFICATION_SYS.set(Arc::new(NotificationSys::new(eps).await)).is_ok() {
+        // `notify_one` stores a permit, so a probe that checks availability
+        // just before this publication still wakes without losing the signal.
+        NOTIFICATION_SYS_PUBLISHED.notify_one();
+    }
     Ok(())
 }
 
@@ -426,7 +1528,29 @@ impl NotificationSys {
         Ok(peer_epochs)
     }
 
-    async fn probe_cross_pool_fence_fleet(&self, topology_fingerprint: &str) -> Result<BTreeMap<String, Uuid>> {
+    async fn probe_transition_transaction_compaction_fleet(&self, topology_fingerprint: &str) -> Result<BTreeMap<String, Uuid>> {
+        if self.peer_clients.len() != self.peer_topology_hosts.len() {
+            return Err(Error::other(
+                "transition transaction compaction capability fleet membership is incomplete",
+            ));
+        }
+        let probes = self.peer_clients.iter().map(|client| async {
+            let client = client
+                .as_ref()
+                .ok_or_else(|| Error::other("transition transaction compaction capability peer is unreachable"))?;
+            client
+                .probe_transition_transaction_compaction(topology_fingerprint.to_string())
+                .await
+        });
+        let mut peer_epochs = BTreeMap::new();
+        for result in join_all(probes).await {
+            let (peer, epoch) = result?;
+            insert_remote_version_state_peer(&mut peer_epochs, peer, epoch)?;
+        }
+        Ok(peer_epochs)
+    }
+
+    async fn probe_cross_pool_fence_fleet(&self, topology_fingerprint: &str) -> Result<(BTreeMap<String, Uuid>, u32)> {
         if self.peer_clients.len() != self.peer_topology_hosts.len() {
             return Err(Error::other("cross-pool fence capability fleet membership is incomplete"));
         }
@@ -437,14 +1561,170 @@ impl NotificationSys {
             client.probe_cross_pool_fence(topology_fingerprint.to_string()).await
         });
         let mut peer_epochs = BTreeMap::new();
+        let mut minimum_version = LOCAL_CROSS_POOL_FENCE_POLICY_SUPPORTED_VERSION;
         for result in join_all(probes).await {
             let (peer, version, epoch) = result?;
             if version < CROSS_POOL_FENCE_SUPPORTED_VERSION {
                 return Err(Error::other("cross-pool fence capability version is unsupported"));
             }
+            minimum_version = minimum_version.min(version);
             insert_remote_version_state_peer(&mut peer_epochs, peer, epoch)?;
         }
+        Ok((peer_epochs, minimum_version))
+    }
+
+    async fn probe_ilm_recovery_export_fleet(&self, topology_fingerprint: &str) -> Result<BTreeMap<String, Uuid>> {
+        if self.peer_clients.len() != self.peer_topology_hosts.len() {
+            return Err(Error::other("ILM recovery export capability fleet membership is incomplete"));
+        }
+        let local_member = runtime_sources::local_node_name().await;
+        if local_member.trim().is_empty() {
+            return Err(Error::other("ILM recovery export local member identity is unavailable"));
+        }
+        let mut peer_epochs = BTreeMap::new();
+        insert_remote_version_state_peer(&mut peer_epochs, local_member.clone(), ilm_recovery_export_local_process_epoch())?;
+        let probes = self.peer_clients.iter().map(|client| async {
+            let client = client
+                .as_ref()
+                .ok_or_else(|| Error::other("ILM recovery export capability peer is unreachable"))?;
+            client.probe_ilm_recovery_export(topology_fingerprint.to_string()).await
+        });
+        for result in join_all(probes).await {
+            let (peer, epoch) = result?;
+            insert_remote_version_state_peer(&mut peer_epochs, peer, epoch)?;
+        }
+        validate_ilm_recovery_export_members(&self.peer_topology_hosts, &local_member, &peer_epochs)?;
         Ok(peer_epochs)
+    }
+}
+
+fn validate_ilm_recovery_export_members(
+    expected_remote_members: &[String],
+    local_member: &str,
+    observed: &BTreeMap<String, Uuid>,
+) -> Result<()> {
+    let expected = expected_remote_members
+        .iter()
+        .cloned()
+        .chain(std::iter::once(local_member.to_string()))
+        .collect::<BTreeSet<_>>();
+    if expected.len() != expected_remote_members.len().saturating_add(1) || observed.keys().ne(expected.iter()) {
+        return Err(Error::other("ILM recovery export capability fleet membership does not match topology"));
+    }
+    Ok(())
+}
+
+/// Rolling tier activity summed over every cluster member that answered, with
+/// the reporting coverage behind the sum.
+///
+/// The coverage is part of the result rather than a log line: a sum over a
+/// subset of the cluster is not a cluster total, and a caller that renders it
+/// as one is the defect this type exists to prevent.
+pub struct ClusterTierDailyStats {
+    pub stats: DailyAllTierStats,
+    /// Members whose rolling day is included, always at least this node.
+    pub nodes_reporting: usize,
+    /// Members this deployment expects to hear from, including this node.
+    pub nodes_expected: usize,
+    /// Members that could not be asked, could not answer, or answered with a
+    /// ring this build refuses to merge. Sorted, and named by grid host.
+    pub unavailable_nodes: Vec<String>,
+}
+
+impl ClusterTierDailyStats {
+    pub fn is_complete(&self) -> bool {
+        self.unavailable_nodes.is_empty() && self.nodes_reporting == self.nodes_expected
+    }
+}
+
+/// Fold one member's rolling day into the running cluster total.
+///
+/// Merging (rather than adding totals) ages each member's ring to the newer
+/// clock first, so a member that stopped transitioning yesterday contributes
+/// only the hours still inside the rolling day.
+fn merge_tier_daily_stats(into: &mut DailyAllTierStats, from: DailyAllTierStats) {
+    for (tier, stats) in from {
+        match into.remove(&tier) {
+            Some(existing) => {
+                into.insert(tier, existing.merge(stats));
+            }
+            None => {
+                into.insert(tier, stats);
+            }
+        }
+    }
+}
+
+impl NotificationSys {
+    /// Sum this node's rolling tier activity with every reachable peer's.
+    ///
+    /// Each node records only the transitions it completed itself, so the sum
+    /// is a cluster total and a retried transition is counted once, by the
+    /// node that finally committed it. Peers are probed concurrently under a
+    /// per-peer deadline so one black-holed member cannot hold the admin
+    /// request open.
+    pub async fn tier_daily_stats(&self, local: DailyAllTierStats) -> ClusterTierDailyStats {
+        let mut stats = local;
+        let nodes_expected = self.peer_clients.len() + 1;
+        let mut nodes_reporting = 1;
+        let mut unavailable_nodes = Vec::new();
+
+        let mut probes = Vec::with_capacity(self.peer_clients.len());
+        for (idx, client) in self.peer_clients.iter().enumerate() {
+            let host = self.tier_daily_stats_peer_host(idx, client.as_ref());
+            probes.push(async move {
+                let Some(client) = client.as_ref() else {
+                    return (host, Err(Error::other("peer is not reachable")));
+                };
+                // The peer is already named by the caller's `peer` log field
+                // and by `unavailable_nodes`, so the deadline is reported as
+                // the typed variant rather than a formatted fragment.
+                let result = timeout(TIER_DAILY_STATS_PROBE_TIMEOUT, client.tier_daily_stats())
+                    .await
+                    .unwrap_or(Err(Error::Timeout));
+                (host, result)
+            });
+        }
+
+        for (host, result) in join_all(probes).await {
+            match result {
+                Ok(peer_stats) => {
+                    nodes_reporting += 1;
+                    merge_tier_daily_stats(&mut stats, peer_stats);
+                }
+                Err(err) => {
+                    warn!(
+                        event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        peer = host,
+                        error = %err,
+                        "tier daily stats peer did not report"
+                    );
+                    unavailable_nodes.push(host);
+                }
+            }
+        }
+
+        unavailable_nodes.sort();
+        ClusterTierDailyStats {
+            stats,
+            nodes_reporting,
+            nodes_expected,
+            unavailable_nodes,
+        }
+    }
+
+    /// Name a peer slot even when no client was ever built for it, so an
+    /// unreachable member is reported by host instead of disappearing.
+    fn tier_daily_stats_peer_host(&self, idx: usize, client: Option<&PeerRestClient>) -> String {
+        if let Some(client) = client {
+            return client.grid_host.clone();
+        }
+        self.peer_topology_hosts
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| format!("peer[{idx}]"))
     }
 }
 
@@ -719,52 +1999,68 @@ impl NotificationSys {
     {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         let endpoints = runtime_sources::endpoint_pools().unwrap_or_else(|| Vec::new().into());
-        let peer_timeout = Duration::from_secs(5);
+        let peer_timeout = admin_peer_probe_timeout();
 
         for (idx, client) in self.peer_clients.iter().enumerate() {
             let endpoints = endpoints.clone();
             let cache = self.peer_admin_caches.get(idx);
+            let topology_host = self.peer_topology_hosts.get(idx);
             futures.push(async move {
                 if let Some(client) = client {
                     let host = client.host.to_string();
-                    match timeout(peer_timeout, client.local_storage_info()).await {
+                    let deadline = Instant::now() + peer_timeout;
+                    let probe_timeout = remaining_admin_peer_probe_timeout(deadline).unwrap_or_default();
+                    match timeout(probe_timeout, client.local_storage_info()).await {
                         Ok(Ok(mut info)) => {
                             normalize_and_cache_peer_storage_info(cache, &host, &mut info);
                             Some(info)
                         }
-                        Ok(Err(err)) => {
-                            warn!("peer {} storage_info failed: {}", host, err);
-                            handle_peer_failure(cache, &host, &endpoints)
-                        }
-                        Err(_) => {
-                            warn!("peer {} storage_info timed out after {:?}", host, peer_timeout);
-                            client.evict_connection().await;
-                            handle_peer_failure(cache, &host, &endpoints)
-                        }
+                        Ok(Err(err)) => handle_peer_failure(cache, &host, &endpoints, &err),
+                        Err(_) => handle_peer_failure(cache, &host, &endpoints, &Error::Timeout),
                     }
                 } else {
-                    None
+                    topology_host.and_then(|host| {
+                        handle_peer_failure(
+                            cache,
+                            host,
+                            &endpoints,
+                            &Error::RemoteClientUnavailable("storage inventory client is unavailable".to_string()),
+                        )
+                    })
                 }
             });
         }
 
         let mut replies = join_all(futures).await;
 
-        replies.push(Some(StorageAdminApi::local_storage_info(api).await));
+        let mut local = StorageAdminApi::local_storage_info(api).await;
+        local.observations = vec![storage_info_observation(
+            &runtime_sources::local_node_name().await,
+            StorageInfoProbeStatus::Succeeded,
+            false,
+            Some((SystemTime::now(), Instant::now())),
+        )];
+        replies.push(Some(local));
 
         let mut disks = Vec::new();
+        let mut observations = Vec::new();
         for info in replies.into_iter().flatten() {
             disks.extend(info.disks);
+            observations.extend(info.observations);
         }
 
         let backend = StorageAdminApi::backend_info(api).await;
-        rustfs_madmin::StorageInfo { disks, backend }
+        rustfs_madmin::StorageInfo {
+            disks,
+            backend,
+            observations,
+        }
     }
 
     pub async fn server_info(&self) -> Vec<ServerProperties> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         let endpoints = runtime_sources::endpoint_pools().unwrap_or_else(|| Vec::new().into());
-        let peer_timeout = Duration::from_secs(5);
+        let peer_timeout = admin_peer_probe_timeout();
 
         for (idx, client) in self.peer_clients.iter().enumerate() {
             let host = self
@@ -781,12 +2077,23 @@ impl NotificationSys {
                     };
                 };
 
+                let deadline = Instant::now() + peer_timeout;
+                let Some(first_timeout) = remaining_admin_peer_probe_timeout(deadline) else {
+                    let health = peer_disk_health_with_deadline(&host, deadline).await;
+                    return PeerServerInfoProbe {
+                        host,
+                        result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                    };
+                };
+
                 // First attempt. A single evicted or half-open internode channel
                 // is enough to fail one probe and, before retrying, would drop
-                // the member to unknown/offline for this whole snapshot. So on any
-                // first-attempt failure we evict the channel and re-dial once
-                // before falling back (rustfs/backlog#1049, P1-B).
-                match timeout(peer_timeout, client.server_info()).await {
+                // the member to unknown/offline for this whole snapshot. On a
+                // quick failure we evict the channel and re-dial once before
+                // falling back (rustfs/backlog#1049, P1-B). A slow attempt
+                // consumes the round budget and therefore does not trigger a
+                // second full wait or an asynchronous eviction side effect.
+                match timeout(first_timeout, client.server_info()).await {
                     Ok(Ok(info)) => {
                         return PeerServerInfoProbe { host, result: Ok(info) };
                     }
@@ -800,14 +2107,37 @@ impl NotificationSys {
                 // `evict_connection` would leave that gate up and the retry would
                 // fast-fail with "temporarily offline" instead of reconnecting
                 // (rustfs/backlog#1049 P1-B).
-                client.prepare_retry().await;
+                let Some(retry_budget) = remaining_admin_peer_probe_timeout(deadline) else {
+                    let health = peer_disk_health_with_deadline(&host, deadline).await;
+                    return PeerServerInfoProbe {
+                        host,
+                        result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                    };
+                };
+                // Bound connection-cache cleanup too. The helper clears the offline gate even
+                // when eviction itself times out, so cancellation cannot strand this peer in
+                // fast-fail mode.
+                if !client.prepare_retry_with_timeout(retry_budget).await {
+                    let health = peer_disk_health_with_deadline(&host, deadline).await;
+                    return PeerServerInfoProbe {
+                        host,
+                        result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                    };
+                }
 
                 // Second and final attempt on the fresh channel.
-                match timeout(peer_timeout, client.server_info()).await {
+                let Some(retry_timeout) = remaining_admin_peer_probe_timeout(deadline) else {
+                    let health = peer_disk_health_with_deadline(&host, deadline).await;
+                    return PeerServerInfoProbe {
+                        host,
+                        result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                    };
+                };
+                match timeout(retry_timeout, client.server_info()).await {
                     Ok(Ok(info)) => PeerServerInfoProbe { host, result: Ok(info) },
                     Ok(Err(err)) => {
                         warn!("peer {host} server_info failed after retry: {err}");
-                        let health = peer_disk_health(&host).await;
+                        let health = peer_disk_health_with_deadline(&host, deadline).await;
                         PeerServerInfoProbe {
                             host,
                             result: Err(PeerServerInfoProbeFailure::Rpc { health }),
@@ -815,8 +2145,7 @@ impl NotificationSys {
                     }
                     Err(_) => {
                         warn!("peer {host} server_info timed out after retry ({peer_timeout:?})");
-                        client.evict_connection().await;
-                        let health = peer_disk_health(&host).await;
+                        let health = peer_disk_health_with_deadline(&host, deadline).await;
                         PeerServerInfoProbe {
                             host,
                             result: Err(PeerServerInfoProbeFailure::Rpc { health }),
@@ -1121,9 +2450,21 @@ impl NotificationSys {
             }
         }
 
-        match store.stop_rebalance_for_id(expected_rebalance_id).await {
+        let local_rebalance_id = match expected_rebalance_id {
+            Some(expected_id) => Some(expected_id.to_owned()),
+            None => store.current_rebalance_id().await,
+        };
+        match store.stop_rebalance_for_id(local_rebalance_id.as_deref()).await {
             Ok(_) => {
-                if let Err(err) = store.save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt).await {
+                let save_result = match local_rebalance_id.as_deref() {
+                    Some(expected_id) => {
+                        store
+                            .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, expected_id)
+                            .await
+                    }
+                    None => Ok(()),
+                };
+                if let Err(err) = save_result {
                     error!(
                         event = EVENT_NOTIFICATION_PEER_PROPAGATION,
                         component = LOG_COMPONENT_ECSTORE,
@@ -1414,7 +2755,7 @@ impl NotificationSys {
             futures.push(async move {
                 let client = client.ok_or_else(|| Error::other(format!("scanner activity peer[{idx}] is unreachable")))?;
                 let host = client.grid_host.clone();
-                scanner_activity_with_timeout(SCANNER_ACTIVITY_PROBE_TIMEOUT, &host, client.scanner_activity())
+                scanner_activity_with_retry(&client, &host)
                     .await
                     .map(|activity| (host, activity))
             });
@@ -1427,11 +2768,96 @@ impl NotificationSys {
         Ok(generations)
     }
 
-    pub async fn acknowledge_scanner_dirty_usage(&self, acknowledgements: Vec<(String, String, u64)>) -> Result<bool> {
+    pub async fn scanner_dirty_usage_snapshots(&self) -> Result<Vec<(String, ScannerPeerDirtyUsageSnapshot)>> {
+        if self.peer_clients.is_empty() {
+            return Err(Error::other("scanner dirty usage snapshot probe has no remote peers"));
+        }
+        if self.all_peer_clients.len() != self.peer_clients.len() + 1 {
+            return Err(Error::other("scanner dirty usage snapshot peer topology is incomplete"));
+        }
+
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().cloned() {
+            futures.push(async move {
+                let client = client.ok_or_else(|| Error::other("scanner dirty usage snapshot peer is unreachable"))?;
+                let host = client.grid_host.clone();
+                scanner_dirty_usage_snapshot_with_retry(&client, &host)
+                    .await
+                    .map(|snapshot| (host, snapshot))
+            });
+        }
+
+        let mut snapshots = Vec::with_capacity(futures.len());
+        for result in join_all(futures).await {
+            snapshots.push(result?);
+        }
+        Ok(snapshots)
+    }
+
+    pub async fn scanner_scoped_dirty_usage_capabilities(
+        &self,
+        acknowledgements: Vec<ScannerDirtyUsageAcknowledgement>,
+    ) -> Result<bool> {
         let mut by_host = HashMap::with_capacity(acknowledgements.len());
-        for (host, instance_id, generation) in acknowledgements {
-            if by_host.insert(host.clone(), (instance_id, generation)).is_some() {
-                return Err(Error::other(format!("duplicate scanner dirty usage acknowledgement target: {host}")));
+        for acknowledgement in acknowledgements {
+            let host = match &acknowledgement {
+                ScannerDirtyUsageAcknowledgement::Scoped { host, .. } => host.clone(),
+                ScannerDirtyUsageAcknowledgement::Generation { .. } => {
+                    return Err(Error::other("scanner scoped dirty usage capability requires scoped acknowledgements"));
+                }
+            };
+            if by_host.insert(host.clone(), acknowledgement).is_some() {
+                return Err(Error::other("duplicate scanner dirty usage acknowledgement target"));
+            }
+        }
+
+        let clients = self
+            .peer_clients
+            .iter()
+            .flatten()
+            .map(|client| (client.grid_host.clone(), client.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut futures = Vec::with_capacity(by_host.len());
+        for (host, acknowledgement) in by_host {
+            let Some(client) = clients.get(&host).cloned() else {
+                return Err(Error::other("scanner scoped dirty usage capability failed: peer is not reachable"));
+            };
+            futures.push(async move {
+                let ScannerDirtyUsageAcknowledgement::Scoped {
+                    owner_id,
+                    instance_id,
+                    entries,
+                    ..
+                } = acknowledgement
+                else {
+                    unreachable!("scoped acknowledgement was validated before probing");
+                };
+                timeout(
+                    SCANNER_ACTIVITY_PROBE_TIMEOUT,
+                    client.scanner_scoped_dirty_usage_capability(owner_id, instance_id, entries),
+                )
+                .await
+                .map_err(|_| Error::other("scanner scoped dirty usage capability timed out"))?
+            });
+        }
+
+        for result in join_all(futures).await {
+            if !result? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub async fn acknowledge_scanner_dirty_usage(&self, acknowledgements: Vec<ScannerDirtyUsageAcknowledgement>) -> Result<bool> {
+        let mut by_host = HashMap::with_capacity(acknowledgements.len());
+        for acknowledgement in acknowledgements {
+            let host = match &acknowledgement {
+                ScannerDirtyUsageAcknowledgement::Generation { host, .. }
+                | ScannerDirtyUsageAcknowledgement::Scoped { host, .. } => host.clone(),
+            };
+            if by_host.insert(host.clone(), acknowledgement).is_some() {
+                return Err(Error::other("duplicate scanner dirty usage acknowledgement target"));
             }
         }
 
@@ -1443,22 +2869,134 @@ impl NotificationSys {
             .collect::<HashMap<_, _>>();
         let mut failures = Vec::new();
         let mut futures = Vec::with_capacity(by_host.len());
-        for (host, (instance_id, generation)) in by_host {
+        for (host, acknowledgement) in by_host {
             let Some(client) = clients.get(&host).cloned() else {
                 failures.push(format!("peer {host} scanner dirty usage acknowledgement failed: peer is not reachable"));
                 continue;
             };
             futures.push(async move {
-                let result = scanner_activity_with_timeout(
-                    SCANNER_ACTIVITY_PROBE_TIMEOUT,
-                    &host,
-                    client.acknowledge_scanner_dirty_usage(instance_id, generation),
-                )
-                .await;
+                let result = match acknowledgement {
+                    ScannerDirtyUsageAcknowledgement::Generation {
+                        instance_id, generation, ..
+                    } => {
+                        scanner_activity_with_timeout(
+                            SCANNER_ACTIVITY_PROBE_TIMEOUT,
+                            &host,
+                            client.acknowledge_scanner_dirty_usage(instance_id, generation),
+                        )
+                        .await
+                    }
+                    ScannerDirtyUsageAcknowledgement::Scoped {
+                        owner_id,
+                        instance_id,
+                        entries,
+                        ..
+                    } => {
+                        client
+                            .acknowledge_scanner_scoped_dirty_usage(owner_id, instance_id, entries)
+                            .await
+                    }
+                };
                 (host, result)
             });
         }
         aggregate_scanner_dirty_usage_acknowledgement_results(join_all(futures).await, failures)
+    }
+
+    /// Acquire remote publication leases in a deterministic host order. A
+    /// missing/legacy peer is a hard publication deferral; already acquired
+    /// leases are released before returning so a partial acquisition cannot
+    /// pin movement on one peer.
+    pub async fn acquire_scanner_publication_leases(
+        &self,
+        mut targets: Vec<(String, String, u64)>,
+    ) -> Result<Vec<ScannerPublicationLeaseGrant>> {
+        targets.sort_by(|left, right| left.0.cmp(&right.0));
+        for pair in targets.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                return Err(Error::other(format!("duplicate scanner publication lease target: {}", pair[0].0)));
+            }
+        }
+
+        let mut grants = Vec::with_capacity(targets.len());
+        for (host, session_id, generation) in targets {
+            let Some(client) = self
+                .peer_clients
+                .iter()
+                .flatten()
+                .find(|client| client.grid_host == host)
+                .cloned()
+            else {
+                let _ = self.release_scanner_publication_leases(grants).await;
+                return Err(Error::other(format!("scanner publication lease peer {host} is unavailable")));
+            };
+            match client.acquire_scanner_publication_lease(&session_id, generation).await {
+                Ok(lease) => grants.push(ScannerPublicationLeaseGrant { host, lease }),
+                Err(err) => {
+                    let _ = self.release_scanner_publication_leases(grants).await;
+                    return Err(Error::other(format!("scanner publication lease acquisition failed: {err}")));
+                }
+            }
+        }
+        Ok(grants)
+    }
+
+    pub async fn release_scanner_publication_leases(&self, mut grants: Vec<ScannerPublicationLeaseGrant>) -> Result<()> {
+        grants.sort_by(|left, right| right.host.cmp(&left.host));
+        let mut failures = Vec::new();
+        for grant in grants {
+            let Some(client) = self
+                .peer_clients
+                .iter()
+                .flatten()
+                .find(|client| client.grid_host == grant.host)
+            else {
+                failures.push(format!("peer {} is unavailable", grant.host));
+                continue;
+            };
+            if let Err(err) = client.release_scanner_publication_lease(&grant.lease).await {
+                failures.push(format!("peer {} release failed: {err}", grant.host));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::other(format!(
+                "scanner publication lease release failures: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+
+    /// Revalidate every remote lease in deterministic host order immediately
+    /// before a final scanner metadata write.  A peer restart removes its
+    /// process-owned token table and changes its activity session, so an old
+    /// generation cannot pass this proof even when the numeric generation is
+    /// reused.
+    pub async fn validate_scanner_publication_leases(&self, grants: &[ScannerPublicationLeaseGrant]) -> Result<()> {
+        let mut grants = grants.to_vec();
+        grants.sort_by(|left, right| left.host.cmp(&right.host));
+        for pair in grants.windows(2) {
+            if pair[0].host == pair[1].host {
+                return Err(Error::other(format!("duplicate scanner publication lease target: {}", pair[0].host)));
+            }
+        }
+        for grant in grants {
+            let Some(client) = self
+                .peer_clients
+                .iter()
+                .flatten()
+                .find(|client| client.grid_host == grant.host)
+                .cloned()
+            else {
+                return Err(Error::other(format!("scanner publication lease peer {} is unavailable", grant.host)));
+            };
+            client
+                .validate_scanner_publication_lease(&grant.lease)
+                .await
+                .map_err(|err| Error::other(format!("scanner publication lease validation failed for {}: {err}", grant.host)))?;
+        }
+        Ok(())
     }
 
     pub async fn reload_site_replication_config(&self) -> Vec<NotificationPeerErr> {
@@ -1662,12 +3200,13 @@ impl NotificationSys {
         join_all(futures).await
     }
 
-    pub async fn abort_tier_mutation(&self, mutation_id: Uuid) -> Vec<NotificationPeerErr> {
+    pub async fn abort_tier_mutation(&self, mutation_id: Uuid, canonical_prepare_payload: Bytes) -> Vec<NotificationPeerErr> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter().cloned() {
+            let payload = canonical_prepare_payload.clone();
             futures.push(async move {
                 if let Some(client) = client {
-                    notification_peer_result(client.host.to_string(), client.abort_tier_mutation(mutation_id).await)
+                    notification_peer_result(client.host.to_string(), client.abort_tier_mutation(mutation_id, payload).await)
                 } else {
                     unreachable_notification_peer_err()
                 }
@@ -1797,6 +3336,98 @@ where
         .map_err(|_| Error::other(format!("scanner activity peer {host} timed out after {timeout_duration:?}")))?
 }
 
+/// Classify transport-only activity failures without treating an answered
+/// peer's application error as an outage.
+pub fn scanner_peer_transport_error_message_is_retryable(error: &str) -> bool {
+    crate::cluster::rpc::client::message_has_network_needle(error)
+}
+
+fn scanner_activity_should_retry(first_error: Option<&Error>, timed_out: bool) -> bool {
+    timed_out || first_error.is_some_and(PeerRestClient::is_network_like_error)
+}
+
+/// Retry one activity probe after a bounded reconnect when the first attempt
+/// failed at the transport boundary.  A peer that answered with an invalid or
+/// incompatible activity response is not retried here: it must remain a hard
+/// fail-closed result for the all-peer publication proof.
+async fn scanner_activity_with_retry(client: &PeerRestClient, host: &str) -> Result<ScannerPeerActivity> {
+    let first = timeout(SCANNER_ACTIVITY_PROBE_TIMEOUT, client.scanner_activity()).await;
+    let should_retry = match &first {
+        Ok(Ok(_)) => false,
+        Ok(Err(err)) => scanner_activity_should_retry(Some(err), false),
+        Err(_) => scanner_activity_should_retry(None, true),
+    };
+
+    match first {
+        Ok(Ok(activity)) => return Ok(activity),
+        Ok(Err(err)) if !should_retry => return Err(err),
+        Ok(Err(err)) => {
+            debug!(peer = host, error = %err, "scanner activity probe failed on first transport attempt; reconnecting");
+            client.prepare_retry().await;
+        }
+        Err(_) => {
+            debug!(peer = host, timeout = ?SCANNER_ACTIVITY_PROBE_TIMEOUT, "scanner activity probe timed out on first attempt; reconnecting");
+            client.prepare_retry().await;
+        }
+    }
+
+    match timeout(SCANNER_ACTIVITY_PROBE_TIMEOUT, client.scanner_activity()).await {
+        Ok(result) => result,
+        Err(_) => {
+            client.evict_connection().await;
+            Err(Error::Timeout)
+        }
+    }
+}
+
+async fn scanner_dirty_usage_snapshot_with_retry(client: &PeerRestClient, host: &str) -> Result<ScannerPeerDirtyUsageSnapshot> {
+    let first = timeout(SCANNER_ACTIVITY_PROBE_TIMEOUT, client.scanner_dirty_usage_snapshot()).await;
+    let should_retry = match &first {
+        Ok(Ok(_)) => false,
+        Ok(Err(err)) => scanner_activity_should_retry(Some(err), false),
+        Err(_) => scanner_activity_should_retry(None, true),
+    };
+
+    match first {
+        Ok(Ok(snapshot)) => return Ok(snapshot),
+        Ok(Err(err)) if !should_retry => return Err(err),
+        Ok(Err(err)) => {
+            debug!(
+                event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                result = "retrying",
+                capability = "scanner_dirty_usage_snapshot",
+                peer = host,
+                error = %err,
+                "notification capability probe retrying"
+            );
+            client.prepare_retry().await;
+        }
+        Err(_) => {
+            debug!(
+                event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                result = "retrying",
+                capability = "scanner_dirty_usage_snapshot",
+                peer = host,
+                timeout = ?SCANNER_ACTIVITY_PROBE_TIMEOUT,
+                "notification capability probe retrying"
+            );
+            client.prepare_retry().await;
+        }
+    }
+
+    match timeout(SCANNER_ACTIVITY_PROBE_TIMEOUT, client.scanner_dirty_usage_snapshot()).await {
+        Ok(result) => result,
+        Err(_) => {
+            client.evict_connection().await;
+            Err(Error::Timeout)
+        }
+    }
+}
+
 #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 async fn call_peer_with_timeout<F, Fut>(
     timeout_dur: Duration,
@@ -1821,56 +3452,80 @@ where
     }
 }
 
-/// Handle a peer failure for storage_info: return cached data if available,
-/// or mark offline only after consecutive failures exceed the threshold.
+fn storage_info_observation(
+    host: &str,
+    status: StorageInfoProbeStatus,
+    cached: bool,
+    last_success: Option<(SystemTime, Instant)>,
+) -> StorageInfoObservation {
+    StorageInfoObservation {
+        endpoint: host.to_string(),
+        status,
+        cached,
+        last_success_unix_millis: last_success
+            .and_then(|(wall, _)| wall.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .and_then(|age| u64::try_from(age.as_millis()).ok()),
+        snapshot_age_seconds: last_success.map(|(_, monotonic)| monotonic.elapsed().as_secs()),
+        error_code: None,
+    }
+}
+
+/// An admin RPC failure is missing evidence, not evidence of failed drives.
+/// Preserve bounded historical inventory without presenting its states as live.
 fn handle_peer_failure(
     cache: Option<&Mutex<PeerAdminCache>>,
     host: &str,
     endpoints: &EndpointServerPools,
+    error: &Error,
 ) -> Option<StorageInfo> {
-    let cache = cache?;
-
-    let mut c = match cache.lock() {
-        Ok(cache) => cache,
-        Err(poisoned) => {
-            warn!("peer {host} storage_info cache mutex poisoned");
-            poisoned.into_inner()
-        }
-    };
-    c.storage_failures += 1;
-
-    if let Some(ref cached) = c.last_storage_info
-        && c.storage_failures < CONSECUTIVE_FAILURE_THRESHOLD
-    {
-        debug!(
-            event = "peer_probe_failure",
-            peer = host,
-            probe = "storage_info",
-            consecutive_failures = c.storage_failures,
-            threshold = CONSECUTIVE_FAILURE_THRESHOLD,
-            "peer storage_info probe failed; returning cached state until the offline threshold is reached"
-        );
-        return Some(cached.clone());
-    }
-
-    if c.storage_failures >= CONSECUTIVE_FAILURE_THRESHOLD {
-        if c.storage_failures == CONSECUTIVE_FAILURE_THRESHOLD {
+    let mut cache = cache.map(|cache| cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    let last_success = cache.as_ref().and_then(|cache| cache.last_storage_success);
+    let historical = cache
+        .as_ref()
+        .filter(|_| last_success.is_some_and(|(_, when)| when.elapsed() < STORAGE_INFO_CACHE_MAX_AGE))
+        .and_then(|cache| cache.last_storage_info.clone());
+    let cached = historical.is_some();
+    let mut info = historical.unwrap_or_else(|| StorageInfo {
+        disks: synthesized_disks(host, endpoints, ItemState::Unknown),
+        ..Default::default()
+    });
+    if let Some(cache) = &mut cache {
+        cache.storage_failures = cache.storage_failures.saturating_add(1);
+        if cache.storage_failures == 1 {
             warn!(
-                event = "peer_marked_offline",
+                event = EVENT_STORAGE_INFO_PROBE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                state = "failed",
                 peer = host,
-                probe = "storage_info",
-                consecutive_failures = c.storage_failures,
-                threshold = CONSECUTIVE_FAILURE_THRESHOLD,
-                "reporting peer disks offline after consecutive storage_info failures"
+                error_code = ?error.code(),
+                cached,
+                "Storage inventory probe failed; current drive health is unknown"
             );
         }
-        return Some(StorageInfo {
-            disks: synthesized_disks(host, endpoints, ItemState::Offline),
-            ..Default::default()
-        });
     }
-
-    None
+    for disk in &mut info.disks {
+        disk.state = rustfs_madmin::ITEM_UNKNOWN.to_string();
+        disk.runtime_state = Some(rustfs_madmin::ITEM_UNKNOWN.to_string());
+        disk.offline_duration_seconds = None;
+        disk.capacity_observation_source = Some(if cached { "snapshot" } else { "missing" }.to_string());
+        disk.capacity_observation_age_seconds = if cached {
+            disk.capacity_observation_age_seconds
+                .zip(last_success)
+                .map(|(age, (_, when))| age.saturating_add(when.elapsed().as_secs()))
+        } else {
+            None
+        };
+        disk.local = false;
+    }
+    info.observations = vec![storage_info_observation(
+        host,
+        StorageInfoProbeStatus::Failed,
+        cached,
+        last_success,
+    )];
+    info.observations[0].error_code = Some(format!("{:?}", error.code()));
+    Some(info)
 }
 
 fn normalize_and_cache_peer_storage_info(cache: Option<&Mutex<PeerAdminCache>>, host: &str, info: &mut StorageInfo) {
@@ -1879,6 +3534,15 @@ fn normalize_and_cache_peer_storage_info(cache: Option<&Mutex<PeerAdminCache>>, 
     for disk in &mut info.disks {
         disk.local = false;
     }
+    let last_success = (SystemTime::now(), Instant::now());
+    // The aggregator owns probe provenance, including when an older peer
+    // returns no observation or a peer sends its own observation fields.
+    info.observations = vec![storage_info_observation(
+        host,
+        StorageInfoProbeStatus::Succeeded,
+        false,
+        Some(last_success),
+    )];
 
     let Some(cache) = cache else {
         return;
@@ -1891,16 +3555,20 @@ fn normalize_and_cache_peer_storage_info(cache: Option<&Mutex<PeerAdminCache>>, 
             poisoned.into_inner()
         }
     };
-    if c.storage_failures >= CONSECUTIVE_FAILURE_THRESHOLD {
+    if c.storage_failures > 0 {
         info!(
-            event = "peer_recovered_online",
+            event = EVENT_STORAGE_INFO_PROBE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+            state = "succeeded",
             peer = host,
             probe = "storage_info",
             consecutive_failures = c.storage_failures,
-            "peer storage_info probe succeeded again; peer disks reported online"
+            "Storage inventory probe recovered"
         );
     }
     c.last_storage_info = Some(info.clone());
+    c.last_storage_success = Some(last_success);
     c.storage_failures = 0;
 }
 
@@ -1957,7 +3625,7 @@ async fn peer_disk_health(host: &str) -> Option<PeerDiskHealth> {
                 disks.push(rustfs_madmin::Disk {
                     endpoint: ep.to_string(),
                     state: if online {
-                        rustfs_common::heal_channel::DriveState::Ok.to_string()
+                        rustfs_heal_contracts::heal_channel::DriveState::Ok.to_string()
                     } else {
                         ItemState::Offline.to_string().to_owned()
                     },
@@ -1975,6 +3643,11 @@ async fn peer_disk_health(host: &str) -> Option<PeerDiskHealth> {
     } else {
         Some(PeerDiskHealth { any_online, disks })
     }
+}
+
+async fn peer_disk_health_with_deadline(host: &str, deadline: Instant) -> Option<PeerDiskHealth> {
+    let remaining = remaining_admin_peer_probe_timeout(deadline)?;
+    timeout(remaining, peer_disk_health(host)).await.ok().flatten()
 }
 
 /// Handle a peer failure for server_info: return cached data if available, or
@@ -2257,17 +3930,146 @@ fn aggregate_scanner_dirty_usage_acknowledgement_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
+    use rustfs_data_usage::TierStats;
+
+    fn ring(total_size: u64) -> LastDayTierStats {
+        let mut stats = LastDayTierStats::default();
+        stats.add_stats(TierStats {
+            total_size,
+            num_versions: 1,
+            num_objects: 1,
+        });
+        stats
+    }
+
+    /// rustfs/rustfs#8014: IAM finalization starts the fleet probe before the
+    /// notification system is published. The first probe therefore fails
+    /// closed, and a single node used to wait a full probe interval before the
+    /// durable quota capability appeared, even though `/health` was already
+    /// reporting ok. The probe must retry promptly while it waits for startup
+    /// to publish the notification system.
+    #[tokio::test]
+    async fn fleet_probe_publishes_promptly_once_the_notification_system_appears() {
+        if REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get().is_some() || GLOBAL_NOTIFICATION_SYS.get().is_some() {
+            // Process-wide state was bound by another test in this binary. The
+            // startup ordering under test needs a fresh process; nextest
+            // (the authoritative runner) always provides one.
+            eprintln!("skipping: fleet probe globals already bound in this process");
+            return;
+        }
+
+        // Share the fingerprint every other proof-installing test in this crate
+        // binds, so the plain `cargo test` fallback cannot see two topologies.
+        start_remote_version_state_fleet_probe("object-transaction-fencing-test".to_string());
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            acquire_cross_pool_fence_fleet_proof().is_none(),
+            "no capability proof may exist before the notification system is published"
+        );
+
+        let published_at = Instant::now();
+        new_global_notification_sys(EndpointServerPools::default())
+            .await
+            .expect("single-node notification system initializes");
+
+        let observed = timeout(Duration::from_secs(2), async {
+            while acquire_cross_pool_fence_fleet_proof().is_none() {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            observed.is_ok(),
+            "single-node cross-pool fence proof should publish within 2s of the notification system, waited {:?}",
+            published_at.elapsed()
+        );
+    }
+
+    #[test]
+    fn merging_peer_rings_sums_each_tier_without_double_counting() {
+        let mut cluster = DailyAllTierStats::from([("WARM".to_string(), ring(10))]);
+
+        merge_tier_daily_stats(
+            &mut cluster,
+            DailyAllTierStats::from([("WARM".to_string(), ring(20)), ("COLD".to_string(), ring(5))]),
+        );
+
+        assert_eq!(
+            cluster.get("WARM").expect("the shared tier must survive the merge").total(),
+            TierStats {
+                total_size: 30,
+                num_versions: 2,
+                num_objects: 2,
+            },
+            "both nodes' completions belong in the cluster total"
+        );
+        assert_eq!(
+            cluster.get("COLD").expect("a tier only one node saw must be kept").total(),
+            TierStats {
+                total_size: 5,
+                num_versions: 1,
+                num_objects: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_single_member_result_is_complete_and_a_missing_peer_is_not() {
+        let complete = ClusterTierDailyStats {
+            stats: DailyAllTierStats::new(),
+            nodes_reporting: 1,
+            nodes_expected: 1,
+            unavailable_nodes: Vec::new(),
+        };
+        assert!(complete.is_complete(), "a single-member deployment reports its whole cluster");
+
+        let partial = ClusterTierDailyStats {
+            stats: DailyAllTierStats::new(),
+            nodes_reporting: 1,
+            nodes_expected: 2,
+            unavailable_nodes: vec!["node-b:9000".to_string()],
+        };
+        assert!(!partial.is_complete(), "a silent member must make the sum partial");
+    }
+
+    #[test]
+    fn cross_pool_policy_versions_authorize_only_their_supported_protocols() {
+        let peers = BTreeMap::from([("node-b:9000".to_string(), Uuid::new_v4())]);
+        let (generic_v2, journal_v2, decommission_v2, reconcile_v2) = cross_pool_fence_policy_results(peers.clone(), 2);
+        assert!(generic_v2.is_ok(), "v2 remains valid for existing cross-pool fencing");
+        assert!(journal_v2.is_err(), "a mixed v2/v3 fleet must fail closed for journal-v6 deletion");
+        assert!(decommission_v2.is_err(), "v2 cannot authorize the sticky per-target decommission fence");
+        assert!(reconcile_v2.is_err(), "v2 cannot authorize legacy transition-state reconciliation");
+
+        let (generic_v3, journal_v3, decommission_v3, reconcile_v3) = cross_pool_fence_policy_results(peers.clone(), 3);
+        assert!(generic_v3.is_ok());
+        assert!(journal_v3.is_ok(), "an all-v3 fleet may authorize journal-v6 deletion");
+        assert!(decommission_v3.is_err(), "v3 members do not understand the per-target decommission fence");
+        assert!(reconcile_v3.is_err());
+
+        let (generic_v4, journal_v4, decommission_v4, reconcile_v4) = cross_pool_fence_policy_results(peers.clone(), 4);
+        assert!(generic_v4.is_ok());
+        assert!(journal_v4.is_ok());
+        assert!(decommission_v4.is_ok(), "an all-v4 fleet may create sticky per-target reservations");
+        assert!(reconcile_v4.is_err(), "v4 does not support conditional transition metadata writes");
+
+        let (generic_v5, journal_v5, decommission_v5, reconcile_v5) = cross_pool_fence_policy_results(peers, 5);
+        assert!(generic_v5.is_ok());
+        assert!(journal_v5.is_ok());
+        assert!(decommission_v5.is_ok());
+        assert!(
+            reconcile_v5.is_ok(),
+            "only an all-v5 fleet preserves destination identity and conditional reconcile writes"
+        );
+    }
 
     #[test]
     fn remote_version_state_fleet_proof_rejects_stale_or_mismatched_membership() {
         let now = Instant::now();
         let mut peer_epochs = BTreeMap::new();
         peer_epochs.insert("peer-a".to_string(), Uuid::new_v4());
-        let proof = FleetCapabilityProof {
-            topology_fingerprint: "topology-a".to_string(),
-            peer_epochs: Arc::new(peer_epochs),
-            expires_at: now + Duration::from_secs(1),
-        };
+        let proof = FleetCapabilityProof::new("topology-a".to_string(), Arc::new(peer_epochs), now + Duration::from_secs(1));
 
         assert!(fleet_capability_proof_valid_at(Some(&proof), "topology-a", now));
         assert!(!fleet_capability_proof_valid_at(Some(&proof), "topology-b", now));
@@ -2286,11 +4088,7 @@ mod tests {
     #[test]
     fn remote_version_state_fleet_proof_accepts_single_node_membership() {
         let now = Instant::now();
-        let proof = FleetCapabilityProof {
-            topology_fingerprint: "topology-a".to_string(),
-            peer_epochs: Arc::new(BTreeMap::new()),
-            expires_at: now + Duration::from_secs(1),
-        };
+        let proof = FleetCapabilityProof::new("topology-a".to_string(), Arc::new(BTreeMap::new()), now + Duration::from_secs(1));
 
         assert!(fleet_capability_proof_valid_at(Some(&proof), "topology-a", now));
     }
@@ -2298,19 +4096,170 @@ mod tests {
     #[test]
     fn remote_version_state_fleet_proof_token_changes_with_process_epoch() {
         let now = Instant::now();
-        let proof = FleetCapabilityProof {
-            topology_fingerprint: "topology-a".to_string(),
-            peer_epochs: Arc::new(BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())])),
-            expires_at: now + Duration::from_secs(1),
-        };
+        let proof = FleetCapabilityProof::new(
+            "topology-a".to_string(),
+            Arc::new(BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())])),
+            now + Duration::from_secs(1),
+        );
         let captured = proof.token();
-        let restarted = FleetCapabilityProof {
-            topology_fingerprint: proof.topology_fingerprint.clone(),
-            peer_epochs: Arc::new(BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())])),
-            expires_at: proof.expires_at,
-        };
+        let restarted = FleetCapabilityProof::new(
+            proof.topology_fingerprint.clone(),
+            Arc::new(BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())])),
+            proof.expires_at,
+        );
 
         assert!(captured != restarted.token());
+    }
+
+    #[test]
+    fn ilm_recovery_export_member_digest_is_order_independent_and_epoch_bound() {
+        let now = Instant::now();
+        let local_epoch = ilm_recovery_export_local_process_epoch();
+        assert!(!local_epoch.is_nil());
+        assert_eq!(local_epoch, ilm_recovery_export_local_process_epoch());
+        let remote_epoch = Uuid::new_v4();
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let peers = BTreeMap::from([("node-b".to_string(), remote_epoch), ("node-a".to_string(), local_epoch)]);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(peers), now).is_none());
+        let proof = {
+            let state = slot.read().expect("export proof slot should not poison");
+            acquire_ilm_recovery_export_fleet_proof_from(&state, "topology-a", now).expect("complete fleet should admit export")
+        };
+        let digest = ilm_recovery_export_member_epochs_sha256(&proof);
+
+        let changed_slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let changed = BTreeMap::from([("node-a".to_string(), local_epoch), ("node-b".to_string(), Uuid::new_v4())]);
+        assert!(publish_fleet_capability_probe_result(&changed_slot, "topology-a", Ok(changed), now).is_none());
+        let changed_proof = {
+            let state = changed_slot.read().expect("export proof slot should not poison");
+            acquire_ilm_recovery_export_fleet_proof_from(&state, "topology-a", now).expect("complete fleet should admit export")
+        };
+        assert_ne!(digest, ilm_recovery_export_member_epochs_sha256(&changed_proof));
+    }
+
+    #[test]
+    fn ilm_recovery_export_members_must_match_the_exact_topology() {
+        let expected_remote = vec!["node-b".to_string()];
+        let local = "node-a";
+        let complete = BTreeMap::from([
+            (local.to_string(), Uuid::new_v4()),
+            (expected_remote[0].clone(), Uuid::new_v4()),
+        ]);
+        assert!(validate_ilm_recovery_export_members(&expected_remote, local, &complete).is_ok());
+
+        let unexpected = BTreeMap::from([(local.to_string(), Uuid::new_v4()), ("node-c".to_string(), Uuid::new_v4())]);
+        assert!(validate_ilm_recovery_export_members(&expected_remote, local, &unexpected).is_err());
+        assert!(
+            validate_ilm_recovery_export_members(&[local.to_string()], local, &complete).is_err(),
+            "the configured remote set cannot repeat the local member"
+        );
+    }
+
+    #[test]
+    fn ilm_recovery_export_restart_revokes_authority_until_permit_drains() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let original = BTreeMap::from([("node-a".to_string(), Uuid::new_v4())]);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(original), now).is_none());
+        let admitted = {
+            let state = slot.read().expect("export proof slot should not poison");
+            acquire_ilm_recovery_export_fleet_proof_from(&state, "topology-a", now).expect("fresh fleet should admit export")
+        };
+
+        let restarted = BTreeMap::from([("node-a".to_string(), Uuid::new_v4())]);
+        let draining = publish_fleet_capability_probe_result(&slot, "topology-a", Ok(restarted.clone()), now)
+            .expect("restart must wait for the admitted export effect window");
+        assert!(draining.to_string().contains("previous generation to drain"));
+        {
+            let state = slot.read().expect("export proof slot should not poison");
+            assert!(!ilm_recovery_export_fleet_proof_matches_at(&state, &admitted, "topology-a", now));
+            assert!(
+                acquire_ilm_recovery_export_fleet_proof_from(&state, "topology-a", now).is_none(),
+                "successor authority must wait for the old effect window to drain"
+            );
+        }
+        drop(admitted);
+        assert!(
+            publish_fleet_capability_probe_result(&slot, "topology-a", Ok(restarted), now + Duration::from_millis(1)).is_none()
+        );
+        let state = slot.read().expect("export proof slot should not poison");
+        assert!(acquire_ilm_recovery_export_fleet_proof_from(&state, "topology-a", now).is_some());
+    }
+
+    #[test]
+    fn tier_delete_journal_generation_is_stable_across_members_and_process_restarts() {
+        let topology = "topology-a";
+        let now = Instant::now();
+        let node_a_view = FleetCapabilityProof::new(
+            topology.to_string(),
+            Arc::new(BTreeMap::from([("node-b".to_string(), Uuid::new_v4())])),
+            now + Duration::from_secs(1),
+        );
+        let node_b_view = FleetCapabilityProof::new(
+            topology.to_string(),
+            Arc::new(BTreeMap::from([("node-a".to_string(), Uuid::new_v4())])),
+            now + Duration::from_secs(1),
+        );
+        let restarted_node_a_view = FleetCapabilityProof::new(
+            topology.to_string(),
+            Arc::new(BTreeMap::from([("node-b".to_string(), Uuid::new_v4())])),
+            now + Duration::from_secs(1),
+        );
+
+        let generations = [&node_a_view, &node_b_view, &restarted_node_a_view]
+            .map(|proof| stable_tier_delete_journal_topology_generation(&proof.token().topology_fingerprint));
+        assert_eq!(generations[0], generations[1]);
+        assert_eq!(generations[0], generations[2]);
+        assert_ne!(
+            generations[0],
+            stable_tier_delete_journal_topology_generation("topology-b"),
+            "a real topology change must produce a different durable generation"
+        );
+    }
+
+    #[test]
+    fn tier_delete_journal_restart_revokes_old_token_but_fresh_token_recovers_same_generation() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let original_peers = BTreeMap::from([("node-b".to_string(), Uuid::new_v4())]);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(original_peers), now).is_none());
+        let original = slot
+            .read()
+            .expect("proof slot should not poison")
+            .proof
+            .as_ref()
+            .expect("successful probe should publish proof")
+            .token();
+        let original_generation = stable_tier_delete_journal_topology_generation(&original.topology_fingerprint);
+
+        let restarted_peers = BTreeMap::from([("node-b".to_string(), Uuid::new_v4())]);
+        assert!(
+            publish_fleet_capability_probe_result(&slot, "topology-a", Ok(restarted_peers), now + Duration::from_millis(1))
+                .is_none()
+        );
+        let state = slot.read().expect("proof slot should not poison");
+        let fresh = state
+            .proof
+            .as_ref()
+            .expect("restart probe should publish a fresh proof")
+            .token();
+
+        assert!(!fleet_capability_proof_matches_at(
+            &state,
+            &original,
+            "topology-a",
+            now + Duration::from_millis(2)
+        ));
+        assert!(fleet_capability_proof_matches_at(
+            &state,
+            &fresh,
+            "topology-a",
+            now + Duration::from_millis(2)
+        ));
+        assert_eq!(
+            original_generation,
+            stable_tier_delete_journal_topology_generation(&fresh.topology_fingerprint)
+        );
     }
 
     #[test]
@@ -2353,14 +4302,333 @@ mod tests {
     }
 
     #[test]
+    fn tier_delete_journal_successor_waits_for_inflight_generation_to_drain() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let original_peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(original_peers), now).is_none());
+
+        let admitted = {
+            let state = slot.read().expect("proof slot should not poison");
+            acquire_tier_delete_journal_fleet_proof_from(&state, "topology-a", now)
+                .expect("a fresh proof should admit one journal operation")
+        };
+        {
+            let state = slot.read().expect("proof slot should not poison");
+            assert!(
+                tier_delete_journal_fleet_proof_matches_at(&state, &admitted, "topology-a", now),
+                "a freshly admitted journal proof must remain current"
+            );
+            assert!(
+                acquire_tier_delete_journal_fleet_proof_from(&state, "topology-a", now + REMOTE_VERSION_STATE_PROOF_TTL,)
+                    .is_none(),
+                "TTL expiry must stop new admission"
+            );
+            assert!(
+                !tier_delete_journal_fleet_proof_matches_at(
+                    &state,
+                    &admitted,
+                    "topology-a",
+                    now + REMOTE_VERSION_STATE_PROOF_TTL,
+                ),
+                "TTL expiry must also stop an admitted proof at its next durable fence"
+            );
+            assert!(!admitted._permit.generation.is_drained());
+        }
+
+        let restarted_peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        let blocked = publish_fleet_capability_probe_result(
+            &slot,
+            "topology-a",
+            Ok(restarted_peers.clone()),
+            now + Duration::from_millis(1),
+        )
+        .expect("a successor proof must wait for the admitted generation");
+        assert!(blocked.to_string().contains("previous generation to drain"));
+        {
+            let state = slot.read().expect("proof slot should not poison");
+            assert!(state.proof.is_none(), "new operations must remain closed while the predecessor drains");
+            assert!(state.draining_generation.is_some());
+            assert!(
+                !tier_delete_journal_fleet_proof_matches_at(&state, &admitted, "topology-a", now + Duration::from_millis(1),),
+                "a restarted peer must revoke an admitted proof before its next durable fence"
+            );
+        }
+
+        drop(admitted);
+        assert!(
+            publish_fleet_capability_probe_result(&slot, "topology-a", Ok(restarted_peers), now + Duration::from_millis(2),)
+                .is_none(),
+            "the successor may publish after the in-flight operation releases its permit"
+        );
+        let state = slot.read().expect("proof slot should not poison");
+        assert!(state.proof.is_some());
+        assert!(state.draining_generation.is_none());
+    }
+
+    #[test]
+    fn tier_delete_journal_topology_conflict_revokes_admitted_generation() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(peers), now).is_none());
+        let admitted = {
+            let state = slot.read().expect("proof slot should not poison");
+            acquire_tier_delete_journal_fleet_proof_from(&state, "topology-a", now)
+                .expect("a fresh proof should admit one journal operation")
+        };
+
+        mark_fleet_capability_topology_conflict(&slot);
+
+        let state = slot.read().expect("proof slot should not poison");
+        assert!(state.topology_conflict);
+        assert!(state.proof.is_none());
+        assert!(state.draining_generation.is_some());
+        assert!(!admitted._permit.generation.is_accepting());
+        assert!(
+            !tier_delete_journal_fleet_proof_matches_at(&state, &admitted, "topology-a", now),
+            "topology conflict must revoke an already admitted journal proof"
+        );
+    }
+
+    #[test]
+    fn legacy_transition_state_reconcile_admits_only_compatible_single_and_multi_node_fleets() {
+        let now = Instant::now();
+        for peers in [
+            BTreeMap::new(),
+            BTreeMap::from([("peer-a".to_string(), Uuid::new_v4()), ("peer-b".to_string(), Uuid::new_v4())]),
+        ] {
+            let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+            let (_, _, _, result) =
+                cross_pool_fence_policy_results(peers, LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION);
+            assert!(publish_fleet_capability_probe_result(&slot, "topology-a", result, now).is_none());
+
+            let admitted = {
+                let state = slot.read().expect("reconcile proof slot should not poison");
+                acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now)
+                    .expect("an all-compatible fleet should admit reconciliation")
+            };
+            let state = slot.read().expect("reconcile proof slot should not poison");
+            assert!(legacy_transition_state_reconcile_fleet_proof_matches_at(
+                &state,
+                &admitted,
+                "topology-a",
+                now,
+            ));
+        }
+    }
+
+    #[test]
+    fn legacy_transition_state_reconcile_restart_drains_concurrent_effect_windows() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let original_peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        let (_, _, _, original_result) =
+            cross_pool_fence_policy_results(original_peers, LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", original_result, now).is_none());
+
+        let (first, second) = {
+            let state = slot.read().expect("reconcile proof slot should not poison");
+            (
+                acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now)
+                    .expect("the first reconcile writer should be admitted"),
+                acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now)
+                    .expect("the second reconcile writer should be admitted"),
+            )
+        };
+
+        let restarted_peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        let (_, _, _, restarted_result) =
+            cross_pool_fence_policy_results(restarted_peers.clone(), LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION);
+        let blocked =
+            publish_fleet_capability_probe_result(&slot, "topology-a", restarted_result, now + Duration::from_millis(1))
+                .expect("a restarted member must revoke the old generation and wait for both writers");
+        assert!(blocked.to_string().contains("previous generation to drain"));
+        {
+            let state = slot.read().expect("reconcile proof slot should not poison");
+            assert!(state.proof.is_none());
+            assert!(state.draining_generation.is_some());
+            assert!(!legacy_transition_state_reconcile_fleet_proof_matches_at(
+                &state,
+                &first,
+                "topology-a",
+                now + Duration::from_millis(1),
+            ));
+            assert!(!legacy_transition_state_reconcile_fleet_proof_matches_at(
+                &state,
+                &second,
+                "topology-a",
+                now + Duration::from_millis(1),
+            ));
+        }
+
+        drop(first);
+        let (_, _, _, still_blocked_result) =
+            cross_pool_fence_policy_results(restarted_peers.clone(), LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION);
+        assert!(
+            publish_fleet_capability_probe_result(&slot, "topology-a", still_blocked_result, now + Duration::from_millis(2),)
+                .is_some(),
+            "one remaining writer must keep the successor generation closed"
+        );
+
+        drop(second);
+        let (_, _, _, admitted_result) =
+            cross_pool_fence_policy_results(restarted_peers, LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION);
+        assert!(
+            publish_fleet_capability_probe_result(&slot, "topology-a", admitted_result, now + Duration::from_millis(3),)
+                .is_none(),
+            "the restarted generation may publish only after every old writer drains"
+        );
+    }
+
+    #[test]
+    fn legacy_transition_state_reconcile_fresh_observation_closes_the_polling_window() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let original_peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        let (_, _, _, original_result) =
+            cross_pool_fence_policy_results(original_peers.clone(), LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", original_result, now).is_none());
+        let admitted = {
+            let state = slot.read().expect("reconcile proof slot should not poison");
+            acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now)
+                .expect("the original fleet should admit reconciliation")
+        };
+
+        let restarted_peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        let state = slot.read().expect("reconcile proof slot should not poison");
+        assert!(
+            legacy_transition_state_reconcile_fleet_proof_matches_at(&state, &admitted, "topology-a", now),
+            "the periodic cache has not observed the restart yet"
+        );
+        assert!(!legacy_transition_state_reconcile_fleet_proof_matches_observation_at(
+            &state,
+            &admitted,
+            "topology-a",
+            &restarted_peers,
+            now,
+        ));
+
+        let (_, _, _, downgraded) = cross_pool_fence_policy_results(original_peers, 4);
+        assert!(
+            downgraded.is_err(),
+            "a synchronous observation of a downgraded peer must fail before any cached proof can authorize a write"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_transition_state_reconcile_invalid_token_skips_fleet_observation() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(peers), now).is_none());
+        let admitted = {
+            let state = slot.read().expect("reconcile proof slot should not poison");
+            acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now)
+                .expect("the original fleet should admit reconciliation")
+        };
+        revoke_fleet_capability_proof(&slot);
+
+        assert!(
+            !legacy_transition_state_reconcile_fleet_proof_matches_with_observer(&slot, &admitted, "topology-a", || async {
+                panic!("an invalid local generation must not trigger a fleet observation");
+            },)
+            .await
+        );
+    }
+
+    #[test]
+    fn legacy_transition_state_reconcile_membership_and_topology_changes_revoke_authority() {
+        let now = Instant::now();
+        for replacement in [
+            BTreeMap::from([("peer-a".to_string(), Uuid::new_v4()), ("peer-b".to_string(), Uuid::new_v4())]),
+            BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]),
+        ] {
+            let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+            let original = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+            assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(original), now).is_none());
+            let admitted = {
+                let state = slot.read().expect("reconcile proof slot should not poison");
+                acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now)
+                    .expect("the original fleet should admit reconciliation")
+            };
+
+            assert!(
+                publish_fleet_capability_probe_result(&slot, "topology-a", Ok(replacement), now + Duration::from_millis(1),)
+                    .is_some(),
+                "membership or process-epoch replacement must wait for the admitted writer"
+            );
+            let state = slot.read().expect("reconcile proof slot should not poison");
+            assert!(!legacy_transition_state_reconcile_fleet_proof_matches_at(
+                &state,
+                &admitted,
+                "topology-a",
+                now + Duration::from_millis(1),
+            ));
+        }
+
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(BTreeMap::new()), now).is_none());
+        let admitted = {
+            let state = slot.read().expect("reconcile proof slot should not poison");
+            acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now)
+                .expect("the original topology should admit reconciliation")
+        };
+        mark_fleet_capability_topology_conflict(&slot);
+        let state = slot.read().expect("reconcile proof slot should not poison");
+        assert!(state.topology_conflict);
+        assert!(!legacy_transition_state_reconcile_fleet_proof_matches_at(
+            &state,
+            &admitted,
+            "topology-a",
+            now,
+        ));
+    }
+
+    #[test]
+    fn legacy_transition_state_reconcile_capability_downgrade_fails_closed() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        let (_, _, _, compatible_result) =
+            cross_pool_fence_policy_results(peers.clone(), LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", compatible_result, now).is_none());
+        let admitted = {
+            let state = slot.read().expect("reconcile proof slot should not poison");
+            acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now)
+                .expect("v5 should admit reconciliation")
+        };
+
+        let (_, _, _, downgraded_result) =
+            cross_pool_fence_policy_results(peers, LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION - 1);
+        let err = publish_fleet_capability_probe_result(&slot, "topology-a", downgraded_result, now + Duration::from_millis(1))
+            .expect("a v4 member must revoke reconcile authority");
+        assert!(err.to_string().contains("reconcile policy capability version is unsupported"));
+        let state = slot.read().expect("reconcile proof slot should not poison");
+        assert!(state.proof.is_none());
+        assert!(!legacy_transition_state_reconcile_fleet_proof_matches_at(
+            &state,
+            &admitted,
+            "topology-a",
+            now + Duration::from_millis(1),
+        ));
+        assert!(
+            acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now + Duration::from_millis(1),)
+                .is_none(),
+            "a downgraded fleet must remain inspect-only"
+        );
+    }
+
+    #[test]
     fn remote_version_state_fleet_proof_conflict_revokes_atomic_snapshot() {
         let now = Instant::now();
         let mut state = FleetCapabilityProofState {
-            proof: Some(FleetCapabilityProof {
-                topology_fingerprint: "topology-a".to_string(),
-                peer_epochs: Arc::new(BTreeMap::new()),
-                expires_at: now + Duration::from_secs(1),
-            }),
+            proof: Some(FleetCapabilityProof::new(
+                "topology-a".to_string(),
+                Arc::new(BTreeMap::new()),
+                now + Duration::from_secs(1),
+            )),
+            draining_generation: None,
             topology_conflict: false,
         };
         assert!(acquire_fleet_capability_proof_from(&state, "topology-a", now).is_some());
@@ -2432,11 +4700,93 @@ mod tests {
         assert!(err.to_string().contains("incomplete"));
     }
 
+    #[tokio::test]
+    async fn legacy_transition_state_reconcile_probe_rejects_missing_or_unreachable_members() {
+        let missing = NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: vec![None],
+            peer_topology_hosts: vec!["peer-a".to_string()],
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        };
+        let missing_err = missing
+            .probe_cross_pool_fence_fleet("topology-a")
+            .await
+            .expect_err("a missing member slot must prevent reconcile capability proof");
+        assert!(missing_err.to_string().contains("incomplete"));
+
+        let unreachable = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: vec![None, None],
+            peer_topology_hosts: vec!["peer-a".to_string()],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
+        };
+        let unreachable_err = unreachable
+            .probe_cross_pool_fence_fleet("topology-a")
+            .await
+            .expect_err("an unreachable member must prevent reconcile capability proof");
+        assert!(unreachable_err.to_string().contains("unreachable"));
+    }
+
+    #[tokio::test]
+    async fn legacy_transition_state_reconcile_single_node_advertises_conditional_writer() {
+        let notification_sys = NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: vec![None],
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        };
+        let (peers, minimum_version) = notification_sys
+            .probe_cross_pool_fence_fleet("topology-a")
+            .await
+            .expect("a single-node capability probe should complete");
+        assert!(peers.is_empty());
+        assert_eq!(minimum_version, LOCAL_CROSS_POOL_FENCE_POLICY_SUPPORTED_VERSION);
+        let (_, _, _, reconcile_result) = cross_pool_fence_policy_results(peers, minimum_version);
+        assert!(
+            reconcile_result.is_ok(),
+            "the current node implements the conditional writer and preserves repaired bindings"
+        );
+    }
+
     fn build_props(endpoint: &str) -> ServerProperties {
         ServerProperties {
             endpoint: endpoint.to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn admin_peer_probe_timeout_rejects_zero_and_caps_large_values() {
+        assert_eq!(
+            resolve_admin_peer_probe_timeout_secs(None),
+            rustfs_config::DEFAULT_ADMIN_PEER_PROBE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolve_admin_peer_probe_timeout_secs(Some(0)),
+            rustfs_config::DEFAULT_ADMIN_PEER_PROBE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolve_admin_peer_probe_timeout_secs(Some(rustfs_config::MAX_ADMIN_PEER_PROBE_TIMEOUT_SECS + 1)),
+            rustfs_config::MAX_ADMIN_PEER_PROBE_TIMEOUT_SECS
+        );
+        assert_eq!(resolve_admin_peer_probe_timeout_secs(Some(7)), 7);
+    }
+
+    #[tokio::test]
+    async fn admin_peer_probe_health_fallback_respects_expired_deadline() {
+        let deadline = Instant::now();
+        assert!(peer_disk_health_with_deadline("peer-1", deadline).await.is_none());
+    }
+
+    #[test]
+    fn admin_peer_probe_deadline_is_shared_across_attempts() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        assert!(remaining_admin_peer_probe_timeout_at(deadline, start + Duration::from_secs(6)).is_some());
+        assert!(remaining_admin_peer_probe_timeout_at(deadline, start + Duration::from_secs(10)).is_none());
     }
 
     #[tokio::test]
@@ -2604,6 +4954,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scanner_publication_lease_release_reports_all_unavailable_peers() {
+        let sys = NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        };
+        let grants = ["peer-a", "peer-b"]
+            .into_iter()
+            .map(|host| ScannerPublicationLeaseGrant {
+                host: host.to_string(),
+                lease: ScannerPublicationLease {
+                    token: Uuid::new_v4(),
+                    movement_generation: 3,
+                    owner_id: Uuid::new_v4().to_string(),
+                    session_id: "session-a".to_string(),
+                    expires_at: Instant::now() + Duration::from_secs(30),
+                },
+            })
+            .collect();
+
+        let error = sys
+            .release_scanner_publication_leases(grants)
+            .await
+            .expect_err("an unavailable peer must not silently release a remote lease");
+        let message = error.to_string();
+        assert!(message.contains("peer-a"));
+        assert!(message.contains("peer-b"));
+    }
+
+    #[tokio::test]
     async fn scanner_activity_probe_rejects_an_incomplete_peer_topology() {
         let client = PeerRestClient::new(
             "127.0.0.1:9000".to_string().try_into().expect("peer host should parse"),
@@ -2622,6 +5004,52 @@ mod tests {
             .await
             .expect_err("an incomplete peer topology must disable scanner idle backoff");
 
+        assert!(err.to_string().contains("peer topology is incomplete"));
+    }
+
+    #[tokio::test]
+    async fn scanner_dirty_usage_snapshot_probe_rejects_unusable_peer_topologies() {
+        let unreachable = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: vec![None, None],
+            peer_topology_hosts: vec!["node-a:9000".to_string()],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
+        };
+        let err = unreachable
+            .scanner_dirty_usage_snapshots()
+            .await
+            .expect_err("an unreachable peer must invalidate the distributed dirty usage snapshot");
+        assert!(err.to_string().contains("peer is unreachable"));
+
+        let empty = NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        };
+        let err = empty
+            .scanner_dirty_usage_snapshots()
+            .await
+            .expect_err("an empty peer set must not produce a distributed dirty usage snapshot");
+        assert!(err.to_string().contains("no remote peers"));
+
+        let client = PeerRestClient::new(
+            "127.0.0.1:9000".to_string().try_into().expect("peer host should parse"),
+            "http://127.0.0.1:9000".to_string(),
+        );
+        let incomplete = NotificationSys {
+            peer_clients: vec![Some(client)],
+            all_peer_clients: vec![None],
+            peer_topology_hosts: vec!["127.0.0.1:9000".to_string()],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
+        };
+        let err = incomplete
+            .scanner_dirty_usage_snapshots()
+            .await
+            .expect_err("an incomplete topology must not produce a distributed dirty usage snapshot");
         assert!(err.to_string().contains("peer topology is incomplete"));
     }
 
@@ -2653,6 +5081,7 @@ mod tests {
             server_failures: 1,
             storage_failures: 0,
             last_storage_info: None,
+            last_storage_success: None,
         });
         let cache_b = Mutex::new(PeerAdminCache {
             last_server_info: Some(build_props("cached-b")),
@@ -2660,6 +5089,7 @@ mod tests {
             server_failures: 1,
             storage_failures: 0,
             last_storage_info: None,
+            last_storage_success: None,
         });
         let caches = [cache_a, cache_b];
         let endpoints = EndpointServerPools::from(Vec::new());
@@ -2685,6 +5115,20 @@ mod tests {
         assert!(err.to_string().contains("peer-1"));
     }
 
+    #[test]
+    fn scanner_activity_retry_only_reconnects_transport_failures() {
+        assert!(scanner_activity_should_retry(None, true));
+        assert!(scanner_activity_should_retry(Some(&Error::other("connection refused")), false));
+        assert!(!scanner_activity_should_retry(
+            Some(&Error::other("peer returned an invalid scanner activity response proof")),
+            false
+        ));
+        assert!(!scanner_activity_should_retry(
+            Some(&Error::from(tonic::Status::internal("peer rejected activity"))),
+            false
+        ));
+    }
+
     #[tokio::test]
     async fn scanner_dirty_usage_acknowledgement_rejects_missing_and_duplicate_targets() {
         let sys = NotificationSys {
@@ -2695,15 +5139,28 @@ mod tests {
             peer_topology_hosts: Vec::new(),
         };
         let missing = sys
-            .acknowledge_scanner_dirty_usage(vec![("peer-1".to_string(), "0123456789abcdef0123456789abcdef".to_string(), 7)])
+            .acknowledge_scanner_dirty_usage(vec![ScannerDirtyUsageAcknowledgement::Generation {
+                host: "peer-1".to_string(),
+                instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+                generation: 7,
+            }])
             .await
             .expect_err("a missing acknowledgement target must remain pending");
         assert!(missing.to_string().contains("peer is not reachable"));
 
         let duplicate = sys
             .acknowledge_scanner_dirty_usage(vec![
-                ("peer-1".to_string(), "0123456789abcdef0123456789abcdef".to_string(), 7),
-                ("peer-1".to_string(), "0123456789abcdef0123456789abcdef".to_string(), 7),
+                ScannerDirtyUsageAcknowledgement::Generation {
+                    host: "peer-1".to_string(),
+                    instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+                    generation: 7,
+                },
+                ScannerDirtyUsageAcknowledgement::Scoped {
+                    host: "peer-1".to_string(),
+                    owner_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                    instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+                    entries: Vec::new(),
+                },
             ])
             .await
             .expect_err("duplicate acknowledgement targets must be rejected");
@@ -2725,6 +5182,8 @@ mod tests {
             data_movement_active: Some(false),
             dirty_usage_generation: Some(2),
             dirty_usage_pending,
+            movement_generation: Some(1),
+            publication_blocked: Some(false),
         };
 
         let pending = aggregate_scanner_dirty_usage_acknowledgement_results(
@@ -3022,20 +5481,85 @@ mod tests {
         assert_eq!(commit.len(), 1);
         assert!(commit[0].err.is_some());
 
-        let abort = sys.abort_tier_mutation(mutation_id).await;
+        let abort = sys.abort_tier_mutation(mutation_id, Bytes::from_static(b"prepare")).await;
         assert_eq!(abort.len(), 1);
         assert!(abort[0].err.is_some());
     }
 
     // --- Tests for handle_peer_failure / handle_server_info_failure caching ---
 
+    #[tokio::test]
+    async fn storage_info_preserves_failed_members_when_no_rpc_client_exists() {
+        #[derive(Debug)]
+        struct LocalInventory;
+
+        #[async_trait::async_trait]
+        impl StorageAdminApi for LocalInventory {
+            type BackendInfo = rustfs_madmin::BackendInfo;
+            type StorageInfo = StorageInfo;
+            type Disk = ();
+            type Error = Error;
+
+            async fn backend_info(&self) -> Self::BackendInfo {
+                Self::BackendInfo::default()
+            }
+
+            async fn storage_info(&self) -> StorageInfo {
+                panic!("aggregation must query local inventory only")
+            }
+
+            async fn local_storage_info(&self) -> StorageInfo {
+                StorageInfo::default()
+            }
+
+            async fn disk_set_inventory(
+                &self,
+                _: crate::storage_api_contracts::admin::DiskSetSelector,
+            ) -> Result<Vec<Option<Self::Disk>>> {
+                panic!("admin probe must not access the data plane")
+            }
+
+            fn set_drive_counts(&self) -> Vec<usize> {
+                Vec::new()
+            }
+        }
+
+        let sys = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: vec![None, None],
+            peer_topology_hosts: vec!["peer-unavailable".to_string()],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
+        };
+        let info = sys.storage_info(&LocalInventory).await;
+        let peer = info
+            .observations
+            .iter()
+            .find(|observation| observation.endpoint == "peer-unavailable")
+            .expect("failed topology member remains visible");
+        assert_eq!(peer.status, StorageInfoProbeStatus::Failed);
+        assert!(!peer.cached);
+        assert_eq!(peer.error_code.as_deref(), Some("RemoteClientUnavailable"));
+        assert!(
+            info.observations
+                .iter()
+                .any(|observation| observation.status == StorageInfoProbeStatus::Succeeded)
+        );
+    }
+
     #[test]
-    fn handle_peer_failure_first_failure_returns_none_when_no_cache() {
+    fn handle_peer_failure_first_failure_reports_unknown_inventory_without_cache() {
         let cache = Mutex::new(PeerAdminCache::new());
         let endpoints = EndpointServerPools::default();
 
-        let result = handle_peer_failure(Some(&cache), "peer-1", &endpoints);
-        assert!(result.is_none());
+        let result = handle_peer_failure(Some(&cache), "peer-1", &endpoints, &Error::Timeout);
+        let info = result.expect("failed peer must remain visible without cached disks");
+        assert!(info.disks.is_empty());
+        assert_eq!(info.observations[0].status, StorageInfoProbeStatus::Failed);
+        assert!(!info.observations[0].cached);
+        assert_eq!(info.observations[0].last_success_unix_millis, None);
+        assert_eq!(info.observations[0].snapshot_age_seconds, None);
+        assert_eq!(info.observations[0].error_code.as_deref(), Some("Timeout"));
         assert_eq!(cache.lock().unwrap().storage_failures, 1);
     }
 
@@ -3052,6 +5576,7 @@ mod tests {
 
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: Some(cached_info),
+            last_storage_success: Some((SystemTime::now(), Instant::now())),
             last_server_info: None,
             storage_failures: 0,
             server_failures: 0,
@@ -3059,11 +5584,17 @@ mod tests {
         });
         let endpoints = EndpointServerPools::default();
 
-        // First failure: should return cached data
-        let result = handle_peer_failure(Some(&cache), "peer-1", &endpoints);
+        // Historical inventory is available, but its health is not live.
+        let result = handle_peer_failure(Some(&cache), "peer-1", &endpoints, &Error::Timeout);
         let info = result.unwrap();
         assert_eq!(info.disks.len(), 1);
-        assert_eq!(info.disks[0].state, "ok");
+        assert_eq!(info.disks[0].state, "unknown");
+        assert_eq!(info.disks[0].runtime_state.as_deref(), Some("unknown"));
+        assert_eq!(info.disks[0].capacity_observation_source.as_deref(), Some("snapshot"));
+        assert_eq!(info.disks[0].capacity_observation_age_seconds, None);
+        assert!(info.observations[0].cached);
+        assert_eq!(info.observations[0].status, StorageInfoProbeStatus::Failed);
+        assert!(info.observations[0].last_success_unix_millis.is_some());
         assert_eq!(cache.lock().unwrap().storage_failures, 1);
     }
 
@@ -3109,13 +5640,13 @@ mod tests {
         );
         drop(cached);
 
-        let degraded = handle_peer_failure(Some(&cache), "peer-1", &EndpointServerPools::default())
+        let degraded = handle_peer_failure(Some(&cache), "peer-1", &EndpointServerPools::default(), &Error::Timeout)
             .expect("first peer failure must return the cached snapshot");
         assert!(degraded.disks.iter().all(|disk| !disk.local));
     }
 
     #[test]
-    fn handle_peer_failure_returns_offline_after_threshold_exceeded() {
+    fn handle_peer_failure_cache_age_does_not_depend_on_poll_count() {
         let cached_info = StorageInfo {
             disks: vec![rustfs_madmin::Disk {
                 endpoint: "disk-0".to_string(),
@@ -3127,6 +5658,7 @@ mod tests {
 
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: Some(cached_info),
+            last_storage_success: Some((SystemTime::now(), Instant::now())),
             last_server_info: None,
             storage_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
             server_failures: 0,
@@ -3134,10 +5666,31 @@ mod tests {
         });
         let endpoints = EndpointServerPools::default();
 
-        // This failure pushes us to the threshold => offline
-        let result = handle_peer_failure(Some(&cache), "peer-1", &endpoints);
-        assert!(result.is_some());
-        assert_eq!(cache.lock().unwrap().storage_failures, CONSECUTIVE_FAILURE_THRESHOLD);
+        for _ in 0..10 {
+            let info = handle_peer_failure(Some(&cache), "peer-1", &endpoints, &Error::Timeout).expect("failed probe");
+            assert_eq!(info.disks.len(), 1);
+            assert_eq!(info.disks[0].state, "unknown");
+            assert!(info.observations[0].cached);
+        }
+        cache.lock().expect("age cache").last_storage_success =
+            Some((SystemTime::now() - Duration::from_secs(61), Instant::now() - Duration::from_secs(61)));
+        let info = handle_peer_failure(Some(&cache), "peer-1", &endpoints, &Error::Timeout).expect("expired probe");
+        assert!(!info.observations[0].cached);
+        assert!(info.observations[0].snapshot_age_seconds.expect("known last success") >= 61);
+        assert!(info.disks.is_empty(), "expired inventory must not be reused");
+
+        let mut recovered = StorageInfo {
+            disks: vec![rustfs_madmin::Disk {
+                state: "ok".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        normalize_and_cache_peer_storage_info(Some(&cache), "peer-1", &mut recovered);
+        assert_eq!(recovered.disks[0].state, "ok");
+        assert_eq!(recovered.observations[0].status, StorageInfoProbeStatus::Succeeded);
+        assert!(!recovered.observations[0].cached);
+        assert_eq!(cache.lock().expect("recovered cache").storage_failures, 0);
     }
 
     #[test]
@@ -3150,6 +5703,7 @@ mod tests {
 
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: Some(cached_props),
             storage_failures: 0,
             server_failures: 0,
@@ -3180,6 +5734,7 @@ mod tests {
 
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: Some(cached_props),
             storage_failures: 0,
             server_failures: 0,
@@ -3307,6 +5862,7 @@ mod tests {
 
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: Some(cached_props),
             storage_failures: 0,
             server_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
@@ -3326,6 +5882,7 @@ mod tests {
         // the real per-drive health), not offline (rustfs/backlog#1049 P0-B).
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: None,
             storage_failures: 0,
             server_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
@@ -3354,6 +5911,7 @@ mod tests {
         // this is a genuine offline, degraded must not mask it.
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: None,
             storage_failures: 0,
             server_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
@@ -3377,6 +5935,7 @@ mod tests {
     fn success_resets_failure_counters_independently() {
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: None,
             storage_failures: 2,
             server_failures: 2,
@@ -3398,6 +5957,7 @@ mod tests {
     fn storage_failures_do_not_affect_server_failures() {
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: Some(StorageInfo::default()),
+            last_storage_success: None,
             last_server_info: Some(ServerProperties {
                 endpoint: "peer-1".to_string(),
                 state: "online".to_string(),
@@ -3409,7 +5969,7 @@ mod tests {
         });
         let endpoints = EndpointServerPools::default();
 
-        let storage_result = handle_peer_failure(Some(&cache), "peer-1", &endpoints);
+        let storage_result = handle_peer_failure(Some(&cache), "peer-1", &endpoints, &Error::Timeout);
         assert!(storage_result.is_some());
 
         let server_result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints, None);
@@ -3432,8 +5992,10 @@ mod tests {
             panic!("poison server cache mutex");
         });
 
-        let storage_result = handle_peer_failure(Some(&storage_cache), "peer-1", &endpoints);
-        assert!(storage_result.is_none());
+        let storage_result = handle_peer_failure(Some(&storage_cache), "peer-1", &endpoints, &Error::Timeout);
+        let storage = storage_result.expect("poisoned cache must still report the failed peer");
+        assert_eq!(storage.observations[0].status, StorageInfoProbeStatus::Failed);
+        assert!(!storage.observations[0].cached);
 
         let server_result = handle_server_info_failure(Some(&server_cache), "peer-1", &endpoints, None);
         assert_eq!(server_result.endpoint, "peer-1");
@@ -3444,6 +6006,7 @@ mod tests {
     fn poisoned_admin_cache_recovers_on_success_and_resets_failures() {
         let storage_cache = Mutex::new(PeerAdminCache {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: None,
             storage_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
             server_failures: 0,
@@ -3451,6 +6014,7 @@ mod tests {
         });
         let server_cache = Mutex::new(PeerAdminCache {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: None,
             storage_failures: 0,
             server_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
@@ -3489,9 +6053,11 @@ mod tests {
             },
         );
 
-        let storage_result = handle_peer_failure(Some(&storage_cache), "peer-1", &endpoints);
+        let storage_result = handle_peer_failure(Some(&storage_cache), "peer-1", &endpoints, &Error::Timeout);
         assert!(storage_result.is_some());
-        assert_eq!(storage_result.unwrap().disks[0].state, "ok");
+        let storage = storage_result.expect("failed probe after recovery");
+        assert_eq!(storage.disks[0].state, "unknown");
+        assert!(storage.observations[0].cached);
 
         let server_result = handle_server_info_failure(Some(&server_cache), "peer-1", &endpoints, None);
         assert_eq!(server_result.state, "online");

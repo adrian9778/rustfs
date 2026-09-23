@@ -438,6 +438,12 @@ pub struct ReplicatedTargetInfo {
     /// Version the target assigned to the delete marker it just created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_delete_marker_version_id: Option<String>,
+    /// Version the target assigned to this object version when it differs
+    /// from the source id (a target that mints its own ids). Persisted as the
+    /// per-target ledger every later version-addressed mutation resolves
+    /// through; `None` on targets that adopt the source id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_version_id: Option<String>,
 }
 
 impl ReplicatedTargetInfo {
@@ -640,6 +646,26 @@ pub struct MrfReplicateEntry {
     // to preserve pre-existing behaviour (backlog#867).
     #[serde(rename = "deleteMarkerMtime", skip_serializing_if = "Option::is_none", default)]
     pub delete_marker_mtime: Option<i64>,
+
+    // For delete-marker purge intents: the exact version id each target assigned to the
+    // replicated marker, keyed by target ARN. A generic S3 target mints its own version ids
+    // and answers a DELETE of an unknown id with 204, so a replay that fell back to the source
+    // marker id would be acknowledged while the real marker stayed behind (backlog#2290).
+    // Old files lack this key; default=empty means "unknown" and replay keeps the source-id
+    // fallback it always had.
+    #[serde(rename = "targetDeleteMarkerVersionIDs", skip_serializing_if = "HashMap::is_empty", default)]
+    pub target_delete_marker_version_ids: HashMap<String, String>,
+
+    // Companion to the map above: the source metadata disagreed about the recorded ids when
+    // the intent was journaled, so the live path refused to guess and reported the target as
+    // failed. Replay must keep refusing instead of falling back to the source id. Old files
+    // lack this key; default=false.
+    #[serde(
+        rename = "targetDeleteMarkerVersionIDsCorrupt",
+        skip_serializing_if = "std::ops::Not::not",
+        default
+    )]
+    pub target_delete_marker_version_ids_corrupt: bool,
 
     #[serde(rename = "targetARNs", skip_serializing_if = "Vec::is_empty", default)]
     pub target_arns: Vec<String>,
@@ -849,6 +875,20 @@ pub fn parse_replicate_decision(_bucket: &str, s: &str) -> std::io::Result<Repli
     // }
 }
 
+/// Source snapshot used to fence replication terminal-status publication.
+///
+/// Timestamp and mutation id remain opaque because supported RustFS/MinIO
+/// writers may use different textual representations. `invalid` preserves the
+/// distinction between truly absent legacy metadata and corrupt/conflicting
+/// compatibility aliases.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationGenerationSnapshot {
+    pub timestamp: Option<String>,
+    pub mutation_id: Option<String>,
+    pub payload_fingerprint: Option<[u8; 32]>,
+    pub invalid: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReplicateObjectInfo {
     pub name: String,
@@ -871,6 +911,10 @@ pub struct ReplicateObjectInfo {
     pub target_statuses: HashMap<String, ReplicationStatusType>,
     pub target_purge_statuses: HashMap<String, VersionPurgeStatusType>,
     pub replication_timestamp: Option<OffsetDateTime>,
+    /// Exact persisted source snapshot used to fence terminal status
+    /// write-back after remote I/O.
+    #[serde(default)]
+    pub replication_generation: ReplicationGenerationSnapshot,
     pub ssec: bool,
     pub user_tags: String,
     pub checksum: Option<Bytes>,

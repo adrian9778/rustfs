@@ -16,16 +16,20 @@
 //! Concrete use-case modules will be introduced incrementally in Phase 3.
 
 pub mod admin_usecase;
+pub(crate) mod bucket_list_through;
 pub mod bucket_usecase;
 pub mod context;
 pub(crate) mod metadata_route;
 pub mod multipart_usecase;
+pub mod object;
 pub(crate) mod object_data_cache;
 pub(crate) mod object_traffic_health;
 pub mod object_usecase;
 pub(crate) mod runtime_sources;
 mod select_object;
 pub(crate) mod storage_api;
+pub(crate) mod table_list_isolation;
+pub(crate) mod trailer_adapter;
 
 #[cfg(test)]
 mod capacity_dirty_scope_test;

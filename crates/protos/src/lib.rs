@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod compat_manifest;
 // SAFETY: `generated` is prost/tonic-generated protocol code. The allowance is
 // scoped to that module so generated internals do not relax lints elsewhere.
 #[allow(unsafe_code)]
@@ -171,11 +172,19 @@ pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = heal_control::RESULT_MAX_SI
 pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 3;
 pub const DYNAMIC_CONFIG_PROTOCOL_VERSION: u32 = 1;
 pub const BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION: u32 = 2;
-pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v3\0";
+// v4 is an admission boundary, not a transport version bump. A peer that
+// cannot recognize this probe must fail the Admin Heal capability preflight;
+// accepting the older v3 probe would allow an upgraded node to silently lose
+// newly validated request semantics during a rolling upgrade.
+pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v4\0";
 pub const REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-tier-remote-version-state-capability-v1\0";
 pub const CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-cross-pool-fence-capability-v1\0";
+pub const ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-ilm-recovery-export-capability-v1\0";
+pub const TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX: &[u8] =
+    b"rustfs-transition-transaction-compaction-capability-v1\0";
 pub const TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE: usize = 64 * 1024;
 pub const TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE: usize = 1024;
+pub const TIER_MUTATION_RPC_MAX_ABORT_PAYLOAD_SIZE: usize = TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE;
 pub const TIER_MUTATION_RPC_MAX_MESSAGE_SIZE: usize = TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE + 4096;
 
 pub fn heal_control_coordinator_epoch(topology_fingerprint: &str) -> Result<u64, &'static str> {
@@ -215,6 +224,30 @@ pub fn is_remote_version_state_capability_probe(command: &[u8]) -> bool {
 pub fn is_cross_pool_fence_capability_probe(command: &[u8]) -> bool {
     command.len() == CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX.len() + 16
         && command.starts_with(CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn ilm_recovery_export_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_ilm_recovery_export_capability_probe(command: &[u8]) -> bool {
+    command.len() == ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn transition_transaction_compaction_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_transition_transaction_compaction_capability_probe(command: &[u8]) -> bool {
+    command.len() == TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX)
 }
 
 pub fn encode_remote_version_state_capability(
@@ -289,7 +322,7 @@ pub fn canonical_heal_control_capability_ack(
     topology_fingerprint: &str,
     probe: &[u8],
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
-    const DOMAIN: &[u8] = b"rustfs-heal-control-capability-ack-v3\0";
+    const DOMAIN: &[u8] = b"rustfs-heal-control-capability-ack-v4\0";
 
     let fingerprint = topology_fingerprint.as_bytes();
     let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + probe.len());
@@ -341,7 +374,16 @@ impl TierMutationRpcPhase {
     }
 }
 
-pub const TIER_MUTATION_RPC_PROTOCOL_VERSION: u32 = 1;
+// Version 2 required peer Prepare to block new tier-reference creators and
+// drain their in-flight operation leases. Version 3 additionally binds Abort
+// to the canonical Prepare intent so a missing-record Abort can persist an
+// identity-bound tombstone and linearize against a delayed Prepare. Version 4
+// signs a typed failure classification while retaining the exact v3 proof
+// bytes for rolling compatibility.
+pub const TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION: u32 = 3;
+pub const TIER_MUTATION_RPC_PROTOCOL_VERSION: u32 = 4;
+pub const TIER_MUTATION_RPC_MAX_ERROR_INFO_SIZE: usize = 1024;
+pub const TIER_MUTATION_RPC_MAX_RESPONSE_PROOF_SIZE: usize = 4096;
 
 pub fn canonical_tier_mutation_rpc_body(
     version: u32,
@@ -373,19 +415,23 @@ pub struct TierMutationRpcResponseProofInput<'a> {
     pub state: i32,
     pub applied: bool,
     pub error_info: Option<&'a str>,
+    pub failure_class: i32,
 }
 
 pub fn canonical_tier_mutation_rpc_response_body(
     input: TierMutationRpcResponseProofInput<'_>,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
-    const DOMAIN: &[u8] = b"rustfs-tier-mutation-rpc-response-v1\0";
+    const V3_DOMAIN: &[u8] = b"rustfs-tier-mutation-rpc-response-v1\0";
+    const V4_DOMAIN: &[u8] = b"rustfs-tier-mutation-rpc-response-v2\0";
 
     let phase = input.phase.as_wire_str().as_bytes();
     let mutation_id = input.mutation_id.as_bytes();
     let error_info = input.error_info.map(str::as_bytes);
     let error_info_len = error_info.map_or(0, <[u8]>::len);
+    let is_v4 = input.version >= TIER_MUTATION_RPC_PROTOCOL_VERSION;
+    let domain = if is_v4 { V4_DOMAIN } else { V3_DOMAIN };
     let mut body = Vec::with_capacity(
-        DOMAIN.len()
+        domain.len()
             + 4
             + 8
             + phase.len()
@@ -397,9 +443,10 @@ pub fn canonical_tier_mutation_rpc_response_body(
             + 1
             + 1
             + 8
-            + error_info_len,
+            + error_info_len
+            + if is_v4 { 4 } else { 0 },
     );
-    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(domain);
     body.extend_from_slice(&input.version.to_be_bytes());
     body.extend_from_slice(&u64::try_from(phase.len())?.to_be_bytes());
     body.extend_from_slice(phase);
@@ -413,6 +460,9 @@ pub fn canonical_tier_mutation_rpc_response_body(
     body.extend_from_slice(&u64::try_from(error_info_len)?.to_be_bytes());
     if let Some(error_info) = error_info {
         body.extend_from_slice(error_info);
+    }
+    if is_v4 {
+        body.extend_from_slice(&input.failure_class.to_be_bytes());
     }
     Ok(body)
 }
@@ -483,6 +533,192 @@ pub fn canonical_scanner_activity_response_body(
     body.push(u8::from(response.data_movement_active));
     body.extend_from_slice(&response.dirty_usage_generation.to_be_bytes());
     body.push(u8::from(response.dirty_usage_pending));
+    Ok(body)
+}
+
+/// Builds the protocol-v7 response body.  The optional movement fields are
+/// presence-bound so a missing terminal-generation proof cannot authenticate
+/// as the value zero.
+pub fn canonical_scanner_activity_v7_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerActivityResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-activity-response-v3\0";
+
+    let instance_id = response.instance_id.as_bytes();
+    let topology_digest = response.topology_digest.as_ref();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + instance_id.len() + topology_digest.len() + 4 + 8 * 8 + 4);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(instance_id.len())?.to_be_bytes());
+    body.extend_from_slice(instance_id);
+    body.extend_from_slice(&response.namespace_generation.to_be_bytes());
+    body.extend_from_slice(&response.maintenance_generation.to_be_bytes());
+    body.extend_from_slice(&response.protocol_version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(topology_digest.len())?.to_be_bytes());
+    body.extend_from_slice(topology_digest);
+    body.push(u8::from(response.data_movement_active));
+    body.extend_from_slice(&response.dirty_usage_generation.to_be_bytes());
+    body.push(u8::from(response.dirty_usage_pending));
+    body.push(u8::from(response.movement_generation.is_some()));
+    if let Some(generation) = response.movement_generation {
+        body.extend_from_slice(&generation.to_be_bytes());
+    }
+    body.push(u8::from(response.publication_blocked.is_some()));
+    if let Some(blocked) = response.publication_blocked {
+        body.push(u8::from(blocked));
+    }
+    Ok(body)
+}
+
+pub mod scoped_dirty_usage;
+
+pub fn canonical_scanner_dirty_usage_snapshot_request_body(
+    request: &proto_gen::node_service::ScannerDirtyUsageSnapshotRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-scanner-dirty-usage-snapshot-request-v1\0");
+    body.push_u32(request.protocol_version);
+    body.push_bytes(request.challenge.as_ref())?;
+    Ok(body.finish())
+}
+
+pub fn canonical_scanner_dirty_usage_snapshot_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerDirtyUsageSnapshotResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-scanner-dirty-usage-snapshot-response-v1\0");
+    body.push_bytes(challenge)?;
+    body.push_str(&response.instance_id)?;
+    body.push_u64(response.generation);
+    body.push_u64(response.pending_bucket_count);
+    body.push_u32(response.protocol_version);
+    body.push_str(&response.owner_id)?;
+    body.push_bool(response.complete);
+    body.push_count(response.buckets.len())?;
+    for bucket in &response.buckets {
+        body.push_str(&bucket.bucket)?;
+        body.push_u64(bucket.generation);
+        body.push_bytes(bucket.bucket_incarnation.as_ref())?;
+    }
+    Ok(body.finish())
+}
+
+/// Builds the body authenticated by the short-lived remote scanner publication
+/// lease request. This is a separate domain from ScannerActivity so v6/v7
+/// observation proofs remain byte-for-byte compatible.
+pub fn canonical_scanner_publication_lease_request_body(
+    request: &proto_gen::node_service::ScannerPublicationLeaseRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-request-v1\0";
+    let challenge = request.challenge.as_ref();
+    let session_id = request.expected_session_id.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + session_id.len() + 40);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&request.expected_movement_generation.to_be_bytes());
+    body.extend_from_slice(&request.ttl_ms.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    // Empty keeps the original acquire body byte-for-byte compatible.  A
+    // non-empty token is the authenticated validation form used immediately
+    // before a coordinator commits its final publication.
+    let token = request.token.as_ref();
+    if !token.is_empty() {
+        body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+        body.extend_from_slice(token);
+    }
+    Ok(body)
+}
+
+/// Builds the body authenticated by a remote scanner publication lease
+/// release request.
+pub fn canonical_scanner_publication_lease_release_request_body(
+    request: &proto_gen::node_service::ScannerPublicationLeaseReleaseRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-release-request-v1\0";
+    let challenge = request.challenge.as_ref();
+    let token = request.token.as_ref();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + token.len() + 16);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+    body.extend_from_slice(token);
+    let owner_id = request.owner_id.as_bytes();
+    let session_id = request.session_id.as_bytes();
+    body.extend_from_slice(&u64::try_from(owner_id.len())?.to_be_bytes());
+    body.extend_from_slice(owner_id);
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    Ok(body)
+}
+
+pub fn canonical_scanner_publication_lease_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerPublicationLeaseResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-response-v1\0";
+    let token = response.token.as_ref();
+    let owner_id = response.owner_id.as_bytes();
+    let session_id = response.session_id.as_bytes();
+    let error_info = response.error.as_ref().map(|error| error.error_info.as_bytes());
+    let error_code = response.error.as_ref().map_or(0, |error| error.code);
+    let mut body = Vec::with_capacity(
+        DOMAIN.len() + challenge.len() + token.len() + owner_id.len() + session_id.len() + error_info.map_or(0, |v| v.len()) + 72,
+    );
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.push(u8::from(response.success));
+    body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+    body.extend_from_slice(token);
+    body.extend_from_slice(&response.movement_generation.to_be_bytes());
+    body.extend_from_slice(&response.lease_ttl_ms.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(owner_id.len())?.to_be_bytes());
+    body.extend_from_slice(owner_id);
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    body.push(u8::from(response.error.is_some()));
+    body.extend_from_slice(&error_code.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(error_info.map_or(0, |value| value.len()))?.to_be_bytes());
+    if let Some(error_info) = error_info {
+        body.extend_from_slice(error_info);
+    }
+    Ok(body)
+}
+
+pub fn canonical_scanner_publication_lease_release_response_body(
+    challenge: &[u8],
+    request: &proto_gen::node_service::ScannerPublicationLeaseReleaseRequest,
+    response: &proto_gen::node_service::ScannerPublicationLeaseReleaseResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-release-response-v1\0";
+    let token = request.token.as_ref();
+    let owner_id = request.owner_id.as_bytes();
+    let session_id = request.session_id.as_bytes();
+    let error_info = response.error.as_ref().map(|error| error.error_info.as_bytes());
+    let error_code = response.error.as_ref().map_or(0, |error| error.code);
+    let mut body = Vec::with_capacity(
+        DOMAIN.len() + challenge.len() + token.len() + owner_id.len() + session_id.len() + error_info.map_or(0, |v| v.len()) + 56,
+    );
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+    body.extend_from_slice(token);
+    body.extend_from_slice(&u64::try_from(owner_id.len())?.to_be_bytes());
+    body.extend_from_slice(owner_id);
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    body.push(u8::from(response.success));
+    body.push(u8::from(response.error.is_some()));
+    body.extend_from_slice(&error_code.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(error_info.map_or(0, |value| value.len()))?.to_be_bytes());
+    if let Some(error_info) = error_info {
+        body.extend_from_slice(error_info);
+    }
     Ok(body)
 }
 
@@ -585,6 +821,9 @@ impl_canonical_mutation_body!(
     |request, body| {
         body.push_str(&request.bucket)?;
         body.push_str(&request.options)?;
+        if !request.bucket_incarnation_id.is_empty() {
+            body.push_bytes(&request.bucket_incarnation_id)?;
+        }
     }
 );
 impl_canonical_mutation_body!(
@@ -758,6 +997,15 @@ pub fn canonical_rename_data_request_body(
     body.push_str(&request.dst_volume)?;
     body.push_str(&request.dst_path)?;
     body.push_bytes(&request.file_info_bin)?;
+    // Keep legacy rename requests byte-for-byte compatible.  The optional
+    // token is included only for the scanner's target-side lease fence.
+    if !request.scanner_publication_lease_token.is_empty() {
+        body.push_bytes(&request.scanner_publication_lease_token)?;
+    }
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_str("bucket-incarnation-v1")?;
+        body.push_bytes(&request.bucket_incarnation_id)?;
+    }
     Ok(body.finish())
 }
 
@@ -773,6 +1021,9 @@ pub fn canonical_delete_version_request_body(
     body.push_str(&request.opts)?;
     body.push_bytes(&request.file_info_bin)?;
     body.push_bytes(&request.opts_bin)?;
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_bytes(&request.bucket_incarnation_id)?;
+    }
     Ok(body.finish())
 }
 
@@ -804,6 +1055,10 @@ pub fn canonical_write_metadata_request_body(
     body.push_str(&request.path)?;
     body.push_str(&request.file_info)?;
     body.push_bytes(&request.file_info_bin)?;
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_str("bucket-incarnation-v1")?;
+        body.push_bytes(&request.bucket_incarnation_id)?;
+    }
     Ok(body.finish())
 }
 
@@ -832,6 +1087,20 @@ pub fn canonical_write_all_request_body(
     Ok(body.finish())
 }
 
+pub fn canonical_compare_and_update_file_request_body(
+    request: &proto_gen::node_service::CompareAndUpdateFileRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-compare-and-update-file-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bool(request.expected.is_some());
+    body.push_bytes(request.expected.as_deref().unwrap_or_default())?;
+    body.push_bool(request.replacement.is_some());
+    body.push_bytes(request.replacement.as_deref().unwrap_or_default())?;
+    Ok(body.finish())
+}
+
 pub fn canonical_delete_request_body(
     request: &proto_gen::node_service::DeleteRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -840,6 +1109,13 @@ pub fn canonical_delete_request_body(
     body.push_str(&request.volume)?;
     body.push_str(&request.path)?;
     body.push_str(&request.options)?;
+    if !request.scanner_publication_lease_token.is_empty() {
+        body.push_bytes(&request.scanner_publication_lease_token)?;
+    }
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_str("bucket-incarnation-v1")?;
+        body.push_bytes(&request.bucket_incarnation_id)?;
+    }
     Ok(body.finish())
 }
 
@@ -899,6 +1175,11 @@ pub fn canonical_rename_file_request_body(
     body.push_str(&request.src_path)?;
     body.push_str(&request.dst_volume)?;
     body.push_str(&request.dst_path)?;
+    // Preserve the release signature for ordinary renames. An older server
+    // computes a different digest for a durable request and rejects mutation.
+    if request.durable {
+        body.push_bool(true);
+    }
     Ok(body.finish())
 }
 
@@ -975,10 +1256,10 @@ pub fn canonical_make_volumes_request_body(
 #[cfg(test)]
 mod disk_mutation_canonical_tests {
     use super::proto_gen::node_service::{
-        DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, MakeVolumeRequest,
-        MakeVolumesRequest, PreparePartTransactionRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest,
-        SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
-        UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
+        CompareAndUpdateFileRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest,
+        DeleteVolumeRequest, MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, RenameDataRequest,
+        RenameFileRequest, RenamePartRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest,
+        SnapshotLeaseRenewRequest, SnapshotLeaseRequest, UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
     };
     use super::*;
 
@@ -995,6 +1276,7 @@ mod disk_mutation_canonical_tests {
     #[test]
     fn rename_data_canonical_body_binds_every_field() {
         let baseline = RenameDataRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "disk-a".into(),
             src_volume: "src-vol".into(),
             src_path: "src-path".into(),
@@ -1002,6 +1284,7 @@ mod disk_mutation_canonical_tests {
             dst_volume: "dst-vol".into(),
             dst_path: "dst-path".into(),
             file_info_bin: vec![0x81, 0x01].into(),
+            scanner_publication_lease_token: Vec::new().into(),
         };
         let mut bodies = vec![canonical_rename_data_request_body(&baseline).unwrap()];
         for mutate in [
@@ -1013,6 +1296,8 @@ mod disk_mutation_canonical_tests {
             |r: &mut RenameDataRequest| r.dst_path = "dst-path2".into(),
             |r: &mut RenameDataRequest| r.file_info_bin = vec![0x81, 0x02].into(),
             |r: &mut RenameDataRequest| r.file_info_bin = Vec::new().into(),
+            |r: &mut RenameDataRequest| r.scanner_publication_lease_token = vec![0x01; 16].into(),
+            |r: &mut RenameDataRequest| r.bucket_incarnation_id = vec![0x01; 16].into(),
         ] {
             let mut request = baseline.clone();
             mutate(&mut request);
@@ -1043,6 +1328,7 @@ mod disk_mutation_canonical_tests {
     #[test]
     fn delete_version_canonical_body_binds_every_field() {
         let baseline = DeleteVersionRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "disk-a".into(),
             volume: "vol".into(),
             path: "path".into(),
@@ -1062,6 +1348,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut DeleteVersionRequest| r.opts = "{\"o\":1}".into(),
             |r: &mut DeleteVersionRequest| r.file_info_bin = vec![0x82].into(),
             |r: &mut DeleteVersionRequest| r.opts_bin = Vec::new().into(),
+            |r: &mut DeleteVersionRequest| r.bucket_incarnation_id = vec![1; 16].into(),
         ] {
             let mut request = baseline.clone();
             mutate(&mut request);
@@ -1104,6 +1391,7 @@ mod disk_mutation_canonical_tests {
         // Mutating each field in turn and asserting all bodies differ catches a dropped or
         // duplicated `push_*` in these hand-written builders — an unbound field is tamperable.
         let write_metadata = WriteMetadataRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "d".into(),
             volume: "v".into(),
             path: "p".into(),
@@ -1117,6 +1405,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut WriteMetadataRequest| r.path = "p2".into(),
             |r: &mut WriteMetadataRequest| r.file_info = "{\"a\":2}".into(),
             |r: &mut WriteMetadataRequest| r.file_info_bin = vec![0x82].into(),
+            |r: &mut WriteMetadataRequest| r.bucket_incarnation_id = vec![1; 16].into(),
         ] {
             let mut request = write_metadata.clone();
             mutate(&mut request);
@@ -1168,11 +1457,38 @@ mod disk_mutation_canonical_tests {
         }
         assert_all_distinct(&bodies);
 
+        let compare_and_update_file = CompareAndUpdateFileRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            expected: Some(vec![0xAA, 0xBB].into()),
+            replacement: Some(vec![0xCC, 0xDD].into()),
+        };
+        let mut bodies = vec![canonical_compare_and_update_file_request_body(&compare_and_update_file).unwrap()];
+        for mutate in [
+            |r: &mut CompareAndUpdateFileRequest| r.disk = "d2".into(),
+            |r: &mut CompareAndUpdateFileRequest| r.volume = "v2".into(),
+            |r: &mut CompareAndUpdateFileRequest| r.path = "p2".into(),
+            |r: &mut CompareAndUpdateFileRequest| r.expected = None,
+            |r: &mut CompareAndUpdateFileRequest| r.expected = Some(Vec::new().into()),
+            |r: &mut CompareAndUpdateFileRequest| r.expected = Some(vec![0xAA, 0xBC].into()),
+            |r: &mut CompareAndUpdateFileRequest| r.replacement = None,
+            |r: &mut CompareAndUpdateFileRequest| r.replacement = Some(Vec::new().into()),
+            |r: &mut CompareAndUpdateFileRequest| r.replacement = Some(vec![0xCC, 0xDE].into()),
+        ] {
+            let mut request = compare_and_update_file.clone();
+            mutate(&mut request);
+            bodies.push(canonical_compare_and_update_file_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
         let delete = DeleteRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "d".into(),
             volume: "v".into(),
             path: "p".into(),
             options: "{\"o\":1}".into(),
+            scanner_publication_lease_token: Vec::new().into(),
         };
         let mut bodies = vec![canonical_delete_request_body(&delete).unwrap()];
         for mutate in [
@@ -1180,6 +1496,8 @@ mod disk_mutation_canonical_tests {
             |r: &mut DeleteRequest| r.volume = "v2".into(),
             |r: &mut DeleteRequest| r.path = "p2".into(),
             |r: &mut DeleteRequest| r.options = "{\"recursive\":true}".into(),
+            |r: &mut DeleteRequest| r.bucket_incarnation_id = vec![1; 16].into(),
+            |r: &mut DeleteRequest| r.scanner_publication_lease_token = vec![0x01; 16].into(),
         ] {
             let mut request = delete.clone();
             mutate(&mut request);
@@ -1206,6 +1524,7 @@ mod disk_mutation_canonical_tests {
         assert_all_distinct(&bodies);
 
         let rename_file = RenameFileRequest {
+            durable: false,
             disk: "d".into(),
             src_volume: "sv".into(),
             src_path: "sp".into(),
@@ -1214,6 +1533,7 @@ mod disk_mutation_canonical_tests {
         };
         let mut bodies = vec![canonical_rename_file_request_body(&rename_file).unwrap()];
         for mutate in [
+            |r: &mut RenameFileRequest| r.durable = true,
             |r: &mut RenameFileRequest| r.disk = "d2".into(),
             |r: &mut RenameFileRequest| r.src_volume = "sv2".into(),
             |r: &mut RenameFileRequest| r.src_path = "sp2".into(),
@@ -1389,9 +1709,27 @@ mod disk_mutation_canonical_tests {
     }
 
     #[test]
+    fn durable_rename_extension_preserves_old_wire_defaults_and_signatures() {
+        use crate::proto_gen::node_service::RenameFileResponse;
+        use prost::Message;
+        // Release wire messages omitted request tag 6 and response tag 3.
+        let mut request =
+            RenameFileRequest::decode(b"\x0a\x01d\x12\x01s\x1a\x01p\x22\x01v\x2a\x01q".as_slice()).expect("release request");
+        assert!(!request.durable);
+        let old_body = b"rustfs-rename-file-request-v1\0\0\0\0\0\0\0\0\x01d\0\0\0\0\0\0\0\x01s\0\0\0\0\0\0\0\x01p\0\0\0\0\0\0\0\x01v\0\0\0\0\0\0\0\x01q";
+        assert_eq!(canonical_rename_file_request_body(&request).expect("body"), old_body);
+        request.durable = true;
+        assert_ne!(canonical_rename_file_request_body(&request).expect("durable body"), old_body);
+        let old_success = RenameFileResponse::decode(b"\x08\x01".as_slice()).expect("release response");
+        assert!(old_success.success);
+        assert!(!old_success.durability_applied, "old success cannot certify durable publication");
+    }
+
+    #[test]
     fn disk_mutation_canonical_domains_are_distinct_per_message() {
         // The same field values must never authenticate one RPC's request as another's.
         let rename_file = RenameFileRequest {
+            durable: false,
             disk: "d".into(),
             src_volume: "sv".into(),
             src_path: "sp".into(),
@@ -1497,7 +1835,7 @@ mod non_disk_mutation_canonical_tests {
 
     #[test]
     fn bucket_and_lock_canonical_bodies_bind_every_semantic_field() {
-        assert_fields_bound!(HealBucketRequest, { bucket: "bucket".into(), options: "opts".into() });
+        assert_fields_bound!(HealBucketRequest, { bucket: "bucket".into(), options: "opts".into(), bucket_incarnation_id: vec![1; 16].into() });
         assert_fields_bound!(MakeBucketRequest, { name: "bucket".into(), options: "opts".into() });
         assert_fields_bound!(DeleteBucketRequest, { bucket: "bucket".into(), options: "opts".into() });
         assert_fields_bound!(GenerallyLockRequest, { args: "lock".into() });
@@ -1565,9 +1903,121 @@ mod non_disk_mutation_canonical_tests {
 mod scanner_activity_tests {
     use super::{
         canonical_scanner_activity_request_body, canonical_scanner_activity_response_body,
-        canonical_scanner_activity_v4_response_body,
-        proto_gen::node_service::{ScannerActivityRequest, ScannerActivityResponse},
+        canonical_scanner_activity_v4_response_body, canonical_scanner_activity_v7_response_body,
+        canonical_scanner_dirty_usage_snapshot_request_body, canonical_scanner_dirty_usage_snapshot_response_body,
+        canonical_scanner_publication_lease_release_request_body, canonical_scanner_publication_lease_request_body,
+        canonical_scanner_publication_lease_response_body,
+        proto_gen::node_service::{
+            ScannerActivityRequest, ScannerActivityResponse, ScannerDirtyUsageBucket, ScannerDirtyUsageSnapshotRequest,
+            ScannerDirtyUsageSnapshotResponse, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
+        },
     };
+
+    #[test]
+    fn canonical_scanner_dirty_usage_snapshot_request_binds_every_field() {
+        let request = ScannerDirtyUsageSnapshotRequest {
+            challenge: vec![1; 16].into(),
+            protocol_version: 1,
+        };
+        let baseline = canonical_scanner_dirty_usage_snapshot_request_body(&request)
+            .expect("scanner dirty usage snapshot request should encode");
+
+        for variant in [
+            ScannerDirtyUsageSnapshotRequest {
+                challenge: vec![2; 16].into(),
+                ..request.clone()
+            },
+            ScannerDirtyUsageSnapshotRequest {
+                protocol_version: 2,
+                ..request
+            },
+        ] {
+            assert_ne!(
+                baseline,
+                canonical_scanner_dirty_usage_snapshot_request_body(&variant)
+                    .expect("scanner dirty usage snapshot request variant should encode")
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_scanner_dirty_usage_snapshot_response_binds_every_field() {
+        let response = ScannerDirtyUsageSnapshotResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            generation: 7,
+            pending_bucket_count: 2,
+            protocol_version: 1,
+            complete: true,
+            buckets: vec![
+                ScannerDirtyUsageBucket {
+                    bucket: "archive".to_string(),
+                    generation: 3,
+                    bucket_incarnation: vec![1; 16].into(),
+                },
+                ScannerDirtyUsageBucket {
+                    bucket: "photos".to_string(),
+                    generation: 7,
+                    bucket_incarnation: vec![2; 16].into(),
+                },
+            ],
+            response_proof: vec![9; 32].into(),
+            owner_id: "11111111-1111-1111-1111-111111111111".to_string(),
+        };
+        let baseline = canonical_scanner_dirty_usage_snapshot_response_body(&[1; 16], &response)
+            .expect("scanner dirty usage snapshot response should encode");
+        let mut variants = Vec::new();
+        let mut instance = response.clone();
+        instance.instance_id = "fedcba9876543210fedcba9876543210".to_string();
+        variants.push(instance);
+        let mut generation = response.clone();
+        generation.generation = 8;
+        variants.push(generation);
+        let mut count = response.clone();
+        count.pending_bucket_count = 3;
+        variants.push(count);
+        let mut protocol = response.clone();
+        protocol.protocol_version = 2;
+        variants.push(protocol);
+        let mut owner = response.clone();
+        owner.owner_id = "22222222-2222-2222-2222-222222222222".to_string();
+        variants.push(owner);
+        let mut complete = response.clone();
+        complete.complete = false;
+        variants.push(complete);
+        let mut bucket_name = response.clone();
+        bucket_name.buckets[0].bucket = "backups".to_string();
+        variants.push(bucket_name);
+        let mut bucket_generation = response.clone();
+        bucket_generation.buckets[0].generation = 4;
+        variants.push(bucket_generation);
+        let mut bucket_incarnation = response.clone();
+        bucket_incarnation.buckets[0].bucket_incarnation = vec![3; 16].into();
+        variants.push(bucket_incarnation);
+        let mut bucket_order = response.clone();
+        bucket_order.buckets.reverse();
+        variants.push(bucket_order);
+
+        for variant in variants {
+            assert_ne!(
+                baseline,
+                canonical_scanner_dirty_usage_snapshot_response_body(&[1; 16], &variant)
+                    .expect("scanner dirty usage snapshot response variant should encode")
+            );
+        }
+        assert_ne!(
+            baseline,
+            canonical_scanner_dirty_usage_snapshot_response_body(&[2; 16], &response)
+                .expect("scanner dirty usage snapshot response challenge variant should encode")
+        );
+
+        let mut proof_only = response;
+        proof_only.response_proof = vec![8; 32].into();
+        assert_eq!(
+            baseline,
+            canonical_scanner_dirty_usage_snapshot_response_body(&[1; 16], &proof_only)
+                .expect("response proof must not authenticate itself")
+        );
+    }
 
     #[test]
     fn canonical_scanner_activity_request_binds_every_field() {
@@ -1617,6 +2067,8 @@ mod scanner_activity_tests {
             response_proof: Vec::new().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: Some(19),
+            publication_blocked: Some(false),
         };
         let baseline =
             canonical_scanner_activity_response_body(&[1; 16], &response).expect("scanner activity response should encode");
@@ -1667,6 +2119,25 @@ mod scanner_activity_tests {
             canonical_scanner_activity_response_body(&[2; 16], &response)
                 .expect("scanner activity response with a different challenge should encode")
         );
+
+        let v7_baseline =
+            canonical_scanner_activity_v7_response_body(&[1; 16], &response).expect("scanner activity v7 response should encode");
+        for variant in [
+            ScannerActivityResponse {
+                movement_generation: Some(20),
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                publication_blocked: Some(true),
+                ..response
+            },
+        ] {
+            assert_ne!(
+                v7_baseline,
+                canonical_scanner_activity_v7_response_body(&[1; 16], &variant)
+                    .expect("scanner activity v7 response variant should encode")
+            );
+        }
     }
 
     #[test]
@@ -1681,6 +2152,8 @@ mod scanner_activity_tests {
             response_proof: Vec::new().into(),
             dirty_usage_generation: 0,
             dirty_usage_pending: false,
+            movement_generation: None,
+            publication_blocked: None,
         };
         let baseline =
             canonical_scanner_activity_v4_response_body(&[1; 16], &response).expect("scanner activity v4 response should encode");
@@ -1714,18 +2187,87 @@ mod scanner_activity_tests {
                 .expect("scanner activity v4 response should ignore v5 fields")
         );
     }
+
+    #[test]
+    fn scanner_publication_lease_canonical_bodies_bind_session_owner_and_generation() {
+        let request = ScannerPublicationLeaseRequest {
+            challenge: vec![1; 16].into(),
+            expected_movement_generation: 7,
+            ttl_ms: 60_000,
+            expected_session_id: "session-a".to_string(),
+            token: Vec::new().into(),
+        };
+        let baseline = canonical_scanner_publication_lease_request_body(&request).unwrap();
+        for variant in [
+            ScannerPublicationLeaseRequest {
+                expected_movement_generation: 8,
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                expected_session_id: "session-b".to_string(),
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                ttl_ms: 30_000,
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                token: vec![3; 16].into(),
+                ..request
+            },
+        ] {
+            assert_ne!(baseline, canonical_scanner_publication_lease_request_body(&variant).unwrap());
+        }
+
+        let release_a = crate::proto_gen::node_service::ScannerPublicationLeaseReleaseRequest {
+            challenge: vec![2; 16].into(),
+            token: vec![3; 16].into(),
+            owner_id: "owner-a".to_string(),
+            session_id: "session-a".to_string(),
+        };
+        let release_b = crate::proto_gen::node_service::ScannerPublicationLeaseReleaseRequest {
+            owner_id: "owner-b".to_string(),
+            ..release_a.clone()
+        };
+        assert_ne!(
+            canonical_scanner_publication_lease_release_request_body(&release_a).unwrap(),
+            canonical_scanner_publication_lease_release_request_body(&release_b).unwrap()
+        );
+
+        let response = ScannerPublicationLeaseResponse {
+            success: true,
+            token: vec![4; 16].into(),
+            movement_generation: 7,
+            lease_ttl_ms: 60_000,
+            error: None,
+            response_proof: Vec::new().into(),
+            owner_id: "owner-a".to_string(),
+            session_id: "session-a".to_string(),
+        };
+        let response_changed = ScannerPublicationLeaseResponse {
+            owner_id: "owner-b".to_string(),
+            ..response.clone()
+        };
+        assert_ne!(
+            canonical_scanner_publication_lease_response_body(&[1; 16], &response).unwrap(),
+            canonical_scanner_publication_lease_response_body(&[1; 16], &response_changed).unwrap()
+        );
+    }
 }
 
 #[cfg(test)]
 mod heal_control_tests {
     use super::{
         CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_PROTOCOL_VERSION,
-        REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX, canonical_heal_control_capability_ack, canonical_heal_control_request_body,
-        canonical_heal_control_response_body, decode_remote_version_state_capability, encode_cross_pool_fence_capability,
-        encode_remote_version_state_capability, heal_control_capability_probe, heal_control_coordinator_epoch,
-        heal_control_execution_timeout, heal_control_execution_timeout_for, internode_rpc_timeout,
-        is_cross_pool_fence_capability_probe, is_heal_control_capability_probe, is_remote_version_state_capability_probe,
-        normalize_internode_rpc_timeout, remote_version_state_capability_probe,
+        ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX, REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX,
+        TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX, canonical_heal_control_capability_ack,
+        canonical_heal_control_request_body, canonical_heal_control_response_body, decode_remote_version_state_capability,
+        encode_cross_pool_fence_capability, encode_remote_version_state_capability, heal_control_capability_probe,
+        heal_control_coordinator_epoch, heal_control_execution_timeout, heal_control_execution_timeout_for,
+        ilm_recovery_export_capability_probe, internode_rpc_timeout, is_cross_pool_fence_capability_probe,
+        is_heal_control_capability_probe, is_ilm_recovery_export_capability_probe, is_remote_version_state_capability_probe,
+        is_transition_transaction_compaction_capability_probe, normalize_internode_rpc_timeout,
+        remote_version_state_capability_probe, transition_transaction_compaction_capability_probe,
     };
     use crate::heal_control;
     use std::time::Duration;
@@ -1762,10 +2304,10 @@ mod heal_control_tests {
     #[test]
     fn canonical_capability_ack_binds_version_and_topology() {
         assert_eq!(HEAL_CONTROL_PROTOCOL_VERSION, 3);
-        assert!(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.starts_with(b"rustfs-heal-control-capability-v3"));
+        assert!(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.starts_with(b"rustfs-heal-control-capability-v4"));
         let probe = heal_control_capability_probe(&[7; 16]);
         let ack = canonical_heal_control_capability_ack(1, "ab", &probe).expect("small acknowledgement should encode");
-        let mut golden = b"rustfs-heal-control-capability-ack-v3\0".to_vec();
+        let mut golden = b"rustfs-heal-control-capability-ack-v4\0".to_vec();
         golden.extend_from_slice(&1_u32.to_be_bytes());
         golden.extend_from_slice(&2_u64.to_be_bytes());
         golden.extend_from_slice(b"ab");
@@ -1780,6 +2322,8 @@ mod heal_control_tests {
         );
         assert!(is_heal_control_capability_probe(&probe));
         assert!(!is_heal_control_capability_probe(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX));
+        let legacy_probe = [b"rustfs-heal-control-capability-v3\0".as_slice(), &[7; 16]].concat();
+        assert!(!is_heal_control_capability_probe(&legacy_probe));
     }
 
     #[test]
@@ -1787,6 +2331,34 @@ mod heal_control_tests {
         let probe = remote_version_state_capability_probe(&[7; 16]);
         assert!(is_remote_version_state_capability_probe(&probe));
         assert!(!is_remote_version_state_capability_probe(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX));
+    }
+
+    #[test]
+    fn ilm_recovery_export_capability_probe_requires_exact_prefix_and_nonce() {
+        let probe = ilm_recovery_export_capability_probe(&[7; 16]);
+        assert!(is_ilm_recovery_export_capability_probe(&probe));
+        assert!(!is_ilm_recovery_export_capability_probe(ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX));
+        let mut wrong_prefix = probe.clone();
+        wrong_prefix[0] ^= 1;
+        assert!(!is_ilm_recovery_export_capability_probe(&wrong_prefix));
+        let mut extra = probe;
+        extra.push(0);
+        assert!(!is_ilm_recovery_export_capability_probe(&extra));
+    }
+
+    #[test]
+    fn transition_transaction_compaction_probe_requires_exact_prefix_and_nonce() {
+        let probe = transition_transaction_compaction_capability_probe(&[7; 16]);
+        assert!(is_transition_transaction_compaction_capability_probe(&probe));
+        assert!(!is_transition_transaction_compaction_capability_probe(
+            TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX,
+        ));
+        let mut wrong_prefix = probe.clone();
+        wrong_prefix[0] ^= 1;
+        assert!(!is_transition_transaction_compaction_capability_probe(&wrong_prefix));
+        let mut extra = probe;
+        extra.push(0);
+        assert!(!is_transition_transaction_compaction_capability_probe(&extra));
     }
 
     #[test]
@@ -1877,10 +2449,10 @@ mod heal_control_tests {
 #[cfg(test)]
 mod tier_mutation_rpc_tests {
     use super::{
-        TIER_MUTATION_RPC_PROTOCOL_VERSION, TierMutationRpcPhase, TierMutationRpcResponseProofInput,
-        canonical_tier_mutation_rpc_body, canonical_tier_mutation_rpc_response_body,
+        TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION, TIER_MUTATION_RPC_PROTOCOL_VERSION, TierMutationRpcPhase,
+        TierMutationRpcResponseProofInput, canonical_tier_mutation_rpc_body, canonical_tier_mutation_rpc_response_body,
     };
-    use crate::proto_gen::node_service::TierMutationPeerState;
+    use crate::proto_gen::node_service::{TierMutationFailureClass, TierMutationPeerState};
     use uuid::uuid;
 
     #[test]
@@ -1895,7 +2467,7 @@ mod tier_mutation_rpc_tests {
         )
         .expect("small mutation body should encode");
         let mut golden = b"rustfs-tier-mutation-rpc-v1\0".to_vec();
-        golden.extend_from_slice(&1_u32.to_be_bytes());
+        golden.extend_from_slice(&TIER_MUTATION_RPC_PROTOCOL_VERSION.to_be_bytes());
         golden.extend_from_slice(&7_u64.to_be_bytes());
         golden.extend_from_slice(b"prepare");
         golden.extend_from_slice(mutation_id.as_bytes());
@@ -1905,8 +2477,13 @@ mod tier_mutation_rpc_tests {
 
         assert_ne!(
             baseline,
-            canonical_tier_mutation_rpc_body(2, TierMutationRpcPhase::Prepare, mutation_id, payload)
-                .expect("small mutation body should encode")
+            canonical_tier_mutation_rpc_body(
+                TIER_MUTATION_RPC_PROTOCOL_VERSION + 1,
+                TierMutationRpcPhase::Prepare,
+                mutation_id,
+                payload,
+            )
+            .expect("small mutation body should encode")
         );
         assert_ne!(
             baseline,
@@ -1941,11 +2518,27 @@ mod tier_mutation_rpc_tests {
     }
 
     #[test]
-    fn canonical_tier_mutation_response_binds_request_state_and_error() {
+    fn tier_mutation_v3_request_and_response_golden_bytes_are_unchanged() {
         let mutation_id = uuid!("12345678-1234-5678-9abc-def012345678");
         let payload = b"canonical-intent-record";
-        let baseline = canonical_tier_mutation_rpc_response_body(TierMutationRpcResponseProofInput {
-            version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+        let request = canonical_tier_mutation_rpc_body(
+            TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            payload,
+        )
+        .expect("v3 request should encode");
+        let mut request_golden = b"rustfs-tier-mutation-rpc-v1\0".to_vec();
+        request_golden.extend_from_slice(&TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION.to_be_bytes());
+        request_golden.extend_from_slice(&7_u64.to_be_bytes());
+        request_golden.extend_from_slice(b"prepare");
+        request_golden.extend_from_slice(mutation_id.as_bytes());
+        request_golden.extend_from_slice(&u64::try_from(payload.len()).expect("payload length should fit").to_be_bytes());
+        request_golden.extend_from_slice(payload);
+        assert_eq!(request, request_golden);
+
+        let response = canonical_tier_mutation_rpc_response_body(TierMutationRpcResponseProofInput {
+            version: TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION,
             phase: TierMutationRpcPhase::Prepare,
             mutation_id,
             canonical_payload: payload,
@@ -1953,49 +2546,97 @@ mod tier_mutation_rpc_tests {
             state: TierMutationPeerState::Prepared as i32,
             applied: true,
             error_info: None,
+            // v3 must ignore the field so its authenticated bytes stay exact.
+            failure_class: TierMutationFailureClass::PreDispatchRejected as i32,
         })
-        .expect("small mutation response should encode");
+        .expect("v3 response should encode");
+        let mut response_golden = b"rustfs-tier-mutation-rpc-response-v1\0".to_vec();
+        response_golden.extend_from_slice(&TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION.to_be_bytes());
+        response_golden.extend_from_slice(&7_u64.to_be_bytes());
+        response_golden.extend_from_slice(b"prepare");
+        response_golden.extend_from_slice(mutation_id.as_bytes());
+        response_golden.extend_from_slice(&u64::try_from(payload.len()).expect("payload length should fit").to_be_bytes());
+        response_golden.extend_from_slice(payload);
+        response_golden.push(1);
+        response_golden.extend_from_slice(&(TierMutationPeerState::Prepared as i32).to_be_bytes());
+        response_golden.push(1);
+        response_golden.push(0);
+        response_golden.extend_from_slice(&0_u64.to_be_bytes());
+        assert_eq!(response, response_golden);
+    }
+
+    #[test]
+    fn canonical_tier_mutation_v4_response_binds_request_result_and_failure_class() {
+        let mutation_id = uuid!("12345678-1234-5678-9abc-def012345678");
+        let payload = b"canonical-intent-record";
+        let baseline = canonical_tier_mutation_rpc_response_body(TierMutationRpcResponseProofInput {
+            version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            phase: TierMutationRpcPhase::Prepare,
+            mutation_id,
+            canonical_payload: payload,
+            success: false,
+            state: TierMutationPeerState::Unspecified as i32,
+            applied: false,
+            error_info: Some("failure"),
+            failure_class: TierMutationFailureClass::Ambiguous as i32,
+        })
+        .expect("small v4 mutation response should encode");
 
         let cases = [
             TierMutationRpcResponseProofInput {
-                version: 2,
+                version: TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION,
                 phase: TierMutationRpcPhase::Prepare,
                 mutation_id,
                 canonical_payload: payload,
-                success: true,
-                state: TierMutationPeerState::Prepared as i32,
-                applied: true,
-                error_info: None,
+                success: false,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: false,
+                error_info: Some("failure"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
             },
             TierMutationRpcResponseProofInput {
                 version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
                 phase: TierMutationRpcPhase::Commit,
                 mutation_id,
                 canonical_payload: payload,
-                success: true,
-                state: TierMutationPeerState::Prepared as i32,
-                applied: true,
-                error_info: None,
+                success: false,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: false,
+                error_info: Some("failure"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
             },
             TierMutationRpcResponseProofInput {
                 version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
                 phase: TierMutationRpcPhase::Prepare,
                 mutation_id: uuid!("22345678-1234-5678-9abc-def012345678"),
                 canonical_payload: payload,
-                success: true,
-                state: TierMutationPeerState::Prepared as i32,
-                applied: true,
-                error_info: None,
+                success: false,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: false,
+                error_info: Some("failure"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
             },
             TierMutationRpcResponseProofInput {
                 version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
                 phase: TierMutationRpcPhase::Prepare,
                 mutation_id,
                 canonical_payload: b"tampered-intent-record",
+                success: false,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: false,
+                error_info: Some("failure"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
                 success: true,
-                state: TierMutationPeerState::Prepared as i32,
-                applied: true,
-                error_info: None,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: false,
+                error_info: Some("failure"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
             },
             TierMutationRpcResponseProofInput {
                 version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
@@ -2003,39 +2644,43 @@ mod tier_mutation_rpc_tests {
                 mutation_id,
                 canonical_payload: payload,
                 success: false,
-                state: TierMutationPeerState::Prepared as i32,
-                applied: true,
-                error_info: None,
-            },
-            TierMutationRpcResponseProofInput {
-                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
-                phase: TierMutationRpcPhase::Prepare,
-                mutation_id,
-                canonical_payload: payload,
-                success: true,
                 state: TierMutationPeerState::Committed as i32,
-                applied: true,
-                error_info: None,
-            },
-            TierMutationRpcResponseProofInput {
-                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
-                phase: TierMutationRpcPhase::Prepare,
-                mutation_id,
-                canonical_payload: payload,
-                success: true,
-                state: TierMutationPeerState::Prepared as i32,
                 applied: false,
-                error_info: None,
+                error_info: Some("failure"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
             },
             TierMutationRpcResponseProofInput {
                 version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
                 phase: TierMutationRpcPhase::Prepare,
                 mutation_id,
                 canonical_payload: payload,
-                success: true,
-                state: TierMutationPeerState::Prepared as i32,
+                success: false,
+                state: TierMutationPeerState::Unspecified as i32,
                 applied: true,
-                error_info: Some("error"),
+                error_info: Some("failure"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: false,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: false,
+                error_info: Some("other failure"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: false,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: false,
+                error_info: Some("failure"),
+                failure_class: TierMutationFailureClass::PreDispatchRejected as i32,
             },
         ];
         for case in cases {
@@ -2369,176 +3014,7 @@ mod tests {
         assert_eq!(decoded.protocol_version, 0);
     }
 
-    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-    struct CompatPayloadField {
-        message: &'static str,
-        json_field: &'static str,
-        bin_field: &'static str,
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum RequestJsonPolicy {
-        MsgpackOnlyEligible,
-        AlwaysDualWriteUntilFallbackZero,
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    struct RequestCompatSendSite {
-        field: CompatPayloadField,
-        json_encoder: &'static str,
-        policy: RequestJsonPolicy,
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    struct ResponseCompatSendSite {
-        field: CompatPayloadField,
-        json_encoder: &'static str,
-    }
-
-    const REQUEST_COMPAT_SEND_SITES: &[RequestCompatSendSite] = &[
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "BatchReadVersionRequest",
-                json_field: "batch_read_version_req",
-                bin_field: "batch_read_version_req_bin",
-            },
-            json_encoder: "let batch_read_version_req = compat_json(&req)?;",
-            policy: RequestJsonPolicy::MsgpackOnlyEligible,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "DeleteVersionRequest",
-                json_field: "file_info",
-                bin_field: "file_info_bin",
-            },
-            json_encoder: "let file_info = serde_json::to_string(&fi)?;",
-            policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "DeleteVersionRequest",
-                json_field: "opts",
-                bin_field: "opts_bin",
-            },
-            json_encoder: "let opts = serde_json::to_string(&opts)?;",
-            policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "DeleteVersionsRequest",
-                json_field: "opts",
-                bin_field: "opts_bin",
-            },
-            json_encoder: "let opts = match serde_json::to_string(&opts) {",
-            policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "DeleteVersionsRequest",
-                json_field: "versions",
-                bin_field: "versions_bin",
-            },
-            json_encoder: "versions_str.push(match serde_json::to_string(file_info_versions) {",
-            policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "ReadMultipleRequest",
-                json_field: "read_multiple_req",
-                bin_field: "read_multiple_req_bin",
-            },
-            json_encoder: "let read_multiple_req = compat_json(&req)?;",
-            policy: RequestJsonPolicy::MsgpackOnlyEligible,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "ReadVersionRequest",
-                json_field: "opts",
-                bin_field: "opts_bin",
-            },
-            json_encoder: "let encoded_opts = compat_json(opts).and_then(|opts_str| encode_msgpack(opts).map(|opts_bin| (opts_str, opts_bin)));",
-            policy: RequestJsonPolicy::MsgpackOnlyEligible,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "RenameDataRequest",
-                json_field: "file_info",
-                bin_field: "file_info_bin",
-            },
-            json_encoder: "let file_info = compat_json(&fi)?;",
-            policy: RequestJsonPolicy::MsgpackOnlyEligible,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "UpdateMetadataRequest",
-                json_field: "file_info",
-                bin_field: "file_info_bin",
-            },
-            json_encoder: "let file_info = compat_json(&fi)?;",
-            policy: RequestJsonPolicy::MsgpackOnlyEligible,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "UpdateMetadataRequest",
-                json_field: "opts",
-                bin_field: "opts_bin",
-            },
-            json_encoder: "let opts_str = compat_json(&opts)?;",
-            policy: RequestJsonPolicy::MsgpackOnlyEligible,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "WriteMetadataRequest",
-                json_field: "file_info",
-                bin_field: "file_info_bin",
-            },
-            json_encoder: "let file_info = compat_json(&fi)?;",
-            policy: RequestJsonPolicy::MsgpackOnlyEligible,
-        },
-    ];
-
-    const RESPONSE_COMPAT_SEND_SITES: &[ResponseCompatSendSite] = &[
-        ResponseCompatSendSite {
-            field: CompatPayloadField {
-                message: "BatchReadVersionResponse",
-                json_field: "batch_read_version_resps",
-                bin_field: "batch_read_version_resps_bin",
-            },
-            json_encoder: "compat_response_json(batch_read_version_resp, request_decoded_from_msgpack)",
-        },
-        ResponseCompatSendSite {
-            field: CompatPayloadField {
-                message: "ReadMultipleResponse",
-                json_field: "read_multiple_resps",
-                bin_field: "read_multiple_resps_bin",
-            },
-            json_encoder: "compat_response_json(read_multiple_resp, false)",
-        },
-        ResponseCompatSendSite {
-            field: CompatPayloadField {
-                message: "ReadVersionResponse",
-                json_field: "file_info",
-                bin_field: "file_info_bin",
-            },
-            json_encoder: "let file_info_json = compat_response_json(&file_info, request_had_msgpack_payload);",
-        },
-        ResponseCompatSendSite {
-            field: CompatPayloadField {
-                message: "ReadXLResponse",
-                json_field: "raw_file_info",
-                bin_field: "raw_file_info_bin",
-            },
-            json_encoder: "let raw_file_info_json = compat_response_json(&raw_file_info, false);",
-        },
-        ResponseCompatSendSite {
-            field: CompatPayloadField {
-                message: "RenameDataResponse",
-                json_field: "rename_data_resp",
-                bin_field: "rename_data_resp_bin",
-            },
-            json_encoder: "let rename_data_resp_json = compat_response_json(rename_data_resp, request_decoded_from_msgpack)",
-        },
-    ];
+    use crate::compat_manifest::{CompatPayloadField, REQUEST_COMPAT_SEND_SITES, RESPONSE_COMPAT_SEND_SITES, RequestJsonPolicy};
 
     fn proto_bin_json_fields(message_suffix: &str) -> Vec<CompatPayloadField> {
         let proto = include_str!("node.proto");
@@ -2578,13 +3054,6 @@ mod tests {
         fields
     }
 
-    fn production_source(source: &'static str, file_name: &str) -> &'static str {
-        source
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .unwrap_or_else(|| panic!("{file_name} should contain production source before tests"))
-    }
-
     #[test]
     fn request_compat_send_site_manifest_covers_node_proto_bin_fields() {
         let mut manifest_fields = REQUEST_COMPAT_SEND_SITES
@@ -2600,31 +3069,6 @@ mod tests {
             "duplicate request send-site manifest entry"
         );
         assert_eq!(manifest_fields, proto_bin_json_fields("Request"));
-    }
-
-    #[test]
-    fn request_compat_send_site_manifest_pins_json_policy_and_encoder() {
-        let source = production_source(include_str!("../../ecstore/src/cluster/rpc/remote_disk.rs"), "remote_disk.rs");
-        let msgpack_only_eligible = REQUEST_COMPAT_SEND_SITES
-            .iter()
-            .filter(|send_site| send_site.policy == RequestJsonPolicy::MsgpackOnlyEligible)
-            .count();
-        let always_dual_write = REQUEST_COMPAT_SEND_SITES
-            .iter()
-            .filter(|send_site| send_site.policy == RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero)
-            .count();
-
-        assert_eq!(msgpack_only_eligible, 7);
-        assert_eq!(always_dual_write, 4);
-        for send_site in REQUEST_COMPAT_SEND_SITES {
-            assert!(
-                source.contains(send_site.json_encoder),
-                "{}.{} must keep its manifest encoder: {}",
-                send_site.field.message,
-                send_site.field.json_field,
-                send_site.json_encoder
-            );
-        }
     }
 
     #[test]
@@ -2672,21 +3116,6 @@ mod tests {
             "duplicate response send-site manifest entry"
         );
         assert_eq!(manifest_fields, proto_bin_json_fields("Response"));
-    }
-
-    #[test]
-    fn response_compat_send_site_manifest_pins_json_encoder() {
-        let source = production_source(include_str!("../../../rustfs/src/storage/rpc/node_service/disk.rs"), "disk.rs");
-
-        for send_site in RESPONSE_COMPAT_SEND_SITES {
-            assert!(
-                source.contains(send_site.json_encoder),
-                "{}.{} must keep its manifest encoder: {}",
-                send_site.field.message,
-                send_site.field.json_field,
-                send_site.json_encoder
-            );
-        }
     }
 
     #[test]

@@ -16,7 +16,8 @@
 
 use super::storage_api::admin_usecase::admin::get_server_info;
 use super::storage_api::admin_usecase::capacity::{
-    PoolDecommissionInfo, PoolStatus, RebalStatus, get_total_usable_capacity, get_total_usable_capacity_free,
+    DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus, RebalStatus, get_total_usable_capacity,
+    get_total_usable_capacity_free,
 };
 use super::storage_api::admin_usecase::contract::StorageAdminApi;
 use super::storage_api::admin_usecase::contract::bucket::{BucketOperations as _, BucketOptions};
@@ -42,6 +43,10 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 pub type AdminUsecaseResult<T> = Result<T, ApiError>;
+
+/// `waitingReason` value reported while a pool is paused on target capacity.
+const DECOMMISSION_WAITING_REASON_CAPACITY: &str = "capacity";
+
 pub const ADMIN_CLUSTER_SNAPSHOT_ROUTE: &str = "/rustfs/admin/v4/cluster/snapshot";
 pub const ADMIN_EXTENSIONS_CATALOG_ROUTE: &str = "/rustfs/admin/v4/extensions/catalog";
 pub const ADMIN_RUNTIME_CAPABILITIES_ROUTE: &str = "/rustfs/admin/v4/runtime/capabilities";
@@ -107,6 +112,10 @@ pub struct AdminPoolDecommissionInfo {
     pub bytes_failed: usize,
     #[serde(rename = "waitingReason")]
     pub waiting_reason: Option<String>,
+    #[serde(rename = "capacityBlockedReason", skip_serializing_if = "Option::is_none")]
+    pub capacity_blocked_reason: Option<String>,
+    #[serde(rename = "unresolvedEntries", skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_entries: Vec<DecommissionUnresolvedEntry>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -234,7 +243,7 @@ impl DefaultAdminUsecase {
     /// namespace still contains, carries no usable information and is dropped
     /// exactly as before.
     fn narrow_data_usage_snapshot_to_measured_buckets(info: &mut DataUsageInfo, buckets: impl IntoIterator<Item = String>) {
-        if !info.is_complete_bucket_usage_snapshot() {
+        if !info.is_complete_bucket_usage_snapshot() && !info.is_valid_partial_snapshot() {
             *info = DataUsageInfo::default();
             return;
         }
@@ -619,11 +628,23 @@ impl DefaultAdminUsecase {
             bytes_done: info.bytes_done,
             bytes_failed: info.bytes_failed,
             waiting_reason,
+            capacity_blocked_reason: info.capacity_blocked_reason,
+            unresolved_entries: info.unresolved_entries,
         }
     }
 
+    /// Why a pool is not currently making progress.
+    ///
+    /// A durable capacity pause is reported ahead of the worker states: it is
+    /// the actionable condition, and `capacityBlockedReason` carries the detail.
     fn decommission_waiting_reason(info: &PoolDecommissionInfo) -> Option<&'static str> {
-        if !info.has_decommission_state() || info.complete || info.failed || info.canceled || info.start_time.is_some() {
+        if !info.has_decommission_state() || info.complete || info.failed || info.canceled {
+            return None;
+        }
+        if info.capacity_blocked_reason.is_some() {
+            return Some(DECOMMISSION_WAITING_REASON_CAPACITY);
+        }
+        if info.start_time.is_some() {
             return None;
         }
         if info.queued {
@@ -676,7 +697,7 @@ impl DefaultAdminUsecase {
 
 #[cfg(test)]
 mod tests {
-    use super::super::storage_api::admin_usecase::capacity::{PoolDecommissionInfo, PoolStatus};
+    use super::super::storage_api::admin_usecase::capacity::{DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus};
     use super::*;
     use time::OffsetDateTime;
     use tracing_subscriber::{Layer, Registry, layer::Context, prelude::*};
@@ -754,6 +775,29 @@ mod tests {
         info.usage_snapshot_complete = false;
         DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(&mut info, ["bucket-a".to_string()]);
         assert_eq!(info, DataUsageInfo::default());
+
+        // A structurally valid partial admin view can still carry useful
+        // conservative totals.
+        let mut info = measured("bucket-a");
+        info.usage_snapshot_complete = false;
+        info.usage_snapshot_partial = true;
+        info.usage_snapshot_converged = Some(false);
+        info.scanner_cycle = Some(11);
+        info.scanner_epoch = Some(4);
+        info.usage_snapshot_set_states = vec![rustfs_data_usage::DataUsageSnapshotSetState {
+            pool_index: 0,
+            set_index: 0,
+            scanner_cycle: Some(11),
+            scanner_epoch: Some(4),
+            scan_plan_digest: Some([1; 32]),
+            complete: true,
+            tombstone: false,
+            segment_invalidation_proof: None,
+        }];
+        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(&mut info, ["bucket-a".to_string()]);
+        assert_eq!(info.usage_snapshot_converged, Some(false));
+        assert_eq!(info.buckets_count, 1);
+        assert_eq!(info.objects_total_count, 7);
 
         // An empty namespace with an empty snapshot stays a confirmed zero.
         let mut info = DataUsageInfo {
@@ -968,6 +1012,57 @@ mod tests {
         assert_eq!(item.rebalance_status, "started");
     }
 
+    /// A durable capacity pause must be distinguishable from "slow but
+    /// progressing": the pause surfaces its own waiting reason, the persisted
+    /// detail.
+    #[test]
+    fn admin_pool_list_item_exposes_decommission_capacity_pause() {
+        let item = DefaultAdminUsecase::pool_list_item_from_status(
+            PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                    total_size: 1_000,
+                    current_size: 500,
+                    capacity_blocked_reason: Some("target pool 1 target capacity mutation gate is busy".to_string()),
+                    ..Default::default()
+                }),
+            },
+            (RebalStatus::None, false),
+        );
+
+        let value = serde_json::to_value(item).expect("paused pool status should serialize");
+        assert_eq!(value["decommissionInfo"]["waitingReason"], "capacity");
+        assert_eq!(
+            value["decommissionInfo"]["capacityBlockedReason"],
+            "target pool 1 target capacity mutation gate is busy"
+        );
+    }
+
+    /// Once the pause clears, `waitingReason` must return to the worker states
+    /// without retaining a stale capacity reason.
+    #[test]
+    fn admin_pool_list_item_clears_capacity_pause() {
+        let item = DefaultAdminUsecase::pool_list_item_from_status(
+            PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                    ..Default::default()
+                }),
+            },
+            (RebalStatus::None, false),
+        );
+
+        let value = serde_json::to_value(item).expect("resumed pool status should serialize");
+        assert!(value["decommissionInfo"]["waitingReason"].is_null());
+        assert!(value["decommissionInfo"].get("capacityBlockedReason").is_none());
+    }
+
     #[test]
     fn admin_pool_list_item_exposes_queued_decommission_state() {
         let item = DefaultAdminUsecase::pool_list_item_from_status(
@@ -987,6 +1082,17 @@ mod tests {
                     items_decommission_failed: 1,
                     bytes_done: 1024,
                     bytes_failed: 64,
+                    unresolved_entries: vec![DecommissionUnresolvedEntry {
+                        bucket: "bucket-a".to_string(),
+                        object: "prefix/unresolved.txt".to_string(),
+                        pool_index: 3,
+                        set_index: 1,
+                        source_generation: OffsetDateTime::UNIX_EPOCH,
+                        candidate_count: 2,
+                        disk_error_count: 1,
+                        observed_at: OffsetDateTime::UNIX_EPOCH,
+                        reason: "metadata_resolution_failed".to_string(),
+                    }],
                     ..Default::default()
                 }),
             },
@@ -1010,6 +1116,13 @@ mod tests {
         assert_eq!(value["decommissionInfo"]["objectsDecommissionedFailed"], 1);
         assert_eq!(value["decommissionInfo"]["bytesDecommissioned"], 1024);
         assert_eq!(value["decommissionInfo"]["bytesDecommissionedFailed"], 64);
+        assert_eq!(value["decommissionInfo"]["unresolvedEntries"][0]["bucket"], "bucket-a");
+        assert_eq!(value["decommissionInfo"]["unresolvedEntries"][0]["object"], "prefix/unresolved.txt");
+        assert_eq!(
+            value["decommissionInfo"]["unresolvedEntries"][0]["sourceGeneration"],
+            "1970-01-01T00:00:00Z"
+        );
+        assert_eq!(value["decommissionInfo"]["unresolvedEntries"][0]["reason"], "metadata_resolution_failed");
         assert_eq!(value["decommissionInfo"]["waitingReason"], "queued");
     }
 

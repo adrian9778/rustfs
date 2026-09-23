@@ -30,11 +30,10 @@ use crate::admin::storage_api::error::StorageError;
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use crate::{
     admin::{
-        auth::validate_admin_request,
+        auth::authorize_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
-    auth::{check_key_valid, get_session_token},
-    server::{ADMIN_PREFIX, RemoteAddr},
+    server::ADMIN_PREFIX,
 };
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
@@ -65,13 +64,260 @@ use time::OffsetDateTime;
 use tracing::warn;
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
+const DIAGNOSTIC_EXPORT_PREFIX: &str = "_diagnostic";
+const DIAGNOSTIC_EXPORT_MANIFEST: &str = "_diagnostic-manifest.json";
+
+/// Earlier partial exports omitted configurations and carried this marker.
+/// Reject those archives before import can create an incomplete replacement.
+const EXPORT_UNREADABLE_MANIFEST: &str = "rustfs-unreadable-configs.json";
+
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_BUCKET_META: &str = "bucket_meta";
 const EVENT_ADMIN_BUCKET_META_STATE: &str = "admin_bucket_meta_state";
 
+fn export_internal_error(message: impl Into<String>) -> s3s::S3Error {
+    let message = message.into();
+    s3_error!(InternalError, "{message}")
+}
+
+/// Why one of a bucket's configurations could not be exported.
+///
+/// Ordinary backups fail on either variant. Explicit diagnostics may report
+/// unreadable configurations, but output failures still abort the archive.
+#[derive(Debug)]
+enum ExportConfigError {
+    /// The configuration is stored but this build cannot read it: a
+    /// MinIO-origin or otherwise undecodable blob, or a revision that moved
+    /// underneath the export. Only an explicit diagnostic export may omit it.
+    Unreadable(String),
+    /// This build failed to produce its own output for a configuration it had
+    /// already decoded. Nothing about the stored bytes is in doubt, so the
+    /// export fails closed rather than reporting healthy metadata as
+    /// unreadable.
+    Internal(s3s::S3Error),
+}
+
+impl ExportConfigError {
+    fn unreadable(message: impl Into<String>) -> Self {
+        Self::Unreadable(message.into())
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::Internal(export_internal_error(message))
+    }
+}
+
+fn checked_raw_xml<T, E, F>(validated: &T, raw: Vec<u8>, parse: F) -> Result<Vec<u8>, ExportConfigError>
+where
+    T: PartialEq,
+    E: std::fmt::Display,
+    F: FnOnce(&[u8]) -> Result<T, E>,
+{
+    let selected = parse(&raw).map_err(|e| {
+        ExportConfigError::unreadable(format!("persisted bucket metadata changed to invalid XML during export: {e}"))
+    })?;
+    if selected != *validated {
+        return Err(ExportConfigError::unreadable("bucket metadata changed during export"));
+    }
+    Ok(raw)
+}
+
+fn checked_versioning_xml(validated: &VersioningConfiguration, raw: Vec<u8>) -> Result<Vec<u8>, ExportConfigError> {
+    if raw.is_empty() {
+        if *validated != VersioningConfiguration::default() {
+            return Err(ExportConfigError::unreadable("bucket metadata changed during export"));
+        }
+        return serialize(validated).map_err(|e| ExportConfigError::internal(format!("serialize config failed: {e}")));
+    }
+    checked_raw_xml(validated, raw, deserialize::<VersioningConfiguration>)
+}
+
+/// Bytes to export for one of a bucket's configurations.
+///
+/// `Ok(None)` means the bucket has not configured it. An `Err` never becomes an
+/// exported configuration — a fabricated default here would reach an importer
+/// as a real one — and its variant tells the caller whether the failure belongs
+/// to the stored bytes or to this build's own output; see [`ExportConfigError`].
+async fn exported_bucket_config(bucket: &str, conf: &str) -> Result<Option<Vec<u8>>, ExportConfigError> {
+    match conf {
+        BUCKET_POLICY_CONFIG => {
+            let config: BucketPolicy = match metadata_sys::get_bucket_policy(bucket).await {
+                Ok((res, _)) => res,
+                Err(e) => {
+                    if e == StorageError::ConfigNotFound {
+                        return Ok(None);
+                    }
+                    return Err(ExportConfigError::unreadable(format!("failed to load bucket metadata: {e}")));
+                }
+            };
+            let config_json = serde_json::to_vec(&config)
+                .map_err(|e| ExportConfigError::internal(format!("failed to serialize config: {e}")))?;
+            Ok(Some(config_json))
+        }
+        BUCKET_NOTIFICATION_CONFIG => {
+            let metadata = metadata_sys::get(bucket)
+                .await
+                .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?;
+            if metadata.notification_config_xml.is_empty() {
+                return Ok(None);
+            }
+            let config = metadata
+                .notification_config
+                .as_ref()
+                .ok_or_else(|| ExportConfigError::unreadable("persisted bucket notification configuration is invalid"))?;
+            let config_xml = checked_raw_xml(
+                config,
+                metadata.notification_config_xml.clone(),
+                deserialize::<s3s::dto::NotificationConfiguration>,
+            )?;
+            Ok(Some(config_xml))
+        }
+        BUCKET_LIFECYCLE_CONFIG => {
+            let metadata = metadata_sys::get(bucket)
+                .await
+                .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?;
+            if metadata.lifecycle_config_xml.is_empty() {
+                return Ok(None);
+            }
+            let config = metadata
+                .lifecycle_config
+                .as_ref()
+                .ok_or_else(|| ExportConfigError::unreadable("persisted bucket lifecycle configuration is invalid"))?;
+            let config_xml =
+                checked_raw_xml(config, metadata.lifecycle_config_xml.clone(), deserialize::<BucketLifecycleConfiguration>)?;
+            Ok(Some(config_xml))
+        }
+        BUCKET_TAGGING_CONFIG => {
+            let metadata = metadata_sys::get(bucket)
+                .await
+                .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?;
+            if metadata.tagging_config_xml.is_empty() {
+                return Ok(None);
+            }
+            let config = metadata
+                .tagging_config
+                .as_ref()
+                .ok_or_else(|| ExportConfigError::unreadable("persisted bucket tagging configuration is invalid"))?;
+            let config_xml = checked_raw_xml(config, metadata.tagging_config_xml.clone(), deserialize::<Tagging>)?;
+            Ok(Some(config_xml))
+        }
+        BUCKET_QUOTA_CONFIG_FILE => {
+            let config: BucketQuota = match metadata_sys::get_quota_config(bucket).await {
+                Ok((res, _)) => res,
+                Err(e) => {
+                    if e == StorageError::ConfigNotFound {
+                        return Ok(None);
+                    }
+                    return Err(ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")));
+                }
+            };
+            let config_json =
+                serde_json::to_vec(&config).map_err(|e| ExportConfigError::internal(format!("serialize config failed: {e}")))?;
+
+            Ok(Some(config_json))
+        }
+        OBJECT_LOCK_CONFIG => {
+            let config = match metadata_sys::get_object_lock_config(bucket).await {
+                Ok((res, _)) => res,
+                Err(e) => {
+                    if e == StorageError::ConfigNotFound {
+                        return Ok(None);
+                    }
+                    return Err(ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")));
+                }
+            };
+            let raw_config = metadata_sys::get(bucket)
+                .await
+                .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?
+                .object_lock_config_xml
+                .clone();
+            let config_xml = checked_raw_xml(&config, raw_config, deserialize::<ObjectLockConfiguration>)?;
+
+            Ok(Some(config_xml))
+        }
+        BUCKET_SSECONFIG => {
+            let config = match metadata_sys::get_sse_config(bucket).await {
+                Ok((res, _)) => res,
+                Err(e) => {
+                    if e == StorageError::ConfigNotFound {
+                        return Ok(None);
+                    }
+                    return Err(ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")));
+                }
+            };
+            let raw_config = metadata_sys::get(bucket)
+                .await
+                .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?
+                .encryption_config_xml
+                .clone();
+            let config_xml = checked_raw_xml(&config, raw_config, deserialize::<ServerSideEncryptionConfiguration>)?;
+
+            Ok(Some(config_xml))
+        }
+        BUCKET_VERSIONING_CONFIG => {
+            let config = match metadata_sys::get_versioning_config(bucket).await {
+                Ok((res, _)) => res,
+                Err(e) => {
+                    if e == StorageError::ConfigNotFound {
+                        return Ok(None);
+                    }
+                    return Err(ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")));
+                }
+            };
+            let raw_config = metadata_sys::get(bucket)
+                .await
+                .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?
+                .versioning_config_xml
+                .clone();
+            let config_xml = checked_versioning_xml(&config, raw_config)?;
+
+            Ok(Some(config_xml))
+        }
+        BUCKET_REPLICATION_CONFIG => {
+            let config = match metadata_sys::get_replication_config(bucket).await {
+                Ok((res, _)) => res,
+                Err(e) => {
+                    if e == StorageError::ConfigNotFound {
+                        return Ok(None);
+                    }
+                    return Err(ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")));
+                }
+            };
+            let raw_config = metadata_sys::get(bucket)
+                .await
+                .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?
+                .replication_config_xml
+                .clone();
+            let config_xml = checked_raw_xml(&config, raw_config, deserialize::<ReplicationConfiguration>)?;
+
+            Ok(Some(config_xml))
+        }
+        BUCKET_TARGETS_FILE => {
+            let config: BucketTargets = match metadata_sys::get_bucket_targets_config(bucket).await {
+                Ok(res) => res,
+                Err(e) => {
+                    if e == StorageError::ConfigNotFound {
+                        return Ok(None);
+                    }
+                    return Err(ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")));
+                }
+            };
+
+            let config_json = serde_json::to_vec(&config.redacted_credentials())
+                .map_err(|e| ExportConfigError::internal(format!("serialize config failed: {e}")))?;
+
+            Ok(Some(config_json))
+        }
+        _ => Ok(None),
+    }
+}
+
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct ExportBucketMetadataQuery {
+    #[serde(default)]
     pub bucket: String,
+    #[serde(default)]
+    pub diagnostic: bool,
 }
 
 pub struct ExportBucketMetadata {}
@@ -117,22 +363,11 @@ impl Operation for ExportBucketMetadata {
             }
         };
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::ExportBucketMetadataAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ExportBucketMetadataAction)]).await?;
 
         let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
@@ -152,6 +387,7 @@ impl Operation for ExportBucketMetadata {
         };
 
         let mut zip_writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let mut errors = Vec::new();
 
         let confs = [
             BUCKET_POLICY_CONFIG,
@@ -169,213 +405,52 @@ impl Operation for ExportBucketMetadata {
         for bucket in buckets {
             for &conf in confs.iter() {
                 let conf_path = path_join_buf(&[bucket.name.as_str(), conf]);
-                match conf {
-                    BUCKET_POLICY_CONFIG => {
-                        let config: BucketPolicy = match metadata_sys::get_bucket_policy(&bucket.name).await {
-                            Ok((res, _)) => res,
-                            Err(e) => {
-                                if e == StorageError::ConfigNotFound {
-                                    continue;
-                                }
-                                return Err(s3_error!(InternalError, "failed to load bucket metadata: {e}"));
-                            }
-                        };
-                        let config_json = serde_json::to_vec(&config)
-                            .map_err(|e| s3_error!(InternalError, "failed to serialize config: {e}"))?;
-                        zip_writer
-                            .start_file(conf_path, SimpleFileOptions::default())
-                            .map_err(|e| s3_error!(InternalError, "failed to start archive entry: {e}"))?;
-                        zip_writer
-                            .write_all(&config_json)
-                            .map_err(|e| s3_error!(InternalError, "failed to write archive entry: {e}"))?;
+                let config = match exported_bucket_config(&bucket.name, conf).await {
+                    Ok(Some(config)) => config,
+                    Ok(None) => continue,
+                    Err(ExportConfigError::Unreadable(error)) => {
+                        if !query.diagnostic {
+                            return Err(export_internal_error(format!("failed to export {conf_path}: {error}")));
+                        }
+                        // Diagnostics identify omitted configurations without
+                        // exposing payloads or parser details.
+                        errors.push(serde_json::json!({
+                            "bucket": bucket.name,
+                            "config": conf,
+                            "code": "configuration_unavailable",
+                        }));
+                        continue;
                     }
-                    BUCKET_NOTIFICATION_CONFIG => {
-                        let config: s3s::dto::NotificationConfiguration =
-                            match metadata_sys::get_notification_config(&bucket.name).await {
-                                Ok(Some(res)) => res,
-                                Err(e) => {
-                                    if e == StorageError::ConfigNotFound {
-                                        continue;
-                                    }
-                                    return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
-                                }
-                                Ok(None) => continue,
-                            };
-
-                        let config_xml =
-                            serialize(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
-
-                        zip_writer
-                            .start_file(conf_path, SimpleFileOptions::default())
-                            .map_err(|e| s3_error!(InternalError, "start file failed: {e}"))?;
-                        zip_writer
-                            .write_all(&config_xml)
-                            .map_err(|e| s3_error!(InternalError, "write file failed: {e}"))?;
-                    }
-                    BUCKET_LIFECYCLE_CONFIG => {
-                        let config: BucketLifecycleConfiguration = match metadata_sys::get_lifecycle_config(&bucket.name).await {
-                            Ok((res, _)) => res,
-                            Err(e) => {
-                                if e == StorageError::ConfigNotFound {
-                                    continue;
-                                }
-                                return Err(s3_error!(InternalError, "failed to load bucket metadata: {e}"));
-                            }
-                        };
-                        let config_xml =
-                            serialize(&config).map_err(|e| s3_error!(InternalError, "failed to serialize config: {e}"))?;
-
-                        zip_writer
-                            .start_file(conf_path, SimpleFileOptions::default())
-                            .map_err(|e| s3_error!(InternalError, "failed to start archive entry: {e}"))?;
-                        zip_writer
-                            .write_all(&config_xml)
-                            .map_err(|e| s3_error!(InternalError, "failed to write archive entry: {e}"))?;
-                    }
-                    BUCKET_TAGGING_CONFIG => {
-                        let config: Tagging = match metadata_sys::get_tagging_config(&bucket.name).await {
-                            Ok((res, _)) => res,
-                            Err(e) => {
-                                if e == StorageError::ConfigNotFound {
-                                    continue;
-                                }
-                                return Err(s3_error!(InternalError, "failed to load bucket metadata: {e}"));
-                            }
-                        };
-                        let config_xml =
-                            serialize(&config).map_err(|e| s3_error!(InternalError, "failed to serialize config: {e}"))?;
-
-                        zip_writer
-                            .start_file(conf_path, SimpleFileOptions::default())
-                            .map_err(|e| s3_error!(InternalError, "failed to start archive entry: {e}"))?;
-                        zip_writer
-                            .write_all(&config_xml)
-                            .map_err(|e| s3_error!(InternalError, "failed to write archive entry: {e}"))?;
-                    }
-                    BUCKET_QUOTA_CONFIG_FILE => {
-                        let config: BucketQuota = match metadata_sys::get_quota_config(&bucket.name).await {
-                            Ok((res, _)) => res,
-                            Err(e) => {
-                                if e == StorageError::ConfigNotFound {
-                                    continue;
-                                }
-                                return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
-                            }
-                        };
-                        let config_json =
-                            serde_json::to_vec(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
-
-                        zip_writer
-                            .start_file(conf_path, SimpleFileOptions::default())
-                            .map_err(|e| s3_error!(InternalError, "start file failed: {e}"))?;
-                        zip_writer
-                            .write_all(&config_json)
-                            .map_err(|e| s3_error!(InternalError, "write file failed: {e}"))?;
-                    }
-                    OBJECT_LOCK_CONFIG => {
-                        let config = match metadata_sys::get_object_lock_config(&bucket.name).await {
-                            Ok((res, _)) => res,
-                            Err(e) => {
-                                if e == StorageError::ConfigNotFound {
-                                    continue;
-                                }
-                                return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
-                            }
-                        };
-                        let config_xml =
-                            serialize(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
-
-                        zip_writer
-                            .start_file(conf_path, SimpleFileOptions::default())
-                            .map_err(|e| s3_error!(InternalError, "start file failed: {e}"))?;
-                        zip_writer
-                            .write_all(&config_xml)
-                            .map_err(|e| s3_error!(InternalError, "write file failed: {e}"))?;
-                    }
-                    BUCKET_SSECONFIG => {
-                        let config = match metadata_sys::get_sse_config(&bucket.name).await {
-                            Ok((res, _)) => res,
-                            Err(e) => {
-                                if e == StorageError::ConfigNotFound {
-                                    continue;
-                                }
-                                return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
-                            }
-                        };
-                        let config_xml =
-                            serialize(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
-
-                        zip_writer
-                            .start_file(conf_path, SimpleFileOptions::default())
-                            .map_err(|e| s3_error!(InternalError, "start file failed: {e}"))?;
-                        zip_writer
-                            .write_all(&config_xml)
-                            .map_err(|e| s3_error!(InternalError, "write file failed: {e}"))?;
-                    }
-                    BUCKET_VERSIONING_CONFIG => {
-                        let config = match metadata_sys::get_versioning_config(&bucket.name).await {
-                            Ok((res, _)) => res,
-                            Err(e) => {
-                                if e == StorageError::ConfigNotFound {
-                                    continue;
-                                }
-                                return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
-                            }
-                        };
-                        let config_xml =
-                            serialize(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
-
-                        zip_writer
-                            .start_file(conf_path, SimpleFileOptions::default())
-                            .map_err(|e| s3_error!(InternalError, "start file failed: {e}"))?;
-                        zip_writer
-                            .write_all(&config_xml)
-                            .map_err(|e| s3_error!(InternalError, "write file failed: {e}"))?;
-                    }
-                    BUCKET_REPLICATION_CONFIG => {
-                        let config = match metadata_sys::get_replication_config(&bucket.name).await {
-                            Ok((res, _)) => res,
-                            Err(e) => {
-                                if e == StorageError::ConfigNotFound {
-                                    continue;
-                                }
-                                return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
-                            }
-                        };
-                        let config_xml =
-                            serialize(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
-
-                        zip_writer
-                            .start_file(conf_path, SimpleFileOptions::default())
-                            .map_err(|e| s3_error!(InternalError, "start file failed: {e}"))?;
-                        zip_writer
-                            .write_all(&config_xml)
-                            .map_err(|e| s3_error!(InternalError, "write file failed: {e}"))?;
-                    }
-                    BUCKET_TARGETS_FILE => {
-                        let config: BucketTargets = match metadata_sys::get_bucket_targets_config(&bucket.name).await {
-                            Ok(res) => res,
-                            Err(e) => {
-                                if e == StorageError::ConfigNotFound {
-                                    continue;
-                                }
-                                return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
-                            }
-                        };
-
-                        let config_json = serde_json::to_vec(&config.redacted_credentials())
-                            .map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
-
-                        zip_writer
-                            .start_file(conf_path, SimpleFileOptions::default())
-                            .map_err(|e| s3_error!(InternalError, "start file failed: {e}"))?;
-                        zip_writer
-                            .write_all(&config_json)
-                            .map_err(|e| s3_error!(InternalError, "write file failed: {e}"))?;
-                    }
-                    _ => {}
-                }
+                    Err(ExportConfigError::Internal(error)) => return Err(error),
+                };
+                let conf_path = if query.diagnostic {
+                    path_join_buf(&[DIAGNOSTIC_EXPORT_PREFIX, &conf_path])
+                } else {
+                    conf_path
+                };
+                zip_writer
+                    .start_file(conf_path, SimpleFileOptions::default())
+                    .map_err(|e| s3_error!(InternalError, "failed to start archive entry: {e}"))?;
+                zip_writer
+                    .write_all(&config)
+                    .map_err(|e| s3_error!(InternalError, "failed to write archive entry: {e}"))?;
             }
+        }
+
+        if query.diagnostic {
+            let manifest = serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "mode": "diagnostic",
+                "complete": errors.is_empty(),
+                "errors": errors,
+            }))
+            .map_err(|e| s3_error!(InternalError, "failed to serialize diagnostic manifest: {e}"))?;
+            zip_writer
+                .start_file(DIAGNOSTIC_EXPORT_MANIFEST, SimpleFileOptions::default())
+                .map_err(|e| s3_error!(InternalError, "failed to start diagnostic manifest: {e}"))?;
+            zip_writer
+                .write_all(&manifest)
+                .map_err(|e| s3_error!(InternalError, "failed to write diagnostic manifest: {e}"))?;
         }
 
         let zip_bytes = zip_writer
@@ -385,8 +460,17 @@ impl Operation for ExportBucketMetadata {
         header.insert(CONTENT_TYPE, "application/zip".parse().expect("valid header value"));
         header.insert(
             CONTENT_DISPOSITION,
-            "attachment; filename=bucket-meta.zip".parse().expect("valid header value"),
+            if query.diagnostic {
+                "attachment; filename=bucket-meta-diagnostic.zip"
+            } else {
+                "attachment; filename=bucket-meta.zip"
+            }
+            .parse()
+            .expect("valid header value"),
         );
+        if query.diagnostic {
+            header.insert("x-rustfs-bucket-metadata-export", "diagnostic".parse().expect("valid header value"));
+        }
         header.insert(CONTENT_LENGTH, zip_bytes.get_ref().len().to_string().parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(zip_bytes.into_inner())), header))
     }
@@ -412,22 +496,11 @@ impl Operation for ImportBucketMetadata {
             }
         };
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::ImportBucketMetadataAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ImportBucketMetadataAction)]).await?;
 
         let mut input = req.input;
         let body = match input.store_all_limited(MAX_BUCKET_METADATA_IMPORT_SIZE).await {
@@ -462,6 +535,22 @@ impl Operation for ImportBucketMetadata {
                 .map_err(|e| s3_error!(InternalError, "failed to read archive entry content: {e}"))?;
 
             file_contents.push((file_path, content));
+        }
+
+        // Reject the whole archive before creating buckets or writing configs,
+        // even when the marker is malformed or follows ordinary config entries.
+        if file_contents.iter().any(|(path, _)| {
+            path == DIAGNOSTIC_EXPORT_MANIFEST
+                || path == DIAGNOSTIC_EXPORT_PREFIX
+                || path
+                    .strip_prefix(DIAGNOSTIC_EXPORT_PREFIX)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+                || path.rsplit('/').next() == Some(EXPORT_UNREADABLE_MANIFEST)
+        }) {
+            return Err(s3_error!(
+                InvalidRequest,
+                "diagnostic or incomplete bucket metadata archives cannot be imported"
+            ));
         }
 
         let durable_quota_import = imported_quota_requires_fleet_proof(&file_contents)?;
@@ -619,8 +708,17 @@ impl Operation for ImportBucketMetadata {
                     metadata.policy_config_json = content;
                     metadata.policy_config_updated_at = update_at;
                 }
-                BUCKET_NOTIFICATION_CONFIG => {
-                    if let Err(e) = deserialize::<s3s::dto::NotificationConfiguration>(&content) {
+                BUCKET_NOTIFICATION_CONFIG
+                | BUCKET_LIFECYCLE_CONFIG
+                | BUCKET_SSECONFIG
+                | BUCKET_TAGGING_CONFIG
+                | OBJECT_LOCK_CONFIG
+                | BUCKET_VERSIONING_CONFIG
+                | BUCKET_REPLICATION_CONFIG
+                | BUCKET_TARGETS_FILE => {
+                    if let Err(e) =
+                        apply_imported_bucket_config(&mut bucket_metadatas, bucket_name, conf_name, content, update_at)
+                    {
                         warn!(
                             event = EVENT_ADMIN_BUCKET_META_STATE,
                             component = LOG_COMPONENT_ADMIN,
@@ -634,85 +732,6 @@ impl Operation for ImportBucketMetadata {
                         );
                         continue;
                     }
-
-                    let metadata = match bucket_metadatas.get_mut(bucket_name) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    metadata.notification_config_xml = content;
-                    metadata.notification_config_updated_at = update_at;
-                }
-
-                BUCKET_LIFECYCLE_CONFIG => {
-                    if let Err(e) = deserialize::<BucketLifecycleConfiguration>(&content) {
-                        warn!(
-                            event = EVENT_ADMIN_BUCKET_META_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
-                            action = "import_bucket_metadata",
-                            result = "config_deserialize_failed",
-                            bucket = %bucket_name,
-                            config_name = %conf_name,
-                            error = %e,
-                            "admin bucket meta state"
-                        );
-                        continue;
-                    }
-
-                    let metadata = match bucket_metadatas.get_mut(bucket_name) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    metadata.lifecycle_config_xml = content;
-                    metadata.lifecycle_config_updated_at = update_at;
-                }
-
-                BUCKET_SSECONFIG => {
-                    if let Err(e) = deserialize::<ServerSideEncryptionConfiguration>(&content) {
-                        warn!(
-                            event = EVENT_ADMIN_BUCKET_META_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
-                            action = "import_bucket_metadata",
-                            result = "config_deserialize_failed",
-                            bucket = %bucket_name,
-                            config_name = %conf_name,
-                            error = %e,
-                            "admin bucket meta state"
-                        );
-                        continue;
-                    }
-
-                    let metadata = match bucket_metadatas.get_mut(bucket_name) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    metadata.encryption_config_xml = content;
-                    metadata.encryption_config_updated_at = update_at;
-                }
-
-                BUCKET_TAGGING_CONFIG => {
-                    if let Err(e) = deserialize::<Tagging>(&content) {
-                        warn!(
-                            event = EVENT_ADMIN_BUCKET_META_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
-                            action = "import_bucket_metadata",
-                            result = "config_deserialize_failed",
-                            bucket = %bucket_name,
-                            config_name = %conf_name,
-                            error = %e,
-                            "admin bucket meta state"
-                        );
-                        continue;
-                    }
-
-                    let metadata = match bucket_metadatas.get_mut(bucket_name) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    metadata.tagging_config_xml = content;
-                    metadata.tagging_config_updated_at = update_at;
                 }
 
                 BUCKET_QUOTA_CONFIG_FILE => {
@@ -722,102 +741,6 @@ impl Operation for ImportBucketMetadata {
                     };
                     metadata.quota_config_json = content;
                     metadata.quota_config_updated_at = update_at;
-                }
-
-                OBJECT_LOCK_CONFIG => {
-                    if let Err(e) = deserialize::<ObjectLockConfiguration>(&content) {
-                        warn!(
-                            event = EVENT_ADMIN_BUCKET_META_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
-                            action = "import_bucket_metadata",
-                            result = "config_deserialize_failed",
-                            bucket = %bucket_name,
-                            config_name = %conf_name,
-                            error = %e,
-                            "admin bucket meta state"
-                        );
-                        continue;
-                    }
-
-                    let metadata = match bucket_metadatas.get_mut(bucket_name) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    metadata.object_lock_config_xml = content;
-                    metadata.object_lock_config_updated_at = update_at;
-                }
-
-                BUCKET_VERSIONING_CONFIG => {
-                    if let Err(e) = deserialize::<VersioningConfiguration>(&content) {
-                        warn!(
-                            event = EVENT_ADMIN_BUCKET_META_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
-                            action = "import_bucket_metadata",
-                            result = "config_deserialize_failed",
-                            bucket = %bucket_name,
-                            config_name = %conf_name,
-                            error = %e,
-                            "admin bucket meta state"
-                        );
-                        continue;
-                    }
-
-                    let metadata = match bucket_metadatas.get_mut(bucket_name) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    metadata.versioning_config_xml = content;
-                    metadata.versioning_config_updated_at = update_at;
-                }
-
-                BUCKET_REPLICATION_CONFIG => {
-                    if let Err(e) = deserialize::<ReplicationConfiguration>(&content) {
-                        warn!(
-                            event = EVENT_ADMIN_BUCKET_META_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
-                            action = "import_bucket_metadata",
-                            result = "config_deserialize_failed",
-                            bucket = %bucket_name,
-                            config_name = %conf_name,
-                            error = %e,
-                            "admin bucket meta state"
-                        );
-                        continue;
-                    }
-
-                    let metadata = match bucket_metadatas.get_mut(bucket_name) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    metadata.replication_config_xml = content;
-                    metadata.replication_config_updated_at = update_at;
-                }
-
-                BUCKET_TARGETS_FILE => {
-                    if let Err(e) = serde_json::from_slice::<BucketTargets>(&content) {
-                        warn!(
-                            event = EVENT_ADMIN_BUCKET_META_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
-                            action = "import_bucket_metadata",
-                            result = "config_deserialize_failed",
-                            bucket = %bucket_name,
-                            config_name = %conf_name,
-                            error = %e,
-                            "admin bucket meta state"
-                        );
-                        continue;
-                    }
-
-                    let metadata = match bucket_metadatas.get_mut(bucket_name) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    metadata.bucket_targets_config_json = content;
-                    metadata.bucket_targets_config_updated_at = update_at;
                 }
 
                 _ => {}
@@ -907,6 +830,89 @@ fn imported_quota_requires_fleet_proof(file_contents: &[(String, Vec<u8>)]) -> S
         durable |= quota.uses_durable_reservations();
     }
     Ok(durable)
+}
+
+/// Store one imported bucket config that follows the shared validate-then-store shape: the seven
+/// validated XML configs plus the JSON bucket-targets file.
+///
+/// A single `conf_name` match owns both the type a payload must parse as and the [`BucketMetadata`]
+/// field it lands in, so a config file cannot be validated as one type but stored into another
+/// config's field. Validation runs before the metadata lookup, so an unparsable payload is rejected
+/// whether or not `bucket_name` has in-memory metadata.
+///
+/// `Err` carries the parse error's display form and leaves every bucket untouched. `Ok(false)` means
+/// nothing was stored because `conf_name` is not one of these configs, or because `bucket_name` has
+/// no in-memory metadata.
+fn apply_imported_bucket_config(
+    bucket_metadatas: &mut HashMap<String, BucketMetadata>,
+    bucket_name: &str,
+    conf_name: &str,
+    content: Vec<u8>,
+    update_at: OffsetDateTime,
+) -> Result<bool, String> {
+    macro_rules! validated_config {
+        ($validate:expr, $payload_field:ident, $updated_at_field:ident) => {{
+            $validate(&content).map_err(|e| e.to_string())?;
+            |metadata: &mut BucketMetadata, payload: Vec<u8>, updated_at: OffsetDateTime| {
+                metadata.$payload_field = payload;
+                metadata.$updated_at_field = updated_at;
+            }
+        }};
+    }
+
+    let store: fn(&mut BucketMetadata, Vec<u8>, OffsetDateTime) = match conf_name {
+        BUCKET_NOTIFICATION_CONFIG => validated_config!(
+            deserialize::<s3s::dto::NotificationConfiguration>,
+            notification_config_xml,
+            notification_config_updated_at
+        ),
+        BUCKET_LIFECYCLE_CONFIG => {
+            validated_config!(
+                deserialize::<BucketLifecycleConfiguration>,
+                lifecycle_config_xml,
+                lifecycle_config_updated_at
+            )
+        }
+        BUCKET_SSECONFIG => validated_config!(
+            deserialize::<ServerSideEncryptionConfiguration>,
+            encryption_config_xml,
+            encryption_config_updated_at
+        ),
+        BUCKET_TAGGING_CONFIG => validated_config!(deserialize::<Tagging>, tagging_config_xml, tagging_config_updated_at),
+        OBJECT_LOCK_CONFIG => {
+            validated_config!(
+                deserialize::<ObjectLockConfiguration>,
+                object_lock_config_xml,
+                object_lock_config_updated_at
+            )
+        }
+        BUCKET_VERSIONING_CONFIG => {
+            validated_config!(
+                deserialize::<VersioningConfiguration>,
+                versioning_config_xml,
+                versioning_config_updated_at
+            )
+        }
+        BUCKET_REPLICATION_CONFIG => {
+            validated_config!(
+                deserialize::<ReplicationConfiguration>,
+                replication_config_xml,
+                replication_config_updated_at
+            )
+        }
+        BUCKET_TARGETS_FILE => validated_config!(
+            serde_json::from_slice::<BucketTargets>,
+            bucket_targets_config_json,
+            bucket_targets_config_updated_at
+        ),
+        _ => return Ok(false),
+    };
+
+    let Some(metadata) = bucket_metadatas.get_mut(bucket_name) else {
+        return Ok(false);
+    };
+    store(metadata, content, update_at);
+    Ok(true)
 }
 
 /// The `(config_file, data)` pairs to persist for an imported bucket's metadata: every non-empty
@@ -1006,6 +1012,258 @@ fn set_imported_config_string(target: &mut Option<String>, config_file: &str, da
             .map_err(|e| s3_error!(InternalError, "imported bucket metadata {config_file} is not valid UTF-8: {e}"))?,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod imported_config_apply_tests {
+    use super::*;
+
+    const BUCKET: &str = "restored-bucket";
+
+    /// Distinct from every `BucketMetadata::new` default, so a written timestamp is visible.
+    fn imported_at() -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1_755_000_000)
+    }
+
+    /// One imported config file, the [`BucketMetadata`] field pair it owns, and payloads its type
+    /// accepts and rejects.
+    struct ImportCase {
+        conf_name: &'static str,
+        valid: &'static [u8],
+        invalid: &'static [u8],
+        payload: fn(&BucketMetadata) -> &Vec<u8>,
+        updated_at: fn(&BucketMetadata) -> OffsetDateTime,
+    }
+
+    /// The `conf_name` -> (validated type, metadata field) mapping the import handler must honour.
+    /// Storing a config file's payload into another config's field is the regression this table
+    /// pins down.
+    fn import_cases() -> Vec<ImportCase> {
+        vec![
+            ImportCase {
+                conf_name: BUCKET_NOTIFICATION_CONFIG,
+                valid: b"<NotificationConfiguration></NotificationConfiguration>",
+                invalid: b"not xml",
+                payload: |m| &m.notification_config_xml,
+                updated_at: |m| m.notification_config_updated_at,
+            },
+            ImportCase {
+                conf_name: BUCKET_LIFECYCLE_CONFIG,
+                valid: b"<LifecycleConfiguration><Rule><ID>expire</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>",
+                invalid: b"not xml",
+                payload: |m| &m.lifecycle_config_xml,
+                updated_at: |m| m.lifecycle_config_updated_at,
+            },
+            ImportCase {
+                conf_name: BUCKET_SSECONFIG,
+                valid: b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>",
+                invalid: b"not xml",
+                payload: |m| &m.encryption_config_xml,
+                updated_at: |m| m.encryption_config_updated_at,
+            },
+            ImportCase {
+                conf_name: BUCKET_TAGGING_CONFIG,
+                valid: b"<Tagging><TagSet><Tag><Key>team</Key><Value>storage</Value></Tag></TagSet></Tagging>",
+                invalid: b"not xml",
+                payload: |m| &m.tagging_config_xml,
+                updated_at: |m| m.tagging_config_updated_at,
+            },
+            ImportCase {
+                conf_name: OBJECT_LOCK_CONFIG,
+                valid: b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>",
+                invalid: b"not xml",
+                payload: |m| &m.object_lock_config_xml,
+                updated_at: |m| m.object_lock_config_updated_at,
+            },
+            ImportCase {
+                conf_name: BUCKET_VERSIONING_CONFIG,
+                valid: b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+                invalid: b"not xml",
+                payload: |m| &m.versioning_config_xml,
+                updated_at: |m| m.versioning_config_updated_at,
+            },
+            ImportCase {
+                conf_name: BUCKET_REPLICATION_CONFIG,
+                valid: b"<ReplicationConfiguration><Role>arn:aws:iam::123456789012:role/replication</Role><Rule><Status>Enabled</Status><Priority>1</Priority><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Filter><Prefix></Prefix></Filter><Destination><Bucket>arn:aws:s3:::backup</Bucket></Destination></Rule></ReplicationConfiguration>",
+                invalid: b"not xml",
+                payload: |m| &m.replication_config_xml,
+                updated_at: |m| m.replication_config_updated_at,
+            },
+            ImportCase {
+                conf_name: BUCKET_TARGETS_FILE,
+                valid: br#"{"targets":[]}"#,
+                invalid: b"[]",
+                payload: |m| &m.bucket_targets_config_json,
+                updated_at: |m| m.bucket_targets_config_updated_at,
+            },
+        ]
+    }
+
+    fn imported_bucket() -> HashMap<String, BucketMetadata> {
+        HashMap::from([(BUCKET.to_string(), BucketMetadata::new(BUCKET))])
+    }
+
+    #[test]
+    fn a_valid_payload_lands_only_in_the_field_its_config_file_owns() {
+        for case in import_cases() {
+            let mut metadatas = imported_bucket();
+            let stored = apply_imported_bucket_config(&mut metadatas, BUCKET, case.conf_name, case.valid.to_vec(), imported_at())
+                .unwrap_or_else(|e| panic!("{} payload must validate: {e}", case.conf_name));
+            assert!(stored, "{} must be stored", case.conf_name);
+
+            let metadata = &metadatas[BUCKET];
+            assert_eq!((case.payload)(metadata), case.valid, "{} landed in the wrong field", case.conf_name);
+            assert_eq!((case.updated_at)(metadata), imported_at(), "{} timestamp was not written", case.conf_name);
+            for other in import_cases().iter().filter(|other| other.conf_name != case.conf_name) {
+                assert!(
+                    (other.payload)(metadata).is_empty(),
+                    "{} payload leaked into the {} field",
+                    case.conf_name,
+                    other.conf_name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn g_d3_005_new_writer_backup_payloads_pass_old_import_validators() {
+        // Captured from the gateway persistence writers at a16e94426b36c6a454dc200a5639c711b590e1eb.
+        // Keep these bytes independent of RustFS's old serializer so rollback drift stays visible.
+        let new_writer_payloads: [(&str, &[u8]); 7] = [
+            (
+                BUCKET_NOTIFICATION_CONFIG,
+                b"<NotificationConfiguration></NotificationConfiguration>",
+            ),
+            (
+                BUCKET_LIFECYCLE_CONFIG,
+                b"<LifecycleConfiguration><Rule><Expiration><Days>30</Days></Expiration><Filter><Prefix>logs/</Prefix></Filter><ID>expire</ID><Status>Enabled</Status></Rule></LifecycleConfiguration>",
+            ),
+            (
+                BUCKET_SSECONFIG,
+                b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>",
+            ),
+            (
+                BUCKET_TAGGING_CONFIG,
+                b"<Tagging><TagSet><Tag><Key>team</Key><Value>storage</Value></Tag></TagSet></Tagging>",
+            ),
+            (
+                OBJECT_LOCK_CONFIG,
+                b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>",
+            ),
+            (
+                BUCKET_VERSIONING_CONFIG,
+                b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+            ),
+            (
+                BUCKET_REPLICATION_CONFIG,
+                b"<ReplicationConfiguration><Role>arn:aws:iam::123456789012:role/replication</Role><Rule><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Destination><Bucket>arn:aws:s3:::backup</Bucket></Destination><Filter><Prefix></Prefix></Filter><Priority>1</Priority><Status>Enabled</Status></Rule></ReplicationConfiguration>",
+            ),
+        ];
+
+        let imported_xml_cases = import_cases()
+            .into_iter()
+            .filter(|case| case.conf_name != BUCKET_TARGETS_FILE)
+            .collect::<Vec<_>>();
+        assert_eq!(new_writer_payloads.len(), imported_xml_cases.len());
+        assert!(
+            imported_xml_cases
+                .iter()
+                .all(|case| new_writer_payloads.iter().any(|(name, _)| *name == case.conf_name))
+        );
+
+        let mut metadatas = imported_bucket();
+        for (conf_name, payload) in new_writer_payloads {
+            assert!(
+                apply_imported_bucket_config(&mut metadatas, BUCKET, conf_name, payload.to_vec(), imported_at())
+                    .unwrap_or_else(|error| panic!("new-writer {conf_name} must pass the old import validator: {error}"))
+            );
+            let case = imported_xml_cases
+                .iter()
+                .find(|case| case.conf_name == conf_name)
+                .unwrap_or_else(|| panic!("{conf_name} must have an import mapping"));
+            assert_eq!((case.payload)(&metadatas[BUCKET]), payload);
+        }
+    }
+
+    #[test]
+    fn a_rejected_payload_leaves_the_field_untouched() {
+        for case in import_cases() {
+            let mut metadatas = imported_bucket();
+            let before = metadatas[BUCKET].clone();
+            let error = match apply_imported_bucket_config(
+                &mut metadatas,
+                BUCKET,
+                case.conf_name,
+                case.invalid.to_vec(),
+                imported_at(),
+            ) {
+                Ok(_) => panic!("{} must reject an unparsable payload", case.conf_name),
+                Err(e) => e,
+            };
+            assert!(!error.is_empty(), "{} must report why the payload was rejected", case.conf_name);
+
+            let metadata = &metadatas[BUCKET];
+            assert_eq!((case.payload)(metadata), (case.payload)(&before), "{} field was mutated", case.conf_name);
+            assert_eq!(
+                (case.updated_at)(metadata),
+                (case.updated_at)(&before),
+                "{} timestamp was mutated",
+                case.conf_name
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_payload_does_not_stop_the_remaining_configs() {
+        // The handler warns and moves to the next archive entry, so a rejected config must not
+        // keep the entries after it from being imported.
+        let mut metadatas = imported_bucket();
+        for case in import_cases() {
+            assert!(
+                apply_imported_bucket_config(&mut metadatas, BUCKET, case.conf_name, case.invalid.to_vec(), imported_at())
+                    .is_err()
+            );
+        }
+        assert!(imported_configs_to_persist(&metadatas[BUCKET]).is_empty());
+
+        for case in import_cases() {
+            assert!(
+                apply_imported_bucket_config(&mut metadatas, BUCKET, case.conf_name, case.valid.to_vec(), imported_at())
+                    .unwrap_or_else(|e| panic!("{} payload must validate: {e}", case.conf_name))
+            );
+        }
+        assert_eq!(imported_configs_to_persist(&metadatas[BUCKET]).len(), import_cases().len());
+    }
+
+    #[test]
+    fn an_absent_bucket_is_skipped_without_masking_a_parse_error() {
+        // Validation runs before the metadata lookup, so an unparsable payload is still reported
+        // for a bucket that has no in-memory metadata.
+        for case in import_cases() {
+            let mut metadatas = HashMap::new();
+            assert!(
+                !apply_imported_bucket_config(&mut metadatas, BUCKET, case.conf_name, case.valid.to_vec(), imported_at())
+                    .unwrap_or_else(|e| panic!("{} payload must validate: {e}", case.conf_name))
+            );
+            assert!(
+                apply_imported_bucket_config(&mut metadatas, BUCKET, case.conf_name, case.invalid.to_vec(), imported_at())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn policy_and_quota_keep_their_own_handling() {
+        // Both are imported by their own match arms; this helper must not claim them.
+        for conf_name in [BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE] {
+            let mut metadatas = imported_bucket();
+            assert!(
+                !apply_imported_bucket_config(&mut metadatas, BUCKET, conf_name, br#"{"quota":1024}"#.to_vec(), imported_at())
+                    .expect("configs outside the shared shape are not validated here")
+            );
+            assert!(imported_configs_to_persist(&metadatas[BUCKET]).is_empty());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1126,5 +1384,749 @@ mod import_persist_tests {
             serde_json::to_vec(&BucketQuota::new(Some(1024))).expect("durable quota should encode"),
         )];
         assert!(imported_quota_requires_fleet_proof(&durable).expect("durable quota should pass preflight"));
+    }
+}
+
+#[cfg(test)]
+mod backup_zip_compatibility_tests {
+    use super::*;
+    use crate::admin::runtime_sources::{AppContext, publish_test_app_context};
+    use http::{Extensions, Uri};
+    use http_body_util::BodyExt as _;
+    use rustfs_iam::store::{Store as _, object::IAM_CONFIG_PREFIX};
+    use std::sync::Arc;
+
+    const ROOT_ACCESS_KEY: &str = "BUCKETMETABACKUPROOT";
+    const ROOT_SECRET_KEY: &str = "bucketMetaBackupRootSecret123";
+    const BUCKET: &str = "backup-compatibility";
+    const UNREADABLE_BUCKET: &str = "minio-origin-targets";
+    /// The exact `BucketTargetsConfigJSON` payload carried by the MinIO
+    /// `.metadata.bin` fixture in `crates/ecstore/src/bucket/metadata_test.rs`.
+    const MINIO_ARRAY_TARGETS: &[u8] = br#"[{"endpoint":"http://target.example.com","targetBucket":"tb","region":"us-east-1"}]"#;
+    const NOTIFICATION_XML: &[u8] = b"<NotificationConfiguration>\n</NotificationConfiguration>";
+    const LIFECYCLE_XML: &[u8] = b"<LifecycleConfiguration>\n<Rule><ID>expire</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><Expiration><Days>30</Days></Expiration></Rule>\n</LifecycleConfiguration>";
+    const SSE_XML: &[u8] = b"<ServerSideEncryptionConfiguration>\n<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule>\n</ServerSideEncryptionConfiguration>";
+    const TAGGING_XML: &[u8] = b"<Tagging>\n<TagSet><Tag><Key>team</Key><Value>storage</Value></Tag></TagSet>\n</Tagging>";
+    const OBJECT_LOCK_XML: &[u8] =
+        b"<ObjectLockConfiguration>\n<ObjectLockEnabled>Enabled</ObjectLockEnabled>\n</ObjectLockConfiguration>";
+    const VERSIONING_XML: &[u8] = b"<VersioningConfiguration>\n<Status>Enabled</Status>\n</VersioningConfiguration>";
+    const OLD_REPLICATION_XML: &[u8] = b"<ReplicationConfiguration><Role>arn:aws:iam::123456789012:role/replication</Role><FutureTopLevel>preserve-me</FutureTopLevel><Rule><Status>Enabled</Status><Priority>1</Priority><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Filter><Prefix></Prefix></Filter><Destination><Bucket>arn:aws:s3:::backup</Bucket></Destination></Rule></ReplicationConfiguration>";
+    const DIFFERENT_REPLICATION_XML: &[u8] = b"<ReplicationConfiguration><Role>arn:aws:iam::123456789012:role/replication</Role><Rule><Status>Enabled</Status><Priority>2</Priority><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Filter><Prefix>changed/</Prefix></Filter><Destination><Bucket>arn:aws:s3:::replacement</Bucket></Destination></Rule></ReplicationConfiguration>";
+
+    fn persisted_xml_fixtures() -> [(&'static str, &'static [u8]); 7] {
+        [
+            (BUCKET_NOTIFICATION_CONFIG, NOTIFICATION_XML),
+            (BUCKET_LIFECYCLE_CONFIG, LIFECYCLE_XML),
+            (BUCKET_SSECONFIG, SSE_XML),
+            (BUCKET_TAGGING_CONFIG, TAGGING_XML),
+            (OBJECT_LOCK_CONFIG, OBJECT_LOCK_XML),
+            (BUCKET_VERSIONING_CONFIG, VERSIONING_XML),
+            (BUCKET_REPLICATION_CONFIG, OLD_REPLICATION_XML),
+        ]
+    }
+
+    fn persisted_xml<'a>(metadata: &'a BucketMetadata, config_file: &str) -> &'a [u8] {
+        match config_file {
+            BUCKET_NOTIFICATION_CONFIG => &metadata.notification_config_xml,
+            BUCKET_LIFECYCLE_CONFIG => &metadata.lifecycle_config_xml,
+            BUCKET_SSECONFIG => &metadata.encryption_config_xml,
+            BUCKET_TAGGING_CONFIG => &metadata.tagging_config_xml,
+            OBJECT_LOCK_CONFIG => &metadata.object_lock_config_xml,
+            BUCKET_VERSIONING_CONFIG => &metadata.versioning_config_xml,
+            BUCKET_REPLICATION_CONFIG => &metadata.replication_config_xml,
+            _ => panic!("unexpected persisted XML config {config_file}"),
+        }
+    }
+
+    fn zip_with_entries(bucket: &str, entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (config_file, payload) in entries {
+            writer
+                .start_file(format!("{bucket}/{config_file}"), SimpleFileOptions::default())
+                .expect("start compatibility archive entry");
+            writer.write_all(payload).expect("write compatibility archive entry");
+        }
+        writer.finish().expect("finish compatibility archive").into_inner()
+    }
+
+    fn admin_request(method: Method, uri: Uri, body: Vec<u8>) -> S3Request<Body> {
+        S3Request {
+            input: Body::from(body),
+            method,
+            uri,
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: Some(s3s::auth::Credentials {
+                access_key: ROOT_ACCESS_KEY.to_string(),
+                secret_key: s3s::auth::SecretKey::from(ROOT_SECRET_KEY.to_string()),
+            }),
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn import_archive(archive: Vec<u8>) {
+        let response = ImportBucketMetadata {}
+            .call(
+                admin_request(Method::PUT, Uri::from_static("/rustfs/admin/v3/import-bucket-metadata"), archive),
+                Params::new(),
+            )
+            .await
+            .expect("root admin must import the compatibility archive");
+        assert_eq!(response.output.0, StatusCode::OK);
+    }
+
+    async fn assert_unreadable_xml_export_is_explicit(config_file: &str) {
+        const RAW_SECRET: &[u8] = b"unreadable-xml-with-private-config";
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some(ROOT_ACCESS_KEY.to_string()),
+            Some(ROOT_SECRET_KEY.to_string()),
+        );
+        let temp = tempfile::tempdir().expect("create unreadable XML export test root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp.path())
+            .disk_count(1)
+            .build()
+            .await;
+        env.make_bucket(BUCKET, false).await;
+        rustfs_iam::store::object::ObjectStore::new(Arc::clone(&env.ecstore))
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(Arc::clone(&env.ecstore))
+            .await
+            .expect("build test IAM");
+        publish_test_app_context(Arc::new(AppContext::with_default_interfaces(
+            Arc::clone(&env.ecstore),
+            iam,
+            Arc::new(rustfs_kms::KmsServiceManager::new()),
+        )));
+        metadata_sys::update(BUCKET, BUCKET_VERSIONING_CONFIG, VERSIONING_XML.to_vec())
+            .await
+            .expect("persist readable companion config");
+        assert!(
+            exported_bucket_config(BUCKET, config_file)
+                .await
+                .expect("absent configuration")
+                .is_none()
+        );
+
+        let mut metadata = metadata_sys::get_config_from_disk(BUCKET)
+            .await
+            .expect("load source metadata");
+        match config_file {
+            BUCKET_NOTIFICATION_CONFIG => metadata.notification_config_xml = RAW_SECRET.to_vec(),
+            BUCKET_LIFECYCLE_CONFIG => metadata.lifecycle_config_xml = RAW_SECRET.to_vec(),
+            BUCKET_TAGGING_CONFIG => metadata.tagging_config_xml = RAW_SECRET.to_vec(),
+            _ => panic!("unexpected unreadable XML fixture"),
+        }
+        metadata
+            .save_with_store(Arc::clone(&env.ecstore))
+            .await
+            .expect("persist raw configuration with a failed parse");
+        crate::storage::storage_api::set_bucket_metadata(BUCKET.to_string(), metadata)
+            .await
+            .expect("publish unreadable XML fixture");
+
+        let ordinary = ExportBucketMetadata {}
+            .call(
+                admin_request(Method::GET, Uri::from_static("/rustfs/admin/v3/export-bucket-metadata"), Vec::new()),
+                Params::new(),
+            )
+            .await
+            .expect_err("persisted invalid XML must not disappear from an ordinary backup");
+        assert_eq!(ordinary.code(), &s3s::S3ErrorCode::InternalError);
+
+        let diagnostic = ExportBucketMetadata {}
+            .call(
+                admin_request(
+                    Method::GET,
+                    Uri::from_static("/rustfs/admin/v3/export-bucket-metadata?diagnostic=true"),
+                    Vec::new(),
+                ),
+                Params::new(),
+            )
+            .await
+            .expect("diagnostic export must identify the omitted configuration");
+        assert_eq!(diagnostic.output.0, StatusCode::OK);
+        let bytes = diagnostic
+            .output
+            .1
+            .collect()
+            .await
+            .expect("read diagnostic archive")
+            .to_bytes();
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).expect("open diagnostic archive");
+        let mut files = HashMap::new();
+        for index in 0..archive.len() {
+            let mut file = archive.by_index(index).expect("read diagnostic entry");
+            let mut content = Vec::new();
+            file.read_to_end(&mut content).expect("read diagnostic config");
+            assert!(!content.windows(RAW_SECRET.len()).any(|window| window == RAW_SECRET));
+            files.insert(file.name().to_string(), content);
+        }
+        assert!(!files.contains_key(&format!("_diagnostic/{BUCKET}/{config_file}")));
+        assert_eq!(files[&format!("_diagnostic/{BUCKET}/{BUCKET_VERSIONING_CONFIG}")], VERSIONING_XML);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&files[DIAGNOSTIC_EXPORT_MANIFEST]).expect("decode diagnostic manifest");
+        assert_eq!(
+            manifest,
+            serde_json::json!({
+                "version": 1,
+                "mode": "diagnostic",
+                "complete": false,
+                "errors": [{ "bucket": BUCKET, "config": config_file, "code": "configuration_unavailable" }],
+            })
+        );
+        assert_eq!(
+            persisted_xml(
+                &metadata_sys::get_config_from_disk(BUCKET)
+                    .await
+                    .expect("read unchanged source"),
+                config_file
+            ),
+            RAW_SECRET
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unreadable_notification_xml_fails_backup_and_is_named_in_diagnostics() {
+        assert_unreadable_xml_export_is_explicit(BUCKET_NOTIFICATION_CONFIG).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unreadable_lifecycle_xml_fails_backup_and_is_named_in_diagnostics() {
+        assert_unreadable_xml_export_is_explicit(BUCKET_LIFECYCLE_CONFIG).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unreadable_tagging_xml_fails_backup_and_is_named_in_diagnostics() {
+        assert_unreadable_xml_export_is_explicit(BUCKET_TAGGING_CONFIG).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn diagnostic_export_isolated_errors_and_import_recovers_unreadable_targets() {
+        const HEALTHY: &str = "diagnostic-healthy";
+        const UNREADABLE: &str = "diagnostic-unreadable";
+        const REPLACEMENT_TARGETS: &[u8] = br#"{"targets":[]}"#;
+        const SECRET: &str = "diagnostic-must-not-expose-this-secret";
+
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some(ROOT_ACCESS_KEY.to_string()),
+            Some(ROOT_SECRET_KEY.to_string()),
+        );
+        let temp = tempfile::tempdir().expect("create diagnostic export test root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp.path())
+            .disk_count(1)
+            .build()
+            .await;
+        env.make_bucket(HEALTHY, false).await;
+        env.make_bucket(UNREADABLE, false).await;
+        rustfs_iam::store::object::ObjectStore::new(Arc::clone(&env.ecstore))
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(Arc::clone(&env.ecstore))
+            .await
+            .expect("build test IAM");
+        publish_test_app_context(Arc::new(AppContext::with_default_interfaces(
+            Arc::clone(&env.ecstore),
+            iam,
+            Arc::new(rustfs_kms::KmsServiceManager::new()),
+        )));
+        metadata_sys::update(HEALTHY, BUCKET_VERSIONING_CONFIG, VERSIONING_XML.to_vec())
+            .await
+            .expect("seed healthy bucket config");
+
+        let minio_blob = hex_simd::decode_to_vec(
+            include_str!("../../../../crates/ecstore/tests/fixtures/minio/bucket_metadata.blob.hex").trim(),
+        )
+        .expect("decode real MinIO metadata fixture");
+        let minio_metadata = BucketMetadata::unmarshal(&minio_blob[4..]).expect("read MinIO metadata fixture");
+        let targets_array = format!(r#"[{{"credentials":{{"secretKey":"{SECRET}"}}}}]"#).into_bytes();
+        for unreadable_targets in [targets_array, minio_metadata.bucket_targets_config_json] {
+            let mut metadata = metadata_sys::get_config_from_disk(UNREADABLE)
+                .await
+                .expect("load bucket before simulating MinIO targets");
+            let incarnation = metadata.bucket_incarnation_id;
+            metadata.bucket_targets_config_json = unreadable_targets.clone();
+            metadata
+                .save_with_store(Arc::clone(&env.ecstore))
+                .await
+                .expect("persist unreadable targets fixture");
+            crate::storage::storage_api::set_bucket_metadata(UNREADABLE.to_string(), metadata)
+                .await
+                .expect("publish unreadable targets fixture");
+            assert!(metadata_sys::get_bucket_targets_config(UNREADABLE).await.is_err());
+
+            let ordinary = ExportBucketMetadata {}
+                .call(
+                    admin_request(Method::GET, Uri::from_static("/rustfs/admin/v3/export-bucket-metadata"), Vec::new()),
+                    Params::new(),
+                )
+                .await
+                .expect_err("an ordinary backup must fail rather than omit an unreadable configuration");
+            assert_eq!(*ordinary.code(), s3s::S3ErrorCode::InternalError);
+            assert!(
+                ordinary
+                    .message()
+                    .is_some_and(|message| message.contains(BUCKET_TARGETS_FILE))
+            );
+
+            let response = ExportBucketMetadata {}
+                .call(
+                    admin_request(
+                        Method::GET,
+                        Uri::from_static("/rustfs/admin/v3/export-bucket-metadata?diagnostic=true"),
+                        Vec::new(),
+                    ),
+                    Params::new(),
+                )
+                .await
+                .expect("one unreadable bucket must not abort diagnostic export");
+            assert_eq!(response.output.0, StatusCode::OK);
+            assert_eq!(response.headers["x-rustfs-bucket-metadata-export"], "diagnostic");
+            assert_eq!(response.headers[CONTENT_DISPOSITION], "attachment; filename=bucket-meta-diagnostic.zip");
+            let bytes = response.output.1.collect().await.expect("read diagnostic archive").to_bytes();
+            let mut archive = ZipArchive::new(Cursor::new(&bytes)).expect("open diagnostic archive");
+            let mut files = HashMap::new();
+            for index in 0..archive.len() {
+                let mut file = archive.by_index(index).expect("read diagnostic entry");
+                let mut content = Vec::new();
+                file.read_to_end(&mut content).expect("read diagnostic config");
+                assert!(!content.windows(SECRET.len()).any(|window| window == SECRET.as_bytes()));
+                assert!(file.name() == DIAGNOSTIC_EXPORT_MANIFEST || file.name().starts_with("_diagnostic/"));
+                files.insert(file.name().to_string(), content);
+            }
+            assert_eq!(files[&format!("_diagnostic/{HEALTHY}/{BUCKET_VERSIONING_CONFIG}")], VERSIONING_XML);
+            assert!(files.contains_key(&format!("_diagnostic/{UNREADABLE}/{BUCKET_VERSIONING_CONFIG}")));
+            assert!(!files.contains_key(&format!("_diagnostic/{UNREADABLE}/{BUCKET_TARGETS_FILE}")));
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&files[DIAGNOSTIC_EXPORT_MANIFEST]).expect("decode diagnostic manifest");
+            assert_eq!(
+                manifest,
+                serde_json::json!({
+                    "version": 1,
+                    "mode": "diagnostic",
+                    "complete": false,
+                    "errors": [{ "bucket": UNREADABLE, "config": BUCKET_TARGETS_FILE, "code": "configuration_unavailable" }],
+                })
+            );
+
+            let error = ImportBucketMetadata {}
+                .call(
+                    admin_request(Method::PUT, Uri::from_static("/rustfs/admin/v3/import-bucket-metadata"), bytes.to_vec()),
+                    Params::new(),
+                )
+                .await
+                .expect_err("diagnostic exports are never backups");
+            assert_eq!(*error.code(), s3s::S3ErrorCode::InvalidRequest);
+            assert_eq!(
+                metadata_sys::get_config_from_disk(UNREADABLE)
+                    .await
+                    .expect("load rejected import state")
+                    .bucket_targets_config_json,
+                unreadable_targets
+            );
+
+            import_archive(zip_with_entries(UNREADABLE, &[(BUCKET_TARGETS_FILE, REPLACEMENT_TARGETS)])).await;
+            let recovered = metadata_sys::get_config_from_disk(UNREADABLE)
+                .await
+                .expect("read recovered targets from disk");
+            assert_eq!(recovered.bucket_incarnation_id, incarnation);
+            assert_eq!(recovered.bucket_targets_config_json, REPLACEMENT_TARGETS);
+            assert!(
+                metadata_sys::get_bucket_targets_config(UNREADABLE)
+                    .await
+                    .expect("existing import API must recover targets readers")
+                    .is_empty()
+            );
+        }
+
+        // Diagnostic and historical partial-export markers may come last.
+        // Neither may allow an earlier configuration write or bucket creation.
+        for marker in [
+            DIAGNOSTIC_EXPORT_MANIFEST.to_string(),
+            DIAGNOSTIC_EXPORT_PREFIX.to_string(),
+            format!("{DIAGNOSTIC_EXPORT_PREFIX}/bucket/config"),
+            format!("diagnostic-never-created/{EXPORT_UNREADABLE_MANIFEST}"),
+        ] {
+            let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+            writer
+                .start_file(format!("{HEALTHY}/{BUCKET_VERSIONING_CONFIG}"), SimpleFileOptions::default())
+                .expect("start ordinary config before rejected marker");
+            writer
+                .write_all(b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>")
+                .expect("write ordinary config before rejected marker");
+            writer
+                .start_file(
+                    format!("diagnostic-never-created/{BUCKET_VERSIONING_CONFIG}"),
+                    SimpleFileOptions::default(),
+                )
+                .expect("start a nonexistent bucket config before rejected marker");
+            writer.write_all(VERSIONING_XML).expect("write nonexistent bucket config");
+            let marker_content = if marker.ends_with(EXPORT_UNREADABLE_MANIFEST) {
+                serde_json::to_vec(&serde_json::json!({
+                    "bucket": "diagnostic-never-created",
+                    "unreadable": [
+                        { "config": BUCKET_TARGETS_FILE, "error": "targets could not be read" },
+                        { "config": OBJECT_LOCK_CONFIG, "error": "object lock could not be read" },
+                    ],
+                }))
+                .expect("encode historical partial-export marker")
+            } else {
+                b"not json".to_vec()
+            };
+            writer
+                .start_file(marker, SimpleFileOptions::default())
+                .expect("start rejected marker");
+            writer.write_all(&marker_content).expect("write rejected marker");
+            let error = ImportBucketMetadata {}
+                .call(
+                    admin_request(
+                        Method::PUT,
+                        Uri::from_static("/rustfs/admin/v3/import-bucket-metadata"),
+                        writer.finish().expect("finish marked archive").into_inner(),
+                    ),
+                    Params::new(),
+                )
+                .await
+                .expect_err("non-restorable archive preflight must reject before any config write");
+            assert_eq!(*error.code(), s3s::S3ErrorCode::InvalidRequest);
+            assert_eq!(
+                metadata_sys::get_config_from_disk(HEALTHY)
+                    .await
+                    .expect("read healthy config after rejected import")
+                    .versioning_config_xml,
+                VERSIONING_XML
+            );
+            assert!(
+                env.ecstore
+                    .get_bucket_info("diagnostic-never-created", &BucketOptions::default())
+                    .await
+                    .is_err(),
+                "non-restorable archive preflight must reject before bucket creation"
+            );
+        }
+
+        let response = ExportBucketMetadata {}
+            .call(
+                admin_request(
+                    Method::GET,
+                    Uri::from_static("/rustfs/admin/v3/export-bucket-metadata?diagnostic=true"),
+                    Vec::new(),
+                ),
+                Params::new(),
+            )
+            .await
+            .expect("diagnostic export after recovery");
+        let bytes = response
+            .output
+            .1
+            .collect()
+            .await
+            .expect("read complete diagnostic archive")
+            .to_bytes();
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).expect("open complete diagnostic archive");
+        let manifest: serde_json::Value = serde_json::from_reader(
+            archive
+                .by_name(DIAGNOSTIC_EXPORT_MANIFEST)
+                .expect("complete diagnostic manifest"),
+        )
+        .expect("parse complete diagnostic manifest");
+        assert_eq!(manifest["complete"], true);
+        let error = ImportBucketMetadata {}
+            .call(
+                admin_request(Method::PUT, Uri::from_static("/rustfs/admin/v3/import-bucket-metadata"), bytes.to_vec()),
+                Params::new(),
+            )
+            .await
+            .expect_err("complete diagnostics must still reject import");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::InvalidRequest);
+
+        let response = ExportBucketMetadata {}
+            .call(
+                admin_request(Method::GET, Uri::from_static("/rustfs/admin/v3/export-bucket-metadata"), Vec::new()),
+                Params::new(),
+            )
+            .await
+            .expect("ordinary cluster export must work after API recovery");
+        assert!(!response.headers.contains_key("x-rustfs-bucket-metadata-export"));
+        assert_eq!(response.headers[CONTENT_DISPOSITION], "attachment; filename=bucket-meta.zip");
+        let bytes = response.output.1.collect().await.expect("read ordinary archive").to_bytes();
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).expect("open ordinary archive");
+        assert!(archive.by_name(DIAGNOSTIC_EXPORT_MANIFEST).is_err());
+        assert!(archive.by_name(&format!("{HEALTHY}/{BUCKET_VERSIONING_CONFIG}")).is_ok());
+        assert!(archive.by_name(&format!("{UNREADABLE}/{BUCKET_TARGETS_FILE}")).is_ok());
+        assert!(
+            archive
+                .by_name(&format!("{UNREADABLE}/{EXPORT_UNREADABLE_MANIFEST}"))
+                .is_err(),
+            "ordinary backups must never contain partial-export markers"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn g_zip_001_002_003_use_real_admin_archive_and_persistence_paths() {
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some(ROOT_ACCESS_KEY.to_string()),
+            Some(ROOT_SECRET_KEY.to_string()),
+        );
+        let temp = tempfile::tempdir().expect("create bucket metadata backup test root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp.path())
+            .disk_count(1)
+            .build()
+            .await;
+        env.make_bucket(BUCKET, false).await;
+        rustfs_iam::store::object::ObjectStore::new(Arc::clone(&env.ecstore))
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(Arc::clone(&env.ecstore))
+            .await
+            .expect("build test IAM");
+        publish_test_app_context(Arc::new(AppContext::with_default_interfaces(
+            Arc::clone(&env.ecstore),
+            iam,
+            Arc::new(rustfs_kms::KmsServiceManager::new()),
+        )));
+
+        let corrupt_error = ImportBucketMetadata {}
+            .call(
+                admin_request(
+                    Method::PUT,
+                    Uri::from_static("/rustfs/admin/v3/import-bucket-metadata"),
+                    b"not a zip archive".to_vec(),
+                ),
+                Params::new(),
+            )
+            .await
+            .expect_err("a corrupt compatibility archive must be rejected");
+        assert!(
+            corrupt_error
+                .message()
+                .is_some_and(|message| message.contains("failed to read import archive")),
+            "corrupt archive returned the wrong error: {corrupt_error:?}"
+        );
+
+        let fixtures = persisted_xml_fixtures();
+        import_archive(zip_with_entries(BUCKET, &fixtures)).await;
+        let imported = metadata_sys::get_config_from_disk(BUCKET)
+            .await
+            .expect("old archive must persist bucket metadata");
+        for (config_file, payload) in fixtures {
+            assert_eq!(persisted_xml(&imported, config_file), payload, "g-zip-001 changed {config_file} bytes");
+        }
+        import_archive(zip_with_entries(BUCKET, &[(BUCKET_REPLICATION_CONFIG, b"not xml")])).await;
+        let after_rejected_payload = metadata_sys::get_config_from_disk(BUCKET)
+            .await
+            .expect("rejected payload must leave persisted metadata readable");
+        assert_eq!(
+            after_rejected_payload.replication_config_xml, OLD_REPLICATION_XML,
+            "a rejected archive payload must not replace persisted bytes"
+        );
+
+        let (validated_replication, _) = metadata_sys::get_replication_config(BUCKET)
+            .await
+            .expect("load the revision validated before export");
+        checked_raw_xml(
+            &validated_replication,
+            DIFFERENT_REPLICATION_XML.to_vec(),
+            deserialize::<ReplicationConfiguration>,
+        )
+        .expect_err("a different valid revision must not be exported after validating the old revision");
+        checked_raw_xml(&validated_replication, b"not xml".to_vec(), deserialize::<ReplicationConfiguration>)
+            .expect_err("an invalid raw revision must not be exported after validating the old revision");
+        let matching_raw = checked_raw_xml(
+            &validated_replication,
+            OLD_REPLICATION_XML.to_vec(),
+            deserialize::<ReplicationConfiguration>,
+        )
+        .expect("the exact validated raw revision must remain exportable");
+        assert_eq!(matching_raw, OLD_REPLICATION_XML);
+        let default_versioning = VersioningConfiguration::default();
+        assert!(
+            !checked_versioning_xml(&default_versioning, Vec::new())
+                .expect("empty persisted versioning keeps the existing default fallback")
+                .is_empty()
+        );
+        let enabled_versioning: VersioningConfiguration = deserialize(VERSIONING_XML).expect("parse enabled versioning fixture");
+        checked_versioning_xml(&enabled_versioning, Vec::new())
+            .expect_err("an empty raw revision must not export a previously validated enabled revision");
+
+        let export_response = ExportBucketMetadata {}
+            .call(
+                admin_request(
+                    Method::GET,
+                    format!("/rustfs/admin/v3/export-bucket-metadata?bucket={BUCKET}")
+                        .parse()
+                        .expect("export URI"),
+                    Vec::new(),
+                ),
+                Params::new(),
+            )
+            .await
+            .expect("root admin must export persisted bucket metadata");
+        assert_eq!(export_response.output.0, StatusCode::OK);
+        let exported_archive = export_response
+            .output
+            .1
+            .collect()
+            .await
+            .expect("read exported archive body")
+            .to_bytes()
+            .to_vec();
+        let mut archive = ZipArchive::new(Cursor::new(&exported_archive)).expect("open exported archive");
+        for (config_file, payload) in persisted_xml_fixtures() {
+            let mut exported_payload = Vec::new();
+            archive
+                .by_name(&format!("{BUCKET}/{config_file}"))
+                .unwrap_or_else(|_| panic!("exported archive must contain {config_file}"))
+                .read_to_end(&mut exported_payload)
+                .unwrap_or_else(|_| panic!("read exported {config_file}"));
+            assert_eq!(exported_payload, payload, "g-zip-003 export must preserve {config_file} byte-for-byte");
+        }
+        drop(archive);
+
+        metadata_sys::update(BUCKET, BUCKET_REPLICATION_CONFIG, DIFFERENT_REPLICATION_XML.to_vec())
+            .await
+            .expect("replace persisted config before rollback import");
+        import_archive(exported_archive).await;
+        let restored = metadata_sys::get_config_from_disk(BUCKET)
+            .await
+            .expect("new archive must persist through old import");
+        for (config_file, payload) in persisted_xml_fixtures() {
+            assert_eq!(
+                persisted_xml(&restored, config_file),
+                payload,
+                "g-zip-002 rollback import did not restore {config_file}"
+            );
+        }
+        let _: ReplicationConfiguration =
+            deserialize(&restored.replication_config_xml).expect("old parser must read the newly exported archive payload");
+
+        // The array-shaped compatibility fixture is unreadable as targets.
+        // A backup must not claim success after silently omitting that setting.
+        env.make_bucket(UNREADABLE_BUCKET, false).await;
+        metadata_sys::update(UNREADABLE_BUCKET, BUCKET_TARGETS_FILE, MINIO_ARRAY_TARGETS.to_vec())
+            .await
+            .expect("persist the array-shaped targets blob");
+        metadata_sys::get_bucket_targets_config(UNREADABLE_BUCKET)
+            .await
+            .expect_err("an array-shaped targets blob must read as unreadable, not as an empty set");
+
+        let cluster_export = ExportBucketMetadata {}
+            .call(
+                admin_request(Method::GET, Uri::from_static("/rustfs/admin/v3/export-bucket-metadata"), Vec::new()),
+                Params::new(),
+            )
+            .await
+            .expect_err("one unreadable configuration must fail the ordinary whole-cluster backup");
+        assert_eq!(*cluster_export.code(), s3s::S3ErrorCode::InternalError);
+        assert_eq!(
+            metadata_sys::get_config_from_disk(UNREADABLE_BUCKET)
+                .await
+                .expect("failed export must leave targets untouched")
+                .bucket_targets_config_json,
+            MINIO_ARRAY_TARGETS
+        );
+    }
+}
+
+#[cfg(test)]
+mod shared_gate_tests {
+    use super::*;
+    use http::Uri;
+    use s3s::S3ErrorCode;
+
+    fn credential_less_request(method: Method, uri: &'static str) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method,
+            uri: Uri::from_static(uri),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn assert_missing_credentials(operation: &dyn Operation, method: Method, uri: &'static str) {
+        let err = operation
+            .call(credential_less_request(method, uri), Params::new())
+            .await
+            .expect_err("a bucket metadata admin request without credentials must fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("authentication required"));
+    }
+
+    /// The shared gate reports "get cred failed"; the per-handler pre-check keeps
+    /// the message each endpoint has always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn bucket_metadata_handlers_keep_their_missing_credentials_response() {
+        assert_missing_credentials(&ExportBucketMetadata {}, Method::GET, "/rustfs/admin/v3/export-bucket-metadata").await;
+        assert_missing_credentials(&ImportBucketMetadata {}, Method::PUT, "/rustfs/admin/v3/import-bucket-metadata").await;
+    }
+
+    fn source_block<'a>(production: &'a str, marker: &str) -> &'a str {
+        let block = production
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("{marker} should exist"))
+            .1;
+        let end = ["\npub struct ", "\nfn ", "\n#[derive(", "\n#[cfg(test)]"]
+            .into_iter()
+            .filter_map(|boundary| block.find(boundary))
+            .min()
+            .unwrap_or(block.len());
+        &block[..end]
+    }
+
+    fn assert_shared_gate_wiring(block: &str, item: &str, actions: &[&str], binds_credentials: bool) {
+        assert_eq!(
+            block.matches("authorize_admin_request(").count(),
+            1,
+            "{item} must use exactly one shared gate"
+        );
+        assert_eq!(
+            block.matches("Action::AdminAction(").count(),
+            actions.len(),
+            "{item} must preserve its exact action-vector length"
+        );
+        for action in actions {
+            assert!(block.contains(&format!("AdminAction::{action}")), "{item} must authorize with {action}");
+        }
+        assert_eq!(
+            block.contains("let cred = authorize_admin_request("),
+            binds_credentials,
+            "{item} credential binding must match its payload-processing contract"
+        );
+    }
+
+    #[test]
+    fn bucket_metadata_handlers_use_the_shared_admin_gate_with_their_actions() {
+        let production = include_str!("bucket_meta.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+
+        for (handler, action) in [
+            ("ExportBucketMetadata", "ExportBucketMetadataAction"),
+            ("ImportBucketMetadata", "ImportBucketMetadataAction"),
+        ] {
+            let block = source_block(production, &format!("impl Operation for {handler}"));
+            assert_shared_gate_wiring(block, handler, &[action], false);
+        }
+
+        assert!(!production.contains("check_key_valid(get_session_token"));
     }
 }

@@ -32,8 +32,7 @@
 //! are frozen beside it. Reordering the checks changes which reason a given
 //! artifact produces, which is itself part of the contract.
 
-use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_NO_PAD};
+use base64_simd::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_NO_PAD};
 use p256::ecdsa::signature::{Signer as _, Verifier as _};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePrivateKey as _;
@@ -46,8 +45,21 @@ use crate::connect::identity::DeviceIdentity;
 /// The hosted enrolment root, compiled in. Both halves are pinned: the
 /// fingerprint identifies the root, and the point is what actually verifies the
 /// first link, so a build cannot be pointed at a different key by supplying one.
-const PINNED_ROOT_KEY_ID: &str = "df22e2806112debbe953672aafa186d699af0e97dd3fd2b09fa8359005fe348f";
-const PINNED_ROOT_PUBLIC_KEY: &str = "BFfx-K-FfEA5nK_Rz3IHacvRCkJyQ7JOd1geLyU6HKRZDgNezmVuKhvJ22VhemyjV__Gshk8JGGqOBzYPMD0p6s";
+const HOSTED_ROOT: EnrollmentRoot = EnrollmentRoot {
+    key_id: "df22e2806112debbe953672aafa186d699af0e97dd3fd2b09fa8359005fe348f",
+    public_key: "BFfx-K-FfEA5nK_Rz3IHacvRCkJyQ7JOd1geLyU6HKRZDgNezmVuKhvJ22VhemyjV__Gshk8JGGqOBzYPMD0p6s",
+};
+
+#[cfg(feature = "offline-enrollment-e2e-root")]
+const E2E_ROOT_KEY_ID: Option<&str> = option_env!("RUSTFS_E2E_OFFLINE_ENROLLMENT_ROOT_KEY_ID");
+#[cfg(feature = "offline-enrollment-e2e-root")]
+const E2E_ROOT_PUBLIC_KEY: Option<&str> = option_env!("RUSTFS_E2E_OFFLINE_ENROLLMENT_ROOT_PUBLIC_KEY");
+
+#[derive(Clone, Copy)]
+struct EnrollmentRoot {
+    key_id: &'static str,
+    public_key: &'static str,
+}
 
 /// Domain separation tags. A document that verifies under one of these must not
 /// be accepted for another artifact type, so the tag is part of the signature
@@ -98,6 +110,9 @@ const PUBLIC_KEY_CHARS: usize = 87;
 /// SEC1 tag of an uncompressed point. Compressed and hybrid forms are refused.
 const UNCOMPRESSED_POINT: u8 = 0x04;
 
+const KEY_ID_CHARS: usize = 64;
+const SERIAL_CHARS: usize = 32;
+
 const TIMESTAMP_CHARS: usize = 20;
 
 /// The chain is exactly two links: a pinned root issues the intermediate, and
@@ -105,6 +120,7 @@ const TIMESTAMP_CHARS: usize = 20;
 /// enumeration is closed.
 const CHAIN_LINK_COUNT: usize = 2;
 const CHAIN_ROLES: [&str; CHAIN_LINK_COUNT] = ["intermediate", "signing"];
+const CHAIN_MAX_VALIDITY_SECONDS: [i64; CHAIN_LINK_COUNT] = [31_536_000, 2_678_400];
 
 /// Skew allowed on the challenge window. A device may have no synchronised
 /// clock at all, so its own reading of "now" is advisory.
@@ -200,9 +216,7 @@ pub enum EnrollmentError {
 
     /// The artifact could not be read as a signed enrolment document at all: the
     /// envelope, the base64 of the signed octets, or a field the frozen order
-    /// reads before the signature verifies did not parse. The frozen reason set
-    /// has no code for a structurally unreadable document, so this variant maps
-    /// to none of them.
+    /// reads before the signature verifies did not parse.
     #[error("the offline enrollment document is not well formed")]
     MalformedDocument,
 
@@ -241,7 +255,7 @@ impl EnrollmentError {
             Self::EnrollmentReplayed => "ENROLLMENT_REPLAYED",
             Self::OrganizationMismatch => "ORGANIZATION_MISMATCH",
             Self::ClusterMismatch => "CLUSTER_MISMATCH",
-            Self::MalformedDocument => "MALFORMED_DOCUMENT",
+            Self::MalformedDocument => "DOCUMENT_MALFORMED",
             Self::ResponseNotProduced => "RESPONSE_NOT_PRODUCED",
         }
     }
@@ -255,6 +269,21 @@ impl EnrollmentError {
 struct SignedDocument {
     bytes: String,
     signature: DocumentSignature,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnverifiedSignedDocument {
+    bytes: String,
+    signature: UnverifiedDocumentSignature,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnverifiedDocumentSignature {
+    algorithm: Option<serde_json::Value>,
+    key_id: Option<serde_json::Value>,
+    value: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -272,7 +301,13 @@ struct DocumentSignature {
 struct ChallengeRouting {
     connect_key_id: String,
     issued_at: String,
-    trust_chain: Vec<SignedDocument>,
+    trust_chain: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrustLinkRouting {
+    issuer_key_id: String,
 }
 
 #[derive(Deserialize)]
@@ -294,6 +329,7 @@ struct ChallengeDocument {
 struct TrustLink {
     format_version: String,
     protocol_version: String,
+    serial: String,
     role: String,
     issuer_key_id: String,
     subject_key_id: String,
@@ -327,30 +363,83 @@ impl OfflineEnrollment {
     /// `now_unix` is the device's reading of the current time, which the clock
     /// skew tolerance treats as advisory.
     pub fn verify_challenge(document: &[u8], now_unix: i64) -> Result<VerifiedChallenge, EnrollmentError> {
-        let envelope: SignedDocument = serde_json::from_slice(document).map_err(|_| EnrollmentError::MalformedDocument)?;
+        Self::verify_challenge_with_root(document, now_unix, HOSTED_ROOT)
+    }
 
-        // Step 1: the encoding is checked before anything is decoded from it, so
-        // a DER, padded, truncated, out-of-range, or high-S signature is refused
-        // on its spelling rather than handed to a library that would accept it.
-        let signature = decode_signature(&envelope.signature)?;
+    /// Verify a challenge against the fixed root carried only by the dedicated
+    /// E2E CLI build. No caller can supply or replace this root at runtime.
+    #[cfg(feature = "offline-enrollment-e2e-root")]
+    #[doc(hidden)]
+    pub fn verify_e2e_challenge(document: &[u8], now_unix: i64) -> Result<VerifiedChallenge, EnrollmentError> {
+        Self::verify_challenge_with_root(document, now_unix, e2e_root()?)
+    }
 
-        // The octets that were transmitted. They are never re-serialised: every
-        // later step signs and parses this same buffer.
-        let bytes = BASE64_STANDARD
-            .decode(envelope.bytes.as_bytes())
-            .map_err(|_| EnrollmentError::MalformedDocument)?;
+    fn verify_challenge_with_root(
+        document: &[u8],
+        now_unix: i64,
+        root: EnrollmentRoot,
+    ) -> Result<VerifiedChallenge, EnrollmentError> {
+        let envelope: UnverifiedSignedDocument =
+            serde_json::from_slice(document).map_err(|_| EnrollmentError::MalformedDocument)?;
 
-        // Step 2: routing only.
+        // Decode the exact transmitted octets before reading any routing field.
+        // Standard padded base64 is canonical in this protocol: accepting an
+        // alternate spelling would give one signed document multiple artifact
+        // identities.
+        let bytes = decode_document_bytes(&envelope.bytes)?;
+
+        // Routing only. These values are still untrusted, but they must be
+        // structurally usable before the signature and trust decisions can be
+        // made in their frozen order.
         let routing: ChallengeRouting = serde_json::from_slice(&bytes).map_err(|_| EnrollmentError::MalformedDocument)?;
+        if !is_key_id(&routing.connect_key_id) {
+            return Err(EnrollmentError::MalformedDocument);
+        }
         let issued_at = parse_timestamp(&routing.issued_at)?;
 
-        // Steps 3 to 5.
-        let connect_key = verify_trust_chain(&routing.trust_chain, &routing.connect_key_id, issued_at)?;
+        // The frozen decision order classifies the top-level signature before
+        // parsing any trust-link envelope or routing fields. Otherwise a
+        // malformed link could mask a malformed artifact signature with
+        // DOCUMENT_MALFORMED.
+        let signature_member = |value: Option<serde_json::Value>| {
+            value
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .ok_or(EnrollmentError::SignatureMalformed)
+        };
+        let signature_document = DocumentSignature {
+            algorithm: signature_member(envelope.signature.algorithm)?,
+            key_id: signature_member(envelope.signature.key_id)?,
+            value: signature_member(envelope.signature.value)?,
+        };
+        let signature = decode_signature(&signature_document)?;
 
-        // Step 6. The verification key comes from the chain, so `signature.keyId`
-        // is a label rather than an input: a value naming some other key simply
-        // fails to verify here.
-        if !verifies(&connect_key, TAG_CHALLENGE, &bytes, &signature) {
+        let first = routing.trust_chain.first().ok_or(EnrollmentError::MalformedDocument)?;
+        let first_bytes = first
+            .get("bytes")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(EnrollmentError::MalformedDocument)
+            .and_then(decode_document_bytes)?;
+        let first_routing: TrustLinkRouting =
+            serde_json::from_slice(&first_bytes).map_err(|_| EnrollmentError::MalformedDocument)?;
+        if !is_key_id(&first_routing.issuer_key_id) {
+            return Err(EnrollmentError::MalformedDocument);
+        }
+
+        // The pinned-root decision precedes full chain-envelope validation.
+        if first_routing.issuer_key_id != root.key_id {
+            return Err(EnrollmentError::EnrollmentRootUnknown);
+        }
+        let trust_chain: Vec<SignedDocument> = serde_json::from_value(serde_json::Value::Array(routing.trust_chain))
+            .map_err(|_| EnrollmentError::TrustChainInvalid)?;
+
+        // Steps 3 to 5.
+        let connect_key =
+            verify_trust_chain(&trust_chain, &routing.connect_key_id, &first_routing.issuer_key_id, issued_at, root)?;
+
+        // Step 6. The detached signature must name the same chained key whose
+        // public key verifies it. A different well-formed key id is a signature
+        // failure, not an opportunity to ignore the binding.
+        if signature_document.key_id != routing.connect_key_id || !verifies(&connect_key, TAG_CHALLENGE, &bytes, &signature) {
             return Err(EnrollmentError::SignatureInvalid);
         }
 
@@ -375,7 +464,7 @@ impl OfflineEnrollment {
             issued_at: challenge.issued_at,
             expires_at: challenge.expires_at,
             connect_key_id: challenge.connect_key_id,
-            challenge_proof: envelope.signature.value,
+            challenge_proof: signature_document.value,
         })
     }
 
@@ -410,8 +499,8 @@ impl OfflineEnrollment {
             challenge_nonce: &challenge.nonce,
             challenge_proof: &challenge.challenge_proof,
             device_key_id: key_id(&point),
-            device_public_key: BASE64_URL_NO_PAD.encode(point),
-            device_nonce: BASE64_URL_NO_PAD.encode(device_nonce),
+            device_public_key: BASE64_URL_NO_PAD.encode_to_string(point),
+            device_nonce: BASE64_URL_NO_PAD.encode_to_string(device_nonce),
             produced_at,
         };
 
@@ -421,7 +510,7 @@ impl OfflineEnrollment {
         let signature = sign(key, TAG_RESPONSE, &bytes)?;
 
         let envelope = SignedDocument {
-            bytes: BASE64_STANDARD.encode(&bytes),
+            bytes: BASE64_STANDARD.encode_to_string(&bytes),
             signature: DocumentSignature {
                 algorithm: SIGNATURE_ALGORITHM.to_owned(),
                 key_id: document.device_key_id,
@@ -433,36 +522,53 @@ impl OfflineEnrollment {
     }
 }
 
+#[cfg(feature = "offline-enrollment-e2e-root")]
+fn e2e_root() -> Result<EnrollmentRoot, EnrollmentError> {
+    let key_id = E2E_ROOT_KEY_ID
+        .filter(|value| !value.is_empty())
+        .ok_or(EnrollmentError::EnrollmentRootUnknown)?;
+    let public_key = E2E_ROOT_PUBLIC_KEY
+        .filter(|value| !value.is_empty())
+        .ok_or(EnrollmentError::EnrollmentRootUnknown)?;
+
+    Ok(EnrollmentRoot { key_id, public_key })
+}
+
 /// Walk the chain from the pinned root to the signing key, returning the key
 /// `connect_key_id` names once the chain vouches for it.
 fn verify_trust_chain(
     chain: &[SignedDocument],
     connect_key_id: &str,
+    first_issuer_key_id: &str,
     challenge_issued_at: i64,
+    root: EnrollmentRoot,
 ) -> Result<VerifyingKey, EnrollmentError> {
     // The pinned root gate runs before the chain's shape is examined, so a
     // chain that is internally consistent under a foreign root — exactly what
     // trust on first use would have accepted — is refused for its root rather
     // than for its length.
     let first = chain.first().ok_or(EnrollmentError::EnrollmentRootUnknown)?;
-    let root = decode_trust_link(first)?;
-    if root.0.issuer_key_id != PINNED_ROOT_KEY_ID {
+    if first_issuer_key_id != root.key_id {
         return Err(EnrollmentError::EnrollmentRootUnknown);
     }
+    let first_link = decode_trust_link(first)?;
 
     let [_, second] = chain else {
         return Err(EnrollmentError::TrustChainInvalid);
     };
-    let links = [root, decode_trust_link(second)?];
+    let links = [first_link, decode_trust_link(second)?];
 
-    let mut issuer_key_id = PINNED_ROOT_KEY_ID.to_owned();
-    let (mut issuer_key, _) = decode_public_key(PINNED_ROOT_PUBLIC_KEY).ok_or(EnrollmentError::EnrollmentRootUnknown)?;
+    let mut issuer_key_id = root.key_id.to_owned();
+    let (mut issuer_key, _) = decode_public_key(root.public_key).ok_or(EnrollmentError::EnrollmentRootUnknown)?;
 
     for (index, ((link, link_bytes), entry)) in links.iter().zip(chain).enumerate() {
         if link.format_version != FORMAT_TRUST_LINK
             || link.protocol_version != PROTOCOL_VERSION
+            || !is_serial(&link.serial)
             || link.role != CHAIN_ROLES[index]
             || link.issuer_key_id != issuer_key_id
+            || !is_key_id(&link.issuer_key_id)
+            || !is_key_id(&link.subject_key_id)
             // A link that names itself as its own issuer would let a stolen
             // intermediate mint its own root.
             || link.subject_key_id == link.issuer_key_id
@@ -476,8 +582,8 @@ fn verify_trust_chain(
             return Err(EnrollmentError::TrustChainInvalid);
         }
 
-        let signature = decode_signature(&entry.signature)?;
-        if !verifies(&issuer_key, TAG_TRUST_LINK, link_bytes, &signature) {
+        let signature = decode_signature(&entry.signature).map_err(|_| EnrollmentError::TrustChainInvalid)?;
+        if entry.signature.key_id != link.issuer_key_id || !verifies(&issuer_key, TAG_TRUST_LINK, link_bytes, &signature) {
             return Err(EnrollmentError::TrustChainInvalid);
         }
 
@@ -485,9 +591,12 @@ fn verify_trust_chain(
         // with no skew tolerance, and against the challenge's issuedAt rather
         // than against the device clock: a challenge carries the chain that was
         // valid when it was issued.
-        let not_before = parse_timestamp(&link.not_before)?;
-        let not_after = parse_timestamp(&link.not_after)?;
-        if challenge_issued_at < not_before || challenge_issued_at > not_after {
+        let not_before = parse_timestamp(&link.not_before).map_err(|_| EnrollmentError::TrustChainInvalid)?;
+        let not_after = parse_timestamp(&link.not_after).map_err(|_| EnrollmentError::TrustChainInvalid)?;
+        if !link_validity_allowed(not_before, not_after, CHAIN_MAX_VALIDITY_SECONDS[index])
+            || challenge_issued_at < not_before
+            || challenge_issued_at > not_after
+        {
             return Err(EnrollmentError::TrustChainInvalid);
         }
 
@@ -505,11 +614,24 @@ fn verify_trust_chain(
 /// Decode a link and keep the octets it was signed over: the signature is
 /// checked against these, never against a re-encoding of the parsed link.
 fn decode_trust_link(entry: &SignedDocument) -> Result<(TrustLink, Vec<u8>), EnrollmentError> {
-    let bytes = BASE64_STANDARD
-        .decode(entry.bytes.as_bytes())
-        .map_err(|_| EnrollmentError::MalformedDocument)?;
+    let bytes = decode_document_bytes(&entry.bytes).map_err(|_| EnrollmentError::TrustChainInvalid)?;
     let link = serde_json::from_slice(&bytes).map_err(|_| EnrollmentError::TrustChainInvalid)?;
     Ok((link, bytes))
+}
+
+fn decode_document_bytes(value: &str) -> Result<Vec<u8>, EnrollmentError> {
+    if !value.len().is_multiple_of(4) {
+        return Err(EnrollmentError::MalformedDocument);
+    }
+
+    let decoded = BASE64_STANDARD
+        .decode_to_vec(value.as_bytes())
+        .map_err(|_| EnrollmentError::MalformedDocument)?;
+    if BASE64_STANDARD.encode_to_string(&decoded) != value {
+        return Err(EnrollmentError::MalformedDocument);
+    }
+
+    Ok(decoded)
 }
 
 /// Check a signature's spelling and range, then admit it.
@@ -518,7 +640,7 @@ fn decode_trust_link(entry: &SignedDocument) -> Result<(TrustLink, Vec<u8>), Enr
 /// the ECDSA library, because a library that accepts high-S — every library
 /// does — would let a malleated copy of an artifact pass as a second artifact.
 fn decode_signature(signature: &DocumentSignature) -> Result<Signature, EnrollmentError> {
-    if signature.algorithm != SIGNATURE_ALGORITHM {
+    if signature.algorithm != SIGNATURE_ALGORITHM || !is_key_id(&signature.key_id) {
         return Err(EnrollmentError::SignatureMalformed);
     }
 
@@ -528,7 +650,7 @@ fn decode_signature(signature: &DocumentSignature) -> Result<Signature, Enrollme
     }
 
     let decoded = BASE64_URL_NO_PAD
-        .decode(value)
+        .decode_to_vec(value)
         .map_err(|_| EnrollmentError::SignatureMalformed)?;
     let octets: [u8; SIGNATURE_OCTETS] = decoded
         .as_slice()
@@ -547,6 +669,24 @@ fn decode_signature(signature: &DocumentSignature) -> Result<Signature, Enrollme
     }
 
     Signature::from_slice(&octets).map_err(|_| EnrollmentError::SignatureMalformed)
+}
+
+fn is_key_id(value: &str) -> bool {
+    value.len() == KEY_ID_CHARS
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_serial(value: &str) -> bool {
+    value.len() == SERIAL_CHARS
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn link_validity_allowed(not_before: i64, not_after: i64, maximum: i64) -> bool {
+    not_after > not_before && not_after - not_before <= maximum
 }
 
 fn verifies(key: &VerifyingKey, tag: &[u8], bytes: &[u8], signature: &Signature) -> bool {
@@ -569,9 +709,9 @@ fn sign(key: &DeviceIdentity, tag: &[u8], bytes: &[u8]) -> Result<String, Enroll
     let signing_key = SigningKey::from_pkcs8_der(pkcs8.as_slice()).map_err(|_| EnrollmentError::ResponseNotProduced)?;
 
     let signature: Signature = signing_key.sign(&signature_input(tag, bytes));
-    let canonical = signature.normalize_s().unwrap_or(signature);
+    let canonical = signature.normalize_s();
 
-    Ok(BASE64_URL_NO_PAD.encode(canonical.to_bytes()))
+    Ok(BASE64_URL_NO_PAD.encode_to_string(canonical.to_bytes()))
 }
 
 /// The device's public point, recovered from the DER encoding the identity
@@ -596,7 +736,7 @@ fn decode_public_key(value: &str) -> Option<(VerifyingKey, [u8; PUBLIC_KEY_OCTET
         return None;
     }
 
-    let point: [u8; PUBLIC_KEY_OCTETS] = BASE64_URL_NO_PAD.decode(value).ok()?.try_into().ok()?;
+    let point: [u8; PUBLIC_KEY_OCTETS] = BASE64_URL_NO_PAD.decode_to_vec(value).ok()?.try_into().ok()?;
     if point[0] != UNCOMPRESSED_POINT {
         return None;
     }
@@ -681,4 +821,42 @@ fn check_challenge_window(issued_at: i64, expires_at: i64, at: i64) -> Result<()
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trust_link_validity_limits_match_the_frozen_boundary_vectors() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../protocol/agent/v1/fixtures/offline-enrollment/boundary-vectors.json"
+        ))
+        .expect("boundary vectors parse");
+        let vectors = fixture["linkValidityPolicyVectors"]
+            .as_array()
+            .expect("link validity policy vectors are a list");
+
+        for vector in vectors {
+            let name = vector["name"].as_str().expect("vector has a name");
+            let role = vector["role"].as_str().expect("vector has a role");
+            let index = CHAIN_ROLES
+                .iter()
+                .position(|candidate| *candidate == role)
+                .expect("known chain role");
+            let not_before =
+                parse_timestamp(vector["notBefore"].as_str().expect("notBefore is a string")).expect("notBefore is an instant");
+            let not_after =
+                parse_timestamp(vector["notAfter"].as_str().expect("notAfter is a string")).expect("notAfter is an instant");
+            let expected = vector["expectedReason"].is_null();
+
+            assert_eq!(
+                link_validity_allowed(not_before, not_after, CHAIN_MAX_VALIDITY_SECONDS[index]),
+                expected,
+                "link validity policy vector '{name}'"
+            );
+        }
+
+        assert_eq!(vectors.len(), 4, "boundary-vectors.json publishes four link-validity vectors");
+    }
 }

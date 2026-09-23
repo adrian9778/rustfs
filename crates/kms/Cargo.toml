@@ -50,8 +50,8 @@ aes-gcm = { workspace = true, features = ["rand_core"] }
 argon2 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
-base64 = { workspace = true }
-hex = { workspace = true }
+base64-simd = { workspace = true }
+hex-simd = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true, features = ["derive"] }
@@ -74,7 +74,10 @@ rustfs-security-governance = { workspace = true }
 rustfs-s3-types = { workspace = true }
 
 # HTTP client for Vault
-reqwest = { workspace = true }
+# `rustls` named explicitly: `reqwest::Identity::from_pem` (Vault mTLS) is only
+# available on the rustls TLS backend, and relying on another crate's feature
+# unification to enable it would break silently if that crate changed.
+reqwest = { workspace = true, features = ["rustls"] }
 vaultrs = { workspace = true }
 # vaultrs surfaces transport-level failures as wrapped rustify errors; the
 # operation policy needs the concrete type to classify them for retry decisions.
@@ -97,7 +100,8 @@ anyhow = { workspace = true }
 metrics-util = { workspace = true, features = ["debugging"] }
 insta = { workspace = true, features = ["yaml", "json"] }
 tempfile = { workspace = true }
-temp-env = { workspace = true }
+temp-env = { workspace = true, features = ["async_closure"] }
+rcgen = { workspace = true }
 # "net" backs the scripted loopback Vault used by the policy wiring tests.
 tokio = { workspace = true, features = ["net", "test-util"] }
 # Replays canned AWS KMS HTTP exchanges so the AWS backend tests stay offline.

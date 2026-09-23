@@ -61,6 +61,13 @@ REQUIRE_SERVER_PROVENANCE=false
 RUN_LABELS=()
 NODE_METRICS_URLS=()
 NODE_DOCKER_CONTAINERS=()
+NODE_SSH_TARGETS=()
+NODE_SSH_IDENTITY_FILE=""
+NODE_SSH_TIMEOUT_SECS=30
+REQUIRE_NODE_TELEMETRY=false
+NODE_TELEMETRY_FAILED=false
+AFTER_PROBE=false
+AFTER_PROBE_DIR=""
 
 usage() {
   cat <<'USAGE'
@@ -135,6 +142,14 @@ Enhanced options:
   --node-docker-container <node=container>
                                Repeatable Docker container mapped to a node; captures
                                CPU, memory, network, and block I/O before/after each round
+  --node-ssh-target <node=host> Repeatable SSH target; captures process CPU/RSS,
+                               iostat IOPS/await, and /proc/pressure/io before/after
+  --node-ssh-identity-file <path>
+                               Optional SSH private key used for node telemetry
+  --node-ssh-timeout-secs <n> Bound each remote telemetry command (default 30)
+  --require-node-telemetry    Mark a round failed when any node snapshot fails
+  --after-probe                After successful PUT, HEAD and GET one sampled object,
+                               verify length, ETag presence, and repeatable SHA-256
 
 Output files:
   round_results.csv            One row per round attempt (with retry trace)
@@ -144,6 +159,7 @@ Output files:
   node_inventory.csv            Per-node container and immutable image identity
   node_metrics_captures.csv    Per-node metric snapshot inventory
   node_resource_captures.csv   Per-node Docker resource and block I/O snapshots
+  after_probe.csv               Sampled PUT object HEAD/GET length/hash verification
 
 Example:
   scripts/run_object_batch_bench_enhanced.sh \
@@ -169,6 +185,35 @@ normalize_warp_host() {
   raw="${raw%%\?*}"
   raw="${raw%%\#*}"
   echo "$raw"
+}
+
+normalize_s3_endpoint() {
+  local raw="$1"
+  if [[ "$raw" == http://* || "$raw" == https://* ]]; then
+    echo "$raw"
+  else
+    echo "http://$raw"
+  fi
+}
+
+size_to_bytes() {
+  local value="$1" number unit factor
+  if [[ "$value" =~ ^([0-9]+)(B|KB|MB|GB|KiB|MiB|GiB)$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+      B) factor=1 ;;
+      KB) factor=1000 ;;
+      MB) factor=1000000 ;;
+      GB) factor=1000000000 ;;
+      KiB) factor=1024 ;;
+      MiB) factor=1048576 ;;
+      GiB) factor=1073741824 ;;
+    esac
+    echo $((number * factor))
+  else
+    echo N/A
+  fi
 }
 
 parse_args() {
@@ -217,6 +262,11 @@ parse_args() {
       --label) RUN_LABELS+=("$2"); shift 2 ;;
       --node-metrics-url) NODE_METRICS_URLS+=("$2"); shift 2 ;;
       --node-docker-container) NODE_DOCKER_CONTAINERS+=("$2"); shift 2 ;;
+      --node-ssh-target) NODE_SSH_TARGETS+=("$2"); shift 2 ;;
+      --node-ssh-identity-file) NODE_SSH_IDENTITY_FILE="$2"; shift 2 ;;
+      --node-ssh-timeout-secs) NODE_SSH_TIMEOUT_SECS="$2"; shift 2 ;;
+      --require-node-telemetry) REQUIRE_NODE_TELEMETRY=true; shift ;;
+      --after-probe) AFTER_PROBE=true; shift ;;
       --extra-args)
         # shellcheck disable=SC2206
         EXTRA_ARGS=($2)
@@ -317,17 +367,17 @@ default_service_metrics_filter_regex() {
         return
         ;;
       put)
-        echo "rustfs_s3_put_object_|rustfs_io_put_object_|rustfs_zero_copy_write|rustfs_buffer_|rustfs_ec_|rustfs_io_bytespool_"
+        echo "rustfs_s3_put_object_|rustfs_io_put_object_|rustfs_zero_copy_write|rustfs_buffer_|rustfs_ec_|rustfs_io_bytespool_|rustfs_system_network_internode_"
         return
         ;;
       mixed)
-        echo "rustfs_s3_get_object_|rustfs_io_get_object_|rustfs_s3_put_object_|rustfs_io_put_object_|rustfs_zero_copy_|rustfs_buffer_|rustfs_ec_"
+        echo "rustfs_s3_get_object_|rustfs_io_get_object_|rustfs_s3_put_object_|rustfs_io_put_object_|rustfs_zero_copy_|rustfs_buffer_|rustfs_ec_|rustfs_system_network_internode_"
         return
         ;;
     esac
   fi
 
-  echo "rustfs_s3_put_object_|rustfs_io_put_object_|rustfs_s3_get_object_|rustfs_io_get_object_"
+  echo "rustfs_s3_put_object_|rustfs_io_put_object_|rustfs_s3_get_object_|rustfs_io_get_object_|rustfs_system_network_internode_"
 }
 
 default_service_prometheus_query() {
@@ -338,17 +388,17 @@ default_service_prometheus_query() {
         return
         ;;
       put)
-        echo '{__name__=~"rustfs_(s3_put_object|io_put_object|zero_copy_write|buffer|ec|io_bytespool)_.*"}'
+        echo '{__name__=~"rustfs_(s3_put_object|io_put_object|zero_copy_write|buffer|ec|io_bytespool|system_network_internode)_.*"}'
         return
         ;;
       mixed)
-        echo '{__name__=~"rustfs_(s3_get_object|io_get_object|s3_put_object|io_put_object|zero_copy|buffer|ec)_.*"}'
+        echo '{__name__=~"rustfs_(s3_get_object|io_get_object|s3_put_object|io_put_object|zero_copy|buffer|ec|system_network_internode)_.*"}'
         return
         ;;
     esac
   fi
 
-  echo '{__name__=~"rustfs_(s3_put_object|io_put_object|s3_get_object|io_get_object)_.*"}'
+  echo '{__name__=~"rustfs_(s3_put_object|io_put_object|s3_get_object|io_get_object|system_network_internode)_.*"}'
 }
 
 validate_args() {
@@ -370,6 +420,7 @@ validate_args() {
   validate_positive_int "$SERVICE_METRICS_CONNECT_TIMEOUT_SECS" "--service-metrics-connect-timeout-secs"
   validate_positive_int "$SERVICE_METRICS_MAX_TIME_SECS" "--service-metrics-max-time-secs"
   validate_nonnegative_int "$SERVICE_METRICS_SETTLE_SECS" "--service-metrics-settle-secs"
+  validate_positive_int "$NODE_SSH_TIMEOUT_SECS" "--node-ssh-timeout-secs"
   if [[ -n "$SERVICE_METRICS_URL" && -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
     echo "ERROR: --service-metrics-url and --service-prometheus-query-url are mutually exclusive" >&2
     exit 1
@@ -387,6 +438,11 @@ validate_args() {
   if ((${#NODE_DOCKER_CONTAINERS[@]} > 0)) && [[ "$DRY_RUN" != "true" ]]; then
     require_cmd docker
   fi
+  if [[ "$AFTER_PROBE" == "true" ]] && [[ "$DRY_RUN" != "true" ]]; then
+    require_cmd mc
+    require_cmd jq
+    require_cmd sha256sum
+  fi
   if [[ "$TOOL" == "s3bench" ]]; then
     validate_positive_int "$SAMPLES" "--samples"
   fi
@@ -403,6 +459,15 @@ validate_args() {
   fi
   if ((${#NODE_DOCKER_CONTAINERS[@]} > 0)); then
     validate_named_values "--node-docker-container" "${NODE_DOCKER_CONTAINERS[@]}"
+  fi
+  if ((${#NODE_SSH_TARGETS[@]} > 0)); then
+    validate_named_values "--node-ssh-target" "${NODE_SSH_TARGETS[@]}"
+    require_cmd ssh
+    [[ "$DRY_RUN" == "true" ]] || require_cmd timeout
+    if [[ -n "$NODE_SSH_IDENTITY_FILE" && "$DRY_RUN" != "true" && ! -r "$NODE_SSH_IDENTITY_FILE" ]]; then
+      echo "ERROR: --node-ssh-identity-file is not readable: $NODE_SSH_IDENTITY_FILE" >&2
+      exit 1
+    fi
   fi
   validate_manifest_value "$SERVER_IMAGE_REF" "--server-image-ref"
   validate_manifest_value "$SERVER_IMAGE_DIGEST" "--server-image-digest"
@@ -459,7 +524,7 @@ write_manifest_entry() {
 
 write_run_manifest() {
   local manifest_file="$OUT_DIR/run_manifest.env"
-  local started_at_utc git_commit git_branch git_dirty rustc_version uname_s service_metrics_csv
+  local started_at_utc git_commit git_branch git_dirty rustc_version uname_s service_metrics_csv report_operation
   started_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   git_commit="$(git_value unknown rev-parse --short HEAD)"
   git_branch="$(git_value unknown branch --show-current)"
@@ -467,6 +532,10 @@ write_run_manifest() {
   rustc_version="$(rustc --version 2>/dev/null || echo unknown)"
   uname_s="$(uname -a 2>/dev/null || echo unknown)"
   service_metrics_csv="${SERVICE_METRICS_CSV:-}"
+  report_operation="N/A"
+  if [[ "$TOOL" == "warp" ]]; then
+    report_operation="$(warp_report_operation)"
+  fi
 
   cat >"$manifest_file" <<EOF
 started_at_utc=${started_at_utc}
@@ -494,6 +563,7 @@ retry_sleep_secs=${RETRY_SLEEP_SECS}
 cooldown_secs=${COOLDOWN_SECS}
 warp_bin=${WARP_BIN}
 warp_mode=${WARP_MODE}
+warp_report_operation=${report_operation}
 duration=${DURATION}
 s3bench_bin=${S3BENCH_BIN}
 samples=${SAMPLES}
@@ -528,6 +598,11 @@ EOF
     fi
     echo "node_metrics_count=${#NODE_METRICS_URLS[@]}"
     echo "node_docker_container_count=${#NODE_DOCKER_CONTAINERS[@]}"
+    echo "node_ssh_target_count=${#NODE_SSH_TARGETS[@]}"
+    echo "node_ssh_identity_file=${NODE_SSH_IDENTITY_FILE:-N/A}"
+    echo "node_ssh_timeout_secs=${NODE_SSH_TIMEOUT_SECS}"
+    echo "require_node_telemetry=${REQUIRE_NODE_TELEMETRY}"
+    echo "after_probe=${AFTER_PROBE}"
   } >>"$manifest_file"
 }
 
@@ -568,6 +643,9 @@ setup_output() {
   if ((${#NODE_DOCKER_CONTAINERS[@]} > 0)); then
     mkdir -p "$OUT_DIR/node_resources"
   fi
+  if ((${#NODE_SSH_TARGETS[@]} > 0)); then
+    mkdir -p "$OUT_DIR/node_telemetry"
+  fi
 
   ROUND_CSV="$OUT_DIR/round_results.csv"
   MEDIAN_CSV="$OUT_DIR/median_summary.csv"
@@ -575,6 +653,9 @@ setup_output() {
   SERVICE_METRICS_CSV="$OUT_DIR/service_metrics_captures.csv"
   NODE_METRICS_CSV="$OUT_DIR/node_metrics_captures.csv"
   NODE_RESOURCE_CSV="$OUT_DIR/node_resource_captures.csv"
+  NODE_SSH_CSV="$OUT_DIR/node_telemetry_captures.csv"
+  AFTER_PROBE_CSV="$OUT_DIR/after_probe.csv"
+  AFTER_PROBE_DIR="${OUT_DIR}/after_probe"
 
   echo "size,tool,round,attempt,concurrency,status,exit_code,round_started_at_utc,round_finished_at_utc,throughput_human,throughput_bps,reqps,latency_human,latency_ms,log_file,req_p90_human,req_p90_ms,req_p99_human,req_p99_ms" > "$ROUND_CSV"
   echo "size,tool,concurrency,successful_rounds,failed_rounds,median_throughput_bps,median_reqps,median_latency_ms,median_req_p90_ms,median_req_p99_ms" > "$MEDIAN_CSV"
@@ -586,6 +667,14 @@ setup_output() {
   fi
   if ((${#NODE_DOCKER_CONTAINERS[@]} > 0)); then
     echo "size,tool,round,attempt,phase,node,container,status,snapshot_file" > "$NODE_RESOURCE_CSV"
+  fi
+  if ((${#NODE_SSH_TARGETS[@]} > 0)); then
+    mkdir -p "$OUT_DIR/node_telemetry"
+    echo "size,tool,round,attempt,phase,node,host,status,snapshot_file" > "$NODE_SSH_CSV"
+  fi
+  if [[ "$AFTER_PROBE" == "true" ]]; then
+    mkdir -p "$AFTER_PROBE_DIR"
+    echo "size,tool,round,attempt,status,bucket,key,expected_size,head_size,get_size,hash1,hash2,etag,error" > "$AFTER_PROBE_CSV"
   fi
   write_run_manifest
   write_node_inventory
@@ -662,24 +751,23 @@ to_ms() {
   awk -v n="$number" -v f="$factor" 'BEGIN { printf "%.6f\n", n * f }'
 }
 
-extract_first() {
-  local regex="$1"
-  local file="$2"
-  rg -o "$regex" "$file" | head -n1 || true
+warp_report_operation() {
+  case "$WARP_MODE" in
+    get) echo GET ;;
+    put|mixed) echo PUT ;;
+  esac
 }
 
-extract_report_line() {
-  local regex="$1"
+extract_warp_report() {
+  local operation="$1"
   local file="$2"
-  awk -v regex="$regex" '
-    /^Report:/ {
-      in_report = 1
+  awk -v operation="$operation" '
+    /^(Report|Operation):/ {
+      target = "^(Report|Operation):[[:space:]]*" operation "([[:space:].-]|$)"
+      in_report = ($0 ~ target || $0 ~ /^Report:[[:space:]]*$/)
       next
     }
-    in_report && $0 ~ regex {
-      print
-      exit
-    }
+    in_report { print }
   ' "$file"
 }
 
@@ -703,30 +791,35 @@ normalize_duration_metric() {
 extract_metrics() {
   local log_file="$1"
 
-  local average_line reqs_line throughput reqps latency req_p90 req_p99 reqps_num
-  average_line="$(extract_report_line '^[[:space:]]*[*][[:space:]]+Average:' "$log_file")"
-  reqs_line="$(extract_report_line '^[[:space:]]*[*][[:space:]]+Reqs:' "$log_file")"
+  local report average_line throughput_line request_line throughput reqps latency req_p90 req_p99 reqps_num
+  if [[ "$TOOL" == "warp" ]]; then
+    report="$(extract_warp_report "$(warp_report_operation)" "$log_file")"
+  else
+    report="$(<"$log_file")"
+  fi
+  average_line="$(printf '%s\n' "$report" | awk '/^[[:space:]]*[*][[:space:]]+Average:/ { print; exit }')"
+  throughput_line="$(printf '%s\n' "$report" | awk '/^[[:space:]]*[*][[:space:]]+Throughput:/ { print; exit }')"
+  request_line="$(printf '%s\n' "$report" | awk '/^[[:space:]]*[*][[:space:]]+(Reqs:[[:space:]]+)?Avg:/ { print; exit }')"
 
   if [[ -n "$average_line" ]]; then
     throughput="$(echo "$average_line" | sed -E 's/^.*Average:[[:space:]]*//; s/,[[:space:]]*.*$//')"
     reqps="$(echo "$average_line" | sed -E 's/^.*Average:[[:space:]]*[^,]+,[[:space:]]*//; s/[[:space:]]*$//')"
+  elif [[ -n "$throughput_line" ]]; then
+    throughput="$(printf '%s\n' "$throughput_line" | rg -o '[0-9]+(\.[0-9]+)?[[:space:]]*(GiB/s|MiB/s|KiB/s|GB/s|MB/s|KB/s|B/s)' | head -n1 || true)"
+    reqps="$(printf '%s\n' "$throughput_line" | rg -o '[0-9]+(\.[0-9]+)?[[:space:]]*(obj/s|req/s|ops/s|requests/s)' | head -n1 || true)"
   else
-    throughput="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(GiB/s|MiB/s|KiB/s|GB/s|MB/s|KB/s|B/s)' "$log_file")"
-    reqps="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(obj/s|req/s|ops/s|requests/s)' "$log_file")"
+    throughput="$(printf '%s\n' "$report" | rg -o '[0-9]+(\.[0-9]+)?[[:space:]]*(GiB/s|MiB/s|KiB/s|GB/s|MB/s|KB/s|B/s)' | head -n1 || true)"
+    reqps="$(printf '%s\n' "$report" | rg -o '[0-9]+(\.[0-9]+)?[[:space:]]*(obj/s|req/s|ops/s|requests/s)' | head -n1 || true)"
   fi
 
-  if [[ -n "$reqs_line" ]]; then
-    latency="$(echo "$reqs_line" | rg -o 'Avg:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | sed -E 's/^Avg:[[:space:]]+//')"
-    req_p90="$(echo "$reqs_line" | rg -o '90%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | sed -E 's/^90%:[[:space:]]+//')"
-    req_p99="$(echo "$reqs_line" | rg -o '99%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | sed -E 's/^99%:[[:space:]]+//')"
+  if [[ -n "$request_line" ]]; then
+    latency="$(echo "$request_line" | rg -o 'Avg:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | sed -E 's/^Avg:[[:space:]]+//')"
+    req_p90="$(echo "$request_line" | rg -o '90%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | sed -E 's/^90%:[[:space:]]+//')"
+    req_p99="$(echo "$request_line" | rg -o '99%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | sed -E 's/^99%:[[:space:]]+//')"
   else
-    latency="$(rg -o 'Reqs:[[:space:]]+Avg:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^Reqs:[[:space:]]+Avg:[[:space:]]+//')"
-    req_p90="$(rg -o '90%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^90%:[[:space:]]+//')"
-    req_p99="$(rg -o '99%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^99%:[[:space:]]+//')"
-  fi
-
-  if [[ -z "$latency" ]]; then
-    latency="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(ms|us|µs|s)' "$log_file")"
+    latency="$(printf '%s\n' "$report" | rg -o 'Reqs:[[:space:]]+Avg:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | head -n1 | sed -E 's/^Reqs:[[:space:]]+Avg:[[:space:]]+//' || true)"
+    req_p90="$(printf '%s\n' "$report" | rg -o '90%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | head -n1 | sed -E 's/^90%:[[:space:]]+//' || true)"
+    req_p99="$(printf '%s\n' "$report" | rg -o '99%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | head -n1 | sed -E 's/^99%:[[:space:]]+//' || true)"
   fi
 
   throughput="$(trim "${throughput:-N/A}")"
@@ -1079,6 +1172,138 @@ capture_round_node_resources() {
   done
 }
 
+capture_round_node_telemetry() {
+  local size="$1" round="$2" attempt="$3" phase="$4" entry node host token snapshot_file
+  if ((${#NODE_SSH_TARGETS[@]} == 0)); then
+    return
+  fi
+  for entry in "${NODE_SSH_TARGETS[@]}"; do
+    node="${entry%%=*}"
+    host="${entry#*=}"
+    local -a ssh_args=(-o BatchMode=yes -o ConnectTimeout=5)
+    if [[ -n "$NODE_SSH_IDENTITY_FILE" ]]; then
+      ssh_args+=(-i "$NODE_SSH_IDENTITY_FILE")
+    fi
+    token="$(metric_snapshot_token "$size" "$round" "$attempt")"
+    snapshot_file="$OUT_DIR/node_telemetry/${token}_${node}_${phase}.txt"
+    if [[ "$DRY_RUN" == "true" ]]; then
+      : >"$snapshot_file"
+      echo "$size,$TOOL,$round,$attempt,$phase,$node,$host,not_run_dry_run,$snapshot_file" >>"$NODE_SSH_CSV"
+      continue
+    fi
+    if timeout "$NODE_SSH_TIMEOUT_SECS" ssh "${ssh_args[@]}" "$host" 'set -u
+      pid="$(pgrep -o -f /usr/local/bin/rustfs || true)"
+      echo "captured_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "pid=${pid:-N/A}"
+      if [[ -n "$pid" ]]; then
+        process_metrics="$(ps -p "$pid" -o pcpu=,pmem=,rss=,vsz=,nlwp= | awk '\''NR == 1 {print $1, $2, $3, $4, $5}'\'')"
+        read -r process_cpu process_mem process_rss process_vsz process_threads <<<"$process_metrics"
+        echo "process_cpu_percent=${process_cpu:-N/A}"
+        echo "process_mem_percent=${process_mem:-N/A}"
+        echo "process_rss_kb=${process_rss:-N/A}"
+        echo "process_vsz_kb=${process_vsz:-N/A}"
+        echo "process_threads=${process_threads:-N/A}"
+      else
+        echo "process_status=missing"
+      fi
+      if command -v iostat >/dev/null 2>&1; then
+        echo "iostat_begin"
+        iostat -c -dx 1 1 2>/dev/null || true
+        echo "iostat_end"
+      else
+        echo "iostat_status=unavailable"
+      fi
+      echo "scheduler_begin"
+      echo "loadavg=$(cat /proc/loadavg 2>/dev/null || echo N/A)"
+      awk "/^ctxt / || /^procs_running / || /^procs_blocked / {print}" /proc/stat 2>/dev/null || true
+      if command -v vmstat >/dev/null 2>&1; then
+        vmstat_sample="$(vmstat 1 2 2>/dev/null | tail -n 1 || true)"
+        echo "vmstat_sample=${vmstat_sample:-N/A}"
+        if [[ -n "$vmstat_sample" ]]; then
+          read -r vm_r vm_b vm_swpd vm_free vm_buff vm_cache vm_si vm_so vm_bi vm_bo vm_in vm_cs vm_us vm_sy vm_id vm_wa vm_st <<<"$vmstat_sample"
+          echo "vmstat_r=${vm_r:-N/A}"
+          echo "vmstat_b=${vm_b:-N/A}"
+          echo "vmstat_iowait_pct=${vm_wa:-N/A}"
+          echo "vmstat_steal_pct=${vm_st:-N/A}"
+        fi
+      else
+        echo "vmstat_status=unavailable"
+      fi
+      echo "scheduler_end"
+      echo "io_psi_begin"
+      cat /proc/pressure/io 2>/dev/null || echo "io_psi_status=unavailable"
+      echo "io_psi_end"' >"$snapshot_file" && [[ -s "$snapshot_file" ]]; then
+      echo "$size,$TOOL,$round,$attempt,$phase,$node,$host,ok,$snapshot_file" >>"$NODE_SSH_CSV"
+    else
+      NODE_TELEMETRY_FAILED=true
+      : >"$snapshot_file"
+      echo "$size,$TOOL,$round,$attempt,$phase,$node,$host,capture_failed,$snapshot_file" >>"$NODE_SSH_CSV"
+      echo "WARN: failed to capture node telemetry node=${node} host=${host}" >&2
+    fi
+  done
+}
+
+capture_after_probe() {
+  local size="$1" round="$2" attempt="$3" bucket alias probe_root key stat_json expected_size head_size get_size hash1 hash2 etag error
+  if [[ "$AFTER_PROBE" != "true" || "$TOOL" != "warp" || "$WARP_MODE" != "put" ]]; then
+    return 0
+  fi
+  probe_root="$AFTER_PROBE_DIR/probe-${size}-${round}-${attempt}"
+  mkdir -p "$probe_root"
+  bucket="$(bucket_for_size "$size")"
+  alias="probe"
+  key=""
+  stat_json=""
+  expected_size="$(size_to_bytes "$size")"
+  head_size="N/A"
+  get_size="N/A"
+  hash1="N/A"
+  hash2="N/A"
+  etag="N/A"
+  error=""
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "$size,$TOOL,$round,$attempt,not_run_dry_run,$bucket,N/A,$expected_size,N/A,N/A,N/A,N/A,N/A,dry_run" >>"$AFTER_PROBE_CSV"
+    return 0
+  fi
+
+  export MC_CONFIG_DIR="$probe_root/mc-config"
+  if ! mc alias set "$alias" "$(normalize_s3_endpoint "$ENDPOINT")" "$ACCESS_KEY" "$SECRET_KEY" --api S3v4 >/dev/null 2>"$probe_root/alias.err"; then
+    error="alias_setup_failed"
+  else
+    key="$(mc ls --json --recursive "$alias/$bucket" 2>"$probe_root/ls.err" | jq -r 'select(.type == "file") | [(.lastModified // ""), .key] | @tsv' | sort -r | head -n1 | cut -f2- || true)"
+    if [[ -z "$key" ]]; then
+      error="no_object_found"
+    else
+      stat_json="$(mc stat --json "$alias/$bucket/$key" 2>"$probe_root/stat.err" || true)"
+      head_size="$(printf '%s' "$stat_json" | jq -r '.size // empty' 2>/dev/null || true)"
+      etag="$(printf '%s' "$stat_json" | jq -r '.etag // empty' 2>/dev/null || true)"
+      head_size="${head_size:-N/A}"
+      etag="${etag:-N/A}"
+      mc cat "$alias/$bucket/$key" >"$probe_root/get1.bin" 2>"$probe_root/get1.err" || true
+      mc cat "$alias/$bucket/$key" >"$probe_root/get2.bin" 2>"$probe_root/get2.err" || true
+      if [[ -f "$probe_root/get1.bin" ]]; then
+        get_size="$(wc -c <"$probe_root/get1.bin" | tr -d '[:space:]')"
+        hash1="$(sha256sum "$probe_root/get1.bin" | awk '{print $1}')"
+      fi
+      if [[ -f "$probe_root/get2.bin" ]]; then
+        hash2="$(sha256sum "$probe_root/get2.bin" | awk '{print $1}')"
+      fi
+      if [[ "$head_size" != "$expected_size" ]]; then error="head_size_mismatch"; fi
+      if [[ "$get_size" != "$expected_size" ]]; then error="${error:+$error; }get_size_mismatch"; fi
+      if [[ "$hash1" == "N/A" || "$hash1" != "$hash2" ]]; then error="${error:+$error; }hash_mismatch_or_missing"; fi
+    fi
+  fi
+  rm -rf "$MC_CONFIG_DIR"
+  if [[ -z "$error" ]]; then
+    echo "$size,$TOOL,$round,$attempt,ok,$bucket,$key,$expected_size,$head_size,$get_size,$hash1,$hash2,$etag,N/A" >>"$AFTER_PROBE_CSV"
+    return 0
+  fi
+  echo "$size,$TOOL,$round,$attempt,failed,$bucket,$key,$expected_size,$head_size,$get_size,$hash1,$hash2,$etag,$error" >>"$AFTER_PROBE_CSV"
+  echo "WARN: after-probe failed size=${size} round=${round} attempt=${attempt}: ${error}" >&2
+  return 1
+}
+
 median_from_numbers() {
   local values="$1"
   local count
@@ -1109,9 +1334,11 @@ run_one_attempt() {
   local status="ok"
   local exit_code=0
   local started_at_utc finished_at_utc
+  NODE_TELEMETRY_FAILED=false
   capture_round_service_metrics "$size" "$round" "$attempt" before
   capture_round_node_metrics "$size" "$round" "$attempt" before
   capture_round_node_resources "$size" "$round" "$attempt" before
+  capture_round_node_telemetry "$size" "$round" "$attempt" before
   started_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   if [[ "$TOOL" == "warp" ]]; then
@@ -1128,7 +1355,12 @@ run_one_attempt() {
       "--concurrent" "$CONCURRENCY"
       "--duration" "$DURATION"
       "--region" "$REGION"
+      "--no-color"
+      "--analyze.v"
     )
+    if [[ "$AFTER_PROBE" == "true" && "$WARP_MODE" == "put" ]]; then
+      cmd+=("--noclear")
+    fi
     if [[ "$INSECURE" == "true" ]]; then
       cmd+=("--insecure")
     fi
@@ -1187,6 +1419,15 @@ run_one_attempt() {
   capture_round_service_metrics "$size" "$round" "$attempt" after
   capture_round_node_metrics "$size" "$round" "$attempt" after
   capture_round_node_resources "$size" "$round" "$attempt" after
+  capture_round_node_telemetry "$size" "$round" "$attempt" after
+  if [[ "$REQUIRE_NODE_TELEMETRY" == "true" && "$NODE_TELEMETRY_FAILED" == "true" ]]; then
+    status="failed"
+    exit_code=1
+  fi
+  if ! capture_after_probe "$size" "$round" "$attempt"; then
+    status="failed"
+    exit_code=1
+  fi
 
   local metrics throughput_human reqps latency_human throughput_bps latency_ms req_p90_human req_p90_ms req_p99_human req_p99_ms
   if [[ "$DRY_RUN" == "true" ]]; then
@@ -1210,6 +1451,12 @@ run_one_attempt() {
     latency_ms="$(to_ms "$latency_human")"
     req_p90_ms="$(to_ms "$req_p90_human")"
     req_p99_ms="$(to_ms "$req_p99_human")"
+  fi
+
+  if [[ "$DRY_RUN" != "true" && "$TOOL" == "warp" && "$status" == "ok" ]] \
+    && rg -q '^[[:space:]]*(Total[[:space:]]+)?Errors:[[:space:]]*[1-9][0-9]*[.]?([[:space:]]|$)' "$log_file"; then
+    status="failed"
+    exit_code=1
   fi
 
   if [[ "$DRY_RUN" != "true" && "$status" == "ok" ]]; then
@@ -1318,10 +1565,21 @@ compare_baseline() {
 
       dr="N/A"; dl="N/A"; dt="N/A"; dp90="N/A"; dp99="N/A"; ne="N/A"; be="N/A"; de="N/A"
       if (br!="N/A" && n_req!="N/A" && br+0!=0) dr=sprintf("%.2f", ((n_req-br)/br)*100)
-      if (bl!="N/A" && n_lat!="N/A" && bl+0!=0) dl=sprintf("%.2f", ((n_lat-bl)/bl)*100)
+      if (bl!="N/A" && n_lat!="N/A") {
+        if (bl+0!=0) dl=sprintf("%.2f", ((n_lat-bl)/bl)*100)
+        else if (n_lat+0==0) dl="0.00"
+      }
       if (bt!="N/A" && n_thr!="N/A" && bt+0!=0) dt=sprintf("%.2f", ((n_thr-bt)/bt)*100)
-      if (bp90!="N/A" && n_p90!="N/A" && bp90+0!=0) dp90=sprintf("%.2f", ((n_p90-bp90)/bp90)*100)
-      if (bp99!="N/A" && n_p99!="N/A" && bp99+0!=0) dp99=sprintf("%.2f", ((n_p99-bp99)/bp99)*100)
+      # Warp v1 rounds sub-millisecond latency to 0s. Two zero readings are
+      # the same below-resolution bucket; a nonzero candidate remains invalid.
+      if (bp90!="N/A" && n_p90!="N/A") {
+        if (bp90+0!=0) dp90=sprintf("%.2f", ((n_p90-bp90)/bp90)*100)
+        else if (n_p90+0==0) dp90="0.00"
+      }
+      if (bp99!="N/A" && n_p99!="N/A") {
+        if (bp99+0!=0) dp99=sprintf("%.2f", ((n_p99-bp99)/bp99)*100)
+        else if (n_p99+0==0) dp99="0.00"
+      }
       if (n_ok!="N/A" && n_fail!="N/A" && n_ok+n_fail>0) ne=sprintf("%.2f", (n_fail/(n_ok+n_fail))*100)
       if (bok!="N/A" && bfail!="N/A" && bok+bfail>0) be=sprintf("%.2f", (bfail/(bok+bfail))*100)
       if (ne!="N/A" && be!="N/A") de=sprintf("%.2f", ne-be)

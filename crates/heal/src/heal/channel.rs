@@ -19,9 +19,10 @@ use crate::heal::{
     utils,
 };
 use crate::{Error, Result};
-use rustfs_common::heal_channel::{
+use rustfs_heal_contracts::heal_channel::{
     HealAdmissionReceipt, HealAdmissionResult, HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest,
-    HealChannelResponse, HealReceiptCommand, HealReceiptReceiver, HealRequestSource, HealScanMode, publish_heal_response,
+    HealChannelResponse, HealOpts, HealReceiptCommand, HealReceiptReceiver, HealRequestSource, HealScanMode,
+    publish_heal_response,
 };
 use rustfs_madmin::heal_commands::HealResultItem;
 use serde::Serialize;
@@ -76,6 +77,12 @@ struct HealTaskStatusPayload<'a> {
     min_seq: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     progress: Option<&'a HealProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<&'a super::outcome::HealTaskOutcome>,
+    #[serde(rename = "outcomeStatus", skip_serializing_if = "Option::is_none")]
+    outcome_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    settings: Option<&'a HealOpts>,
 }
 
 fn u64_is_zero(value: &u64) -> bool {
@@ -87,17 +94,21 @@ fn encode_heal_task_status_payload(
     mut items: Vec<HealResultItem>,
     progress: Option<&HealProgress>,
     mut truncated: bool,
-    next_seq: u64,
-    min_seq: u64,
+    sequence: (u64, u64),
+    outcome: Option<&super::outcome::HealTaskOutcome>,
+    settings: Option<&HealOpts>,
 ) -> Result<(Vec<u8>, bool)> {
     loop {
         let data = serde_json::to_vec(&HealTaskStatusPayload {
             summary,
             items: &items,
             truncated,
-            next_seq,
-            min_seq,
+            next_seq: sequence.0,
+            min_seq: sequence.1,
             progress,
+            outcome,
+            outcome_status: (outcome.is_none() && matches!(summary, "finished" | "stopped")).then_some("unavailable"),
+            settings,
         })
         .map_err(|e| Error::Serialization(format!("failed to serialize heal task status: {e}")))?;
         if data.len() <= MAX_HEAL_STATUS_PAYLOAD_SIZE {
@@ -111,25 +122,35 @@ fn encode_heal_task_status_payload(
     }
 }
 
-fn heal_status_detail(detail: Option<String>, truncated: bool) -> Option<String> {
-    if !truncated {
-        return detail;
-    }
-    let truncation = "heal result items were truncated";
-    Some(detail.map_or_else(|| truncation.to_string(), |detail| format!("{detail}; {truncation}")))
+#[derive(Default)]
+struct HealStatusResponseContext<'a> {
+    progress: Option<&'a HealProgress>,
+    detail: Option<String>,
+    truncated: bool,
+    sequence: (u64, u64),
+    outcome: Option<&'a super::outcome::HealTaskOutcome>,
+    settings: Option<&'a HealOpts>,
 }
 
 fn encode_heal_status_response(
     summary: &str,
     items: Vec<HealResultItem>,
-    progress: Option<&HealProgress>,
-    detail: Option<String>,
-    truncated: bool,
-    next_seq: u64,
-    min_seq: u64,
+    context: HealStatusResponseContext<'_>,
 ) -> Result<(Vec<u8>, Option<String>)> {
-    let (data, truncated) = encode_heal_task_status_payload(summary, items, progress, truncated, next_seq, min_seq)?;
-    Ok((data, heal_status_detail(detail, truncated)))
+    let (summary, detail) = match context.outcome {
+        Some(outcome) => outcome.legacy_status(summary, context.detail),
+        None => (summary, context.detail),
+    };
+    let (data, truncated) = encode_heal_task_status_payload(
+        summary,
+        items,
+        context.progress,
+        context.truncated,
+        context.sequence,
+        context.outcome,
+        context.settings,
+    )?;
+    Ok((data, super::outcome::heal_status_detail(detail, truncated)))
 }
 
 impl HealChannelProcessor {
@@ -323,11 +344,14 @@ impl HealChannelProcessor {
     /// Process start request
     async fn process_start_request(
         &self,
-        request: HealChannelRequest,
+        mut request: HealChannelRequest,
         preserve_alias: bool,
         publish_canonical_id: bool,
         response_tx: oneshot::Sender<std::result::Result<HealAdmissionReceipt, String>>,
     ) -> Result<()> {
+        if request.id.is_empty() {
+            request.id = uuid::Uuid::new_v4().to_string();
+        }
         debug!(
             target: "rustfs::heal::channel",
             event = EVENT_HEAL_CHANNEL_REQUEST,
@@ -439,6 +463,11 @@ impl HealChannelProcessor {
                 .await
         };
 
+        let outcome = report.as_ref().ok().and_then(|report| report.outcome.clone());
+        let settings = report
+            .as_ref()
+            .ok()
+            .and_then(|report| report.options.as_ref().map(heal_options_to_wire));
         let (summary, detail, items, truncated, progress, next_seq, min_seq) = match report {
             Ok(HealTaskReport {
                 status: HealTaskStatus::Pending | HealTaskStatus::Running,
@@ -447,6 +476,7 @@ impl HealChannelProcessor {
                 progress,
                 next_seq,
                 min_seq,
+                ..
             }) => (
                 "running".to_string(),
                 None,
@@ -463,6 +493,7 @@ impl HealChannelProcessor {
                 progress,
                 next_seq,
                 min_seq,
+                ..
             }) => (
                 "running".to_string(),
                 Some(format!("heal task retrying after recoverable failure, attempt {retry_attempt}: {error}")),
@@ -479,6 +510,7 @@ impl HealChannelProcessor {
                 progress,
                 next_seq,
                 min_seq,
+                ..
             }) => (
                 "finished".to_string(),
                 None,
@@ -495,6 +527,7 @@ impl HealChannelProcessor {
                 progress,
                 next_seq,
                 min_seq,
+                ..
             }) => (
                 "stopped".to_string(),
                 Some("heal task cancelled".to_string()),
@@ -511,6 +544,7 @@ impl HealChannelProcessor {
                 progress,
                 next_seq,
                 min_seq,
+                ..
             }) => (
                 "stopped".to_string(),
                 Some("heal task timed out".to_string()),
@@ -527,6 +561,7 @@ impl HealChannelProcessor {
                 progress,
                 next_seq,
                 min_seq,
+                ..
             }) => (
                 "stopped".to_string(),
                 Some(error),
@@ -570,8 +605,18 @@ impl HealChannelProcessor {
             }
         };
 
-        let (data, detail) =
-            encode_heal_status_response(&summary, items, progress.as_ref(), detail, truncated, next_seq, min_seq)?;
+        let (data, detail) = encode_heal_status_response(
+            &summary,
+            items,
+            HealStatusResponseContext {
+                progress: progress.as_ref(),
+                detail,
+                truncated,
+                sequence: (next_seq, min_seq),
+                outcome: outcome.as_deref(),
+                settings: settings.as_ref(),
+            },
+        )?;
 
         let response = HealChannelResponse {
             request_id: client_token,
@@ -646,10 +691,12 @@ impl HealChannelProcessor {
     /// Convert channel request to heal request
     fn convert_to_heal_request(&self, request: HealChannelRequest) -> Result<HealRequest> {
         let recursive = request.recursive.unwrap_or(false);
+        let mut inferred_set_scope = None;
         let heal_type = if let Some(disk_id) = &request.disk {
             let set_disk_id = utils::normalize_set_disk_id(disk_id).ok_or_else(|| Error::InvalidHealType {
                 heal_type: format!("erasure-set({disk_id})"),
             })?;
+            inferred_set_scope = utils::parse_set_disk_id(&set_disk_id).ok();
             HealType::ErasureSet {
                 buckets: vec![],
                 set_disk_id,
@@ -697,6 +744,11 @@ impl HealChannelProcessor {
             | HealRequestSource::Mrf => true,
         });
 
+        // `no_lock` is an internal coordination hint. An admin request can
+        // carry the legacy field over the wire, but cannot use it as ambient
+        // authority to bypass storage namespace locking.
+        let no_lock = request.no_lock.unwrap_or(false) && request.source != HealRequestSource::Admin;
+
         // Build HealOptions with all available fields
         let options = HealOptions {
             scan_mode: request.scan_mode.unwrap_or(HealScanMode::Normal),
@@ -705,15 +757,16 @@ impl HealChannelProcessor {
             update_parity: request.update_parity.unwrap_or(true),
             recursive,
             dry_run: request.dry_run.unwrap_or(false),
-            no_lock: request.no_lock.unwrap_or(false),
+            no_lock,
             timeout: request.timeout_seconds.map(std::time::Duration::from_secs),
-            pool_index: request.pool_index,
-            set_index: request.set_index,
+            pool_index: request.pool_index.or_else(|| inferred_set_scope.map(|(pool, _)| pool)),
+            set_index: request.set_index.or_else(|| inferred_set_scope.map(|(_, set)| set)),
         };
 
         let mut heal_request = HealRequest::new(heal_type, options, priority);
         heal_request.id = request.id;
         heal_request.source = request.source;
+        heal_request.heal_endpoints = request.heal_endpoints;
         // force_start controls admission/queue semantics only. Do not reinterpret it as
         // destructive heal options: admin clients commonly pass forceStart=true together
         // with remove=false, and turning that into remove_corrupted=true can delete the
@@ -757,13 +810,28 @@ impl HealChannelProcessor {
     }
 }
 
+fn heal_options_to_wire(options: &HealOptions) -> HealOpts {
+    HealOpts {
+        recursive: options.recursive,
+        dry_run: options.dry_run,
+        remove: options.remove_corrupted,
+        recreate: options.recreate_missing,
+        scan_mode: options.scan_mode,
+        update_parity: options.update_parity,
+        no_lock: options.no_lock,
+        read_repair: false,
+        pool: options.pool_index,
+        set: options.set_index,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::DiskStore;
     use super::*;
     use crate::heal::manager::HealConfig;
     use crate::heal::storage::{HealObjectInfo, HealStorageAPI};
-    use rustfs_common::heal_channel::{
+    use rustfs_heal_contracts::heal_channel::{
         HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealRequestSource, HealScanMode,
     };
     use std::sync::Arc;
@@ -793,14 +861,14 @@ mod tests {
             _bucket: &str,
             _object: &str,
             _version_id: Option<&str>,
-            _opts: &rustfs_common::heal_channel::HealOpts,
+            _opts: &rustfs_heal_contracts::heal_channel::HealOpts,
         ) -> crate::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<crate::Error>)> {
             Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
         }
         async fn heal_bucket(
             &self,
             _bucket: &str,
-            _opts: &rustfs_common::heal_channel::HealOpts,
+            _opts: &rustfs_heal_contracts::heal_channel::HealOpts,
         ) -> crate::Result<rustfs_madmin::heal_commands::HealResultItem> {
             Ok(rustfs_madmin::heal_commands::HealResultItem::default())
         }
@@ -826,7 +894,7 @@ mod tests {
 
     fn create_test_heal_manager() -> Arc<HealManager> {
         let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-        Arc::new(HealManager::new(storage, None))
+        Arc::new(HealManager::new_without_root_recovery_for_test(storage, None))
     }
 
     #[test]
@@ -846,18 +914,193 @@ mod tests {
     }
 
     #[test]
+    fn terminal_without_outcome_is_explicitly_unavailable() {
+        for summary in ["finished", "stopped", "running"] {
+            let (bytes, _) = encode_heal_status_response(summary, Vec::new(), HealStatusResponseContext::default())
+                .expect("status without canonical outcome");
+            let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("status JSON");
+            assert!(payload.get("outcome").is_none(), "missing counters cannot become zero counters");
+            if summary == "running" {
+                assert!(payload.get("outcomeStatus").is_none());
+            } else {
+                assert_eq!(payload["outcomeStatus"], "unavailable");
+            }
+        }
+        let mut outcome = super::super::outcome::HealTaskOutcome::default();
+        outcome.finish(None);
+        let (bytes, _) = encode_heal_status_response(
+            "finished",
+            Vec::new(),
+            HealStatusResponseContext {
+                outcome: Some(&outcome),
+                ..Default::default()
+            },
+        )
+        .expect("known terminal outcome");
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("known status JSON");
+        assert!(payload.get("outcomeStatus").is_none());
+        assert_eq!(payload["outcome"]["execution"]["state"], "completed");
+    }
+
+    #[test]
     fn oversized_status_items_are_truncated_before_transport() {
         let items = vec![HealResultItem {
             detail: "x".repeat(MAX_HEAL_STATUS_PAYLOAD_SIZE + 1),
             ..Default::default()
         }];
 
-        let (data, detail) = encode_heal_status_response("running", items, None, None, false, 0, 0).unwrap();
+        let (data, detail) = encode_heal_status_response("running", items, HealStatusResponseContext::default()).unwrap();
 
         assert!(data.len() <= MAX_HEAL_STATUS_PAYLOAD_SIZE);
         let payload: serde_json::Value = serde_json::from_slice(&data).unwrap();
         assert_eq!(payload["truncated"], true);
         assert!(payload["items"].as_array().unwrap().is_empty());
+        assert_eq!(detail.as_deref(), Some("heal result items were truncated"));
+    }
+
+    #[test]
+    fn outcome_v3_fixture_matches_canonical_owner_and_preserves_legacy_terminals() {
+        use crate::heal::outcome::*;
+        let cases: serde_json::Value = serde_json::from_str(include_str!("../../../madmin/tests/fixtures/heal-outcome-v3.json"))
+            .expect("shared client fixtures");
+        for case in cases.as_array().expect("fixture cases") {
+            if case.get("remoteResponse").is_some() {
+                continue;
+            }
+            let mut outcome = HealTaskOutcome::default();
+            let name = case["name"].as_str().expect("case name");
+            if matches!(name, "unknown" | "completed_with_errors") {
+                let disposition = if name == "unknown" {
+                    HealObjectDisposition::Unknown
+                } else {
+                    outcome.attempt_failed();
+                    HealObjectDisposition::Failed(HealFailureClass::RetryExhausted)
+                };
+                outcome.record(HealObjectOutcome {
+                    identity: HealObjectIdentity {
+                        kind: HealObjectKind::Object,
+                        bucket: "bucket".into(),
+                        object: "object".into(),
+                        version_id: None,
+                        bucket_incarnation_id: None,
+                        pool_index: None,
+                        set_index: None,
+                    },
+                    disposition,
+                    detail: None,
+                });
+            }
+            let abort = match name {
+                "cancelled" => Some(HealAbortReason::Cancelled),
+                "deadline" => Some(HealAbortReason::Deadline),
+                "untraversable" => Some(HealAbortReason::Untraversable),
+                _ => None,
+            };
+            outcome.finish(abort);
+            let expected = &case["response"];
+            let initial_detail = abort.map(|reason| {
+                match reason {
+                    HealAbortReason::Cancelled => "heal task cancelled",
+                    HealAbortReason::Deadline => "heal task timed out",
+                    HealAbortReason::Untraversable => "heal listing is untraversable",
+                }
+                .to_string()
+            });
+            let (bytes, detail) = encode_heal_status_response(
+                if abort.is_some() { "stopped" } else { "finished" },
+                Vec::new(),
+                HealStatusResponseContext {
+                    detail: initial_detail,
+                    truncated: true,
+                    sequence: (9, 4),
+                    outcome: Some(&outcome),
+                    ..Default::default()
+                },
+            )
+            .expect("canonical owner encoding");
+            let decoded: serde_json::Value = serde_json::from_slice(&bytes).expect("wire payload");
+            assert_eq!(decoded["summary"], expected["summary"], "{name}");
+            assert_eq!(detail.unwrap_or_default(), expected["detail"].as_str().expect("detail"), "{name}");
+            assert_eq!(decoded["outcome"], expected["outcome"], "{name}");
+            assert_eq!((decoded["next_seq"].as_u64(), decoded["min_seq"].as_u64()), (Some(9), Some(4)));
+            assert!(decoded["outcome"].get("retainedObjectBytes").is_none());
+            assert!(decoded["outcome"].get("untraversable").is_none());
+        }
+    }
+
+    #[test]
+    fn outcome_v3_abort_cannot_be_hidden_by_a_finished_status() {
+        use crate::heal::outcome::{HealAbortReason, HealTaskOutcome};
+        for reason in [
+            HealAbortReason::Cancelled,
+            HealAbortReason::Deadline,
+            HealAbortReason::Untraversable,
+        ] {
+            let mut outcome = HealTaskOutcome::default();
+            outcome.finish(Some(reason));
+            let (data, detail) = encode_heal_status_response(
+                "finished",
+                Vec::new(),
+                HealStatusResponseContext {
+                    outcome: Some(&outcome),
+                    ..Default::default()
+                },
+            )
+            .expect("canonical abort adapter");
+            let json: serde_json::Value = serde_json::from_slice(&data).expect("public state");
+            assert_eq!(json["summary"], "stopped");
+            assert_eq!(json["outcome"]["execution"]["state"], "aborted");
+            assert!(detail.is_some());
+        }
+    }
+
+    #[test]
+    fn outcome_v3_payload_bound_keeps_cumulative_outcome_and_cursors() {
+        use crate::heal::outcome::*;
+        let mut outcome = HealTaskOutcome::default();
+        outcome.start();
+        for index in 0..256 {
+            outcome.record(HealObjectOutcome {
+                identity: HealObjectIdentity {
+                    kind: HealObjectKind::Object,
+                    bucket: "bucket".into(),
+                    object: format!("object-{index}"),
+                    version_id: None,
+                    bucket_incarnation_id: None,
+                    pool_index: None,
+                    set_index: None,
+                },
+                disposition: HealObjectDisposition::Unknown,
+                detail: Some("\"".repeat(1024)),
+            });
+        }
+        let retained = outcome.objects.len();
+        let items = vec![
+            HealResultItem::default(),
+            HealResultItem {
+                detail: "x".repeat(MAX_HEAL_STATUS_PAYLOAD_SIZE + 1),
+                ..Default::default()
+            },
+        ];
+        let (bytes, detail) = encode_heal_status_response(
+            "running",
+            items,
+            HealStatusResponseContext {
+                sequence: (9, 4),
+                outcome: Some(&outcome),
+                ..Default::default()
+            },
+        )
+        .expect("bounded status with cumulative outcome");
+        assert!(bytes.len() <= MAX_HEAL_STATUS_PAYLOAD_SIZE);
+        let wire: serde_json::Value = serde_json::from_slice(&bytes).expect("bounded payload");
+        assert_eq!(wire["items"].as_array().expect("items").len(), 1);
+        assert_eq!(wire["truncated"], true);
+        assert_eq!((wire["next_seq"].as_u64(), wire["min_seq"].as_u64()), (Some(9), Some(4)));
+        assert_eq!(wire["outcome"]["counters"]["processed"], 256);
+        assert_eq!(wire["outcome"]["counters"]["healed"], 0);
+        assert_eq!(wire["outcome"]["objects"].as_array().expect("outcome window").len(), retained);
+        assert!(retained < 256 && outcome.objects_truncated);
         assert_eq!(detail.as_deref(), Some("heal result items were truncated"));
     }
 
@@ -901,6 +1144,7 @@ mod tests {
             object_prefix: None,
             object_version_id: None,
             disk: None,
+            heal_endpoints: Vec::new(),
             priority: HealChannelPriority::Normal,
             scan_mode: None,
             remove_corrupted: None,
@@ -933,6 +1177,7 @@ mod tests {
             object_prefix: None,
             object_version_id: None,
             disk: None,
+            heal_endpoints: Vec::new(),
             priority: HealChannelPriority::High,
             scan_mode: Some(HealScanMode::Normal),
             remove_corrupted: Some(false),
@@ -965,6 +1210,7 @@ mod tests {
             object_prefix: Some("test-object".to_string()),
             object_version_id: None,
             disk: None,
+            heal_endpoints: Vec::new(),
             priority: HealChannelPriority::High,
             scan_mode: Some(HealScanMode::Deep),
             remove_corrupted: Some(true),
@@ -991,6 +1237,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_convert_to_heal_request_admin_cannot_bypass_object_lock() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+        let channel_request = HealChannelRequest {
+            id: "admin-no-lock".to_string(),
+            bucket: "test-bucket".to_string(),
+            object_prefix: Some("test-object".to_string()),
+            no_lock: Some(true),
+            source: HealRequestSource::Admin,
+            ..Default::default()
+        };
+
+        let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
+        assert!(!heal_request.options.no_lock, "admin nolock must not become storage lock authority");
+    }
+
+    #[tokio::test]
     async fn test_convert_to_heal_request_scanner_defaults_recreate_missing_false() {
         let heal_manager = create_test_heal_manager();
         let processor = HealChannelProcessor::new(heal_manager);
@@ -1001,6 +1264,7 @@ mod tests {
             object_prefix: Some("test-object".to_string()),
             object_version_id: None,
             disk: None,
+            heal_endpoints: Vec::new(),
             priority: HealChannelPriority::Low,
             scan_mode: None,
             remove_corrupted: None,
@@ -1038,6 +1302,7 @@ mod tests {
                 object_prefix: Some("test-object".to_string()),
                 object_version_id: None,
                 disk: None,
+                heal_endpoints: Vec::new(),
                 priority: HealChannelPriority::Normal,
                 scan_mode: None,
                 remove_corrupted: None,
@@ -1077,6 +1342,7 @@ mod tests {
                 object_prefix: Some("test-object".to_string()),
                 object_version_id: None,
                 disk: None,
+                heal_endpoints: Vec::new(),
                 priority: HealChannelPriority::Normal,
                 scan_mode: None,
                 remove_corrupted: None,
@@ -1109,6 +1375,7 @@ mod tests {
             object_prefix: Some("logs/".to_string()),
             object_version_id: None,
             disk: None,
+            heal_endpoints: Vec::new(),
             priority: HealChannelPriority::High,
             scan_mode: Some(HealScanMode::Normal),
             remove_corrupted: Some(false),
@@ -1144,7 +1411,10 @@ mod tests {
             object_prefix: None,
             object_version_id: None,
             disk: Some("pool_0_set_1".to_string()),
+            heal_endpoints: vec!["http://node0:9000/drive1".to_string()],
             priority: HealChannelPriority::Critical,
+            pool_index: Some(0),
+            set_index: Some(1),
             scan_mode: None,
             remove_corrupted: None,
             recreate_missing: None,
@@ -1153,15 +1423,16 @@ mod tests {
             dry_run: None,
             no_lock: None,
             timeout_seconds: None,
-            pool_index: None,
-            set_index: None,
             force_start: false,
-            source: HealRequestSource::Internal,
+            source: HealRequestSource::AutoHeal,
         };
 
         let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
         assert!(matches!(heal_request.heal_type, HealType::ErasureSet { .. }));
         assert_eq!(heal_request.priority, HealPriority::Urgent);
+        assert_eq!(heal_request.heal_endpoints, ["http://node0:9000/drive1"]);
+        assert_eq!(heal_request.options.pool_index, Some(0));
+        assert_eq!(heal_request.options.set_index, Some(1));
     }
 
     #[tokio::test]
@@ -1175,6 +1446,7 @@ mod tests {
             object_prefix: None,
             object_version_id: None,
             disk: Some("invalid-disk-id".to_string()),
+            heal_endpoints: Vec::new(),
             priority: HealChannelPriority::Normal,
             scan_mode: None,
             remove_corrupted: None,
@@ -1213,6 +1485,7 @@ mod tests {
                 object_prefix: None,
                 object_version_id: None,
                 disk: None,
+                heal_endpoints: Vec::new(),
                 priority: channel_priority,
                 scan_mode: None,
                 remove_corrupted: None,
@@ -1244,6 +1517,7 @@ mod tests {
             object_prefix: None,
             object_version_id: None,
             disk: None,
+            heal_endpoints: Vec::new(),
             priority: HealChannelPriority::Normal,
             scan_mode: None,
             remove_corrupted: Some(false),
@@ -1277,6 +1551,7 @@ mod tests {
             object_prefix: Some("".to_string()), // Empty prefix should be treated as bucket heal
             object_version_id: None,
             disk: None,
+            heal_endpoints: Vec::new(),
             priority: HealChannelPriority::Normal,
             scan_mode: None,
             remove_corrupted: None,
@@ -1299,7 +1574,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_start_request_returns_admission_result() {
         let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-        let manager = Arc::new(HealManager::new(
+        let manager = Arc::new(HealManager::new_without_root_recovery_for_test(
             storage,
             Some(HealConfig {
                 queue_size: 1,
@@ -1314,6 +1589,7 @@ mod tests {
             object_prefix: Some("object".to_string()),
             object_version_id: None,
             disk: None,
+            heal_endpoints: Vec::new(),
             priority: HealChannelPriority::Low,
             scan_mode: Some(HealScanMode::Normal),
             remove_corrupted: None,
@@ -1368,7 +1644,7 @@ mod tests {
             source: HealRequestSource::Admin,
             ..Default::default()
         };
-        let mut responses = rustfs_common::heal_channel::subscribe_heal_responses();
+        let mut responses = rustfs_heal_contracts::heal_channel::subscribe_heal_responses();
 
         let (tx, rx) = oneshot::channel();
         processor
@@ -1518,6 +1794,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heal_empty_request_ids_keep_scanner_objects_independent() {
+        let manager = create_test_heal_manager();
+        let mut processor = HealChannelProcessor::new(manager.clone());
+        let request = HealChannelRequest {
+            bucket: "scanner-bucket".to_string(),
+            object_prefix: Some("first".to_string()),
+            source: HealRequestSource::Scanner,
+            priority: HealChannelPriority::Normal,
+            ..Default::default()
+        };
+        let mut other = request.clone();
+        other.object_prefix = Some("second".to_string());
+        let (first, second) =
+            tokio::join!(processor.execute_start_request(request.clone()), processor.execute_start_request(other),);
+        let first = first.expect("first scanner object should be admitted");
+        let second = second.expect("second scanner object should be admitted");
+        assert_eq!(first.result, HealAdmissionResult::Accepted);
+        assert_eq!(second.result, HealAdmissionResult::Accepted);
+        assert!(!first.task_id.is_empty());
+        assert!(!second.task_id.is_empty());
+        assert_ne!(first.task_id, second.task_id);
+        let mut published_ids = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let response = processor
+                .response_receiver
+                .try_recv()
+                .expect("admission should publish its response");
+            assert!(response.success);
+            published_ids.insert(response.request_id);
+        }
+        assert_eq!(
+            published_ids,
+            std::collections::HashSet::from([first.task_id.clone(), second.task_id.clone()])
+        );
+
+        let merged = processor
+            .execute_start_request(request.clone())
+            .await
+            .expect("a repeated object should retain its canonical owner");
+        assert_eq!(merged.result, HealAdmissionResult::Merged);
+        assert_eq!(merged.task_id, first.task_id);
+        let mut conflict = request;
+        conflict.id = first.task_id.clone();
+        conflict.object_prefix = Some("conflicting-object".to_string());
+        let conflict = processor
+            .execute_start_request(conflict)
+            .await
+            .expect("conflicting ID should get a receipt");
+        assert_eq!(conflict.result, HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning));
+        assert_eq!(conflict.task_id, first.task_id);
+        for id in [&first.task_id, &second.task_id] {
+            let status = processor
+                .execute_query_request(String::new(), id.clone())
+                .await
+                .expect("generated token should be queryable");
+            assert!(status.success);
+            assert_eq!(status.request_id, *id);
+        }
+        let cancelled = processor
+            .execute_cancel_request(String::new(), first.task_id.clone())
+            .await
+            .expect("generated token should cancel its own request");
+        assert!(cancelled.success);
+        assert!(matches!(manager.get_task_status(&first.task_id).await, Err(Error::TaskNotFound { .. })));
+        assert_eq!(
+            manager
+                .get_task_status(&second.task_id)
+                .await
+                .expect("other object must retain its queued owner"),
+            HealTaskStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_empty_request_ids_legacy_response_matches_admitted_task() {
+        let manager = create_test_heal_manager();
+        let mut processor = HealChannelProcessor::new(manager.clone());
+        let (tx, rx) = oneshot::channel();
+        processor
+            .process_command(HealChannelCommand::Start {
+                request: HealChannelRequest {
+                    bucket: "bucket".to_string(),
+                    object_prefix: Some("object".to_string()),
+                    source: HealRequestSource::Scanner,
+                    ..Default::default()
+                },
+                response_tx: tx,
+            })
+            .await
+            .expect("legacy start should be processed");
+        assert_eq!(
+            rx.await.expect("start response should arrive").expect("start should succeed"),
+            HealAdmissionResult::Accepted
+        );
+        let response = processor
+            .response_receiver
+            .try_recv()
+            .expect("legacy response should be published");
+        assert!(response.success);
+        assert!(!response.request_id.is_empty());
+        assert_eq!(
+            manager
+                .get_task_status_for_path("bucket/object", &response.request_id)
+                .await
+                .expect("published ID must resolve to the admitted object"),
+            HealTaskStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_empty_request_ids_are_normalized_at_manager_admission() {
+        let manager = create_test_heal_manager();
+        let mut first = HealRequest::object("bucket".to_string(), "first".to_string(), None);
+        first.id.clear();
+        let mut second = HealRequest::object("bucket".to_string(), "second".to_string(), None);
+        second.id.clear();
+        let (first, second) = tokio::join!(
+            manager.submit_heal_request_with_receipt(first),
+            manager.submit_heal_request_with_receipt(second),
+        );
+        let first = first.expect("first direct request should be admitted");
+        let second = second.expect("second direct request should be admitted");
+        assert_eq!(first.result, HealAdmissionResult::Accepted);
+        assert_eq!(second.result, HealAdmissionResult::Accepted);
+        assert!(!first.task_id.is_empty());
+        assert!(!second.task_id.is_empty());
+        assert_ne!(first.task_id, second.task_id);
+        for id in [&first.task_id, &second.task_id] {
+            assert_eq!(
+                manager
+                    .get_task_status(id)
+                    .await
+                    .expect("canonical owner should be queryable"),
+                HealTaskStatus::Pending
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn direct_control_execution_preserves_target_dedup_and_token_ownership() {
         let manager = create_test_heal_manager();
         let processor = HealChannelProcessor::new(manager);
@@ -1592,6 +2007,7 @@ mod tests {
             object_prefix: None,
             object_version_id: None,
             disk: Some("invalid".to_string()),
+            heal_endpoints: Vec::new(),
             priority: HealChannelPriority::Normal,
             scan_mode: None,
             remove_corrupted: None,
@@ -1642,7 +2058,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_query_request_reports_displaced_terminal_detail() {
-        let heal_manager = Arc::new(HealManager::new(
+        let heal_manager = Arc::new(HealManager::new_without_root_recovery_for_test(
             Arc::new(MockStorage),
             Some(HealConfig {
                 queue_size: 1,
@@ -1697,7 +2113,23 @@ mod tests {
     #[tokio::test]
     async fn test_process_query_request_reports_running_for_queued_task() {
         let heal_manager = create_test_heal_manager();
-        let request = HealRequest::bucket("bucket".to_string());
+        let request = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions {
+                scan_mode: HealScanMode::Deep,
+                remove_corrupted: true,
+                recreate_missing: false,
+                update_parity: false,
+                recursive: true,
+                dry_run: true,
+                pool_index: Some(1),
+                set_index: Some(2),
+                ..Default::default()
+            },
+            HealPriority::High,
+        );
         let task_id = request.id.clone();
         assert_eq!(
             heal_manager
@@ -1726,6 +2158,14 @@ mod tests {
                 .expect("status payload should be json");
         assert_eq!(payload["summary"], "running");
         assert_eq!(payload["items"].as_array().expect("items should be an array").len(), 0);
+        assert_eq!(payload["settings"]["scanMode"], 2);
+        assert_eq!(payload["settings"]["dryRun"], true);
+        assert_eq!(payload["settings"]["remove"], true);
+        assert_eq!(payload["settings"]["recreate"], false);
+        assert_eq!(payload["settings"]["updateParity"], false);
+        assert_eq!(payload["settings"]["recursive"], true);
+        assert_eq!(payload["settings"]["pool"], 1);
+        assert_eq!(payload["settings"]["set"], 2);
     }
 
     #[tokio::test]

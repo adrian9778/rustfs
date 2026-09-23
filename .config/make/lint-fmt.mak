@@ -45,6 +45,11 @@ logging-guardrails-check: ## Check logging guardrails for redaction and noise re
 	@echo "🪵 Checking logging guardrails..."
 	./scripts/check_logging_guardrails.sh
 
+.PHONY: error-other-ratchet-check
+error-other-ratchet-check: ## Check the ecstore ::other(format!) quorum-bucketing ratchet stays shrink-only
+	@echo "🪣 Checking error other(format!) ratchet..."
+	./scripts/check_error_other_format_ratchet.sh
+
 .PHONY: tokio-io-uring-check
 tokio-io-uring-check: ## Check tokio io-uring runtime feature stays removed
 	@echo "🚫 Checking tokio io-uring feature guard..."
@@ -75,10 +80,16 @@ embedded-secrets-check: ## Check no private key material or credential literal i
 	@echo "🔑 Checking embedded secret material guard..."
 	./scripts/check_embedded_secrets.sh
 
+.PHONY: offline-enrollment-e2e-check
+offline-enrollment-e2e-check: core-deps ## Build and exercise the dedicated offline enrollment E2E root
+	@echo "🔐 Checking the offline enrollment E2E root boundary..."
+	./scripts/check_offline_enrollment_e2e.sh
+
 .PHONY: test-wiring-check
 test-wiring-check: ## Check tests stay registered and selected by their intended runners
 	@echo "🧪 Checking test wiring..."
-	python3 ./scripts/check_test_wiring.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/ci_gate.py --check-workflow
 
 .PHONY: log-analyzer-rules-check
 log-analyzer-rules-check: core-deps ## Check log-analyzer rule anchors still exist verbatim in source

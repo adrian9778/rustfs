@@ -163,10 +163,10 @@ python3 scripts/table-catalog/engine_compatibility.py --print-live-evidence-sche
 ```
 
 Use these outputs when updating release notes, PR descriptions, or follow-up
-work items. They are intentionally conservative: only PyIceberg is automated by
-this script today. Spark has a repeatable manual/live harness with pinned
-client package inputs, generated configuration, generated SQL, expected
-results, and a CI opt-in gate. Trino, DuckDB, Databend, and Snowflake now have
+work items. They are intentionally conservative: PyIceberg and DuckDB have
+separate automated smoke entrypoints. Spark has a repeatable manual/live harness
+with pinned client package inputs, generated configuration, generated SQL,
+expected results, and a CI opt-in gate. Trino, Databend, and Snowflake have
 generated manual probe inputs, but they remain opt-in and do not promote write
 or full vendor interoperability claims.
 
@@ -241,6 +241,7 @@ python3 scripts/table-catalog/engine_compatibility.py \
   --table-bucket analytics \
   --print-spark-config
 python3 scripts/table-catalog/engine_compatibility.py --print-spark-sql --cleanup
+python3 scripts/table-catalog/engine_compatibility.py --print-duckdb-rest-sql
 python3 scripts/table-catalog/engine_compatibility.py --print-live-conformance --cleanup
 python3 scripts/table-catalog/engine_compatibility.py --print-operations-guide
 ```
@@ -310,7 +311,7 @@ The smoke test also probes catalog-backed advanced Iceberg surfaces:
 | PyIceberg | Automated smoke target | create namespace, create table, append, reload, scan, metadata-location, refs, views, maintenance, diagnostics, optional catalog-vended table credentials with exact-prefix data-plane scope probe |
 | Spark Iceberg REST catalog | Manual/live harness | pinned Spark and Iceberg package inputs, configuration, SQL, run command, expected row count, and cleanup can be generated for a running RustFS endpoint; CI execution is opt-in |
 | Trino Iceberg REST catalog | Manual/live read probe | generated catalog properties and a read-only SELECT probe for a table created by PyIceberg or Spark; no write compatibility claim yet |
-| DuckDB Iceberg | Manual/live read probe | generated httpfs/iceberg SQL using an operator-supplied current metadata location; read-path only |
+| DuckDB Iceberg | Automated smoke target | metadata-location read plus generic REST Catalog single-table DDL, DML, schema evolution, snapshots, `/iceberg` and `/_iceberg` signing, fail-closed unsupported boundaries, endpoint-disabled non-atomic multi-table mode, concurrent writers, and PyIceberg cross-read |
 | StarRocks Iceberg REST catalog | Documented, not automated | external catalog read-path reference only |
 | Databend | Manual/live S3 stage probe | generated S3 stage read probe for table data files; Iceberg REST catalog integration is not claimed |
 | Snowflake/Open Catalog integrations | Manual reference probe | generated external volume/catalog SQL template; live RustFS interoperability is not claimed |
@@ -474,25 +475,32 @@ current unsupported inventory is:
 ## Credential Boundary
 
 RustFS advertises table credential scope metadata without returning reusable
-storage secrets by default. `loadTable` includes the table warehouse prefix in
-the response config, and the standard credentials endpoint is registered:
+storage secrets by default. The standard credentials endpoint is registered:
 
 ```text
 GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials
 ```
 
 The endpoint returns an empty `storage-credentials` list unless table catalog
-credential vending is explicitly enabled. When enabled, RustFS issues temporary
-table-scoped S3 credentials through the credentials endpoint. Those credentials
-are constrained to the table warehouse prefix and include a session token and
-expiration.
+credential vending is explicitly enabled. LoadTable uses the same issuer when
+the request includes `X-Iceberg-Access-Delegation: vended-credentials`. The
+response advertises the issued session for the table warehouse prefix and for
+the exact current metadata object; the session policy keeps table data access
+inside the warehouse and grants only `GetObject` to that metadata object.
 
-The `rustfs-vended-credentials` profile verifies the client handoff from the
-catalog principal to the table-scoped temporary credentials. It still uses the
-configured principal for setup and REST request signing; the vended credentials
-are first checked against the created table warehouse location, then checked
-with a direct S3 scope probe, and finally applied to PyIceberg S3 data-plane
-access after the table has been created.
+LoadTable remains metadata-only when delegation is absent, vending is disabled,
+or the caller lacks the separate table-credentials permission. Disabled and
+not-authorized fallbacks include an explicit reason. Issuer errors, including
+disallowed chained temporary credentials, are returned as request errors rather
+than silently falling back.
+
+The `rustfs-vended-credentials` profile verifies the client handoff through the
+dedicated credentials endpoint. It still uses the configured principal for
+setup and REST request signing; the vended credentials are checked against the
+created table warehouse location, probed directly against S3 scope boundaries,
+and then applied to PyIceberg data-plane access. Stable PyIceberg releases up to
+0.11 do not consume LoadTable `storage-credentials`; native LoadTable coverage
+requires a client release with that support.
 
 Enablement is server-side and fail-closed:
 
@@ -502,6 +510,70 @@ RUSTFS_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS=900
 ```
 
 The TTL is clamped to the supported short-lived range by the server.
+
+## DuckDB REST Catalog Profile
+
+DuckDB can read an individual Iceberg table with `iceberg_scan` or attach RustFS
+as a generic Iceberg REST Catalog. The metadata-location path remains read-only.
+The attached catalog path is the prerequisite for DuckDB writes.
+
+Generate the canonical RustFS REST Catalog profile:
+
+```bash
+python3 scripts/table-catalog/engine_compatibility.py \
+  --endpoint http://127.0.0.1:9000 \
+  --warehouse rustfs-s3table-smoke \
+  --namespace smoke \
+  --table events \
+  --rest-path /iceberg \
+  --rest-signing-name s3 \
+  --print-duckdb-rest-sql
+```
+
+Generate the compatibility alias profile by changing the last three arguments:
+
+```bash
+python3 scripts/table-catalog/engine_compatibility.py \
+  --rest-path /_iceberg \
+  --rest-signing-name s3tables \
+  --print-duckdb-rest-sql
+```
+
+The generated `ATTACH` disables staged create, post-create metadata updates,
+multi-table commit, client-side file removal, and purge-on-drop. These options
+keep DuckDB within RustFS's claimed single-table REST surface. Do not replace
+the explicit endpoint with DuckDB `ENDPOINT_TYPE S3_TABLES`; that shortcut is
+for AWS S3 Tables endpoint and warehouse shapes.
+
+Run the repeatable DuckDB 1.5.5 smoke against an already running RustFS:
+
+```bash
+python3 scripts/table-catalog/duckdb_smoke.py \
+  --duckdb /path/to/duckdb \
+  --endpoint http://127.0.0.1:9000 \
+  --bucket rustfs-duckdb-smoke \
+  --namespace duckdb_smoke \
+  --table events \
+  --cleanup \
+  --rustfs-build rustfs-v1.0.0-rc.4 \
+  --git-sha "$(git rev-parse HEAD)" \
+  --catalog-backing object \
+  --live-evidence-output /tmp/rustfs-duckdb-live-evidence.json
+```
+
+The script requires the same PyIceberg, PyArrow, and boto3 dependencies as the
+PyIceberg smoke because it verifies both cross-engine directions. It creates an
+isolated namespace, keeps the final verified table at two rows for the shared
+evidence contract, and cleans all smoke tables only when `--cleanup` is set.
+It refuses to remove pre-existing suffixed smoke tables unless `--replace` is
+set explicitly. Cleanup preserves a namespace that existed before the run.
+
+The automated claim is limited to DuckDB 1.5.5, static S3 credentials, and the
+single-table scenarios exercised by this script. It does not claim DuckDB's AWS
+`S3_TABLES` shortcut, staged create, purge-on-drop, format v3, multi-table
+atomicity, or catalog-vended credential integration. The smoke verifies that
+DuckDB can run a two-table transaction with its multi-table commit endpoint
+disabled, but each table remains an independent RustFS commit.
 
 ## Spark Manual/Live Harness
 
@@ -577,8 +649,8 @@ python3 scripts/table-catalog/engine_compatibility.py \
   --cleanup
 ```
 
-The generated SQL covers namespace creation, table creation, append, refresh,
-count, and optional cleanup. Until Spark execution is enabled in CI through the
+The generated SQL covers namespace creation, atomic CTAS through the Iceberg
+REST staged-create flow, refresh, count, and optional cleanup. Until Spark execution is enabled in CI through the
 explicit live-conformance gate, do not claim Spark support beyond a manually
 verified run with the exact RustFS build, Spark version, Iceberg version, and
 expected output recorded.
@@ -591,8 +663,9 @@ engines that are not run by default in RustFS CI:
 - Trino: catalog properties and a read-only `SELECT COUNT(*)` command for a
   table already created by PyIceberg or Spark. Trino write compatibility is not
   claimed.
-- DuckDB: `httpfs` and `iceberg` SQL using an operator-supplied current Iceberg
-  metadata location. DuckDB write and commit compatibility are not claimed.
+- DuckDB: a legacy `httpfs` and `iceberg` read probe using an operator-supplied
+  current Iceberg metadata location. The separate `duckdb_smoke.py` entrypoint
+  owns the automated generic REST Catalog single-table read/write claim.
 - Databend: an S3 stage read probe for Parquet data files under the table
   warehouse. Databend Iceberg REST Catalog integration is not claimed.
 - Snowflake: an operator-adapted external volume/catalog integration SQL

@@ -167,7 +167,15 @@ impl VersionMarker {
         if marker == NULL_VERSION_MARKER {
             Ok(Self::Null)
         } else {
-            Ok(Self::Version(Uuid::parse_str(marker)?))
+            let version = Uuid::parse_str(marker)?;
+            // Older releases advertised the null version as a nil UUID
+            // (issue #6745); a stored null version has no UUID, so resuming
+            // by `Version(nil)` could never match. Fold it into `Null`.
+            if version.is_nil() {
+                Ok(Self::Null)
+            } else {
+                Ok(Self::Version(version))
+            }
         }
     }
 }
@@ -179,10 +187,25 @@ pub enum WalkVersionsSortOrder {
     Descending,
 }
 
+/// In-memory compare-and-set identity for a queued exact-version delete.
+///
+/// `version_id` identifies the S3 version while these fields identify the
+/// concrete generation observed before the delete was queued. This matters for
+/// the reusable null version ID in versioning-suspended buckets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectToDeleteIdentity {
+    pub data_dir: Option<Uuid>,
+    pub mod_time: Option<OffsetDateTime>,
+    pub delete_marker: bool,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ObjectToDelete {
     pub object_name: String,
     pub version_id: Option<Uuid>,
+    /// RustFS-only precondition checked under the object write lock.
+    #[doc(hidden)]
+    pub expected_identity: Option<ObjectToDeleteIdentity>,
     pub synthetic_version_id: bool,
     pub delete_marker_replication_status: Option<String>,
     pub version_purge_status: Option<VersionPurgeStatusType>,
@@ -191,6 +214,20 @@ pub struct ObjectToDelete {
 }
 
 impl ObjectToDelete {
+    pub fn with_expected_identity(
+        mut self,
+        data_dir: Option<Uuid>,
+        mod_time: Option<OffsetDateTime>,
+        delete_marker: bool,
+    ) -> Self {
+        self.expected_identity = Some(ObjectToDeleteIdentity {
+            data_dir,
+            mod_time,
+            delete_marker,
+        });
+        self
+    }
+
     pub fn replication_state(&self) -> ReplicationState {
         ReplicationState {
             replication_status_internal: self.delete_marker_replication_status.clone(),
@@ -206,6 +243,16 @@ impl ObjectToDelete {
 #[derive(Debug, Default, Clone)]
 pub struct DeletedObject {
     pub delete_marker: bool,
+    /// True when the delete plan looked the target up and found no such
+    /// object or version.
+    ///
+    /// The lookup only runs when the plan needs the source (Object Lock
+    /// check, replication decision, tier journal, or an expected identity),
+    /// so this proves absence and never proves presence: it stays false when
+    /// no lookup ran. Callers that must not announce a delete that removed
+    /// nothing need this, because the disk layer treats an absent version as
+    /// an idempotent success and reports `found` regardless.
+    pub source_missing: bool,
     pub delete_marker_version_id: Option<Uuid>,
     pub object_name: String,
     pub version_id: Option<Uuid>,
@@ -713,6 +760,19 @@ fn is_modified_since(mod_time: &OffsetDateTime, given_time: &OffsetDateTime) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_marker_parse_folds_null_and_nil_uuid_into_null() {
+        assert_eq!(VersionMarker::parse("null"), Ok(VersionMarker::Null));
+        // Older releases advertised the null version as a nil UUID
+        // (issue #6745); it must resume as the null marker, not a UUID no
+        // stored version carries.
+        assert_eq!(VersionMarker::parse(Uuid::nil().to_string()), Ok(VersionMarker::Null));
+
+        let version = Uuid::from_u128(7);
+        assert_eq!(VersionMarker::parse(version.to_string()), Ok(VersionMarker::Version(version)));
+        assert!(VersionMarker::parse("not-a-version").is_err());
+    }
 
     #[test]
     fn http_preconditions_ignore_empty_etag_headers() {

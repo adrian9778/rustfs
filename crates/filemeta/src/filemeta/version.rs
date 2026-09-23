@@ -30,12 +30,14 @@ use crate::{ChecksumInfo, TransitionVersionState};
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::{
     RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_PART_CHECKSUMS, SUFFIX_PURGESTATUS,
-    SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX, SUFFIX_REPLICATION_RESET_ARN_PREFIX, SUFFIX_TIER_FV_ID,
-    SUFFIX_TIER_FV_MARKER, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITION_TIER_DESTINATION_ID,
-    SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID, SUFFIX_TRANSITIONED_VERSION_STATE, contains_key_bytes,
-    get_bytes, get_consistent_bytes, get_str, has_internal_suffix, insert_bytes, is_internal_key, remove_bytes,
-    strip_internal_prefix, strip_internal_prefix_preserving_case, target_delete_marker_versions,
+    SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX, SUFFIX_REPLICATION_RESET_ARN_PREFIX, SUFFIX_RESTORE_OPERATION_ID,
+    SUFFIX_RESTORE_WORKER_LOCK, SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER,
+    SUFFIX_TRANSITION_TIER_DESTINATION_ID, SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID,
+    SUFFIX_TRANSITIONED_VERSION_STATE, contains_key_bytes, get_bytes, get_consistent_bytes, get_str, has_internal_suffix,
+    insert_bytes, is_internal_key, remove_bytes, strip_internal_prefix, strip_internal_prefix_preserving_case,
+    target_delete_marker_versions,
 };
+use sha2::{Digest as _, Sha256};
 
 const MSGPACK_EXT8: u8 = 0xc7;
 const MSGPACK_EXT16: u8 = 0xc8;
@@ -296,6 +298,20 @@ fn transitioned_version_from_bytes(value: Option<&[u8]>, state: TransitionVersio
     }
 }
 
+fn transition_version_metadata_value(raw: &[u8], decoded: Option<&str>) -> String {
+    decoded.map(str::to_owned).unwrap_or_else(|| {
+        if raw.is_empty() {
+            String::new()
+        } else {
+            String::from_utf8_lossy(raw).into_owned()
+        }
+    })
+}
+
+fn is_transition_version_metadata_key(key: &str) -> bool {
+    strip_internal_prefix_preserving_case(key).is_some_and(|suffix| suffix.eq_ignore_ascii_case(SUFFIX_TRANSITIONED_VERSION_ID))
+}
+
 fn validate_transition_version_state(state: TransitionVersionState, version: Option<&str>) -> Result<()> {
     let valid = match state {
         TransitionVersionState::Unknown | TransitionVersionState::KnownDisabled => version.is_none(),
@@ -365,14 +381,26 @@ impl<'a> DerivedInternalMetadata<'a> {
             }
             *slot = Some(value.as_slice());
         }
+        fn merge_consistent<'a>(canonical: Option<&'a [u8]>, legacy: Option<&'a [u8]>) -> Result<Option<&'a [u8]>> {
+            if let (Some(canonical), Some(legacy)) = (canonical, legacy)
+                && canonical != legacy
+            {
+                return Err(Error::FileCorrupt);
+            }
+            Ok(canonical.or(legacy))
+        }
+
         Ok(Self {
             checksum: canonical.checksum.or(legacy.checksum),
             part_checksums: canonical.part_checksums.or(legacy.part_checksums),
-            transition_status: canonical.transition_status.or(legacy.transition_status),
-            transitioned_object: canonical.transitioned_object.or(legacy.transitioned_object),
-            transitioned_version: canonical.transitioned_version.or(legacy.transitioned_version),
-            transitioned_version_state: canonical.transitioned_version_state.or(legacy.transitioned_version_state),
-            transition_tier: canonical.transition_tier.or(legacy.transition_tier),
+            transition_status: merge_consistent(canonical.transition_status, legacy.transition_status)?,
+            transitioned_object: merge_consistent(canonical.transitioned_object, legacy.transitioned_object)?,
+            transitioned_version: merge_consistent(canonical.transitioned_version, legacy.transitioned_version)?,
+            transitioned_version_state: merge_consistent(
+                canonical.transitioned_version_state,
+                legacy.transitioned_version_state,
+            )?,
+            transition_tier: merge_consistent(canonical.transition_tier, legacy.transition_tier)?,
         })
     }
 }
@@ -437,8 +465,14 @@ impl FileInfo {
     }
 }
 
-fn set_transition_version_state(meta_sys: &mut HashMap<String, Vec<u8>>, state: TransitionVersionState) {
-    if state == TransitionVersionState::Unknown {
+fn set_transition_version_state(
+    meta_sys: &mut HashMap<String, Vec<u8>>,
+    state: TransitionVersionState,
+    source_metadata: &HashMap<String, String>,
+) {
+    if state == TransitionVersionState::Unknown
+        && !rustfs_utils::http::metadata_compat::contains_key_str(source_metadata, SUFFIX_TRANSITIONED_VERSION_STATE)
+    {
         remove_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE);
     } else {
         insert_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE, state.as_str().as_bytes().to_vec());
@@ -2001,6 +2035,7 @@ impl From<MetaObjectV1Part> for ObjectPartInfo {
             index: value.index,
             checksums: value.checksums,
             error: value.error,
+            integrity: None,
         }
     }
 }
@@ -2576,7 +2611,7 @@ impl MetaObject {
                 continue;
             }
 
-            if k == AMZ_STORAGE_CLASS && v == "STANDARD" {
+            if k == metadata_keys::STORAGE_CLASS && v == "STANDARD" {
                 continue;
             }
 
@@ -2588,7 +2623,7 @@ impl MetaObject {
                 continue;
             }
 
-            if k.eq_ignore_ascii_case(AMZ_STORAGE_CLASS) && v == b"STANDARD" {
+            if k.eq_ignore_ascii_case(metadata_keys::STORAGE_CLASS) && v == b"STANDARD" {
                 continue;
             }
 
@@ -2608,7 +2643,7 @@ impl MetaObject {
 
             let st = v.composite_replication_status();
             if !st.is_empty() {
-                metadata.insert(AMZ_BUCKET_REPLICATION_STATUS.to_string(), st.to_string());
+                metadata.insert(metadata_keys::REPLICATION_STATUS.to_string(), st.to_string());
             }
         }
 
@@ -2642,6 +2677,11 @@ impl MetaObject {
         if derived_metadata.transitioned_version_state.is_some() {
             validate_transition_version_state(transition_version_state, transition_version.as_deref())?;
         }
+        for (key, value) in &self.meta_sys {
+            if is_transition_version_metadata_key(key) {
+                metadata.insert(key.to_owned(), transition_version_metadata_value(value, transition_version.as_deref()));
+            }
+        }
         let transition_version_id = transition_version.as_deref().and_then(|value| Uuid::parse_str(value).ok());
         let transition_tier = derived_metadata
             .transition_tier
@@ -2673,6 +2713,33 @@ impl MetaObject {
         if all_parts && include_part_checksums {
             file_info.hydrate_data_movement_part_checksums()?;
         }
+        if !self.part_numbers.is_empty()
+            && rustfs_utils::http::contains_key_str(&file_info.metadata, crate::shard_integrity::SUFFIX_UPLOAD_INTEGRITY)
+        {
+            return Err(Error::FileCorrupt);
+        }
+        if let Some(commitments) = crate::shard_integrity::descriptor_from_metadata(&file_info.metadata)? {
+            let layout = crate::shard_integrity::IntegrityLayout::new(
+                self.erasure_m,
+                self.erasure_n,
+                self.erasure_block_size,
+                file_info.uses_legacy_checksum,
+            )?;
+            if commitments.len() != self.part_numbers.len() || commitments.len() != self.part_sizes.len() {
+                return Err(Error::FileCorrupt);
+            }
+            for (i, commitment) in commitments.into_iter().enumerate() {
+                if commitment.layout != layout
+                    || usize::try_from(commitment.number).map_err(|_| Error::FileCorrupt)? != self.part_numbers[i]
+                    || usize::try_from(commitment.size).map_err(|_| Error::FileCorrupt)? != self.part_sizes[i]
+                {
+                    return Err(Error::FileCorrupt);
+                }
+                if all_parts {
+                    file_info.parts[i].integrity = Some(commitment);
+                }
+            }
+        }
         Ok(file_info)
     }
 
@@ -2688,7 +2755,7 @@ impl MetaObject {
         } else {
             remove_bytes(&mut self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID);
         }
-        set_transition_version_state(&mut self.meta_sys, fi.transition_version_state);
+        set_transition_version_state(&mut self.meta_sys, fi.transition_version_state, &fi.metadata);
         insert_bytes(&mut self.meta_sys, SUFFIX_TRANSITION_TIER, fi.transition_tier.as_bytes().to_vec());
         if let Some(destination_id) = get_str(&fi.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID) {
             insert_bytes(&mut self.meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID, destination_id.into_bytes());
@@ -2696,9 +2763,11 @@ impl MetaObject {
     }
 
     pub fn remove_restore_hdrs(&mut self) {
-        self.meta_user.remove(X_AMZ_RESTORE.as_str());
-        self.meta_user.remove(AMZ_RESTORE_EXPIRY_DAYS);
-        self.meta_user.remove(AMZ_RESTORE_REQUEST_DATE);
+        self.meta_user.remove(metadata_keys::RESTORE);
+        self.meta_user.remove(metadata_keys::RESTORE_EXPIRY_DAYS);
+        self.meta_user.remove(metadata_keys::RESTORE_REQUEST_DATE);
+        remove_bytes(&mut self.meta_sys, SUFFIX_RESTORE_OPERATION_ID);
+        remove_bytes(&mut self.meta_sys, SUFFIX_RESTORE_WORKER_LOCK);
     }
 
     pub fn uses_data_dir(&self) -> bool {
@@ -2725,6 +2794,15 @@ impl MetaObject {
         self.meta_sys.retain(|k, _| !k.starts_with("X-Amz-Restore"));
     }
 
+    /// Builds the free-version cleanup record appended when a transitioned
+    /// version is removed from xl.meta. The record keeps the remote tier
+    /// identity so the lifecycle worker can issue the idempotent remote delete
+    /// and only then remove the record; until then the recovery scan and the
+    /// usage scanner keep re-enqueueing it. S3 and lifecycle deletes also
+    /// persist a committed tier-journal entry for the same remote delete. The
+    /// decommission path copies this record unchanged before source cleanup,
+    /// including when the transition state is unknown — see
+    /// docs/architecture/decommission-compatibility.md.
     pub fn init_free_version(&self, fi: &FileInfo) -> Result<(FileMetaVersion, bool)> {
         if fi.skip_tier_free_version() {
             return Ok((FileMetaVersion::default(), false));
@@ -2818,7 +2896,7 @@ impl From<FileInfo> for MetaObject {
             insert_bytes(&mut meta_sys, SUFFIX_TRANSITIONED_VERSION_ID, transition_version);
         }
         if !value.transition_status.is_empty() {
-            set_transition_version_state(&mut meta_sys, value.transition_version_state);
+            set_transition_version_state(&mut meta_sys, value.transition_version_state, &value.metadata);
         }
 
         if !value.transition_tier.is_empty() {
@@ -2852,7 +2930,12 @@ impl From<FileInfo> for MetaObject {
     }
 }
 
-fn get_internal_replication_state(metadata: &HashMap<String, String>) -> Option<ReplicationState> {
+/// Rebuild the structured replication state from its durable internal metadata.
+///
+/// Mutation paths that update internal replication keys on an existing
+/// [`FileInfo`] must use this parser before serializing xl.meta so the metadata
+/// map and the structured state cannot diverge.
+pub fn get_internal_replication_state(metadata: &HashMap<String, String>) -> Option<ReplicationState> {
     let mut rs = ReplicationState::default();
     let mut has = false;
 
@@ -2928,6 +3011,40 @@ impl TryFrom<LegacyMetaV2DeleteMarker> for MetaDeleteMarker {
 }
 
 impl MetaDeleteMarker {
+    /// Return a deterministic identity for an exact delete-marker body.
+    /// MessagePack map order is intentionally excluded from the identity.
+    pub fn stable_identity(&self) -> [u8; 32] {
+        const DOMAIN: &[u8] = b"rustfs-delete-marker-identity-v1\0";
+
+        let mut hasher = Sha256::new();
+        hasher.update(DOMAIN);
+        match self.version_id {
+            Some(version_id) => {
+                hasher.update([1]);
+                hasher.update(version_id.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        match self.mod_time {
+            Some(mod_time) => {
+                hasher.update([1]);
+                hasher.update(mod_time.unix_timestamp_nanos().to_be_bytes());
+            }
+            None => hasher.update([0]),
+        }
+
+        let mut metadata = self.meta_sys.iter().collect::<Vec<_>>();
+        metadata.sort_unstable_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+        hasher.update(u64::try_from(metadata.len()).unwrap_or(u64::MAX).to_be_bytes());
+        for (key, value) in metadata {
+            hasher.update(u64::try_from(key.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(key.as_bytes());
+            hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(value);
+        }
+        hasher.finalize().into()
+    }
+
     pub fn free_version(&self) -> bool {
         contains_key_bytes(&self.meta_sys, SUFFIX_FREE_VERSION)
     }
@@ -2968,6 +3085,12 @@ impl MetaDeleteMarker {
             fi.transition_version_state = transition_version_state_from_bytes(derived_metadata.transitioned_version_state)?;
             fi.transition_version =
                 transitioned_version_from_bytes(derived_metadata.transitioned_version, fi.transition_version_state);
+            for (key, value) in &self.meta_sys {
+                if is_transition_version_metadata_key(key) {
+                    fi.metadata
+                        .insert(key.to_owned(), transition_version_metadata_value(value, fi.transition_version.as_deref()));
+                }
+            }
             fi.transition_version_id = fi.transition_version.as_deref().and_then(|value| Uuid::parse_str(value).ok());
             if derived_metadata.transitioned_version_state.is_some() {
                 validate_transition_version_state(fi.transition_version_state, fi.transition_version.as_deref())?;
@@ -3135,7 +3258,7 @@ impl From<FileInfo> for MetaDeleteMarker {
             insert_bytes(&mut meta_sys, SUFFIX_TRANSITIONED_VERSION_ID, transition_version);
         }
         if !value.transition_status.is_empty() || value.tier_free_version() {
-            set_transition_version_state(&mut meta_sys, value.transition_version_state);
+            set_transition_version_state(&mut meta_sys, value.transition_version_state, &value.metadata);
         }
         if !value.transition_tier.is_empty() {
             insert_bytes(&mut meta_sys, SUFFIX_TRANSITION_TIER, value.transition_tier.as_bytes().to_vec());
@@ -3226,16 +3349,17 @@ pub fn merge_file_meta_versions(
     requested_versions: usize,
     versions: &[Vec<FileMetaShallowVersion>],
 ) -> Vec<FileMetaShallowVersion> {
-    merge_file_meta_versions_inner(quorum, strict, requested_versions, false, versions)
+    merge_file_meta_versions_inner(quorum, strict, requested_versions, false, 0, versions)
 }
 
 pub(crate) fn merge_file_meta_versions_with_write_quorum(
     quorum: usize,
     strict: bool,
     requested_versions: usize,
+    write_quorum_slack: usize,
     versions: &[Vec<FileMetaShallowVersion>],
 ) -> Vec<FileMetaShallowVersion> {
-    merge_file_meta_versions_inner(quorum, strict, requested_versions, true, versions)
+    merge_file_meta_versions_inner(quorum, strict, requested_versions, true, write_quorum_slack, versions)
 }
 
 fn merge_file_meta_versions_inner(
@@ -3243,6 +3367,7 @@ fn merge_file_meta_versions_inner(
     mut strict: bool,
     requested_versions: usize,
     enforce_write_quorum: bool,
+    write_quorum_slack: usize,
     versions: &[Vec<FileMetaShallowVersion>],
 ) -> Vec<FileMetaShallowVersion> {
     if quorum == 0 {
@@ -3260,7 +3385,7 @@ fn merge_file_meta_versions_inner(
 
         let required_quorum = versions[0]
             .first()
-            .map(|version| version.write_quorum(quorum).max(quorum))
+            .map(|version| version.write_quorum(quorum).saturating_sub(write_quorum_slack).max(quorum))
             .unwrap_or(quorum);
         if versions.len() >= required_quorum {
             return versions[0].clone();
@@ -3274,7 +3399,7 @@ fn merge_file_meta_versions_inner(
 
     let required_quorum = |version: &FileMetaShallowVersion| {
         if enforce_write_quorum {
-            version.write_quorum(quorum).max(quorum)
+            version.write_quorum(quorum).saturating_sub(write_quorum_slack).max(quorum)
         } else {
             quorum
         }
@@ -4555,6 +4680,7 @@ mod tests {
             .into_fileinfo("b", "k", false)
             .expect("into_fileinfo");
         assert_eq!(fi.transition_version_id, None);
+        assert_eq!(get_str(&fi.metadata, SUFFIX_TRANSITIONED_VERSION_ID), Some(String::new()));
     }
 
     #[test]
@@ -4566,6 +4692,10 @@ mod tests {
             .into_fileinfo("b", "k", false)
             .expect("into_fileinfo");
         assert_eq!(fi.transition_version_id, None);
+        assert!(
+            get_str(&fi.metadata, SUFFIX_TRANSITIONED_VERSION_ID).is_some_and(|value| !value.is_empty()),
+            "nil UUID bytes must remain distinguishable from an empty MinIO version"
+        );
     }
 
     #[test]
@@ -4579,6 +4709,7 @@ mod tests {
         assert_eq!(fi.transition_version_id, Some(id));
         assert_eq!(fi.transition_version, Some(id.to_string()));
         assert_eq!(fi.transition_version_state, TransitionVersionState::Unknown);
+        assert_eq!(get_str(&fi.metadata, SUFFIX_TRANSITIONED_VERSION_ID), Some(id.to_string()));
     }
 
     #[test]
@@ -4616,6 +4747,36 @@ mod tests {
         assert_eq!(fi.transition_version_id, None);
         assert_eq!(fi.transition_version.as_deref(), Some("opaque-generation-42"));
         assert_eq!(fi.transition_version_state, TransitionVersionState::Unknown);
+    }
+
+    #[test]
+    fn meta_object_transition_version_state_explicit_unknown_is_not_legacy_missing() {
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            SUFFIX_TRANSITIONED_VERSION_STATE,
+            TransitionVersionState::Unknown.as_str().to_string(),
+        );
+        let fi = FileInfo {
+            transition_status: "complete".to_string(),
+            transition_version_state: TransitionVersionState::Unknown,
+            metadata,
+            ..Default::default()
+        };
+
+        let object = MetaObject::from(fi);
+        assert_eq!(
+            get_consistent_bytes(&object.meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE),
+            Some(b"unknown".as_slice())
+        );
+        let decoded = object
+            .into_fileinfo("b", "k", false)
+            .expect("explicit unknown state should decode");
+        assert_eq!(decoded.transition_version_state, TransitionVersionState::Unknown);
+        assert_eq!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(&decoded.metadata, SUFFIX_TRANSITIONED_VERSION_STATE,),
+            Some("unknown")
+        );
     }
 
     #[test]
@@ -4734,6 +4895,10 @@ mod tests {
             .expect("invalid transition version bytes must not fail the object read");
         assert_eq!(fi.transition_version_id, None);
         assert_eq!(fi.transition_version, None);
+        assert!(
+            get_str(&fi.metadata, SUFFIX_TRANSITIONED_VERSION_ID).is_some_and(|value| !value.is_empty()),
+            "invalid raw bytes must remain distinguishable from an empty MinIO version"
+        );
     }
 
     #[test]
@@ -4776,6 +4941,10 @@ mod tests {
         .into_fileinfo("b", "k", false)
         .expect("nil tier version should remain an absent remote version");
         assert_eq!(fi.transition_version_id, None);
+        assert!(
+            get_str(&fi.metadata, SUFFIX_TRANSITIONED_VERSION_ID).is_some_and(|value| !value.is_empty()),
+            "nil UUID bytes must remain distinguishable from an empty MinIO version"
+        );
     }
 
     #[test]
@@ -4793,6 +4962,7 @@ mod tests {
         .expect("legacy binary UUID tier version should decode");
         assert_eq!(fi.transition_version_id, Some(id));
         assert_eq!(fi.transition_version, Some(id.to_string()));
+        assert_eq!(get_str(&fi.metadata, SUFFIX_TRANSITIONED_VERSION_ID), Some(id.to_string()));
     }
 
     #[test]
@@ -4887,6 +5057,23 @@ mod tests {
         }
         .into_fileinfo("b", "k", false)
         .expect_err("conflicting transition aliases must fail closed");
+
+        assert_eq!(err, Error::FileCorrupt);
+    }
+
+    #[test]
+    fn meta_object_transition_version_state_mixed_case_alias_conflict_fails_closed() {
+        let sys = HashMap::from([
+            (
+                format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_TRANSITIONED_VERSION_STATE}"),
+                b"unknown".to_vec(),
+            ),
+            ("X-Minio-Internal-transitioned-version-state".to_string(), b"exact".to_vec()),
+        ]);
+
+        let err = make_meta_object_with_sys(sys)
+            .into_fileinfo("b", "k", false)
+            .expect_err("mixed-case transition state aliases must agree");
 
         assert_eq!(err, Error::FileCorrupt);
     }
@@ -5471,6 +5658,40 @@ mod tests {
 
         // Same content is stable across recomputation.
         assert_eq!(base.get_signature(), base.get_signature());
+    }
+
+    #[test]
+    fn delete_marker_stable_identity_is_order_independent_and_exact() {
+        let version_id = sample_version_id();
+        let mod_time = sample_mod_time();
+        let mut first = MetaDeleteMarker {
+            version_id: Some(version_id),
+            mod_time: Some(mod_time),
+            meta_sys: HashMap::new(),
+        };
+        first.meta_sys.insert("alpha".to_string(), vec![1, 2]);
+        first.meta_sys.insert("beta".to_string(), vec![3, 4]);
+
+        let mut reordered = MetaDeleteMarker {
+            version_id: Some(version_id),
+            mod_time: Some(mod_time),
+            meta_sys: HashMap::new(),
+        };
+        reordered.meta_sys.insert("beta".to_string(), vec![3, 4]);
+        reordered.meta_sys.insert("alpha".to_string(), vec![1, 2]);
+        assert_eq!(first.stable_identity(), reordered.stable_identity());
+
+        let mut changed = first.clone();
+        changed.meta_sys.insert("beta".to_string(), vec![3, 5]);
+        assert_ne!(first.stable_identity(), changed.stable_identity());
+
+        changed = first.clone();
+        changed.version_id = Some(Uuid::new_v4());
+        assert_ne!(first.stable_identity(), changed.stable_identity());
+
+        changed = first.clone();
+        changed.mod_time = changed.mod_time.map(|value| value + time::Duration::NANOSECOND);
+        assert_ne!(first.stable_identity(), changed.stable_identity());
     }
 
     #[test]

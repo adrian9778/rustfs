@@ -16,8 +16,9 @@
 use crate::RUSTFS_META_BUCKET;
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig};
 use crate::scanner_io::{
-    DataUsageCacheScanState, ScannerDiskScanOutcome, ScannerIODisk, acquire_scanner_cache_locks, cache_root_entry_info,
-    current_cache_root_or_prepare, scanner_set_disk_inventory,
+    DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerCheckpointPersistContext, ScannerCheckpointPersistResult,
+    ScannerDiskScanOptions, ScannerDiskScanOutcome, ScannerIODisk, acquire_scanner_cache_locks, cache_root_entry_info,
+    current_cache_root_or_prepare_with_generation, persist_scanner_checkpoint, scanner_set_disk_inventory,
 };
 use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
 use crate::{
@@ -26,9 +27,9 @@ use crate::{
     scanner_publication_admission_for_epoch, scanner_publication_epoch,
 };
 use hmac::{Hmac, KeyInit, Mac};
-use rustfs_common::heal_channel::HealScanMode;
-use rustfs_common::metrics::{Metric, Metrics};
 use rustfs_credentials::try_get_rpc_token;
+use rustfs_heal_contracts::heal_channel::HealScanMode;
+use rustfs_scanner_metrics::metrics::{Metric, Metrics};
 use rustfs_utils::path::path_join_buf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -42,7 +43,7 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, OwnedSemaphorePermit};
+use tokio::sync::{Notify, OwnedSemaphorePermit, mpsc};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -213,6 +214,7 @@ pub(crate) struct RemoteScannerScanSpec<'a> {
     pub(crate) session_id: Uuid,
     pub(crate) session_sequence: u64,
     pub(crate) scan_plan_digest: DataUsageScanPlanDigest,
+    pub(crate) tier_registry_generation: u64,
     pub(crate) skip_healing: bool,
     pub(crate) scan_mode: HealScanMode,
 }
@@ -223,6 +225,7 @@ struct RemoteScannerResponseExpectation<'a> {
     source: DataUsageCacheSource,
     next_cycle: u64,
     scan_plan_digest: DataUsageScanPlanDigest,
+    tier_registry_generation: u64,
 }
 
 #[derive(Debug)]
@@ -669,6 +672,11 @@ async fn scan_and_persist_local_bucket(
         scan_mode,
         ..
     } = request;
+    // Keep the worker's cycle snapshot alive through cache reuse, scanning,
+    // and persistence. Without the guard, a later cycle can prune this key
+    // while this request is still running and allow a second registry to be
+    // selected for the same cycle.
+    let _tier_cycle_guard = crate::begin_tier_registry_cycle(next_cycle, leader_epoch);
     let store = resolve_scanner_object_store_handle()
         .ok_or_else(|| RemoteScannerServerError::worker("remote namespace scanner object layer is unavailable"))?;
     validate_remote_scanner_request_fence_with_store(next_cycle, leader_epoch, store.clone())
@@ -701,10 +709,37 @@ async fn scan_and_persist_local_bucket(
             }
         })?;
     let mut cache = DataUsageCache::default();
-    let revisions = cache.load_with_revisions(set.clone(), &cache_name).await.map_err(|err| {
+    let mut revisions = cache.load_with_revisions(set.clone(), &cache_name).await.map_err(|err| {
         RemoteScannerServerError::worker(format!("remote namespace scanner cache load or revision lookup failed: {err}"))
     })?;
-    let scan_state = current_cache_root_or_prepare(&mut cache, &bucket, source, next_cycle, leader_epoch, scan_plan_digest, true);
+    // Remote workers use the same cycle-frozen registry as `scan_data_folder`.
+    // Requiring its generation here prevents a cache snapshot classified by an
+    // older registry from being reused before the folder scan gets a chance to
+    // refresh it.
+    let tier_registry_generation = crate::runtime_tier_registry_for_cycle(next_cycle, leader_epoch)
+        .await
+        .generation;
+    let scan_state = current_cache_root_or_prepare_with_generation(
+        &mut cache,
+        &bucket,
+        source,
+        next_cycle,
+        leader_epoch,
+        scan_plan_digest,
+        DataUsageCacheReuseOptions {
+            require_source: true,
+            tier_registry_generation: Some(tier_registry_generation),
+            checkpoint_identity: crate::scanner_io::scanner_bucket_checkpoint_identity(
+                &set,
+                &bucket,
+                expected_publication_epoch,
+                tier_registry_generation,
+                scan_mode,
+            )
+            .await
+            .ok(),
+        },
+    );
     match scan_state {
         DataUsageCacheScanState::Current(usage) => {
             if guard.is_lock_lost() {
@@ -744,13 +779,27 @@ async fn scan_and_persist_local_bucket(
     cache.info.skip_healing = skip_healing;
 
     let set_disks = scanner_set_disk_inventory(set.as_ref()).await;
+    let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel::<DataUsageCache>(1);
     let scan_ctx = ctx.child_token();
-    let scan = ScannerIODisk::nsscanner_disk(disk.clone(), scan_ctx.clone(), budget, set_disks, cache, None, scan_mode);
+    let scan = ScannerIODisk::nsscanner_disk(
+        disk.clone(),
+        scan_ctx.clone(),
+        budget,
+        set_disks,
+        cache,
+        None,
+        ScannerDiskScanOptions {
+            scan_mode,
+            prefix_scan_scope: None,
+            checkpoint_tx: Some(checkpoint_tx),
+        },
+    );
     tokio::pin!(scan);
     let fence_watch = watch_remote_scanner_request_fence(next_cycle, leader_epoch, store.clone(), NS_SCANNER_FENCE_POLL_INTERVAL);
     tokio::pin!(fence_watch);
     let mut lock_watch = tokio::time::interval(NS_SCANNER_LOCK_POLL_INTERVAL);
     lock_watch.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut checkpoint_channel_closed = false;
     let outcome = loop {
         tokio::select! {
             result = &mut scan => {
@@ -777,6 +826,53 @@ async fn scan_and_persist_local_bucket(
                     ));
                 }
             }
+            checkpoint = checkpoint_rx.recv(), if !checkpoint_channel_closed => {
+                let Some(checkpoint) = checkpoint else {
+                    checkpoint_channel_closed = true;
+                    continue;
+                };
+                if guard.is_lock_lost() {
+                    scan_ctx.cancel();
+                    let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
+                    return Err(RemoteScannerServerError::worker(
+                        "remote namespace scanner cache lock was lost before checkpoint save",
+                    ));
+                }
+                match persist_scanner_checkpoint(
+                    set.clone(),
+                    ScannerCheckpointPersistContext {
+                        ctx: &scan_ctx,
+                        expected_publication_epoch,
+                        cycle: next_cycle,
+                        leader_epoch,
+                    },
+                    &cache_name,
+                    &checkpoint,
+                    &mut revisions,
+                )
+                .await
+                {
+                    ScannerCheckpointPersistResult::Saved => {
+                        if guard.is_lock_lost() {
+                            scan_ctx.cancel();
+                            let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
+                            return Err(RemoteScannerServerError::retry_bucket(
+                                "remote namespace scanner cache lock was lost after checkpoint save",
+                            ));
+                        }
+                    }
+                    ScannerCheckpointPersistResult::FenceChanged => {
+                        scan_ctx.cancel();
+                        let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
+                        return Err(RemoteScannerServerError::retry_bucket(
+                            "remote namespace scanner cache fence changed during checkpoint save",
+                        ));
+                    }
+                    ScannerCheckpointPersistResult::Failed(_error) => {
+                        checkpoint_channel_closed = true;
+                    }
+                }
+            }
             result = &mut fence_watch => {
                 scan_ctx.cancel();
                 let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
@@ -796,6 +892,22 @@ async fn scan_and_persist_local_bucket(
         ScannerDiskScanOutcome::Partial(cache) => (cache, Some(RemoteScannerFrameResult::Partial)),
         ScannerDiskScanOutcome::NamespaceNotFound(cache) => (cache, Some(RemoteScannerFrameResult::NamespaceNotFound)),
     };
+    if let Some(expected) = cache.info.scan_identity
+        && crate::scanner_io::scanner_bucket_checkpoint_identity(
+            &set,
+            &bucket,
+            expected_publication_epoch,
+            tier_registry_generation,
+            scan_mode,
+        )
+        .await
+        .ok()
+            != Some(expected)
+    {
+        return Err(RemoteScannerServerError::retry_bucket(
+            "remote scanner checkpoint identity changed during scanning",
+        ));
+    }
 
     if guard.is_lock_lost() {
         return Err(RemoteScannerServerError::worker(
@@ -869,6 +981,7 @@ pub(crate) async fn scan_remote_bucket(
         session_id,
         session_sequence,
         scan_plan_digest,
+        tier_registry_generation,
         skip_healing,
         scan_mode,
     } = spec;
@@ -957,6 +1070,7 @@ pub(crate) async fn scan_remote_bucket(
             source: expected_source,
             next_cycle,
             scan_plan_digest,
+            tier_registry_generation,
         },
         authenticator,
         rpc_deadline,
@@ -991,6 +1105,48 @@ fn finish_remote_scanner_stream(
 const TEST_NEXT_CYCLE: u64 = 11;
 
 #[cfg(test)]
+pub(crate) async fn checkpoint_fixture_partial_return(progress: (u64, u64), entries_visited: u64) {
+    let request_id = Uuid::new_v4();
+    let writer_auth = FrameAuthenticator::for_test(request_id);
+    let reader_auth = FrameAuthenticator::for_test(request_id);
+    let mut bytes = Vec::new();
+    write_frame(
+        &mut bytes,
+        &writer_auth,
+        &mut 0,
+        &RemoteScannerFrame::terminal(
+            RemoteScannerProgress {
+                objects_scanned: progress.0,
+                directories_started: progress.1,
+                entries_visited,
+            },
+            RemoteScannerFrameResult::Partial,
+        ),
+    )
+    .await
+    .expect("checkpoint partial frame must encode");
+    let frame = read_frame(&mut std::io::Cursor::new(bytes.as_slice()), &reader_auth, &mut 0)
+        .await
+        .expect("checkpoint progress frame must authenticate");
+    assert_eq!(frame.progress.entries_visited, entries_visited);
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, Default::default());
+    let result = consume_remote_scanner_stream(
+        std::io::Cursor::new(bytes),
+        parent,
+        budget.clone(),
+        "bucket",
+        DataUsageCacheSource::new(0, 0),
+        DataUsageScanPlanDigest([17; 32]),
+        reader_auth,
+    )
+    .await
+    .expect("checkpoint partial frame must decode");
+    assert!(matches!(result, RemoteScannerOutcome::Partial));
+    assert_eq!(budget.progress(), progress);
+}
+
+#[cfg(test)]
 async fn consume_remote_scanner_stream<R>(
     reader: R,
     ctx: CancellationToken,
@@ -1012,6 +1168,7 @@ where
             source: expected_source,
             next_cycle: TEST_NEXT_CYCLE,
             scan_plan_digest: expected_scan_plan_digest,
+            tier_registry_generation: 0,
         },
         authenticator,
         Instant::now() + NS_SCANNER_MAX_RPC_LIFETIME,
@@ -1109,6 +1266,11 @@ where
                 if complete.scan_plan_digest != expected.scan_plan_digest {
                     return Err(RemoteScannerStreamError::reconciled(StorageError::other(
                         "remote namespace scanner returned usage for a different bucket plan",
+                    )));
+                }
+                if complete.usage.tier_registry_generation != Some(expected.tier_registry_generation) {
+                    return Err(RemoteScannerStreamError::reconciled(StorageError::other(
+                        "remote namespace scanner returned usage for a different tier registry generation",
                     )));
                 }
                 if !complete.usage.entry.children.is_empty() {

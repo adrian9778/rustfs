@@ -39,8 +39,26 @@ path = "src/main.rs"
 name = "rustfs-cli"
 path = "src/bin/rustfs-cli.rs"
 
+[[bin]]
+name = "rustfs-cli-e2e"
+path = "src/bin/rustfs-cli-e2e.rs"
+required-features = ["offline-enrollment-e2e-root"]
+
+# The Swift protocol suites are manual (#[ignore]) and need a server built with
+# the `swift` feature; gating the test binaries on the same feature keeps the
+# default `cargo test` / nextest build from linking two dead test binaries
+# (backlog#1846 cluster 4).
+[[test]]
+name = "swift_container_integration_test"
+required-features = ["swift"]
+
+[[test]]
+name = "swift_object_integration_test"
+required-features = ["swift"]
+
 [features]
-default = ["ftps", "webdav"]
+default = ["ftps", "webdav", "gcs"]
+gcs = ["rustfs-ecstore/gcs", "dep:google-cloud-auth"]
 metrics-gpu = ["rustfs-obs/gpu"]
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
@@ -49,11 +67,14 @@ sftp = ["rustfs-protocols/sftp"]
 license = []
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
-full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp", "pyroscope"]
-manual-test-runners = []
-e2e-test-hooks = []
+full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp", "pyroscope", "gcs"]
+e2e-test-hooks = ["rustfs-ecstore/e2e-test-hooks"]
+# Shortens Connect credentials only in debug E2E builds.
+connect-e2e-short-credentials = []
+# Builds the dedicated rustfs-cli-e2e target with a build-time public enrollment root.
+offline-enrollment-e2e-root = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
-pyroscope = ["rustfs-obs/pyroscope"]
+pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
 dial9 = ["rustfs-obs/dial9"]
 hotpath = [
@@ -206,6 +227,8 @@ hotpath.workspace = true
 rustfs-heal = { workspace = true }
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
+rustfs-heal-contracts = { workspace = true }
+rustfs-scanner-metrics = { workspace = true }
 rustfs-config = { workspace = true, features = ["notify", "server-config-model"] }
 rustfs-crypto = { workspace = true }
 rustfs-credentials = { workspace = true }
@@ -213,6 +236,7 @@ rustfs-ecstore = { workspace = true }
 rustfs-filemeta.workspace = true
 rustfs-iam = { workspace = true }
 rustfs-keystone = { workspace = true }
+rustfs-license = { workspace = true }
 rustfs-kms = { workspace = true }
 rustfs-lock.workspace = true
 rustfs-log-analyzer = { workspace = true }
@@ -223,6 +247,7 @@ rustfs-policy = { workspace = true }
 rustfs-protocols = { workspace = true }
 rustfs-protos = { workspace = true }
 rustfs-rio = { workspace = true }
+rustfs-s3-client = { workspace = true }
 rustfs-s3-types = { workspace = true }
 rustfs-s3-ops = { workspace = true }
 rustfs-security-governance = { workspace = true }
@@ -245,12 +270,13 @@ rustfs-scanner = { workspace = true }
 tempfile = { workspace = true }
 
 # Connect device identity: P-256 keys, PKCS#10 certificate requests, ES256 proofs.
-p256 = { version = "0.13.2", features = ["ecdsa", "pkcs8"] }
+p256 = { workspace = true }
 rcgen = { workspace = true }
 
 # Async Runtime and Networking
 async-trait = { workspace = true }
 axum.workspace = true
+faster-hex.workspace = true
 futures.workspace = true
 futures-lite.workspace = true
 futures-util.workspace = true
@@ -263,6 +289,11 @@ reqwest = { workspace = true, features = ["json", "stream"] }
 socket2 = { workspace = true, features = ["all"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util", "fs"] }
 tokio-rustls = { workspace = true, default-features = false, features = ["logging", "tls12", "aws-lc-rs"] }
+aws-smithy-runtime-api = { workspace = true, features = ["http-1x"] }
+aws-smithy-types = { workspace = true }
+google-cloud-auth = { workspace = true, optional = true }
+moka = { workspace = true, features = ["sync"] }
+xxhash-rust = { workspace = true, features = ["xxh3"] }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 tokio-stream.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat", "time"] }
@@ -276,6 +307,7 @@ bytes = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["serde"] }
 flate2 = { workspace = true }
 flatbuffers.workspace = true
+prost.workspace = true
 rmp-serde.workspace = true
 quick-xml.workspace = true
 rustfs-signer.workspace = true
@@ -286,19 +318,20 @@ snap.workspace = true
 zstd.workspace = true
 
 # Cryptography and Security
+ed25519-dalek.workspace = true
 rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types = { workspace = true }
+rustix.workspace = true
 x509-parser = { workspace = true }
 subtle = { workspace = true }
 jiff = { workspace = true, features = ["serde"] }
 time = { workspace = true, features = ["parsing", "formatting", "serde", "macros"] }
 
 # Utilities and Tools
-astral-tokio-tar = { workspace = true }
+rustfs-tokio-tar = { workspace = true }
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
 async_zip = { workspace = true, default-features = false, features = ["tokio", "deflate"] }
-base64 = { workspace = true }
 zeroize = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
@@ -316,6 +349,7 @@ pin-project-lite.workspace = true
 parking_lot = { workspace = true }
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s = { workspace = true, features = ["minio"] }
+s3s-sigv4 = { workspace = true }
 shadow-rs = { workspace = true, default-features = false, features = ["build", "metadata"] }
 sysinfo = { workspace = true, features = ["multithread"] }
 thiserror = { workspace = true }
@@ -333,6 +367,7 @@ chacha20poly1305 = { workspace = true }
 # Observability and Metrics
 metrics = { workspace = true }
 opentelemetry = { workspace = true }
+opentelemetry-proto = { workspace = true, features = ["trace"] }
 tracing-opentelemetry = { workspace = true }
 # Data structures
 hashbrown = { workspace = true, features = ["serde", "rayon"] }
@@ -341,8 +376,8 @@ rustfs-mimalloc = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
 
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-rustfs-mimalloc-sys.workspace = true
+[target.'cfg(any(all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))))'.dependencies]
+pyroscope = { workspace = true, optional = true, features = ["backend-pprof-rs"] }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
@@ -351,7 +386,7 @@ tempfile = { workspace = true }
 aws-config = { workspace = true }
 anyhow = { workspace = true }
 insta = { workspace = true, features = ["yaml", "json"] }
-proptest = "1"
+proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }
 temp-env = { workspace = true, features = ["async_closure"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
@@ -365,6 +400,7 @@ zip = { workspace = true }
 # Enables the shared MockWarmBackend / xl.meta assertion helpers exposed via
 # the ecstore `api::tier::test_util` facade module (rustfs/backlog#1148 ilm-6).
 rustfs-ecstore = { workspace = true, features = ["test-util"] }
+rustfs-heal = { workspace = true, features = ["test-util"] }
 
 [build-dependencies]
 http.workspace = true

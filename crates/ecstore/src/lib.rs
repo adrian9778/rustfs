@@ -55,8 +55,9 @@ mod set_disk;
 mod storage_api_contracts;
 mod store;
 
+pub use store::PoolMetaWriteGateStatus;
+
 // pub mod checksum;
-mod client;
 mod event;
 
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;

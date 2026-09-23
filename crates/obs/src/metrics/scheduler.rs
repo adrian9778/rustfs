@@ -23,16 +23,18 @@
 //! - Process disk I/O metrics
 //! - Host network I/O metrics
 
+use crate::metrics::collectors::cluster_drive::collect_cluster_drive_metrics;
 use crate::metrics::collectors::{
     AuditTargetRuntimeStats,
     AuditTargetStats,
     BucketReplicationBacklogStats,
     BucketReplicationBandwidthStats,
     BucketReplicationRuntimeStats,
-    DriveRuntimeDetailedStats,
     NotificationStats,
     NotificationTargetRuntimeStats,
     NotificationTargetStats,
+    OdmBackfillRuntimeStats,
+    OnDemandMigrationBucketStats,
     // System monitoring collectors (migrated from rustfs-obs::system)
     ProcessAttributeError,
     ProcessCpuStats,
@@ -64,6 +66,8 @@ use crate::metrics::collectors::{
     collect_node_metrics,
     collect_notification_runtime_metrics,
     collect_notification_target_runtime_metrics,
+    collect_on_demand_migration_backfill_metrics,
+    collect_on_demand_migration_metrics,
     collect_process_attributes,
     collect_process_cpu_metrics,
     collect_process_disk_metrics,
@@ -73,6 +77,7 @@ use crate::metrics::collectors::{
     collect_request_metrics,
     collect_resource_metrics,
     collect_scanner_runtime_metrics,
+    collect_tier_request_metrics,
 };
 use crate::metrics::config::{
     DEFAULT_AUDIT_METRICS_INTERVAL, DEFAULT_BUCKET_METRICS_INTERVAL, DEFAULT_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL,
@@ -102,7 +107,6 @@ use crate::metrics::schema::bucket_replication::{
     BUCKET_REPL_TARGET_SENT_COUNT_MD, BUCKET_REPL_TARGET_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TARGET_TOTAL_FAILED_COUNT_MD,
     OPERATION_L, RANGE_L, RESULT_L, TARGET_ARN_L,
 };
-use crate::metrics::schema::cluster::{CLUSTER_BUCKETS_TOTAL_MD, CLUSTER_OBJECTS_TOTAL_MD};
 use crate::metrics::schema::cluster_usage::{
     BUCKET_LABEL as USAGE_BUCKET_LABEL, RANGE_LABEL as USAGE_RANGE_LABEL, USAGE_BUCKET_DELETE_MARKERS_COUNT_MD,
     USAGE_BUCKET_OBJECT_SIZE_DISTRIBUTION_MD, USAGE_BUCKET_OBJECT_VERSION_COUNT_DISTRIBUTION_MD, USAGE_BUCKET_OBJECTS_TOTAL_MD,
@@ -118,29 +122,39 @@ use crate::metrics::schema::notification_target::{
     NOTIFICATION_TARGET_TOTAL_MESSAGES_BY_SERVER_MD, NOTIFICATION_TARGET_TOTAL_MESSAGES_MD, SERVER as NOTIFICATION_SERVER_LABEL,
     TARGET_ID as NOTIFICATION_TARGET_ID_LABEL, TARGET_TYPE as NOTIFICATION_TARGET_TYPE_LABEL,
 };
+use crate::metrics::schema::on_demand_migration::{
+    BACKFILL_STATES as ODM_BACKFILL_STATES, BUCKET_L as ODM_BUCKET_L, LE_L as ODM_LE_L, ODM_BACKFILL_BYTES_MD,
+    ODM_BACKFILL_ENQUEUED_MD, ODM_BACKFILL_FAILED_MD, ODM_BACKFILL_JOBS_MD, ODM_BACKFILL_LISTED_MD, ODM_BACKFILL_PULLED_MD,
+    ODM_BACKFILL_SKIPPED_EXISTING_MD, ODM_BREAKER_STATE_MD, ODM_INFLIGHT_PULLS_MD, ODM_PULL_FAILURES_TOTAL_MD,
+    ODM_PULLED_BYTES_TOTAL_MD, ODM_PULLED_OBJECTS_TOTAL_MD, ODM_QUEUE_DEPTH_MD, ODM_REQUESTS_TOTAL_MD,
+    ODM_SOURCE_LATENCY_SECONDS_COUNT_MD, ODM_SOURCE_LATENCY_SECONDS_DISTRIBUTION_MD, ODM_SOURCE_LATENCY_SECONDS_SUM_MD,
+    OP_L as ODM_OP_L, OUTCOME_L as ODM_OUTCOME_L, PATH_L as ODM_PATH_L, PULL_FAILURE_REASONS as ODM_PULL_FAILURE_REASONS,
+    PULL_PATHS as ODM_PULL_PATHS, REASON_L as ODM_REASON_L, REQUEST_OPS as ODM_REQUEST_OPS,
+    REQUEST_OUTCOMES as ODM_REQUEST_OUTCOMES, SERVER_L as ODM_SERVER_L, SOURCE_LATENCY_LE as ODM_SOURCE_LATENCY_LE,
+    STATE_L as ODM_STATE_L,
+};
 use crate::metrics::schema::scanner::{
     BUCKET_LABEL as SCANNER_BUCKET_LABEL, CYCLE_SCOPE_LABEL as SCANNER_CYCLE_SCOPE_LABEL, DRIVE_LABEL as SCANNER_DRIVE_LABEL,
     RESULT_LABEL as SCANNER_RESULT_LABEL, SCANNER_ACTIVE_BUCKET_DRIVE_SCAN_AGE_SECONDS_MD, SCANNER_ACTIVE_BUCKET_DRIVE_SCANS_MD,
     SCANNER_BUCKET_DRIVE_RESULT_TOTAL_MD, SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD, SOURCE_LABEL as SCANNER_SOURCE_LABEL,
 };
-use crate::metrics::schema::system_drive::{
-    API_LABEL as DRIVE_API_LABEL, DISK_ID_LABEL, DRIVE_API_CALLS_MD, DRIVE_API_LATENCY_BY_API_MD, DRIVE_DELETES_TOTAL_MD,
-    DRIVE_HEALING_MD, DRIVE_INDEX_LABEL, DRIVE_INFO_MD, DRIVE_LABEL, DRIVE_OFFLINE_DURATION_SECONDS_MD, DRIVE_RUNTIME_STATE_MD,
-    DRIVE_SCANNING_MD, DRIVE_WRITES_TOTAL_MD, POOL_INDEX_LABEL, SET_INDEX_LABEL, STATE_LABEL as DRIVE_STATE_LABEL,
-};
 use crate::metrics::schema::system_process::{PROCESS_EXECUTABLE_NAME_LABEL, PROCESS_PID_LABEL};
 use crate::metrics::stats_collector::{
     ProcessMetricBundle, collect_api_request_stats, collect_bucket_replication_bandwidth_stats,
-    collect_bucket_replication_stats_bundle, collect_bucket_stats, collect_cluster_and_health_stats,
-    collect_cluster_config_stats, collect_cluster_usage_metric_stats, collect_compression_cluster_stats,
-    collect_disk_and_system_drive_runtime_stats, collect_erasure_set_stats, collect_host_network_stats, collect_iam_stats,
-    collect_ilm_runtime_metric_stats, collect_internode_network_stats, collect_process_metric_bundle_with,
-    collect_replication_stats, collect_scanner_runtime_metric_stats, collect_system_cpu_and_memory_stats_with,
+    collect_bucket_replication_stats_bundle, collect_bucket_stats, collect_cluster_config_stats,
+    collect_cluster_storage_snapshot, collect_cluster_usage_metric_stats, collect_compression_cluster_stats,
+    collect_disk_and_system_drive_runtime_stats, collect_host_network_stats, collect_iam_stats, collect_ilm_runtime_metric_stats,
+    collect_internode_network_stats, collect_on_demand_migration_backfill_stats, collect_on_demand_migration_stats,
+    collect_process_metric_bundle_with, collect_replication_stats, collect_scanner_runtime_metric_stats,
+    collect_system_cpu_and_memory_stats_with, collect_tier_request_metric_stats,
 };
+use crate::metrics::storage_snapshot::StorageSnapshotMetrics;
 use crate::node_identity::{SERVER_LABEL, current_local_node_identity};
 use crate::telemetry::retire_metric_series;
 use futures_util::FutureExt;
 use rustfs_audit::audit_target_metrics;
+use rustfs_config::METER_INTERVAL;
+use rustfs_config::observability::ENV_OBS_METER_INTERVAL;
 use rustfs_io_metrics::ProcessSampler;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
 use rustfs_utils::get_env_opt_u64;
@@ -154,7 +168,7 @@ use std::time::Duration;
 use sysinfo::{Networks, System};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{error, warn};
 
 const LOG_COMPONENT_OBS: &str = "obs";
 const LOG_SUBSYSTEM_METRICS_RUNTIME: &str = "metrics_runtime";
@@ -298,141 +312,16 @@ static METRICS_RUNTIME_COLLECTOR_HEALTH: OnceLock<MetricsRuntimeCollectorHealth>
 
 type ReplBwKey = (String, String); // (bucket, target_arn)
 type BucketKey = String;
+/// `(full metric name, labels)` of one series.
+type MetricSeriesKey = (String, Vec<(&'static str, Cow<'static, str>)>);
 type BucketRangeKey = (String, String); // (bucket, range)
 type AuditLegacyTargetKey = String;
 type AuditTargetKey = (String, String); // (server, target_id)
 type NotificationLegacyTargetKey = (String, String); // (target_id, target_type)
 type NotificationTargetKey = (String, String, String); // (server, target_id, target_type)
-type DriveTopologyKey = (String, String, String, String, String); // (server, drive, pool, set, drive_index)
-type DriveBasicKey = (String, String); // (server, drive)
-type DriveTopologyApiKey = (String, String, String, String, String, String); // (server, drive, pool, set, drive_index, api)
-type DriveInfoKey = (String, String, String, String, String, String); // (server, drive, pool, set, drive_index, disk_id)
 type ScannerCycleBucketDriveResultKey = (String, String, String, String, String); // (server, cycle_scope, bucket, drive, result)
 type ScannerBucketDriveResultKey = (String, String, String, String); // (server, bucket, drive, result)
 type ScannerActiveBucketDriveKey = (String, String, String, String); // (server, source, bucket, drive)
-
-fn drive_info_live_keys(stats: &[DriveRuntimeDetailedStats]) -> HashSet<DriveInfoKey> {
-    stats.iter().filter_map(drive_info_key).collect()
-}
-
-fn drive_basic_live_keys(stats: &[DriveRuntimeDetailedStats]) -> HashSet<DriveBasicKey> {
-    stats
-        .iter()
-        .map(|stat| (stat.stats.server.clone(), stat.stats.drive.clone()))
-        .collect()
-}
-
-fn retire_drive_basic_metric_series(key: &DriveBasicKey) -> usize {
-    let labels = [
-        (SERVER_LABEL, Cow::Owned(key.0.clone())),
-        (DRIVE_LABEL, Cow::Owned(key.1.clone())),
-    ];
-    retire_metric_series(&DRIVE_WRITES_TOTAL_MD.get_full_metric_name(), &labels)
-        + retire_metric_series(&DRIVE_DELETES_TOTAL_MD.get_full_metric_name(), &labels)
-}
-
-fn drive_topology_live_keys(stats: &[DriveRuntimeDetailedStats]) -> HashSet<DriveTopologyKey> {
-    stats.iter().filter_map(drive_topology_key).collect()
-}
-
-fn drive_topology_api_live_keys(stats: &[DriveRuntimeDetailedStats]) -> HashSet<DriveTopologyApiKey> {
-    stats
-        .iter()
-        .filter_map(|stat| {
-            let topology = drive_topology_key(stat)?;
-            Some(
-                stat.api_calls
-                    .iter()
-                    .map(|(api, _)| api)
-                    .chain(stat.api_latency_by_api_micros.iter().map(|(api, _)| api))
-                    .map(move |api| {
-                        (
-                            topology.0.clone(),
-                            topology.1.clone(),
-                            topology.2.clone(),
-                            topology.3.clone(),
-                            topology.4.clone(),
-                            api.clone(),
-                        )
-                    }),
-            )
-        })
-        .flatten()
-        .collect()
-}
-
-fn drive_topology_key(stat: &DriveRuntimeDetailedStats) -> Option<DriveTopologyKey> {
-    Some((
-        stat.stats.server.clone(),
-        stat.stats.drive.clone(),
-        stat.pool_index.as_ref()?.clone(),
-        stat.set_index.as_ref()?.clone(),
-        stat.drive_index.as_ref()?.clone(),
-    ))
-}
-
-fn drive_info_key(stat: &DriveRuntimeDetailedStats) -> Option<DriveInfoKey> {
-    let disk_id = stat.disk_id.as_ref().filter(|disk_id| !disk_id.is_empty())?;
-    Some((
-        stat.stats.server.clone(),
-        stat.stats.drive.clone(),
-        stat.pool_index.as_ref()?.clone(),
-        stat.set_index.as_ref()?.clone(),
-        stat.drive_index.as_ref()?.clone(),
-        disk_id.clone(),
-    ))
-}
-
-fn retire_drive_info_metric_series(key: &DriveInfoKey) -> usize {
-    let labels = [
-        (SERVER_LABEL, Cow::Owned(key.0.clone())),
-        (DRIVE_LABEL, Cow::Owned(key.1.clone())),
-        (POOL_INDEX_LABEL, Cow::Owned(key.2.clone())),
-        (SET_INDEX_LABEL, Cow::Owned(key.3.clone())),
-        (DRIVE_INDEX_LABEL, Cow::Owned(key.4.clone())),
-        (DISK_ID_LABEL, Cow::Owned(key.5.clone())),
-    ];
-    retire_metric_series(&DRIVE_INFO_MD.get_full_metric_name(), &labels)
-}
-
-fn retire_drive_topology_metric_series(key: &DriveTopologyKey) -> usize {
-    let labels = [
-        (SERVER_LABEL, Cow::Owned(key.0.clone())),
-        (DRIVE_LABEL, Cow::Owned(key.1.clone())),
-        (POOL_INDEX_LABEL, Cow::Owned(key.2.clone())),
-        (SET_INDEX_LABEL, Cow::Owned(key.3.clone())),
-        (DRIVE_INDEX_LABEL, Cow::Owned(key.4.clone())),
-    ];
-    let mut retired = 0;
-    for descriptor in [&DRIVE_HEALING_MD, &DRIVE_SCANNING_MD, &DRIVE_OFFLINE_DURATION_SECONDS_MD] {
-        retired += retire_metric_series(&descriptor.get_full_metric_name(), &labels);
-    }
-    for state in ["online", "offline", "returning", "suspect", "unknown"] {
-        let state_labels = [
-            (SERVER_LABEL, Cow::Owned(key.0.clone())),
-            (DRIVE_LABEL, Cow::Owned(key.1.clone())),
-            (POOL_INDEX_LABEL, Cow::Owned(key.2.clone())),
-            (SET_INDEX_LABEL, Cow::Owned(key.3.clone())),
-            (DRIVE_INDEX_LABEL, Cow::Owned(key.4.clone())),
-            (DRIVE_STATE_LABEL, Cow::Borrowed(state)),
-        ];
-        retired += retire_metric_series(&DRIVE_RUNTIME_STATE_MD.get_full_metric_name(), &state_labels);
-    }
-    retired
-}
-
-fn retire_drive_topology_api_metric_series(key: &DriveTopologyApiKey) -> usize {
-    let labels = [
-        (SERVER_LABEL, Cow::Owned(key.0.clone())),
-        (DRIVE_LABEL, Cow::Owned(key.1.clone())),
-        (POOL_INDEX_LABEL, Cow::Owned(key.2.clone())),
-        (SET_INDEX_LABEL, Cow::Owned(key.3.clone())),
-        (DRIVE_INDEX_LABEL, Cow::Owned(key.4.clone())),
-        (DRIVE_API_LABEL, Cow::Owned(key.5.clone())),
-    ];
-    retire_metric_series(&DRIVE_API_CALLS_MD.get_full_metric_name(), &labels)
-        + retire_metric_series(&DRIVE_API_LATENCY_BY_API_MD.get_full_metric_name(), &labels)
-}
 
 fn scanner_cycle_bucket_drive_result_live_keys(stats: &ScannerRuntimeStats) -> HashSet<ScannerCycleBucketDriveResultKey> {
     stats
@@ -827,6 +716,21 @@ fn stagger_duration(period: Duration, numerator: u32, denominator: u32) -> Durat
     Duration::from_nanos(u64::try_from(staggered_nanos).unwrap_or(u64::MAX))
 }
 
+fn storage_snapshot_metrics(scope: &'static str, collection_interval: Duration) -> StorageSnapshotMetrics {
+    let export_interval = Duration::from_secs(
+        get_env_opt_u64(ENV_OBS_METER_INTERVAL)
+            .filter(|value| *value > 0)
+            .unwrap_or(METER_INTERVAL),
+    );
+    let max_age = collection_interval.max(export_interval).saturating_mul(3);
+    StorageSnapshotMetrics::new(
+        opentelemetry::global::meter("rustfs.storage"),
+        scope,
+        current_local_node_identity(),
+        max_age,
+    )
+}
+
 fn metrics_interval(period: Duration, initial_delay: Duration) -> Interval {
     let mut interval = tokio::time::interval_at(Instant::now() + initial_delay, period);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -895,6 +799,14 @@ fn repl_flow_live_keys(stats: &[BucketReplicationRuntimeStats]) -> HashSet<ReplB
 
 fn repl_proxy_bucket_live_keys(stats: &[BucketReplicationRuntimeStats]) -> HashSet<BucketKey> {
     stats.iter().map(|stat| stat.stats.bucket.clone()).collect()
+}
+
+fn on_demand_migration_bucket_live_keys(stats: &[OnDemandMigrationBucketStats]) -> HashSet<BucketKey> {
+    stats.iter().map(|stat| stat.bucket.clone()).collect()
+}
+
+fn on_demand_migration_backfill_bucket_live_keys(stats: &OdmBackfillRuntimeStats) -> HashSet<BucketKey> {
+    stats.buckets.iter().map(|stat| stat.bucket.clone()).collect()
 }
 
 fn update_series_zero_tombstones<T: Clone + Eq + std::hash::Hash>(
@@ -1577,6 +1489,94 @@ fn retire_bucket_replication_proxy_request_metric_series(bucket: &str) -> usize 
     retired
 }
 
+/// Every on-demand migration series a bucket can own, as `(name, labels)`:
+/// the fixed label sets of the runtime snapshot, in the collector's label
+/// order. Retirement walks this list once the bucket's config is gone.
+fn on_demand_migration_metric_series(bucket: &str) -> Vec<MetricSeriesKey> {
+    let bucket_label = || (ODM_BUCKET_L, Cow::Owned(bucket.to_string()));
+    let mut series = Vec::new();
+    for op in ODM_REQUEST_OPS {
+        for outcome in ODM_REQUEST_OUTCOMES {
+            series.push((
+                ODM_REQUESTS_TOTAL_MD.get_full_metric_name(),
+                vec![
+                    bucket_label(),
+                    (ODM_OP_L, Cow::Borrowed(op)),
+                    (ODM_OUTCOME_L, Cow::Borrowed(outcome)),
+                ],
+            ));
+        }
+    }
+    series.push((ODM_PULLED_BYTES_TOTAL_MD.get_full_metric_name(), vec![bucket_label()]));
+    for path in ODM_PULL_PATHS {
+        series.push((
+            ODM_PULLED_OBJECTS_TOTAL_MD.get_full_metric_name(),
+            vec![bucket_label(), (ODM_PATH_L, Cow::Borrowed(path))],
+        ));
+    }
+    for reason in ODM_PULL_FAILURE_REASONS {
+        series.push((
+            ODM_PULL_FAILURES_TOTAL_MD.get_full_metric_name(),
+            vec![bucket_label(), (ODM_REASON_L, Cow::Borrowed(reason))],
+        ));
+    }
+    series.push((ODM_INFLIGHT_PULLS_MD.get_full_metric_name(), vec![bucket_label()]));
+    series.push((ODM_QUEUE_DEPTH_MD.get_full_metric_name(), vec![bucket_label()]));
+    for le in ODM_SOURCE_LATENCY_LE {
+        series.push((
+            ODM_SOURCE_LATENCY_SECONDS_DISTRIBUTION_MD.get_full_metric_name(),
+            vec![bucket_label(), (ODM_LE_L, Cow::Borrowed(le))],
+        ));
+    }
+    series.push((ODM_SOURCE_LATENCY_SECONDS_SUM_MD.get_full_metric_name(), vec![bucket_label()]));
+    series.push((ODM_SOURCE_LATENCY_SECONDS_COUNT_MD.get_full_metric_name(), vec![bucket_label()]));
+    series.push((ODM_BREAKER_STATE_MD.get_full_metric_name(), vec![bucket_label()]));
+    series
+}
+
+fn retire_on_demand_migration_metric_series(bucket: &str) -> usize {
+    on_demand_migration_metric_series(bucket)
+        .iter()
+        .map(|(name, labels)| retire_metric_series(name, labels))
+        .sum()
+}
+
+/// Every on-demand migration backfill series one node's job can own. The
+/// `state` gauge is enumerated over the checkpoint's fixed lifecycle values
+/// because only one of them is emitted per cycle.
+fn on_demand_migration_backfill_metric_series(server: &str, bucket: &str) -> Vec<MetricSeriesKey> {
+    let job_labels = || {
+        vec![
+            (ODM_SERVER_L, Cow::Owned(server.to_string())),
+            (ODM_BUCKET_L, Cow::Owned(bucket.to_string())),
+        ]
+    };
+    let mut series = Vec::new();
+    for state in ODM_BACKFILL_STATES {
+        let mut labels = job_labels();
+        labels.push((ODM_STATE_L, Cow::Borrowed(state)));
+        series.push((ODM_BACKFILL_JOBS_MD.get_full_metric_name(), labels));
+    }
+    for descriptor in [
+        &*ODM_BACKFILL_LISTED_MD,
+        &*ODM_BACKFILL_ENQUEUED_MD,
+        &*ODM_BACKFILL_PULLED_MD,
+        &*ODM_BACKFILL_SKIPPED_EXISTING_MD,
+        &*ODM_BACKFILL_FAILED_MD,
+        &*ODM_BACKFILL_BYTES_MD,
+    ] {
+        series.push((descriptor.get_full_metric_name(), job_labels()));
+    }
+    series
+}
+
+fn retire_on_demand_migration_backfill_metric_series(server: &str, bucket: &str) -> usize {
+    on_demand_migration_backfill_metric_series(server, bucket)
+        .iter()
+        .map(|(name, labels)| retire_metric_series(name, labels))
+        .sum()
+}
+
 fn retire_repl_backlog_target_metric_series(bucket: &str, target_arn: &str) -> usize {
     let labels = [
         (BUCKET_L, Cow::Owned(bucket.to_string())),
@@ -1655,26 +1655,21 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     let token_clone = token.clone();
     tokio::spawn(async move {
         let mut interval = metrics_interval(cluster_interval, Duration::ZERO);
-        let mut objects_count_was_authoritative = false;
-        let mut buckets_count_was_authoritative = false;
+        let mut snapshot = storage_snapshot_metrics("cluster", cluster_interval);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     run_metrics_collector_tick(health, MetricsCollectorTaskId::ClusterStats, "cluster_stats", async {
-                        let (stats, cluster_health) = collect_cluster_and_health_stats().await;
-                        if objects_count_was_authoritative && stats.objects_count.is_none() {
-                            let labels: [(&'static str, Cow<'static, str>); 0] = [];
-                            let _ = retire_metric_series(&CLUSTER_OBJECTS_TOTAL_MD.get_full_metric_name(), &labels);
+                        let collection_started = std::time::Instant::now();
+                        if let Some(stats) = collect_cluster_storage_snapshot().await {
+                            let mut metrics = collect_cluster_metrics(&stats.cluster);
+                            metrics.extend(collect_cluster_health_metrics(&stats.health));
+                            metrics.extend(collect_cluster_drive_metrics(&stats.drives));
+                            metrics.extend(collect_erasure_set_metrics(&stats.erasure_sets));
+                            if let Err(error) = snapshot.replace_collected(metrics, collection_started) {
+                                error!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "cluster_stats", result = "invalid_snapshot", error = %error, "storage metrics snapshot rejected");
+                            }
                         }
-                        if buckets_count_was_authoritative && stats.buckets_count.is_none() {
-                            let labels: [(&'static str, Cow<'static, str>); 0] = [];
-                            let _ = retire_metric_series(&CLUSTER_BUCKETS_TOTAL_MD.get_full_metric_name(), &labels);
-                        }
-                        objects_count_was_authoritative = stats.objects_count.is_some();
-                        buckets_count_was_authoritative = stats.buckets_count.is_some();
-                        let mut metrics = collect_cluster_metrics(&stats);
-                        metrics.extend(collect_cluster_health_metrics(&cluster_health));
-                        report_metrics(&metrics);
                     }).await;
                 }
                 _ = token_clone.cancelled() => {
@@ -1712,11 +1707,6 @@ pub fn init_metrics_runtime(token: CancellationToken) {
 
                             if let Some(stats) = collect_cluster_config_stats().await {
                                 metrics.extend(collect_cluster_config_metrics(&stats));
-                            }
-
-                            let erasure_sets = collect_erasure_set_stats().await;
-                            if !erasure_sets.is_empty() {
-                                metrics.extend(collect_erasure_set_metrics(&erasure_sets));
                             }
 
                             if let Some(stats) = collect_iam_stats().await {
@@ -1879,63 +1869,19 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     let token_clone = token.clone();
     tokio::spawn(async move {
         let mut interval = metrics_interval(node_interval, Duration::ZERO);
-        let mut prev_drive_basic_keys: HashSet<DriveBasicKey> = HashSet::new();
-        let mut prev_drive_info_keys: HashSet<DriveInfoKey> = HashSet::new();
-        let mut prev_drive_topology_keys: HashSet<DriveTopologyKey> = HashSet::new();
-        let mut prev_drive_topology_api_keys: HashSet<DriveTopologyApiKey> = HashSet::new();
-        let mut has_seen_drive_info_snapshot = false;
+        let mut snapshot = storage_snapshot_metrics("local", node_interval);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     run_metrics_collector_tick(health, MetricsCollectorTaskId::NodeDiskStats, "node_disk_stats", async {
-                        let (disk_stats, drive_stats, drive_counts) = collect_disk_and_system_drive_runtime_stats().await;
-                        let current_drive_info_keys = drive_info_live_keys(&drive_stats);
-                        let current_drive_basic_keys = drive_basic_live_keys(&drive_stats);
-                        let current_drive_topology_keys = drive_topology_live_keys(&drive_stats);
-                        let current_drive_topology_api_keys = drive_topology_api_live_keys(&drive_stats);
-                        let retire_drive_info_keys = if has_seen_drive_info_snapshot {
-                            prev_drive_info_keys.difference(&current_drive_info_keys).cloned().collect::<Vec<_>>()
-                        } else {
-                            Vec::new()
-                        };
-                        let retire_drive_basic_keys = if has_seen_drive_info_snapshot {
-                            prev_drive_basic_keys.difference(&current_drive_basic_keys).cloned().collect::<Vec<_>>()
-                        } else {
-                            Vec::new()
-                        };
-                        let retire_drive_topology_keys = if has_seen_drive_info_snapshot {
-                            prev_drive_topology_keys.difference(&current_drive_topology_keys).cloned().collect::<Vec<_>>()
-                        } else {
-                            Vec::new()
-                        };
-                        let retire_drive_topology_api_keys = if has_seen_drive_info_snapshot {
-                            prev_drive_topology_api_keys
-                                .difference(&current_drive_topology_api_keys)
-                                .cloned()
-                                .collect::<Vec<_>>()
-                        } else {
-                            Vec::new()
-                        };
-                        prev_drive_info_keys = current_drive_info_keys;
-                        prev_drive_basic_keys = current_drive_basic_keys;
-                        prev_drive_topology_keys = current_drive_topology_keys;
-                        prev_drive_topology_api_keys = current_drive_topology_api_keys;
-                        has_seen_drive_info_snapshot = true;
-                        let mut metrics = collect_node_metrics(&disk_stats);
-                        metrics.extend(collect_drive_runtime_detailed_metrics(&drive_stats));
-                        metrics.extend(collect_drive_count_metrics(&drive_counts));
-                        report_metrics(&metrics);
-                        for key in retire_drive_info_keys {
-                            let _ = retire_drive_info_metric_series(&key);
-                        }
-                        for key in retire_drive_basic_keys {
-                            let _ = retire_drive_basic_metric_series(&key);
-                        }
-                        for key in retire_drive_topology_keys {
-                            let _ = retire_drive_topology_metric_series(&key);
-                        }
-                        for key in retire_drive_topology_api_keys {
-                            let _ = retire_drive_topology_api_metric_series(&key);
+                        let collection_started = std::time::Instant::now();
+                        if let Some((disk_stats, drive_stats, drive_counts)) = collect_disk_and_system_drive_runtime_stats().await {
+                            let mut metrics = collect_node_metrics(&disk_stats);
+                            metrics.extend(collect_drive_runtime_detailed_metrics(&drive_stats));
+                            metrics.extend(collect_drive_count_metrics(&drive_counts));
+                            if let Err(error) = snapshot.replace_collected(metrics, collection_started) {
+                                error!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "node_disk_stats", result = "invalid_snapshot", error = %error, "storage metrics snapshot rejected");
+                            }
                         }
                     }).await;
                 }
@@ -1966,6 +1912,10 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         let mut has_seen_valid_flow_snapshot = false;
         let mut prev_proxy_bucket_live_keys: HashSet<BucketKey> = HashSet::new();
         let mut has_seen_proxy_bucket_snapshot = false;
+        let mut prev_on_demand_migration_live_keys: HashSet<BucketKey> = HashSet::new();
+        let mut has_seen_on_demand_migration_snapshot = false;
+        let mut prev_on_demand_migration_backfill_live_keys: HashSet<BucketKey> = HashSet::new();
+        let mut has_seen_on_demand_migration_backfill_snapshot = false;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -2039,6 +1989,39 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             metrics.extend(collect_repl_backlog_zero_tombstone_metrics(&backlog_zero_tombstones));
                             metrics.extend(collect_repl_backlog_target_zero_tombstone_metrics(&backlog_target_zero_tombstones));
                             metrics.extend(collect_repl_flow_zero_tombstone_metrics(&flow_zero_tombstones));
+                            // A bucket whose on-demand migration config is gone leaves the
+                            // snapshot; its series are retired after this cycle's report.
+                            let on_demand_migration = collect_on_demand_migration_stats();
+                            let current_on_demand_migration_live_keys = on_demand_migration_bucket_live_keys(&on_demand_migration);
+                            let retire_on_demand_migration_buckets = if has_seen_on_demand_migration_snapshot {
+                                prev_on_demand_migration_live_keys
+                                    .difference(&current_on_demand_migration_live_keys)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                            } else {
+                                Vec::new()
+                            };
+                            prev_on_demand_migration_live_keys = current_on_demand_migration_live_keys;
+                            has_seen_on_demand_migration_snapshot = true;
+                            metrics.extend(collect_on_demand_migration_metrics(&on_demand_migration));
+                            // Backfill jobs come and go independently of the bucket's config,
+                            // so their series are retired on their own key set.
+                            let on_demand_migration_backfill = collect_on_demand_migration_backfill_stats();
+                            let current_on_demand_migration_backfill_live_keys =
+                                on_demand_migration_backfill_bucket_live_keys(&on_demand_migration_backfill);
+                            let retire_on_demand_migration_backfill_buckets = if has_seen_on_demand_migration_backfill_snapshot
+                            {
+                                prev_on_demand_migration_backfill_live_keys
+                                    .difference(&current_on_demand_migration_backfill_live_keys)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                            } else {
+                                Vec::new()
+                            };
+                            prev_on_demand_migration_backfill_live_keys = current_on_demand_migration_backfill_live_keys;
+                            has_seen_on_demand_migration_backfill_snapshot = true;
+                            let on_demand_migration_backfill_server = on_demand_migration_backfill.server.clone();
+                            metrics.extend(collect_on_demand_migration_backfill_metrics(&on_demand_migration_backfill));
                             let replication = collect_replication_stats().await;
                             metrics.extend(collect_replication_runtime_metrics(&ReplicationRuntimeStats {
                                 server: current_local_node_identity(),
@@ -2064,6 +2047,15 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             }
                             for bucket in retire_proxy_buckets {
                                 let _ = retire_bucket_replication_proxy_request_metric_series(&bucket);
+                            }
+                            for bucket in retire_on_demand_migration_buckets {
+                                let _ = retire_on_demand_migration_metric_series(&bucket);
+                            }
+                            for bucket in retire_on_demand_migration_backfill_buckets {
+                                let _ = retire_on_demand_migration_backfill_metric_series(
+                                    &on_demand_migration_backfill_server,
+                                    &bucket,
+                                );
                             }
                         },
                     ).await;
@@ -2236,6 +2228,8 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             if let Some(stats) = collect_ilm_runtime_metric_stats().await {
                                 metrics.extend(collect_ilm_runtime_metrics(&stats));
                             }
+
+                            metrics.extend(collect_tier_request_metrics(&collect_tier_request_metric_stats()));
 
                             let mut retire_scanner_cycle_bucket_drive_result_keys = Vec::new();
                             let mut retire_scanner_bucket_drive_result_keys = Vec::new();
@@ -2614,24 +2608,6 @@ mod tests {
         (server.to_string(), target_id.to_string(), target_type.to_string())
     }
 
-    fn drive_info_stat(disk_id: &str) -> DriveRuntimeDetailedStats {
-        DriveRuntimeDetailedStats {
-            pool_index: Some("0".to_string()),
-            set_index: Some("1".to_string()),
-            drive_index: Some("2".to_string()),
-            disk_id: Some(disk_id.to_string()),
-            runtime_state: Some("online".to_string()),
-            api_calls: vec![("read_all".to_string(), 1)],
-            api_latency_by_api_micros: vec![("write_all".to_string(), 2)],
-            stats: crate::metrics::DriveDetailedStats {
-                server: "server-a".to_string(),
-                drive: "/data1".to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
-
     fn scanner_stats_with_last_result(bucket: &str) -> ScannerRuntimeStats {
         ScannerRuntimeStats {
             server: "server-a".to_string(),
@@ -2669,69 +2645,6 @@ mod tests {
             }],
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn drive_info_live_keys_detect_disk_identity_replacement() {
-        let previous = drive_info_live_keys(&[drive_info_stat("disk-old")]);
-        let current = drive_info_live_keys(&[drive_info_stat("disk-new")]);
-        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
-
-        assert!(current.contains(&(
-            "server-a".to_string(),
-            "/data1".to_string(),
-            "0".to_string(),
-            "1".to_string(),
-            "2".to_string(),
-            "disk-new".to_string(),
-        )));
-        assert!(retired.contains(&(
-            "server-a".to_string(),
-            "/data1".to_string(),
-            "0".to_string(),
-            "1".to_string(),
-            "2".to_string(),
-            "disk-old".to_string(),
-        )));
-    }
-
-    #[test]
-    fn drive_topology_keys_detect_removed_drives() {
-        let previous = drive_topology_live_keys(&[drive_info_stat("disk-old")]);
-        let current = drive_topology_live_keys(&[]);
-        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
-
-        assert!(retired.contains(&(
-            "server-a".to_string(),
-            "/data1".to_string(),
-            "0".to_string(),
-            "1".to_string(),
-            "2".to_string(),
-        )));
-    }
-
-    #[test]
-    fn drive_topology_api_keys_detect_removed_drives() {
-        let previous = drive_topology_api_live_keys(&[drive_info_stat("disk-old")]);
-        let current = drive_topology_api_live_keys(&[]);
-        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
-
-        assert!(retired.contains(&(
-            "server-a".to_string(),
-            "/data1".to_string(),
-            "0".to_string(),
-            "1".to_string(),
-            "2".to_string(),
-            "read_all".to_string(),
-        )));
-        assert!(retired.contains(&(
-            "server-a".to_string(),
-            "/data1".to_string(),
-            "0".to_string(),
-            "1".to_string(),
-            "2".to_string(),
-            "write_all".to_string(),
-        )));
     }
 
     #[test]
@@ -2828,6 +2741,127 @@ mod tests {
 
         assert_eq!(retired, bucket_keys(&["photos"]));
         assert_eq!(current, bucket_keys(&["logs"]));
+    }
+
+    #[test]
+    fn on_demand_migration_bucket_keys_detect_removed_buckets() {
+        let previous = on_demand_migration_bucket_live_keys(&[
+            OnDemandMigrationBucketStats {
+                bucket: "photos".to_string(),
+                ..Default::default()
+            },
+            OnDemandMigrationBucketStats {
+                bucket: "logs".to_string(),
+                ..Default::default()
+            },
+        ]);
+        let current = on_demand_migration_bucket_live_keys(&[OnDemandMigrationBucketStats {
+            bucket: "logs".to_string(),
+            ..Default::default()
+        }]);
+        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
+
+        assert_eq!(retired, bucket_keys(&["photos"]));
+        assert_eq!(current, bucket_keys(&["logs"]));
+        assert!(on_demand_migration_bucket_live_keys(&[]).is_empty());
+    }
+
+    /// Retirement must name exactly the series the collector emitted for the
+    /// bucket, with identical label order, or the recorder keeps them alive.
+    #[test]
+    fn on_demand_migration_retirement_covers_every_emitted_series() {
+        let stats = crate::metrics::collectors::on_demand_migration::tests::golden_stats("photos");
+        let emitted = collect_on_demand_migration_metrics(&[stats])
+            .into_iter()
+            .map(|metric| {
+                (
+                    metric.name.to_string(),
+                    metric
+                        .labels
+                        .into_iter()
+                        .map(|(key, value)| (key, value.to_string()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        let retired = on_demand_migration_metric_series("photos")
+            .into_iter()
+            .map(|(name, labels)| {
+                (
+                    name,
+                    labels
+                        .into_iter()
+                        .map(|(key, value)| (key, value.to_string()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashSet<_>>();
+
+        assert_eq!(retired, emitted);
+        // Without a process-global recorder there is nothing to retire; the
+        // walk itself must still cover every series.
+        assert_eq!(retire_on_demand_migration_metric_series("photos"), 0);
+        assert_eq!(on_demand_migration_metric_series("photos").len(), emitted.len());
+    }
+
+    #[test]
+    fn on_demand_migration_backfill_bucket_keys_detect_finished_jobs() {
+        let stats = crate::metrics::collectors::on_demand_migration::tests::backfill_golden_stats("node1:9000");
+        let previous = on_demand_migration_backfill_bucket_live_keys(&stats);
+        let current = on_demand_migration_backfill_bucket_live_keys(&OdmBackfillRuntimeStats {
+            server: stats.server.clone(),
+            buckets: stats.buckets[..1].to_vec(),
+        });
+        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
+
+        assert_eq!(retired, bucket_keys(&["docs"]));
+        assert_eq!(current, bucket_keys(&["photos"]));
+        assert!(on_demand_migration_backfill_bucket_live_keys(&OdmBackfillRuntimeStats::default()).is_empty());
+    }
+
+    /// Every emitted backfill series must be named by the retirement walk.
+    /// The walk is wider than one cycle's emission on purpose: only the
+    /// job's current `state` gauge is emitted, so retirement enumerates all
+    /// lifecycle values to clear whichever one is live.
+    #[test]
+    fn on_demand_migration_backfill_retirement_covers_every_emitted_series() {
+        let stats = crate::metrics::collectors::on_demand_migration::tests::backfill_golden_stats("node1:9000");
+        let emitted = collect_on_demand_migration_backfill_metrics(&stats)
+            .into_iter()
+            .map(|metric| {
+                (
+                    metric.name.to_string(),
+                    metric
+                        .labels
+                        .into_iter()
+                        .map(|(key, value)| (key, value.to_string()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        let retired = stats
+            .buckets
+            .iter()
+            .flat_map(|bucket| on_demand_migration_backfill_metric_series(&stats.server, &bucket.bucket))
+            .map(|(name, labels)| {
+                (
+                    name,
+                    labels
+                        .into_iter()
+                        .map(|(key, value)| (key, value.to_string()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashSet<_>>();
+
+        assert!(emitted.is_subset(&retired), "emitted: {emitted:?}, retired: {retired:?}");
+        assert_eq!(
+            on_demand_migration_backfill_metric_series("node1:9000", "photos").len(),
+            ODM_BACKFILL_STATES.len() + 6
+        );
+        // Without a process-global recorder there is nothing to retire; the
+        // walk itself must still cover every series.
+        assert_eq!(retire_on_demand_migration_backfill_metric_series("node1:9000", "photos"), 0);
     }
 
     #[test]

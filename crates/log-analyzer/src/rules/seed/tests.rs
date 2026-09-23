@@ -110,7 +110,7 @@ fn every_rule_has_a_positive_sample() {
         ("remote-peer-faulty", msg("Remote peer health check failed for node2: marking as faulty")),
         (
             "peer-disks-offline",
-            msg("reporting peer disks offline after consecutive storage_info failures"),
+            msg("Storage inventory probe failed; current drive health is unknown"),
         ),
         ("drive-faulty-error", msg("remote drive is faulty")),
         (
@@ -262,10 +262,12 @@ fn every_rule_has_a_positive_sample() {
         ),
         (
             "decom-capacity-insufficient",
-            msg("failed to start decommission: insufficient target pool capacity: required 100 bytes available 50 bytes"),
+            msg(
+                "failed to start decommission: insufficient reserved physical target capacity: required 100 bytes available 50 bytes",
+            ),
         ),
         // ops
-        ("decom-object-failed", msg("decommission_pool: decommission_object err timeout")),
+        ("decom-object-failed", msg("Decommission object migration failed")),
         ("rebalance-worker-error", msg("Rebalance worker 3 error: disk gone")),
         (
             "datamove-same-pool",
@@ -316,6 +318,10 @@ fn smoke_samples_hit_exact_rule_sets() {
         &["disk-marked-faulty"],
     );
     exact(&msg("erasure write quorum (required=8, achieved=5)"), &["ec-write-quorum"]);
+    exact(
+        &msg("reporting peer disks offline after consecutive storage_info failures"),
+        &["peer-disks-offline"],
+    );
     exact(
         &Sample {
             message: "Metacache listing quorum failed",

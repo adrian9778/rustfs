@@ -22,14 +22,14 @@ pub(crate) use rustfs_ecstore::api::disk::{
     BUCKET_META_PREFIX as ECSTORE_BUCKET_META_PREFIX, Bytes as EcstoreDiskBytes,
     ConditionalFileUpdate as EcstoreConditionalFileUpdate, DeleteOptions as EcstoreDeleteOptions, DiskAPI as EcstoreDiskAPI,
     DiskStore as EcstoreDiskStore, HEALING_MARKER_PATH as ECSTORE_HEALING_MARKER_PATH,
-    RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET,
+    RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET, ReplacementExecutionLease as EcstoreReplacementExecutionLease,
 };
-#[cfg(test)]
 pub(crate) use rustfs_ecstore::api::disk::{DiskOption as EcstoreDiskOption, new_disk as ecstore_new_disk};
 pub(crate) use rustfs_ecstore::api::error::{Error as EcstoreErrorType, StorageError as EcstoreStorageError};
 pub(crate) use rustfs_ecstore::api::runtime::local_disk_map_read as ecstore_local_disk_map_read;
 pub(crate) use rustfs_ecstore::api::storage::{
     ECStore as EcstoreStore, HealLifecycleExpiryContext as EcstoreHealLifecycleExpiryContext,
+    HealObjectStorageResult as EcstoreHealObjectStorageResult, POOL_META_NAME as ECSTORE_POOL_META_NAME,
 };
 use rustfs_storage_api as storage_contracts;
 
@@ -37,17 +37,18 @@ pub(crate) mod owner {
     pub(crate) use super::storage_contracts::{ObjectIO, ObjectOperations};
 
     pub(crate) use super::{
-        ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_HEALING_MARKER_PATH, ECSTORE_RUSTFS_META_BUCKET,
-        EcstoreConditionalFileUpdate, EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError,
-        EcstoreDiskResult, EcstoreDiskStore, EcstoreEndpoint, EcstoreErrorType, EcstoreHealLifecycleExpiryContext,
-        EcstoreStorageError, EcstoreStore, ecstore_load_admin_data_usage_from_backend_cached, ecstore_local_disk_map_read,
+        ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_HEALING_MARKER_PATH, ECSTORE_POOL_META_NAME,
+        ECSTORE_RUSTFS_META_BUCKET, EcstoreConditionalFileUpdate, EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes,
+        EcstoreDiskError, EcstoreDiskResult, EcstoreDiskStore, EcstoreEndpoint, EcstoreErrorType,
+        EcstoreHealLifecycleExpiryContext, EcstoreStorageError, EcstoreStore, ecstore_load_admin_data_usage_from_backend_cached,
+        ecstore_local_disk_map_read,
     };
 
-    #[cfg(test)]
     pub(crate) use super::{EcstoreDiskOption, ecstore_new_disk};
 }
 
 pub(crate) mod storage {
+    pub(crate) use super::EcstoreHealObjectStorageResult;
     pub(crate) use super::storage_contracts::{
         BucketInfo, BucketOperations, DiskSetSelector, HealOperations, ListOperations, ObjectIO, ObjectOperations,
         StorageAdminApi,

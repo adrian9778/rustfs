@@ -15,18 +15,16 @@
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(unused_assignments)]
-#![allow(unused_must_use)]
-#![allow(clippy::all)]
 
 use super::runtime_boundary as runtime_sources;
 use crate::bucket::lifecycle::bucket_lifecycle_ops::ExpiryOp;
 use crate::bucket::lifecycle::lifecycle::{self, ObjectOpts};
 use crate::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry;
-use crate::client::signer_error::error_chain_contains_signer_header_marker;
 use crate::object_api::ObjectInfo;
 use crate::services::tier::tier::{TierConfigMgr, TierDestinationId, TierOperationLease};
 use crate::storage_api_contracts::lifecycle::TransitionedObject;
 use crate::store::ECStore;
+use rustfs_s3_client::signer_error::error_chain_contains_signer_header_marker;
 use rustfs_utils::get_env_usize;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -72,9 +70,11 @@ static REMOTE_DELETE_BREAKER: LazyLock<Mutex<RemoteDeleteBreaker>> = LazyLock::n
 });
 
 #[cfg(test)]
-static REMOTE_TIER_DELETE_TEST_HOOK: std::sync::LazyLock<
-    std::sync::Mutex<Option<Box<dyn Fn(&str, &str, &str) -> std::io::Result<()> + Send + Sync>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+type RemoteTierDeleteTestHook = Box<dyn Fn(&str, &str, &str) -> std::io::Result<()> + Send + Sync>;
+
+#[cfg(test)]
+static REMOTE_TIER_DELETE_TEST_HOOK: std::sync::LazyLock<std::sync::Mutex<Option<RemoteTierDeleteTestHook>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 #[derive(Debug)]
 struct RemoteDeleteBreaker {
@@ -107,7 +107,7 @@ impl RemoteDeleteBreaker {
     fn prune(&mut self, now: Instant) {
         while let Some(ts) = self.failures.front().copied() {
             if now.duration_since(ts) > self.window {
-                self.failures.pop_front();
+                let _ = self.failures.pop_front();
             } else {
                 break;
             }
@@ -137,10 +137,10 @@ fn is_signer_header_error(err: &std::io::Error) -> bool {
         return false;
     }
 
-    if let Some(source) = err.get_ref() {
-        if error_chain_contains_signer_header_marker(source) {
-            return true;
-        }
+    if let Some(source) = err.get_ref()
+        && error_chain_contains_signer_header_marker(source)
+    {
+        return true;
     }
 
     let message = err.to_string().to_ascii_lowercase();
@@ -205,7 +205,7 @@ impl ObjSweeper {
 
     #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     pub fn with_version(&mut self, vid: Option<Uuid>) -> &Self {
-        self.version_id = vid.clone();
+        self.version_id = vid;
         self
     }
 
@@ -219,7 +219,7 @@ impl ObjSweeper {
     #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     pub fn get_opts(&self) -> lifecycle::ObjectOpts {
         let mut opts = ObjectOpts {
-            version_id: self.version_id.clone(),
+            version_id: self.version_id,
             versioned: self.versioned,
             version_suspended: self.suspended,
             ..Default::default()
@@ -255,6 +255,7 @@ impl ObjSweeper {
         }
         if del_tier {
             return Some(Jentry {
+                persisted_version: 0,
                 obj_name: self.remote_object.clone(),
                 version_id: self.transition_version_id.clone(),
                 tier_name: self.transition_tier.clone(),
@@ -266,6 +267,7 @@ impl ObjSweeper {
                 version_state: self.transition_version_state,
                 state: TierDeleteJournalState::Committed,
                 source: None,
+                dispatch: None,
             });
         }
         None
@@ -298,7 +300,17 @@ impl ObjSweeper {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum TierDeleteJournalState {
     Prepared,
+    Dispatched,
     Committed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TierDeleteDispatchBinding {
+    pub(crate) operation_id: Uuid,
+    pub(crate) manifest_object: String,
+    pub(crate) journal_set_sha256: String,
+    pub(crate) topology_generation: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -342,6 +354,10 @@ impl TierDeleteSourceIdentity {
 #[derive(Debug, Clone)]
 #[allow(unused_assignments)]
 pub struct Jentry {
+    /// On-disk format version when decoded. Newly constructed entries use 0;
+    /// the encoder chooses their format from the durable ownership fields.
+    /// Recovery uses this value to quarantine v1-v5 without rewriting them.
+    pub(crate) persisted_version: u8,
     pub(crate) obj_name: String,
     pub(crate) version_id: String,
     pub(crate) tier_name: String,
@@ -350,13 +366,30 @@ pub struct Jentry {
     pub(crate) version_state: rustfs_filemeta::TransitionVersionState,
     pub(crate) state: TierDeleteJournalState,
     pub(crate) source: Option<TierDeleteSourceIdentity>,
+    pub(crate) dispatch: Option<TierDeleteDispatchBinding>,
+}
+
+impl Jentry {
+    /// Whether this prepared transaction is eligible to become the sole
+    /// cleanup owner for its transitioned source. The caller may use this to
+    /// decide whether to persist it, but must not set `skip_free_version`
+    /// until persistence succeeds.
+    pub(crate) fn can_replace_tier_free_version(&self) -> bool {
+        self.state == TierDeleteJournalState::Prepared
+            && self.backend_identity.is_some()
+            && self.version_state != rustfs_filemeta::TransitionVersionState::Unknown
+            && self
+                .source
+                .as_ref()
+                .is_some_and(TierDeleteSourceIdentity::has_stable_identity)
+    }
 }
 
 impl ExpiryOp for Jentry {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        hasher.update(format!("{}", self.tier_name).as_bytes());
-        hasher.update(format!("{}", self.obj_name).as_bytes());
+        hasher.update(self.tier_name.as_bytes());
+        hasher.update(self.obj_name.as_bytes());
         xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
@@ -403,7 +436,7 @@ async fn delete_object_from_remote_tier_raw_with_manager(
     tier_name: &str,
     tier_config_mgr: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
 ) -> Result<(), std::io::Error> {
-    let lease = TierConfigMgr::acquire_operation_lease(&tier_config_mgr, tier_name)
+    let lease = TierConfigMgr::acquire_operation_lease(tier_config_mgr, tier_name)
         .await
         .map_err(std::io::Error::other)?;
     delete_object_from_remote_tier_raw_with_lease(obj_name, rv_id, &lease, false, true).await
@@ -542,6 +575,7 @@ pub(crate) async fn delete_confirmed_transition_candidate_exact_with_lease_idemp
 #[cfg(test)]
 static CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) async fn delete_confirmed_transition_candidate_exact_with_manager_and_identity(
     obj_name: &str,
     rv_id: &str,
@@ -617,6 +651,7 @@ pub fn transitioned_force_delete_journal_entry(
     }
 
     Some(Jentry {
+        persisted_version: 0,
         obj_name: transitioned.name.clone(),
         version_id: transitioned.version_id.clone(),
         tier_name: transitioned.tier.clone(),
@@ -628,6 +663,7 @@ pub fn transitioned_force_delete_journal_entry(
         version_state: transition_version_state,
         state: TierDeleteJournalState::Committed,
         source: None,
+        dispatch: None,
     })
 }
 
@@ -670,11 +706,13 @@ pub(crate) fn transitioned_delete_journal_entry_for_source(
 
 #[cfg(test)]
 mod test {
-    use crate::client::signer_error::invalid_utf8_header_error;
+    #[cfg(feature = "test-util")]
+    use super::delete_confirmed_transition_candidate_exact_with_manager_and_identity;
+    use rustfs_s3_client::signer_error::invalid_utf8_header_error;
 
     use super::{
-        CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES, ERR_REMOTE_DELETE_BREAKER_OPEN, ERR_REMOTE_DELETE_LIMITER_CLOSED,
-        RemoteDeleteBreaker, RemoteTierDeleteOutcome, delete_confirmed_transition_candidate_exact_with_manager_and_identity,
+        CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES, ERR_REMOTE_DELETE_BREAKER_OPEN, ERR_REMOTE_DELETE_LIMITER_CLOSED, Jentry,
+        RemoteDeleteBreaker, RemoteTierDeleteOutcome, TierDeleteJournalState, TierDeleteSourceIdentity,
         delete_object_from_remote_tier_idempotent, delete_object_from_remote_tier_idempotent_with_manager_and_identity,
         is_remote_tier_not_found_error, is_signer_header_error, lifecycle, set_remote_tier_delete_test_hook,
         should_record_remote_delete_failure, transitioned_delete_journal_entry, transitioned_force_delete_journal_entry,
@@ -683,6 +721,61 @@ mod test {
     use rustfs_filemeta::TransitionVersionState;
     use std::io::{Error, ErrorKind};
     use std::time::{Duration, Instant};
+
+    fn stable_prepared_journal() -> Jentry {
+        Jentry {
+            persisted_version: 0,
+            obj_name: "remote/object".to_string(),
+            version_id: "remote-version".to_string(),
+            tier_name: "WARM".to_string(),
+            backend_identity: Some([7; 32]),
+            version_id_exact: true,
+            version_state: TransitionVersionState::Exact,
+            state: TierDeleteJournalState::Prepared,
+            source: Some(TierDeleteSourceIdentity {
+                bucket: "bucket".to_string(),
+                object: "object".to_string(),
+                version_id: Some(uuid::Uuid::new_v4().to_string()),
+                versioned: true,
+                version_suspended: false,
+                data_dir: None,
+                etag: None,
+                mod_time: None,
+            }),
+            dispatch: None,
+        }
+    }
+
+    #[test]
+    fn only_stable_prepared_journal_can_replace_tier_free_version() {
+        let stable = stable_prepared_journal();
+        assert!(stable.can_replace_tier_free_version());
+
+        let mut committed = stable.clone();
+        committed.state = TierDeleteJournalState::Committed;
+        assert!(!committed.can_replace_tier_free_version());
+
+        let mut unbound = stable.clone();
+        unbound.backend_identity = None;
+        assert!(!unbound.can_replace_tier_free_version());
+
+        let mut unknown = stable.clone();
+        unknown.version_state = TransitionVersionState::Unknown;
+        assert!(!unknown.can_replace_tier_free_version());
+
+        let mut unstable = stable;
+        unstable.source = Some(TierDeleteSourceIdentity {
+            bucket: "bucket".to_string(),
+            object: "object".to_string(),
+            version_id: None,
+            versioned: false,
+            version_suspended: false,
+            data_dir: None,
+            etag: Some("etag-only".to_string()),
+            mod_time: None,
+        });
+        assert!(!unstable.can_replace_tier_free_version());
+    }
 
     #[test]
     fn signer_header_error_detection_matches_utf8_failures() {

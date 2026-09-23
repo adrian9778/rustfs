@@ -25,7 +25,8 @@ use crate::admin::{
     system,
 };
 use crate::cluster_snapshot::{
-    ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot, cluster_has_actionable_pressure,
+    ClusterPoolMetaWriteGateSnapshot, ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot,
+    cluster_has_actionable_pressure,
 };
 use crate::server::{ADMIN_PREFIX, ReadinessDegradedReason};
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -37,6 +38,9 @@ use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const USAGE_DEFERRED_STALE_THRESHOLD_SECS: u64 = 300;
 
 pub fn register_cluster_snapshot_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -151,6 +155,7 @@ pub(crate) struct ClusterSnapshotView {
     pub observability: ObservabilitySnapshot,
     pub workload_admission: Vec<WorkloadAdmissionView>,
     pub runtime_status: ClusterRuntimeStatusView,
+    pub pool_meta_write_gate: ClusterPoolMetaWriteGateView,
     pub actionable_pressure: bool,
 }
 
@@ -179,7 +184,54 @@ impl ClusterSnapshotView {
             observability: snapshot.observability,
             workload_admission: workload_admission_views(snapshot.workload_admission),
             runtime_status: ClusterRuntimeStatusView::from(snapshot.runtime_status),
+            pool_meta_write_gate: ClusterPoolMetaWriteGateView::from(snapshot.pool_meta_write_gate),
             actionable_pressure,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClusterPoolMetaWriteGateView {
+    pub state: &'static str,
+    pub writes_ready: bool,
+    pub write_blocked: bool,
+    pub transaction_aborted: bool,
+    pub pool_meta_absent: bool,
+    pub identity_initialized: Option<bool>,
+    pub identity_needs_repair: bool,
+    pub cluster_epoch: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since_unix_secs: Option<i64>,
+}
+
+impl From<ClusterPoolMetaWriteGateSnapshot> for ClusterPoolMetaWriteGateView {
+    fn from(snapshot: ClusterPoolMetaWriteGateSnapshot) -> Self {
+        let state = if snapshot.check_timed_out {
+            "check_timeout"
+        } else if snapshot.writes_ready {
+            "writable"
+        } else if snapshot.write_blocked || snapshot.transaction_aborted {
+            "blocked"
+        } else {
+            "unavailable"
+        };
+        Self {
+            state,
+            writes_ready: snapshot.writes_ready,
+            write_blocked: snapshot.write_blocked,
+            transaction_aborted: snapshot.transaction_aborted,
+            pool_meta_absent: snapshot.pool_meta_absent,
+            identity_initialized: snapshot.identity_initialized,
+            identity_needs_repair: snapshot.identity_needs_repair,
+            cluster_epoch: snapshot.cluster_epoch,
+            reason: snapshot.reason,
+            phase: snapshot.phase,
+            since_unix_secs: snapshot.since_unix_secs,
         }
     }
 }
@@ -242,7 +294,16 @@ pub(crate) struct ClusterUsageFreshnessStatus {
     pub last_usage_save_unix_secs: u64,
     pub last_usage_save_result: String,
     pub last_success_unix_secs: Option<u64>,
+    pub last_durable_success_unix_secs: u64,
+    pub last_publication_unix_secs: u64,
+    pub last_publication_state: String,
+    pub last_publication_reason: String,
     pub last_error: Option<String>,
+    pub deferred_pending: bool,
+    pub deferred_total: u64,
+    pub last_deferred_unix_secs: u64,
+    pub last_deferred_reason: String,
+    pub deferred_age_secs: Option<u64>,
 }
 
 fn component_status(source: &'static str, status: CapabilityStatus) -> ClusterComponentStatus {
@@ -644,6 +705,8 @@ fn summarize_storage_readiness(snapshot: &ClusterReadOnlySnapshot) -> Capability
         .iter()
         .filter_map(|reason| match reason {
             ReadinessDegradedReason::StorageQuorumUnavailable
+            | ReadinessDegradedReason::PoolMetaWriteBlocked
+            | ReadinessDegradedReason::PoolMetadataCheckTimeout
             | ReadinessDegradedReason::StorageAndIamUnavailable
             | ReadinessDegradedReason::StorageAndLockUnavailable
             | ReadinessDegradedReason::StorageIamAndLockUnavailable => Some(reason.as_str()),
@@ -701,32 +764,71 @@ fn summarize_listing_metacache(snapshot: &ClusterReadOnlySnapshot) -> ClusterLis
 
 fn summarize_usage_freshness(snapshot: &ClusterReadOnlySnapshot) -> ClusterUsageFreshnessStatus {
     let freshness = &snapshot.usage_freshness;
-    let (condition, status) = match freshness.last_usage_save_result.as_str() {
-        "success" if freshness.dirty_pending_buckets == 0 => (
-            "healthy",
-            CapabilityStatus::supported().with_reason("usage cache was saved successfully and has no pending dirty buckets"),
-        ),
-        "success" | "" if freshness.dirty_pending_buckets > 0 => (
+    let deferred_age_secs = (freshness.deferred_pending && freshness.last_deferred_unix_secs > 0).then(|| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        now.saturating_sub(freshness.last_deferred_unix_secs)
+    });
+    let deferred_stale = deferred_age_secs.is_some_and(|age| age > USAGE_DEFERRED_STALE_THRESHOLD_SECS);
+    let (condition, status) = if freshness.last_publication_state == "no_update" {
+        (
+            "no_update",
+            CapabilityStatus::unknown().with_reason("usage cache publication produced no update"),
+        )
+    } else if freshness.deferred_pending && deferred_stale {
+        (
             "stale",
-            CapabilityStatus::unknown()
-                .with_reason(format!("usage cache has {} pending dirty buckets", freshness.dirty_pending_buckets)),
-        ),
-        "skipped_stale" => (
-            "stale",
-            CapabilityStatus::unknown().with_reason("last usage cache save was skipped because scanner data was stale"),
-        ),
-        "failed" => ("degraded", CapabilityStatus::unknown().with_reason("last usage cache save failed")),
-        "encode_failed" => (
-            "degraded",
-            CapabilityStatus::unknown().with_reason("last usage cache save failed during encoding"),
-        ),
-        _ => (
-            "unknown",
-            CapabilityStatus::unknown().with_reason("no usage cache save result has been reported"),
-        ),
+            CapabilityStatus::unknown().with_reason(format!(
+                "usage cache publication has been deferred for {} seconds (threshold: {} seconds)",
+                deferred_age_secs.unwrap_or_default(),
+                USAGE_DEFERRED_STALE_THRESHOLD_SECS
+            )),
+        )
+    } else if freshness.deferred_pending {
+        (
+            "deferred",
+            CapabilityStatus::unknown().with_reason(if freshness.last_deferred_reason.is_empty() {
+                "usage cache publication is temporarily deferred"
+            } else {
+                freshness.last_deferred_reason.as_str()
+            }),
+        )
+    } else {
+        match freshness.last_usage_save_result.as_str() {
+            "success" if freshness.dirty_pending_buckets == 0 => (
+                "healthy",
+                CapabilityStatus::supported().with_reason("usage cache was saved successfully and has no pending dirty buckets"),
+            ),
+            "success" | "" if freshness.dirty_pending_buckets > 0 => (
+                "stale",
+                CapabilityStatus::unknown()
+                    .with_reason(format!("usage cache has {} pending dirty buckets", freshness.dirty_pending_buckets)),
+            ),
+            "skipped_stale" => (
+                "stale",
+                CapabilityStatus::unknown().with_reason("last usage cache save was skipped because scanner data was stale"),
+            ),
+            "failed" => ("degraded", CapabilityStatus::unknown().with_reason("last usage cache save failed")),
+            "encode_failed" => (
+                "degraded",
+                CapabilityStatus::unknown().with_reason("last usage cache save failed during encoding"),
+            ),
+            _ => (
+                "unknown",
+                CapabilityStatus::unknown().with_reason("no usage cache save result has been reported"),
+            ),
+        }
     };
-    let last_success_unix_secs = (freshness.last_usage_save_result == "success" && freshness.last_usage_save_unix_secs > 0)
-        .then_some(freshness.last_usage_save_unix_secs);
+    // Mixed-version nodes do not publish the additive durable timestamp yet;
+    // retain the legacy successful-save timestamp until all peers are upgraded.
+    let last_success_unix_secs = if freshness.last_durable_success_unix_secs > 0 {
+        Some(freshness.last_durable_success_unix_secs)
+    } else if freshness.last_usage_save_result == "success" && freshness.last_usage_save_unix_secs > 0 {
+        Some(freshness.last_usage_save_unix_secs)
+    } else {
+        None
+    };
     let last_error = match freshness.last_usage_save_result.as_str() {
         "failed" | "skipped_stale" | "encode_failed" => Some(freshness.last_usage_save_result.clone()),
         _ => None,
@@ -744,7 +846,16 @@ fn summarize_usage_freshness(snapshot: &ClusterReadOnlySnapshot) -> ClusterUsage
         last_usage_save_unix_secs: freshness.last_usage_save_unix_secs,
         last_usage_save_result: freshness.last_usage_save_result.clone(),
         last_success_unix_secs,
+        last_durable_success_unix_secs: freshness.last_durable_success_unix_secs,
+        last_publication_unix_secs: freshness.last_publication_unix_secs,
+        last_publication_state: freshness.last_publication_state.clone(),
+        last_publication_reason: freshness.last_publication_reason.clone(),
         last_error,
+        deferred_pending: freshness.deferred_pending,
+        deferred_total: freshness.deferred_total,
+        last_deferred_unix_secs: freshness.last_deferred_unix_secs,
+        last_deferred_reason: freshness.last_deferred_reason.clone(),
+        deferred_age_secs,
     }
 }
 
@@ -907,7 +1018,9 @@ fn summarize_named_capability_statuses<const N: usize>(
 
 #[cfg(test)]
 mod tests {
-    use super::{ClusterMembershipView, ClusterSnapshotResponse, ClusterSnapshotSummary, ClusterSnapshotView};
+    use super::{
+        ClusterMembershipView, ClusterPoolMetaWriteGateView, ClusterSnapshotResponse, ClusterSnapshotSummary, ClusterSnapshotView,
+    };
     use crate::admin::storage_api::cluster::CapabilityState;
     use crate::admin::storage_api::cluster::{CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
     use crate::admin::storage_api::cluster::{
@@ -916,8 +1029,8 @@ mod tests {
         ClusterPoolStateSnapshot, ClusterRpcBoundarySnapshot, ClusterRpcChannelSnapshot, ClusterRpcPlane, ClusterRpcTransport,
     };
     use crate::cluster_snapshot::{
-        ClusterListingDiagnosticsSnapshot, ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot,
-        ClusterUsageFreshnessSnapshot,
+        ClusterListingDiagnosticsSnapshot, ClusterPoolMetaWriteGateSnapshot, ClusterReadOnlySnapshot,
+        ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot, ClusterUsageFreshnessSnapshot,
     };
     use crate::shared_types::{DependencyReadiness, ReadinessDegradedReason};
     use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadClass};
@@ -972,6 +1085,64 @@ mod tests {
     fn cluster_snapshot_response_serializes_none_snapshot() {
         let value = serde_json::to_value(ClusterSnapshotResponse { snapshot: None }).expect("serialize response");
         assert_eq!(value, serde_json::json!({ "snapshot": null }));
+    }
+
+    #[test]
+    fn pool_meta_write_gate_details_are_additive_and_clear_when_not_blocked() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct LegacyGate {
+            writes_ready: bool,
+            write_blocked: bool,
+            transaction_aborted: bool,
+        }
+
+        let blocked = ClusterPoolMetaWriteGateSnapshot {
+            writes_ready: false,
+            transaction_aborted: true,
+            reason: Some("transaction_unknown"),
+            phase: Some("publication"),
+            since_unix_secs: Some(1_700_000_000),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(ClusterPoolMetaWriteGateView::from(blocked)).unwrap();
+        assert_eq!(value["state"], "blocked");
+        assert_eq!(value["reason"], "transaction_unknown");
+        assert_eq!(value["phase"], "publication");
+        assert_eq!(value["sinceUnixSecs"], 1_700_000_000);
+        assert!(value.get("since_unix_secs").is_none());
+        assert!(value.get("operation").is_none());
+        assert!(value.get("source").is_none());
+        let legacy: LegacyGate = serde_json::from_value(value).unwrap();
+        assert!(!legacy.writes_ready);
+        assert!(!legacy.write_blocked);
+        assert!(legacy.transaction_aborted);
+
+        for (snapshot, state) in [
+            (ClusterPoolMetaWriteGateSnapshot::default(), "writable"),
+            (
+                ClusterPoolMetaWriteGateSnapshot {
+                    writes_ready: false,
+                    check_timed_out: true,
+                    ..Default::default()
+                },
+                "check_timeout",
+            ),
+            (
+                ClusterPoolMetaWriteGateSnapshot {
+                    writes_ready: false,
+                    ..Default::default()
+                },
+                "unavailable",
+            ),
+        ] {
+            let value = serde_json::to_value(ClusterPoolMetaWriteGateView::from(snapshot)).unwrap();
+            assert_eq!(value["state"], state);
+            assert_eq!(value["writesReady"], state == "writable");
+            for field in ["reason", "phase", "sinceUnixSecs"] {
+                assert!(value.get(field).is_none(), "{state} must not retain {field}: {value}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -1063,6 +1234,15 @@ mod tests {
             listing_diagnostics: ClusterListingDiagnosticsSnapshot {
                 internode_stall_timeouts_total: 2,
             },
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot {
+                writes_ready: false,
+                write_blocked: true,
+                transaction_aborted: true,
+                identity_initialized: Some(true),
+                identity_needs_repair: true,
+                cluster_epoch: Some(7),
+                ..Default::default()
+            },
         };
 
         let value = serde_json::to_value(ClusterSnapshotView::from_snapshot(snapshot, Some(":::9000".to_string())))
@@ -1075,6 +1255,13 @@ mod tests {
         assert_eq!(value["components"]["listing"]["source"], "workload_admission+internode_metrics");
         assert_eq!(value["components"]["listing"]["condition"], "unknown");
         assert_eq!(value["components"]["listing"]["internode_stall_timeouts_total"], 2);
+        assert_eq!(value["pool_meta_write_gate"]["writesReady"], false);
+        assert_eq!(value["pool_meta_write_gate"]["writeBlocked"], true);
+        assert_eq!(value["pool_meta_write_gate"]["transactionAborted"], true);
+        assert_eq!(value["pool_meta_write_gate"]["identityInitialized"], true);
+        assert_eq!(value["pool_meta_write_gate"]["identityNeedsRepair"], true);
+        assert_eq!(value["pool_meta_write_gate"]["clusterEpoch"], 7);
+        assert_eq!(value["actionable_pressure"], true);
         assert_eq!(value["components"]["usage"]["source"], "scanner_metrics");
         assert_eq!(value["components"]["usage"]["condition"], "stale");
         assert_eq!(value["membership"]["nodes"][0]["server_info_endpoint"], ":::9000");
@@ -1132,6 +1319,7 @@ mod tests {
             },
             usage_freshness: ClusterUsageFreshnessSnapshot::default(),
             listing_diagnostics: ClusterListingDiagnosticsSnapshot::default(),
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot::default(),
         };
 
         let summary = ClusterSnapshotSummary::from(&snapshot);
@@ -1198,6 +1386,7 @@ mod tests {
             listing_diagnostics: ClusterListingDiagnosticsSnapshot {
                 internode_stall_timeouts_total: 0,
             },
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot::default(),
         };
 
         let view = ClusterSnapshotView::from(snapshot);
@@ -1223,6 +1412,46 @@ mod tests {
     }
 
     #[test]
+    fn cluster_snapshot_storage_summary_reports_pool_meta_write_blocked() {
+        let snapshot = ClusterReadOnlySnapshot {
+            topology: TopologySnapshot::default(),
+            membership: ClusterMembershipSnapshot::default(),
+            pool_state: ClusterPoolStateSnapshot::default(),
+            local_storage: ClusterLocalNodeStorageSnapshot::default(),
+            peer_health: ClusterPeerHealthSnapshot::default(),
+            rpc_boundary: sample_rpc_boundary_snapshot(),
+            observability: ObservabilitySnapshot::default(),
+            workload_admission: WorkloadAdmissionRegistrySnapshot::new(Vec::new()),
+            runtime_status: ClusterRuntimeStatusSnapshot {
+                readiness: DependencyReadiness {
+                    storage_ready: false,
+                    iam_ready: true,
+                    lock_quorum_ready: true,
+                    peer_health_ready: true,
+                },
+                state: ClusterRuntimeReadinessState::Degraded,
+                degraded_reasons: vec![ReadinessDegradedReason::PoolMetaWriteBlocked],
+            },
+            usage_freshness: ClusterUsageFreshnessSnapshot::default(),
+            listing_diagnostics: ClusterListingDiagnosticsSnapshot::default(),
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot {
+                writes_ready: false,
+                write_blocked: true,
+                ..Default::default()
+            },
+        };
+
+        let view = ClusterSnapshotView::from(snapshot);
+
+        assert_eq!(view.components.storage.status.state, CapabilityState::Unknown);
+        assert_eq!(
+            view.components.storage.status.reason.as_deref(),
+            Some("storage readiness degraded: pool_meta_write_blocked")
+        );
+        assert_eq!(view.components.storage.condition, "degraded");
+    }
+
+    #[test]
     fn cluster_snapshot_listing_component_keeps_historical_stalls_as_evidence() {
         let snapshot = ClusterReadOnlySnapshot {
             topology: TopologySnapshot::default(),
@@ -1245,6 +1474,7 @@ mod tests {
             listing_diagnostics: ClusterListingDiagnosticsSnapshot {
                 internode_stall_timeouts_total: 2,
             },
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot::default(),
         };
 
         let component = super::summarize_listing_metacache(&snapshot);
@@ -1282,11 +1512,13 @@ mod tests {
             usage_freshness: ClusterUsageFreshnessSnapshot {
                 dirty_pending_buckets: 0,
                 last_usage_save_unix_secs: 456,
+                last_durable_success_unix_secs: 450,
                 last_usage_save_result: "success".to_string(),
                 last_usage_save_result_code: 1,
                 ..Default::default()
             },
             listing_diagnostics: ClusterListingDiagnosticsSnapshot::default(),
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot::default(),
         };
 
         let component = super::summarize_usage_freshness(&snapshot);
@@ -1295,6 +1527,12 @@ mod tests {
         assert_eq!(component.condition, "healthy");
         assert_eq!(component.last_usage_save_unix_secs, 456);
         assert_eq!(component.last_usage_save_result, "success");
+        assert_eq!(component.last_success_unix_secs, Some(450));
+
+        let mut legacy_snapshot = snapshot;
+        legacy_snapshot.usage_freshness.last_durable_success_unix_secs = 0;
+        let legacy_component = super::summarize_usage_freshness(&legacy_snapshot);
+        assert_eq!(legacy_component.last_success_unix_secs, Some(456));
     }
 
     #[test]
@@ -1318,6 +1556,7 @@ mod tests {
                 ..Default::default()
             },
             listing_diagnostics: ClusterListingDiagnosticsSnapshot::default(),
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot::default(),
         };
 
         let component = super::summarize_usage_freshness(&snapshot);
@@ -1367,6 +1606,7 @@ mod tests {
             },
             usage_freshness: ClusterUsageFreshnessSnapshot::default(),
             listing_diagnostics: ClusterListingDiagnosticsSnapshot::default(),
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot::default(),
         };
 
         let summary = ClusterSnapshotSummary::from(&snapshot);

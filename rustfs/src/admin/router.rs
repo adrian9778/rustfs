@@ -18,7 +18,7 @@ use super::storage_api::bucket::replication::{self, BucketReplicationResyncStatu
 use super::storage_api::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
 use super::storage_api::bucket::target_sys::{
     BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, SsecPassthroughCapability, TargetClient,
-    append_version_id_query,
+    VersionIdentityCapability, append_version_id_query, resolve_delete_api_version_id,
 };
 use super::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use super::storage_api::bucket::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
@@ -34,7 +34,7 @@ use crate::admin::runtime_sources::{
 };
 use crate::admin::storage_api::access::{ReqInfo, authorize_request, spawn_traced};
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
-use crate::auth::{check_key_valid, constant_time_eq, get_session_token};
+use crate::auth::{check_key_valid, constant_time_eq, get_session_token, reject_unsigned_amz_headers_on_sigv4_request};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{
@@ -1013,7 +1013,7 @@ fn build_get_object_response_headers(output: &GetObjectOutput, base_headers: &He
         insert_string_header(&mut headers, http::header::LAST_MODIFIED, format_timestamp_http_date(last_modified)?)?;
     }
     if let Some(expires) = &output.expires {
-        insert_string_header(&mut headers, http::header::EXPIRES, format_timestamp_http_date(expires)?)?;
+        insert_string_header(&mut headers, http::header::EXPIRES, expires.clone())?;
     }
     if let Some(version_id) = &output.version_id {
         insert_string_header(&mut headers, HeaderName::from_static("x-amz-version-id"), version_id.clone())?;
@@ -2100,6 +2100,18 @@ async fn check_replication_target(
         }
         _ => {}
     }
+    // Same for the identity verdict: once a target is known to mint its own
+    // version ids, the worker locates replicas by content identity instead of
+    // re-driving PUTs whenever a version-addressed HEAD answers 404.
+    match (result.phases.version_fidelity.status, result.phases.version_fidelity.code) {
+        ("OK", _) => {
+            BucketTargetSys::get().record_version_identity_capability(&target.arn, VersionIdentityCapability::Adopts);
+        }
+        ("FAILED", Some(REPLICATION_CHECK_CODE_VERSION_MISMATCH)) => {
+            BucketTargetSys::get().record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        }
+        _ => {}
+    }
 
     result
 }
@@ -2233,12 +2245,13 @@ async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, op
     match operations.put().await {
         Ok(outcome) => {
             result.phases.put = ReplicationCheckPhaseStatus::passed();
-            // P1-19 version-identity contract: replication only converges on
-            // targets that adopt the source version id — version-addressed
-            // deletes and heal re-drives never match a minted id. Judge it
-            // from the probe PUT's own response; on mismatch the later
-            // mutation phases are pointless (they address by version id), but
-            // cleanup still runs against whatever id the target assigned.
+            // P1-19 version-identity contract: a target that mints its own
+            // version ids never answers to the source id. Judge it from the
+            // probe PUT's own response. The mutation phases below still run
+            // on such a target: they address the id the target assigned —
+            // the same ledger the replication worker records per object
+            // (rustfs/backlog#2340) — so they report whether version-
+            // addressed deletes can converge there at all.
             match version_fidelity_error("PutObject", &outcome) {
                 None => result.phases.version_fidelity = ReplicationCheckPhaseStatus::passed(),
                 Some(error) => {
@@ -2313,7 +2326,12 @@ async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, op
         }
     }
 
-    if result.phases.put.status == "OK" && result.phases.version_fidelity.status == "OK" {
+    // DeleteMarker / VersionDelete address `probe_version_id`, the id the
+    // target actually assigned, so they run on a drifting target too. What
+    // they cannot prove there is the source-id addressing VersionFidelity
+    // already failed; what they do prove is that the ledger-addressed purge
+    // path the worker uses on such a target works against this endpoint.
+    if result.phases.put.status == "OK" && probe_version_id.is_some() {
         match operations.create_delete_marker(probe_version_id.as_deref()).await {
             Ok(version_id) => {
                 delete_marker_version_id = version_id;
@@ -2727,12 +2745,22 @@ async fn delete_replication_probe_object(
         insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_CHECK, "true");
     }
 
+    if let Some(version_id) = version_id {
+        insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, version_id);
+    }
+
+    // Same wire shape as live delete replication: a marker creation carries
+    // no `versionId` (the target mints the marker), a version delete does. A
+    // generic S3 target handed the version id on the marker step would
+    // permanently delete the probe version instead, and the VersionDelete
+    // phase would then find nothing (seen on Wasabi).
+    let api_version_id = resolve_delete_api_version_id(version_id.map(ToOwned::to_owned), &options);
     target_client
         .client
         .delete_object()
         .bucket(target_bucket)
         .key(probe_key)
-        .set_version_id(version_id.map(ToOwned::to_owned))
+        .set_version_id(api_version_id)
         .customize()
         .map_request(move |mut req| {
             for (key, value) in headers.clone() {
@@ -2764,6 +2792,14 @@ async fn delete_replication_probe_version(
         .map_err(S3ClientError::from)
 }
 
+/// The VersionDelete phase already removed the probe version the cleanup is
+/// handed, and a strict S3 target (Wasabi) answers a second DELETE of that
+/// id with `NoSuchVersion` where RustFS/MinIO answer 204: the goal is met
+/// either way.
+fn probe_version_already_gone(err: &S3ClientError) -> bool {
+    matches!(err.code.as_deref(), Some("NoSuchKey" | "NoSuchVersion"))
+}
+
 async fn cleanup_replication_probe<'a>(
     target_client: &TargetClient,
     target_bucket: &str,
@@ -2775,6 +2811,7 @@ async fn cleanup_replication_probe<'a>(
     for version_id in known_version_ids.into_iter().flatten() {
         if deleted_ids.insert(version_id.to_string())
             && let Err(err) = delete_replication_probe_version(target_client, target_bucket, probe_key, version_id).await
+            && !probe_version_already_gone(&err)
         {
             errors.push(format_replication_check_client_error(
                 &err,
@@ -2820,6 +2857,7 @@ async fn cleanup_replication_probe<'a>(
         for version_id in discovered_ids {
             if deleted_ids.insert(version_id.clone())
                 && let Err(err) = delete_replication_probe_version(target_client, target_bucket, probe_key, &version_id).await
+                && !probe_version_already_gone(&err)
             {
                 errors.push(format_replication_check_client_error(
                     &err,
@@ -3231,6 +3269,10 @@ where
 
     // check_access before call
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
+        // GHSA-g8w9-qw9q-fghr: custom routes bypass `S3Access::check`, so the
+        // SigV4 signed-header rule is enforced here as well.
+        reject_unsigned_amz_headers_on_sigv4_request(&req.headers, req.uri.query())?;
+
         if let Some(server_ctx) = &self.server_ctx {
             req.extensions.insert(server_ctx.clone());
             if !is_public_health_path(req.uri.path()) && server_ctx.installed_app_context().is_none() {
@@ -3882,6 +3924,8 @@ mod tests {
         version_delete_error: Option<&'static str>,
         cleanup_error: Option<&'static str>,
         calls: Vec<&'static str>,
+        /// Version ids the delete-marker and version-delete phases addressed.
+        mutation_ids: Vec<Option<String>>,
         cleanup_ids: Vec<Option<String>>,
     }
 
@@ -3926,16 +3970,18 @@ mod tests {
             }
         }
 
-        async fn create_delete_marker(&mut self, _version_id: Option<&str>) -> Result<Option<String>, S3ClientError> {
+        async fn create_delete_marker(&mut self, version_id: Option<&str>) -> Result<Option<String>, S3ClientError> {
             self.calls.push("delete-marker");
+            self.mutation_ids.push(version_id.map(ToOwned::to_owned));
             match self.delete_marker_error {
                 Some(code) => Err(scripted_probe_error(code)),
                 None => Ok(Some("marker-version".to_string())),
             }
         }
 
-        async fn delete_version(&mut self, _version_id: Option<&str>) -> Result<(), S3ClientError> {
+        async fn delete_version(&mut self, version_id: Option<&str>) -> Result<(), S3ClientError> {
             self.calls.push("version-delete");
+            self.mutation_ids.push(version_id.map(ToOwned::to_owned));
             match self.version_delete_error {
                 Some(code) => Err(scripted_probe_error(code)),
                 None => Ok(()),
@@ -3956,12 +4002,12 @@ mod tests {
     }
 
     /// P1-19: a target that mints its own version ids must fail the
-    /// VersionFidelity phase with the machine-readable mismatch code, skip
-    /// the version-addressed mutation phases (they cannot mean anything on a
-    /// drifting target), and still clean up using the id the target actually
-    /// assigned — the source-derived id would never match.
+    /// VersionFidelity phase with the machine-readable mismatch code. The
+    /// mutation phases still run, addressing the id the target assigned
+    /// (the ledger the worker records per object, rustfs/backlog#2340), and
+    /// cleanup uses that id too — the source-derived id would never match.
     #[tokio::test]
-    async fn replication_probe_flags_version_minting_target() {
+    async fn replication_probe_flags_version_minting_target_and_probes_mutations_by_assigned_id() {
         let mut result = replication_check_target("arn:a", "OK", None);
         let mut operations = ScriptedReplicationProbe {
             minted_version_id: Some("target-minted-version"),
@@ -3970,16 +4016,52 @@ mod tests {
 
         execute_replication_probe(&mut result, &mut operations).await;
 
-        assert_eq!(operations.calls, ["put", "cleanup"]);
+        assert_eq!(operations.calls, ["put", "delete-marker", "version-delete", "cleanup"]);
         assert_eq!(result.status, "FAILED");
         assert_eq!(result.phases.put.status, "OK");
         assert_eq!(result.phases.version_fidelity.status, "FAILED");
         assert_eq!(result.phases.version_fidelity.code, Some(REPLICATION_CHECK_CODE_VERSION_MISMATCH));
-        assert_eq!(result.phases.delete_marker.status, "SKIPPED");
-        assert_eq!(result.phases.version_delete.status, "SKIPPED");
+        assert_eq!(result.phases.delete_marker.status, "OK");
+        assert_eq!(result.phases.version_delete.status, "OK");
+        assert_eq!(
+            operations.mutation_ids,
+            [
+                Some("target-minted-version".to_string()),
+                Some("target-minted-version".to_string())
+            ],
+            "both mutation phases must address the id the target assigned"
+        );
         assert_eq!(result.phases.ssec_passthrough.status, "SKIPPED");
         assert_eq!(result.phases.cleanup.status, "OK");
-        assert_eq!(operations.cleanup_ids, [Some("target-minted-version".to_string()), None, None, None]);
+        assert_eq!(
+            operations.cleanup_ids,
+            [
+                Some("target-minted-version".to_string()),
+                None,
+                None,
+                Some("marker-version".to_string())
+            ]
+        );
+    }
+
+    /// A drifting target that also refuses the ledger-addressed delete keeps
+    /// the phase-level evidence: VersionDelete fails on its own, apart from
+    /// the identity verdict.
+    #[tokio::test]
+    async fn replication_probe_reports_version_delete_failure_on_a_drifting_target() {
+        let mut result = replication_check_target("arn:a", "OK", None);
+        let mut operations = ScriptedReplicationProbe {
+            minted_version_id: Some("target-minted-version"),
+            version_delete_error: Some("AccessDenied"),
+            ..Default::default()
+        };
+
+        execute_replication_probe(&mut result, &mut operations).await;
+
+        assert_eq!(result.phases.version_fidelity.status, "FAILED");
+        assert_eq!(result.phases.delete_marker.status, "OK");
+        assert_eq!(result.phases.version_delete.status, "FAILED");
+        assert_eq!(result.phases.cleanup.status, "OK");
     }
 
     #[tokio::test]
@@ -4649,6 +4731,25 @@ mod tests {
 
         let listen_root_route = parse_misc_extension_request(&Method::GET, &listen_root).expect("root listen route should parse");
         assert_eq!(listen_root_route, MiscExtRoute::ListenNotification { bucket: None });
+    }
+
+    #[test]
+    fn s3_route_claims_listen_notification_before_generated_s3_routes() {
+        let router: S3Router<StatusOperation> = S3Router::new(false);
+        let headers = HeaderMap::new();
+
+        for uri in [
+            "/?events=s3:ObjectRemoved:*&x-id=ListenNotification",
+            "/demo-bucket?events=s3:ObjectCreated:*&x-id=ListenBucketNotification",
+            "/demo-bucket/?events=s3:ObjectCreated:*&events=s3:ObjectRemoved:Delete",
+        ] {
+            let uri: Uri = uri.parse().expect("uri should parse");
+            let mut extensions = http::Extensions::new();
+            assert!(
+                router.is_match(&Method::GET, &uri, &headers, &mut extensions),
+                "listen notification custom route must claim {uri}"
+            );
+        }
     }
 
     #[test]
@@ -5512,6 +5613,75 @@ mod tests {
             .await
             .expect_err("anonymous extension request must be denied");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    /// GHSA-g8w9-qw9q-fghr: custom routes must apply the presigned
+    /// signed-header rule too, since they never reach `S3Access::check`.
+    #[tokio::test]
+    async fn ghsa_g8w9_check_access_rejects_unsigned_amz_header_on_presigned_custom_route() {
+        let router: S3Router<AdminOperation> = S3Router::new(false);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-tagging", HeaderValue::from_static("owner=attacker"));
+        let mut req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: "/demo-bucket?replication-metrics&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test%2F20260827%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=signature"
+                .parse()
+                .expect("uri should parse"),
+            headers,
+            extensions: http::Extensions::new(),
+            credentials: Some(s3s::auth::Credentials {
+                access_key: "test".into(),
+                secret_key: s3s::auth::SecretKey::from("secret".to_string()),
+            }),
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = router
+            .check_access(&mut req)
+            .await
+            .expect_err("presigned custom-route request with an unsigned x-amz header must be denied");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.message(), Some(crate::auth::UNSIGNED_HEADERS_MESSAGE));
+    }
+
+    /// GHSA-xm99-m3gq-83g8: custom routes must apply the header-signed SigV4
+    /// signed-header rule too, since they never reach `S3Access::check`.
+    #[tokio::test]
+    async fn ghsa_xm99_check_access_rejects_unsigned_amz_header_on_header_signed_custom_route() {
+        let router: S3Router<AdminOperation> = S3Router::new(false);
+        let mut headers = HeaderMap::new();
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=test/20260827/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={}",
+            "0".repeat(64)
+        );
+        headers.insert("authorization", authorization.parse().expect("authorization"));
+        headers.insert("x-amz-date", HeaderValue::from_static("20260827T000000Z"));
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static("UNSIGNED-PAYLOAD"));
+        headers.insert("x-amz-tagging", HeaderValue::from_static("owner=attacker"));
+        let mut req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: "/demo-bucket?replication-metrics".parse().expect("uri should parse"),
+            headers,
+            extensions: http::Extensions::new(),
+            credentials: Some(s3s::auth::Credentials {
+                access_key: "test".into(),
+                secret_key: s3s::auth::SecretKey::from("secret".to_string()),
+            }),
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = router
+            .check_access(&mut req)
+            .await
+            .expect_err("header-signed custom-route request with an unsigned x-amz header must be denied");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.message(), Some(crate::auth::UNSIGNED_HEADERS_MESSAGE));
     }
 
     // backlog#1052 S2: the router hands its server's context slot to every

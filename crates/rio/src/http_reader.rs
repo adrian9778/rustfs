@@ -57,6 +57,7 @@ const EXCESSIVE_EMPTY_CHUNKS_ERROR: &str = "HTTP body returned too many empty ch
 pub const INTERNODE_DISK_ERROR_HEADER: &str = "x-rustfs-disk-error";
 pub const INTERNODE_FILE_NOT_FOUND: &str = "file-not-found";
 pub const INTERNODE_VOLUME_NOT_FOUND: &str = "volume-not-found";
+pub const INTERNODE_FILE_CORRUPT: &str = "file-corrupt";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InternodeHttpErrorKind {
@@ -185,6 +186,7 @@ pub struct InternodeHttpError {
 enum RemoteDiskErrorKind {
     FileNotFound,
     VolumeNotFound,
+    FileCorrupt,
 }
 
 impl std::fmt::Debug for InternodeHttpError {
@@ -213,6 +215,10 @@ impl InternodeHttpError {
 
     pub fn is_remote_volume_not_found(&self) -> bool {
         self.remote_disk_error == Some(RemoteDiskErrorKind::VolumeNotFound)
+    }
+
+    pub fn is_remote_file_corrupt(&self) -> bool {
+        self.remote_disk_error == Some(RemoteDiskErrorKind::FileCorrupt)
     }
 
     fn new(kind: InternodeHttpErrorKind, context: InternodeHttpRequestContext) -> Self {
@@ -328,6 +334,20 @@ pub fn new_test_remote_volume_not_found_http_io_error() -> io::Error {
     .into_io_error()
 }
 
+#[doc(hidden)]
+pub fn new_test_remote_file_corrupt_http_io_error() -> io::Error {
+    InternodeHttpError::with_remote_disk_error(
+        InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        InternodeHttpRequestContext {
+            method: "GET".to_string(),
+            target: READ_FILE_STREAM_PATH.to_string(),
+            operation: Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        },
+        RemoteDiskErrorKind::FileCorrupt,
+    )
+    .into_io_error()
+}
+
 fn add_root_certificates_from_der(builder: reqwest::ClientBuilder, certs_der: &[Vec<u8>]) -> reqwest::ClientBuilder {
     let mut b = builder;
     for der in certs_der {
@@ -392,8 +412,8 @@ struct InternodeHttpClientTuning {
     http2_initial_connection_window_size: Option<u32>,
     http2_adaptive_window: bool,
     proxy_mode: InternodeHttpProxyMode,
-    /// True when the operator explicitly configured any HTTP/2 tuning knob
-    /// (a window size, the keepalive timeout, or a non-default tuning profile).
+    /// True when the operator explicitly configured an HTTP/2 window or a
+    /// non-default tuning profile.
     /// Used to warn once when that tuning is inert because the internode
     /// connection negotiated HTTP/1.1 over plaintext (backlog#805-C3).
     h2_tuning_explicit: bool,
@@ -410,7 +430,7 @@ impl InternodeHttpClientTuning {
     fn from_env() -> Self {
         let profile =
             parse_internode_http_tuning_profile(get_env_opt_str(rustfs_config::ENV_INTERNODE_HTTP_TUNING_PROFILE).as_deref());
-        let mut tuning = Self::from_values(
+        Self::from_values(
             profile,
             get_env_opt_usize(rustfs_config::ENV_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST),
             get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS),
@@ -421,14 +441,7 @@ impl InternodeHttpClientTuning {
                 profile.default_http2_adaptive_window(),
             ),
             get_env_opt_str(rustfs_config::ENV_INTERNODE_HTTP_PROXY).as_deref(),
-        );
-        // The keepalive timeout env is read in build_http_client, not passed to
-        // from_values; fold it into the explicit-tuning signal here so the
-        // inert-h2 warning also fires when only the keepalive knob is set.
-        if get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS).is_some() {
-            tuning.h2_tuning_explicit = true;
-        }
-        tuning
+        )
     }
 
     fn from_values(
@@ -442,7 +455,6 @@ impl InternodeHttpClientTuning {
     ) -> Self {
         // Explicit h2 tuning = an operator-set window size (raw arg, before the
         // profile fallback) or a non-default (non-Legacy) tuning profile. The
-        // keepalive-env contribution is OR-ed in by from_env.
         let h2_tuning_explicit =
             stream_window_size.is_some() || connection_window_size.is_some() || profile != InternodeHttpTuningProfile::Legacy;
         Self {
@@ -530,11 +542,11 @@ fn clamp_http2_window(value: Option<u64>) -> Option<u32> {
 /// Applies internode HTTP client tuning (connection pool + HTTP/2 window
 /// sizes) to a reqwest client builder.
 ///
-/// IMPORTANT (backlog#805-C3): the HTTP/2 window and keepalive settings only
+/// IMPORTANT (backlog#805-C3): the HTTP/2 window settings only
 /// take effect when the internode connection actually negotiates HTTP/2, which
 /// happens via TLS-ALPN. Over plaintext internode transport the connection is
-/// HTTP/1.1 and every `http2_*` knob here (and the keepalive settings in
-/// `build_http_client`) is silently inert. Enable internode TLS to use them.
+/// HTTP/1.1 and every `http2_*` knob here is silently inert. Enable internode
+/// TLS to use them.
 /// `should_warn_h2_inert` emits a one-time warning when explicitly-configured
 /// h2 tuning is observed to be inert on a live connection.
 fn apply_http_client_tuning(mut builder: reqwest::ClientBuilder, tuning: InternodeHttpClientTuning) -> reqwest::ClientBuilder {
@@ -557,23 +569,26 @@ fn apply_http_client_tuning(mut builder: reqwest::ClientBuilder, tuning: Interno
     builder
 }
 
+/// Apply liveness detection for the internode HTTP data plane.
+///
+/// Hyper does not cancel a pending HTTP/2 keepalive deadline when DATA resumes.
+/// Under connection-level backpressure, a PING ACK can therefore remain queued
+/// behind healthy stream traffic until the timeout closes every multiplexed
+/// stream. Long-running data-plane paths already enforce operation-specific
+/// stall and total deadlines, while TCP keepalive covers a dead peer, so
+/// HTTP/2 PING keepalive is deliberately disabled for this client.
+fn apply_http_data_plane_liveness(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder
+        .tcp_keepalive(std::time::Duration::from_secs(rustfs_config::DEFAULT_INTERNODE_TCP_KEEPALIVE_SECS))
+        .http2_keep_alive_interval(None::<std::time::Duration>)
+}
+
 async fn build_http_client(
     disable_proxy: bool,
     tuning: InternodeHttpClientTuning,
     outbound_tls: &rustfs_tls_runtime::GlobalPublishedOutboundTlsState,
 ) -> io::Result<Client> {
-    // Keep the data-plane HTTP/2 keepalive timeout consistent with the control-plane
-    // gRPC channel and env-configurable. A too-aggressive value (e.g. 3s) tears down a
-    // busy data connection when a PING ACK is delayed under load, aborting in-flight
-    // shard read streams and truncating large-object GETs mid-stream (backlog#832).
-    let http2_keepalive_timeout_secs = get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS)
-        .unwrap_or(rustfs_config::DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS);
-    let mut builder = Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .tcp_keepalive(std::time::Duration::from_secs(10))
-        .http2_keep_alive_interval(std::time::Duration::from_secs(5))
-        .http2_keep_alive_timeout(std::time::Duration::from_secs(http2_keepalive_timeout_secs))
-        .http2_keep_alive_while_idle(true);
+    let mut builder = apply_http_data_plane_liveness(Client::builder().connect_timeout(std::time::Duration::from_secs(5)));
     builder = apply_http_client_tuning(builder, tuning);
 
     if disable_proxy {
@@ -855,6 +870,7 @@ fn classify_http_response(
     let remote_disk_error = match headers.get(INTERNODE_DISK_ERROR_HEADER).and_then(|value| value.to_str().ok()) {
         Some(INTERNODE_FILE_NOT_FOUND) => Some(RemoteDiskErrorKind::FileNotFound),
         Some(INTERNODE_VOLUME_NOT_FOUND) => Some(RemoteDiskErrorKind::VolumeNotFound),
+        Some(INTERNODE_FILE_CORRUPT) => Some(RemoteDiskErrorKind::FileCorrupt),
         _ => None,
     };
     ClassifiedHttpResponse { kind, remote_disk_error }
@@ -1592,7 +1608,7 @@ static H2_INERT_WARNED: AtomicBool = AtomicBool::new(false);
 /// inert. Warn only when the negotiated protocol is not HTTP/2, the operator
 /// explicitly configured h2 tuning, and we have not warned before. HTTP/2 for
 /// internode is negotiated via TLS-ALPN; over plaintext the connection is
-/// HTTP/1.1 and the h2 window/keepalive knobs are silently ignored.
+/// HTTP/1.1 and the h2 window knobs are silently ignored.
 fn should_warn_h2_inert(negotiated_is_http2: bool, h2_tuning_explicit: bool, already_warned: bool) -> bool {
     !negotiated_is_http2 && h2_tuning_explicit && !already_warned
 }
@@ -1609,7 +1625,7 @@ fn maybe_warn_h2_inert(negotiated_version: Version) {
             .is_ok()
     {
         warn!(
-            "internode connection negotiated HTTP/1.1 while HTTP/2 tuning is configured; the HTTP/2 window/keepalive settings apply only over internode TLS (h2 is negotiated via ALPN) — enable internode TLS to use them."
+            "internode connection negotiated HTTP/1.1 while HTTP/2 tuning is configured; the HTTP/2 window settings apply only over internode TLS (h2 is negotiated via ALPN) — enable internode TLS to use them."
         );
     }
 }
@@ -1866,7 +1882,10 @@ mod tests {
     use axum::{Router, body::Body, extract::State, http::StatusCode, response::IntoResponse, routing::get};
     use futures::stream::{self, StreamExt as _};
     use http_body_util::BodyExt as _;
+    use hyper::{Request, Response, body::Incoming, server::conn::http2, service::service_fn};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
     use rustfs_io_metrics::internode_metrics::global_internode_metrics;
+    use std::convert::Infallible;
     use std::io::{self, IoSlice};
     use std::sync::{
         Arc,
@@ -2049,6 +2068,7 @@ mod tests {
         assert_eq!(INTERNODE_DISK_ERROR_HEADER, "x-rustfs-disk-error");
         assert_eq!(INTERNODE_FILE_NOT_FOUND, "file-not-found");
         assert_eq!(INTERNODE_VOLUME_NOT_FOUND, "volume-not-found");
+        assert_eq!(INTERNODE_FILE_CORRUPT, "file-corrupt");
     }
 
     #[test]
@@ -2090,6 +2110,48 @@ mod tests {
         let wrong_operation =
             classify_http_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &headers, Some(INTERNODE_OPERATION_WALK_DIR));
         assert!(wrong_operation.remote_disk_error.is_none());
+    }
+
+    #[test]
+    fn classify_http_response_scopes_corrupt_disk_error_to_read_failures() {
+        let mut headers = HeaderMap::new();
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, INTERNODE_FILE_CORRUPT.parse().expect("valid error token"));
+        let classified = classify_http_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            &headers,
+            Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        );
+        assert_eq!(classified.remote_disk_error, Some(RemoteDiskErrorKind::FileCorrupt));
+        for status in [reqwest::StatusCode::NOT_FOUND, reqwest::StatusCode::SERVICE_UNAVAILABLE] {
+            assert!(
+                classify_http_response(status, &headers, Some(INTERNODE_OPERATION_READ_FILE_STREAM))
+                    .remote_disk_error
+                    .is_none()
+            );
+        }
+        for operation in [
+            None,
+            Some(INTERNODE_OPERATION_WALK_DIR),
+            Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+        ] {
+            assert!(
+                classify_http_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &headers, operation)
+                    .remote_disk_error
+                    .is_none()
+            );
+        }
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, "unknown-disk-error".parse().expect("valid unknown token"));
+        for headers in [&headers, &HeaderMap::new()] {
+            assert!(
+                classify_http_response(
+                    reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                    headers,
+                    Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+                )
+                .remote_disk_error
+                .is_none()
+            );
+        }
     }
 
     #[derive(Clone, Default)]
@@ -2160,6 +2222,16 @@ mod tests {
         let addr = listener.local_addr().expect("listener local address should be available");
         let app = Router::new()
             .route("/stream", get(get_stream).head(reject_head).put(accept_put))
+            .route(
+                READ_FILE_STREAM_PATH,
+                get(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        [(INTERNODE_DISK_ERROR_HEADER, INTERNODE_FILE_CORRUPT)],
+                        "read file err file corrupt",
+                    )
+                }),
+            )
             .route(WALK_DIR_PATH, get(get_stream))
             .route("/reject-put", get(get_stream).put(reject_put))
             .route("/stall", get(get_stalling_stream))
@@ -2172,6 +2244,158 @@ mod tests {
         });
 
         Some((format!("http://{addr}/stream"), handle))
+    }
+
+    #[tokio::test]
+    async fn http_readers_preserve_remote_file_corruption() {
+        let (url, server) = start_test_server(TestState::default())
+            .await
+            .expect("corruption regression server must bind");
+        let url = format!("{}{READ_FILE_STREAM_PATH}", url.strip_suffix("/stream").expect("test server URL suffix"));
+        let byte_error = HttpReader::new(url.clone(), Method::GET, HeaderMap::new(), None)
+            .await
+            .err()
+            .expect("byte reader must reject corrupt shard response");
+        let chunk_error = HttpChunkReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, None)
+            .await
+            .err()
+            .expect("chunk reader must reject corrupt shard response");
+        for error in [byte_error, chunk_error] {
+            let source = error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                .expect("HTTP error must retain typed internode source");
+            assert!(source.is_remote_file_corrupt());
+            assert!(!source.is_remote_file_not_found());
+            assert!(!source.is_remote_volume_not_found());
+            assert_eq!(
+                source.kind(),
+                InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+            );
+            let cloned = clone_internode_http_io_error(&error).expect("typed transport error must be cloneable");
+            assert!(
+                cloned
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                    .expect("clone must retain typed internode source")
+                    .is_remote_file_corrupt()
+            );
+        }
+        server.abort();
+    }
+
+    struct BlockedH2Server {
+        url: String,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        handle: std::thread::JoinHandle<()>,
+    }
+
+    fn start_temporarily_blocked_h2_server(blocked_for: Duration) -> Option<BlockedH2Server> {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("HTTP/2 test listener should bind: {err}"),
+        };
+        let addr = listener
+            .local_addr()
+            .expect("HTTP/2 test listener address should be available");
+        listener
+            .set_nonblocking(true)
+            .expect("HTTP/2 test listener should become nonblocking");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("HTTP/2 test runtime should build");
+            runtime.block_on(async move {
+                let listener = TcpListener::from_std(listener).expect("HTTP/2 test listener should attach to its runtime");
+                let (stream, _) = listener.accept().await.expect("HTTP/2 test server should accept client");
+                let service = service_fn(move |_request: Request<Incoming>| async move {
+                    let body_stream = stream::once(async { Ok::<_, Infallible>(Bytes::from_static(b"partial")) }).chain(
+                        stream::once(async move {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            // Model a saturated peer whose connection task cannot
+                            // process a PING ACK even though an active response body
+                            // remains valid. The server has its own runtime so this
+                            // cannot starve the client-side keepalive timer.
+                            std::thread::sleep(blocked_for);
+                            Ok::<_, Infallible>(Bytes::from_static(b"complete"))
+                        }),
+                    );
+                    Ok::<_, Infallible>(Response::new(Body::from_stream(body_stream)))
+                });
+                tokio::select! {
+                    _ = http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(stream), service) => {},
+                    _ = shutdown_rx => {},
+                }
+            });
+        });
+
+        Some(BlockedH2Server {
+            url: format!("http://{addr}"),
+            shutdown: shutdown_tx,
+            handle,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn data_plane_liveness_does_not_abort_a_valid_h2_stream_while_peer_is_busy() {
+        let Some(baseline_server) = start_temporarily_blocked_h2_server(Duration::from_secs(2)) else {
+            return;
+        };
+        let aggressive_keepalive_client = Client::builder()
+            .no_proxy()
+            .http2_prior_knowledge()
+            .http2_keep_alive_interval(Duration::from_millis(20))
+            .http2_keep_alive_timeout(Duration::from_millis(40))
+            .http2_keep_alive_while_idle(true)
+            .build()
+            .expect("aggressive HTTP/2 keepalive client should build");
+
+        let baseline_result = tokio::time::timeout(Duration::from_secs(4), async {
+            aggressive_keepalive_client
+                .get(&baseline_server.url)
+                .send()
+                .await?
+                .bytes()
+                .await
+        })
+        .await
+        .expect("aggressive keepalive body should finish before the outer test deadline");
+        assert!(
+            baseline_result.is_err(),
+            "fixture must reproduce a PING timeout while the server connection task is blocked"
+        );
+        let _ = baseline_server.shutdown.send(());
+        baseline_server
+            .handle
+            .join()
+            .expect("baseline HTTP/2 test server should exit");
+
+        let Some(candidate_server) = start_temporarily_blocked_h2_server(Duration::from_millis(500)) else {
+            return;
+        };
+        let candidate_client = apply_http_data_plane_liveness(Client::builder().no_proxy().http2_prior_knowledge())
+            .build()
+            .expect("internode data-plane HTTP/2 client should build");
+        let response = tokio::time::timeout(Duration::from_secs(2), async {
+            let response = candidate_client.get(&candidate_server.url).send().await?;
+            let version = response.version();
+            let body = response.bytes().await?;
+            Ok::<_, reqwest::Error>((version, body))
+        })
+        .await
+        .expect("data-plane request should finish before the outer test deadline")
+        .expect("disabled HTTP/2 PING keepalive should preserve the valid stream");
+
+        assert_eq!(response.0, Version::HTTP_2);
+        assert_eq!(response.1, Bytes::from_static(b"partialcomplete"));
+        let _ = candidate_server.shutdown.send(());
+        candidate_server
+            .handle
+            .join()
+            .expect("candidate HTTP/2 test server should exit");
     }
 
     #[test]

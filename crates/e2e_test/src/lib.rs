@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(test)]
+mod storage_metric_ownership_test;
+
 mod reliant;
 mod storage_api;
 
@@ -23,9 +26,16 @@ pub mod common;
 #[cfg(test)]
 pub mod chaos;
 
-// Programmable S3 target for replication failure-path tests (backlog#1147 repl-8).
+// Programmable S3 target for replication failure-path tests (backlog#1147 repl-8)
+// and on-demand-migration source scenarios (backlog#2151).
 #[cfg(test)]
 pub mod fake_s3_target;
+
+// On-demand migration (backlog#2147): shared two-server environment, admin
+// wrappers, and the harness self-test (backlog#2151). Behavior scenarios are
+// added by later ODM tasks.
+#[cfg(test)]
+pub mod on_demand_migration;
 
 // Socket-level network fault-injection proxy for black-box cluster tests
 // (backlog#1325 network fault-injection block): latency / blackhole / one-way
@@ -60,6 +70,24 @@ mod get_codec_streaming_compat_test;
 
 #[cfg(test)]
 mod version_id_regression_test;
+
+#[cfg(test)]
+mod select_request_root_alias_test;
+
+// Pinned previous-release -> current-build on-disk compatibility.
+#[cfg(test)]
+mod upgrade_compatibility_test;
+
+// Receiver-side replication LWW (rustfs/backlog#1953): stale inbound
+// replication metadata must not overwrite a newer local category state.
+#[cfg(test)]
+mod replication_lww_receiver_test;
+
+// Outbound target matrix: every object shape against every remote-target
+// failure mode the fake target models (SOP:
+// docs/postmortems/2026-09-03-replication-checksum-default-regression.md).
+#[cfg(test)]
+mod replication_target_matrix_test;
 
 // Data usage regression tests
 #[cfg(test)]
@@ -151,9 +179,16 @@ mod compression_test;
 #[cfg(test)]
 mod delete_objects_versioning_test;
 
+#[cfg(test)]
+mod delete_authorization_test;
+
 // Regression test for signed DELETE Object?versionId requests without Content-Length.
 #[cfg(test)]
 mod delete_object_no_content_length_test;
+
+// Regression test for signed empty PutObject requests without Content-Length.
+#[cfg(test)]
+mod put_object_no_content_length_test;
 
 // Delete-marker visibility baseline for data-movement migration proof.
 #[cfg(test)]
@@ -189,6 +224,10 @@ mod cluster_multidrive_pool_test;
 #[cfg(test)]
 mod inline_fast_path_cluster_test;
 
+// backlog#2207: two-node gate for the cluster-authoritative tier stats contract.
+#[cfg(test)]
+mod tier_stats_cluster_test;
+
 // PutObject / MultipartUpload with checksum (Content-MD5, x-amz-checksum-*)
 #[cfg(test)]
 mod checksum_upload_test;
@@ -217,6 +256,9 @@ mod copy_object_version_restore_test;
 
 #[cfg(test)]
 mod copy_object_checksum_test;
+
+#[cfg(test)]
+mod multipart_copy_readiness_test;
 
 #[cfg(test)]
 mod ssec_copy_test;
@@ -275,6 +317,7 @@ mod console_smoke_test;
 // plus non-admin 403 probes per endpoint (sec-4 pattern).
 #[cfg(test)]
 mod admin_iam_crud_test;
+mod admin_mfa_test;
 
 #[cfg(test)]
 mod admin_pools_test;
@@ -331,6 +374,11 @@ mod delete_regression_test;
 #[cfg(test)]
 mod listing_regression_test;
 
+// Cluster regression: objects committed at degraded write quorum must stay
+// listable while a different drive is offline (CI run 33478999853).
+#[cfg(test)]
+mod degraded_listing_availability_test;
+
 // P1 regression: bucket statistics accuracy (rustfs#5615, #5008, #5116, #5055, #3898, #1012)
 #[cfg(test)]
 mod bucket_stats_regression_test;
@@ -338,6 +386,11 @@ mod bucket_stats_regression_test;
 // P1 regression: distributed startup/quorum (rustfs#5416, #2945, #2794, #2601, #4040, #5655)
 #[cfg(test)]
 mod distributed_startup_regression_test;
+
+// 4-node / 4-disk distributed Actions suite (S3, lock, versioning, replication,
+// quota, observability, expand/decommission/rebalance, site replication, chaos).
+#[cfg(test)]
+mod distributed;
 
 // P1 regression: tier/ILM transition (rustfs#5218, #5130, #5011, #4826, #5024)
 #[cfg(test)]

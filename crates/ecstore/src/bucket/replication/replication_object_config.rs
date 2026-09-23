@@ -14,8 +14,8 @@
 
 use std::{collections::HashMap, fmt, sync::Arc};
 
+use super::replication_filemeta_boundary::metadata_keys;
 use crate::bucket::metadata::BucketMetadata;
-use rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS;
 use s3s::dto::{BucketVersioningStatus, ReplicationConfiguration, ReplicationRuleStatus, VersioningConfiguration};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -179,9 +179,11 @@ fn replication_config_from_metadata(metadata: &BucketMetadata) -> Result<Option<
 }
 
 fn delete_request_snapshot_from_metadata(metadata: Arc<BucketMetadata>) -> Result<DeleteReplicationConfigSnapshot> {
-    if !metadata.versioning_config_xml.is_empty() && metadata.versioning_config.is_none() {
-        return Err(super::replication_error_boundary::Error::other(
-            "persisted bucket versioning configuration is invalid",
+    if let Some(raw_len) = metadata.xml_config_unreadable_len(crate::bucket::metadata::BUCKET_VERSIONING_CONFIG) {
+        return Err(crate::bucket::metadata::unreadable_config_error(
+            &metadata.name,
+            crate::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+            raw_len,
         ));
     }
 
@@ -332,7 +334,7 @@ impl ReplicationConfig {
         }
 
         let mut user_defined = (*oi.user_defined).clone();
-        user_defined.remove(AMZ_BUCKET_REPLICATION_STATUS);
+        user_defined.remove(metadata_keys::REPLICATION_STATUS);
 
         let dsc = must_replicate(
             oi.bucket.as_str(),
@@ -436,14 +438,19 @@ pub(crate) async fn check_replicate_delete_strict(
     }
 
     for target in decision.targets_map.values_mut() {
-        if let Some(client) = ReplicationTargetStore::remote_target_client(bucket, &target.arn).await {
-            target.synchronous = client.replicate_sync;
-        } else {
-            target.replicate = false;
-            target.synchronous = false;
-        }
+        let replicate_sync = ReplicationTargetStore::remote_target_client(bucket, &target.arn)
+            .await
+            .map(|client| client.replicate_sync);
+        apply_target_delivery_mode(target, replicate_sync);
     }
     Ok(decision)
+}
+
+fn apply_target_delivery_mode(target: &mut ReplicateTargetDecision, replicate_sync: Option<bool>) {
+    // A missing runtime client is a delivery failure, not a rule mismatch.
+    // Preserve admission and fall back to the asynchronous worker, which can
+    // persist FAILED state for the heal/retry path.
+    target.synchronous = replicate_sync.unwrap_or(false);
 }
 
 pub(crate) fn check_replicate_delete_with_snapshot(
@@ -570,13 +577,22 @@ pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplic
         let mut sopts = opts.clone();
         sopts.target_arn = arn.clone();
 
-        let replicate = cfg.replicate(&sopts) && mopts.metadata_target_is_eligible(&arn);
+        let replicate = metadata_target_should_replicate(&cfg, &sopts, &mopts, &arn);
         let synchronous = if let Some(cli) = cli { cli.replicate_sync } else { false };
 
         dsc.set(ReplicateTargetDecision::new(arn, replicate, synchronous));
     }
 
     dsc
+}
+
+fn metadata_target_should_replicate(
+    cfg: &ReplicationConfiguration,
+    opts: &ObjectOpts,
+    mopts: &MustReplicateOptions,
+    arn: &str,
+) -> bool {
+    cfg.replicate(opts) && mopts.metadata_target_is_eligible(arn)
 }
 
 #[cfg(test)]
@@ -609,6 +625,46 @@ mod tests {
     }
 
     #[test]
+    fn metadata_replication_requires_both_current_rule_match_and_historical_admission() {
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let mut rule = replication_rule();
+        rule.destination.bucket = arn.to_string();
+        rule.filter = Some(ReplicationRuleFilter {
+            prefix: Some("admitted/".to_string()),
+            ..Default::default()
+        });
+        let cfg = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![rule],
+        };
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_REPLICATION_STATUS, format!("{arn}=PENDING;"));
+        let admitted = MustReplicateOptions::new(&metadata, String::new(), ReplicationType::Metadata, false);
+        let matching = ObjectOpts {
+            name: "admitted/object".to_string(),
+            target_arn: arn.to_string(),
+            ..Default::default()
+        };
+        assert!(metadata_target_should_replicate(&cfg, &matching, &admitted, arn));
+
+        let rule_mismatch = ObjectOpts {
+            name: "outside/object".to_string(),
+            target_arn: arn.to_string(),
+            ..Default::default()
+        };
+        assert!(
+            !metadata_target_should_replicate(&cfg, &rule_mismatch, &admitted, arn),
+            "historical admission must not bypass the current replication rule"
+        );
+
+        let never_admitted = MustReplicateOptions::new(&HashMap::new(), String::new(), ReplicationType::Metadata, false);
+        assert!(
+            !metadata_target_should_replicate(&cfg, &matching, &never_admitted, arn),
+            "a current rule match must not create historical admission"
+        );
+    }
+
+    #[test]
     fn replication_config_empty_and_replicate_follow_config() {
         let empty = ReplicationConfig::default();
         assert!(empty.is_empty());
@@ -627,6 +683,23 @@ mod tests {
             name: "object".to_string(),
             ..Default::default()
         }));
+    }
+
+    #[test]
+    fn missing_target_client_preserves_delete_admission_as_async() {
+        let mut target = ReplicateTargetDecision::new("arn:target".to_string(), true, true);
+
+        apply_target_delivery_mode(&mut target, None);
+
+        assert!(target.replicate, "a runtime client miss must not erase the replication rule decision");
+        assert!(
+            !target.synchronous,
+            "unavailable synchronous targets must fall back to the async retry path"
+        );
+
+        apply_target_delivery_mode(&mut target, Some(true));
+        assert!(target.replicate);
+        assert!(target.synchronous);
     }
 
     #[test]

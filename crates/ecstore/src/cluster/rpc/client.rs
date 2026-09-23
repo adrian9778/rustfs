@@ -30,6 +30,7 @@ use rustfs_protos::{
     ChannelClass, create_new_channel, get_channel_for_class,
     proto_gen::node_service::{
         heal_control_service_client::HealControlServiceClient, node_service_client::NodeServiceClient,
+        scanner_control_service_client::ScannerControlServiceClient,
         tier_mutation_control_service_client::TierMutationControlServiceClient,
     },
 };
@@ -58,6 +59,24 @@ pub async fn node_service_time_out_client(
     // Default to the latency-sensitive control channel; bulk `bytes` RPCs opt in via the
     // `_for_class` variant below (grpc-optimization P1).
     node_service_time_out_client_for_class(addr, interceptor, ChannelClass::Control).await
+}
+
+pub(crate) async fn scanner_control_time_out_client(
+    addr: &str,
+    interceptor: TonicInterceptor,
+) -> crate::error::Result<ScannerControlServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
+    let interceptor = interceptor.with_rpc_audience(addr)?;
+    let channel = match runtime_sources::cached_node_channel(addr).await {
+        Some(channel) => channel,
+        None => create_new_channel(addr)
+            .await
+            .map_err(|err| crate::error::Error::other(err.to_string()))?,
+    };
+    let channel = ReplayScopeChannel::new(channel, interceptor.replay_scope_audience());
+    let limit = rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES as usize;
+    Ok(ScannerControlServiceClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(limit)
+        .max_encoding_message_size(limit))
 }
 
 pub async fn heal_control_time_out_client(
@@ -94,7 +113,7 @@ pub async fn tier_mutation_control_time_out_client(
 
 /// Build a `NodeServiceClient` bound to the [`ChannelClass`]-appropriate channel for `addr`.
 ///
-/// Bulk `bytes`-carrying RPCs (ReadAll/WriteAll/ReadMultiple/BatchReadVersion) pass
+/// Bulk `bytes`-carrying RPCs (ReadAll/WriteAll/CompareAndUpdateFile/ReadMultiple/BatchReadVersion) pass
 /// [`ChannelClass::Bulk`] so, when channel isolation is enabled, they are physically isolated
 /// from lock/health RPCs; everything else uses [`ChannelClass::Control`]. When isolation is
 /// disabled the two classes resolve to the same cached channel, i.e. legacy behavior.
@@ -198,6 +217,7 @@ pub(crate) fn message_has_network_needle(message: &str) -> bool {
 pub(crate) fn is_network_like_disk_error(err: &DiskErrorType) -> bool {
     match err {
         DiskError::Timeout => true,
+        DiskError::RemoteClientUnavailable(detail) => message_has_network_needle(detail),
         DiskError::Io(io_err) => {
             if let Some(status) = embedded_tonic_status(io_err) {
                 return is_network_like_status(status);
@@ -263,6 +283,20 @@ fn peer_replay_state(audience: &str) -> PeerReplayState {
         .ok()
         .and_then(|states| states.get(audience).copied())
         .unwrap_or_default()
+}
+
+pub(crate) fn clear_peer_replay_state_for_addr(addr: &str) -> std::io::Result<()> {
+    let uri = addr
+        .parse::<Uri>()
+        .map_err(|_| std::io::Error::other("Invalid gRPC peer URI"))?;
+    let audience = uri
+        .authority()
+        .map(|authority| normalize_tonic_rpc_audience(authority.as_str()))
+        .ok_or_else(|| std::io::Error::other("Missing gRPC peer authority"))??;
+    if let Ok(mut states) = PEER_REPLAY_STATES.lock() {
+        states.remove(&audience);
+    }
+    Ok(())
 }
 
 fn apply_peer_replay_response(
@@ -599,6 +633,13 @@ mod tests {
             .remove(audience);
     }
 
+    fn set_peer_capability(audience: &str, state: PeerReplayState) {
+        PEER_REPLAY_STATES
+            .lock()
+            .expect("peer capability cache lock must not be poisoned")
+            .insert(audience.to_string(), state);
+    }
+
     fn rolling_mutation_request(method: &'static str) -> tonic::Request<()> {
         let mut request = tonic::Request::new(rustfs_protos::proto_gen::node_service::GenerallyLockRequest {
             args: "canonical mutation request".to_string(),
@@ -677,7 +718,9 @@ mod tests {
     fn embedded_tonic_status_is_recovered_across_error_conversions() {
         // DiskError and StorageError share one wrapper, so a status keeps its
         // typed classification whichever error it was converted into first.
-        let from_storage: DiskErrorType = crate::error::Error::from(tonic::Status::unavailable("peer gone")).into();
+        let from_storage: DiskErrorType = crate::error::Error::from(tonic::Status::unavailable("peer gone"))
+            .narrow_to_disk()
+            .expect("status-derived Io errors narrow through the bridge");
         let DiskError::Io(io_err) = &from_storage else {
             panic!("status-derived disk error should stay an Io error");
         };
@@ -717,6 +760,16 @@ mod tests {
         )));
         assert!(is_network_like_disk_error(&DiskError::other("connection refused")));
         assert!(!is_network_like_disk_error(&DiskError::FileNotFound));
+    }
+
+    #[test]
+    fn network_like_disk_error_keeps_typed_client_failures_classified() {
+        assert!(is_network_like_disk_error(&DiskError::RemoteClientUnavailable(
+            "transport error: connection refused".to_string()
+        )));
+        assert!(!is_network_like_disk_error(&DiskError::RemoteClientUnavailable(
+            "invalid client credentials".to_string()
+        )));
     }
 
     #[test]
@@ -1059,6 +1112,23 @@ mod tests {
     }
 
     #[test]
+    fn clear_peer_replay_state_for_addr_removes_normalized_audience() {
+        let audience = "clear-peer-replay-state-test:9000";
+        let boot_epoch = Uuid::new_v4();
+        set_peer_capability(
+            audience,
+            PeerReplayState {
+                boot_epoch: Some(boot_epoch),
+                cache_capability: Some(PeerReplayCapability::Capable { boot_epoch }),
+            },
+        );
+
+        clear_peer_replay_state_for_addr("http://clear-peer-replay-state-test:9000").expect("peer URI should clear replay state");
+
+        assert_eq!(peer_replay_state(audience), PeerReplayState::default());
+    }
+
+    #[test]
     fn interceptor_snapshot_prevents_delayed_legacy_response_from_revoking_capability() {
         ensure_test_rpc_secret();
         let audience = "capability-snapshot-client-test:9000";
@@ -1165,6 +1235,195 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::Unauthenticated);
         assert_eq!(error.message(), "RPC peer replay capability changed");
         clear_peer_capability(audience);
+    }
+
+    #[tokio::test]
+    async fn tier_reload_recovers_only_with_authenticated_replay_capability() {
+        use super::super::peer_rest_client::{PeerRestClient, TierConfigReloadOutcome};
+        use bytes::Bytes;
+        use http_body_util::StreamBody;
+        use hyper::{body::Frame, service::service_fn};
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use rustfs_protos::proto_gen::node_service::{LoadTransitionTierConfigResponse, PingResponse};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tonic_prost::prost::Message;
+
+        ensure_test_rpc_secret();
+        let server_epoch = crate::cluster::rpc::http_auth::tonic_rpc_boot_epoch();
+        for (proof, restarted) in [
+            ("valid", false),
+            ("valid", true),
+            ("missing", false),
+            ("missing", true),
+            ("invalid", false),
+            ("invalid", true),
+            ("rejected", false),
+            ("rejected", true),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind test peer");
+            let address = listener.local_addr().expect("test peer address");
+            let audience = address.to_string();
+            let client = PeerRestClient::new(
+                rustfs_utils::XHost {
+                    name: "127.0.0.1".to_string(),
+                    port: address.port(),
+                    is_port_set: true,
+                },
+                format!("http://{address}"),
+            );
+            let old_epoch = if restarted { Uuid::new_v4() } else { server_epoch };
+            let pinned = PeerReplayState {
+                boot_epoch: Some(old_epoch),
+                cache_capability: Some(PeerReplayCapability::Capable { boot_epoch: old_epoch }),
+            };
+            set_peer_capability(&audience, pinned);
+            apply_peer_replay_response(audience.clone(), pinned, Err(std::io::Error::other("startup response omitted proof")));
+            let pings = Arc::new(AtomicUsize::new(0));
+            let reloads = Arc::new(AtomicUsize::new(0));
+            let server_audience = audience.clone();
+            let server_pings = pings.clone();
+            let server_reloads = reloads.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept test client");
+                let service = service_fn(move |request: HttpRequest<hyper::body::Incoming>| {
+                    let audience = server_audience.clone();
+                    let pings = server_pings.clone();
+                    let reloads = server_reloads.clone();
+                    async move {
+                        let authentication = crate::cluster::rpc::verify_tonic_rpc_signature_with_bootstrap(
+                            &audience,
+                            request.uri().path(),
+                            request.headers(),
+                            request.uri().path() == "/node_service.NodeService/Ping",
+                        );
+                        let stale_epoch = authentication
+                            .as_ref()
+                            .is_err_and(|error| error.to_string() == "RPC boot epoch is stale");
+                        assert!(
+                            authentication.is_ok() || stale_epoch,
+                            "requests must retain valid signatures: {authentication:?}"
+                        );
+                        let challenge = tonic_boot_epoch_challenge(request.headers())
+                            .expect("valid challenge")
+                            .expect("challenge present");
+                        let payload = match request.uri().path() {
+                            "/node_service.NodeService/Ping" => {
+                                pings.fetch_add(1, Ordering::SeqCst);
+                                PingResponse {
+                                    version: 1,
+                                    body: Bytes::new(),
+                                }
+                                .encode_to_vec()
+                            }
+                            "/node_service.NodeService/LoadTransitionTierConfig" => {
+                                reloads.fetch_add(1, Ordering::SeqCst);
+                                assert!(
+                                    request.headers().contains_key(RPC_CONTENT_SHA256_HEADER),
+                                    "recovery must not downgrade body binding"
+                                );
+                                LoadTransitionTierConfigResponse {
+                                    success: true,
+                                    error_info: None,
+                                    error_code: None,
+                                }
+                                .encode_to_vec()
+                            }
+                            path => panic!("unexpected test RPC: {path}"),
+                        };
+                        let mut data = vec![0];
+                        data.extend_from_slice(&u32::try_from(payload.len()).expect("small test protobuf").to_be_bytes());
+                        data.extend_from_slice(&payload);
+                        let mut trailers = http::HeaderMap::new();
+                        trailers.insert(
+                            "grpc-status",
+                            if proof == "rejected" {
+                                "16"
+                            } else if stale_epoch {
+                                "14"
+                            } else {
+                                "0"
+                            }
+                            .parse()
+                            .expect("status header"),
+                        );
+                        if proof == "rejected" {
+                            trailers.insert("grpc-message", "invalid credentials".parse().expect("message header"));
+                        }
+                        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> =
+                            vec![Ok(Frame::data(Bytes::from(data))), Ok(Frame::trailers(trailers))];
+                        let mut response = HttpResponse::new(StreamBody::new(futures::stream::iter(frames)));
+                        response
+                            .headers_mut()
+                            .insert("content-type", "application/grpc".parse().expect("content type"));
+                        if matches!(proof, "valid" | "invalid") {
+                            let mut headers =
+                                tonic_boot_epoch_response_headers(&audience, challenge).expect("sign response proof");
+                            if proof == "invalid" {
+                                headers.insert(
+                                    RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER,
+                                    "forged".parse().expect("forged proof header"),
+                                );
+                            }
+                            response.headers_mut().extend(headers);
+                        }
+                        Ok::<_, std::convert::Infallible>(response)
+                    }
+                });
+                hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .expect("serve test peer");
+            });
+
+            let first =
+                tokio::time::timeout(std::time::Duration::from_secs(10), client.load_transition_tier_config_once_outcome())
+                    .await
+                    .expect("recovery attempt must finish");
+            assert_eq!(reloads.load(Ordering::SeqCst), 0, "revoked mutation must never reach the peer");
+            assert_eq!(
+                pings.load(Ordering::SeqCst),
+                1,
+                "revoked capability must trigger a signed read-only probe"
+            );
+            if proof == "rejected" {
+                assert!(
+                    matches!(first, TierConfigReloadOutcome::Terminal(_)),
+                    "invalid credentials must stay terminal"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        first,
+                        TierConfigReloadOutcome::TransientReconnect(_) | TierConfigReloadOutcome::TransientRetrySameChannel(_)
+                    ),
+                    "a probe response must schedule another guarded reload"
+                );
+                let second =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), client.load_transition_tier_config_once_outcome())
+                        .await
+                        .expect("second reload attempt must finish");
+                if proof == "valid" {
+                    assert!(matches!(second, TierConfigReloadOutcome::Success));
+                    assert_eq!(reloads.load(Ordering::SeqCst), 1);
+                    assert_eq!(pings.load(Ordering::SeqCst), 1);
+                    assert_eq!(peer_replay_state(&audience).boot_epoch, Some(server_epoch));
+                } else {
+                    assert!(matches!(
+                        second,
+                        TierConfigReloadOutcome::TransientReconnect(_) | TierConfigReloadOutcome::TransientRetrySameChannel(_)
+                    ));
+                    assert_eq!(reloads.load(Ordering::SeqCst), 0, "unverified proof must not admit a mutation");
+                    assert_eq!(pings.load(Ordering::SeqCst), 2);
+                    assert_eq!(peer_replay_state(&audience).cache_capability, Some(PeerReplayCapability::Revoked));
+                }
+            }
+            server.abort();
+            let _ = server.await;
+            clear_peer_capability(&audience);
+        }
     }
 
     #[test]

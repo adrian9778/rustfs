@@ -90,12 +90,11 @@ use crate::ChecksumType;
 use crate::Sha256Hasher;
 use crate::compress_index::{Index, TryGetIndex};
 use crate::get_content_checksum;
+use crate::trailer::SharedTrailerSource;
 use crate::{DynReader, EtagReader, EtagResolvable, HardLimitReader, HashReaderDetector, WarpReader, boxed_reader, wrap_reader};
-use base64::Engine;
-use base64::engine::general_purpose;
+
 use http::HeaderMap;
 use pin_project_lite::pin_project;
-use s3s::TrailingHeaders;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::io::Write;
@@ -118,8 +117,8 @@ pub trait HashReaderMut {
     fn set_actual_size(&mut self, actual_size: i64);
     fn content_hash(&self) -> &Option<Checksum>;
     fn content_sha256(&self) -> &Option<String>;
-    fn get_trailer(&self) -> Option<&TrailingHeaders>;
-    fn set_trailer(&mut self, trailer: Option<TrailingHeaders>);
+    fn get_trailer(&self) -> Option<&SharedTrailerSource>;
+    fn set_trailer(&mut self, trailer: Option<SharedTrailerSource>);
 }
 
 pin_project! {
@@ -138,7 +137,8 @@ pin_project! {
         content_sha256_hasher: Option<Sha256Hasher>,
         checksum_on_finish: bool,
 
-        trailer_s3s: Option<TrailingHeaders>,
+        // Read only at EOF; see the timing contract in `crate::trailer`.
+        trailer: Option<SharedTrailerSource>,
 
     }
 
@@ -184,7 +184,7 @@ impl HashReader {
             content_sha256: sha256hex.clone(),
             content_sha256_hasher: sha256hex.map(|_| Sha256Hasher::new()),
             checksum_on_finish: false,
-            trailer_s3s: None,
+            trailer: None,
         })
     }
 
@@ -224,7 +224,7 @@ impl HashReader {
             content_sha256: sha256hex.clone(),
             content_sha256_hasher: sha256hex.map(|_| Sha256Hasher::new()),
             checksum_on_finish: false,
-            trailer_s3s: None,
+            trailer: None,
         })
     }
 
@@ -294,7 +294,7 @@ impl HashReader {
                 content_hash,
                 content_hasher,
                 checksum_on_finish: false,
-                trailer_s3s: existing_hash_reader.get_trailer().cloned(),
+                trailer: existing_hash_reader.get_trailer().cloned(),
             })
         } else {
             if size > 0 {
@@ -322,7 +322,7 @@ impl HashReader {
                 content_sha256: sha256hex.clone(),
                 content_sha256_hasher: sha256hex.map(|_| Sha256Hasher::new()),
                 checksum_on_finish: false,
-                trailer_s3s: None,
+                trailer: None,
             })
         }
     }
@@ -353,10 +353,12 @@ impl HashReader {
         self.actual_size
     }
 
-    pub fn add_checksum_from_s3s(
+    /// Records the request checksum declared in `headers`. For a trailing
+    /// checksum, `trailer` supplies its value once the body has been read.
+    pub fn add_checksum(
         &mut self,
         headers: &HeaderMap,
-        trailing_headers: Option<TrailingHeaders>,
+        trailer: Option<SharedTrailerSource>,
         ignore_value: bool,
     ) -> Result<(), std::io::Error> {
         let cs = get_content_checksum(headers)?;
@@ -367,7 +369,7 @@ impl HashReader {
 
         if let Some(checksum) = cs {
             if checksum.checksum_type.trailing() {
-                self.trailer_s3s = trailing_headers;
+                self.trailer = trailer;
             }
 
             self.content_hash = Some(checksum.clone());
@@ -448,14 +450,7 @@ impl HashReader {
             }
 
             if checksum.checksum_type.trailing() {
-                if let Some(trailer) = self.trailer_s3s.as_ref()
-                    && let Some(Some(checksum_str)) = trailer.read(|headers| {
-                        checksum
-                            .checksum_type
-                            .key()
-                            .and_then(|key| headers.get(key).and_then(|value| value.to_str().ok().map(|s| s.to_string())))
-                    })
-                {
+                if let Some(checksum_str) = trailing_checksum_value(self.trailer.as_ref(), checksum.checksum_type) {
                     map.insert(checksum.checksum_type.to_string(), checksum_str);
                 }
                 return map;
@@ -467,6 +462,14 @@ impl HashReader {
         }
         map
     }
+}
+
+/// Returns the received trailer value for `checksum_type`. `Pending` and
+/// `Missing` both yield `None`, which leaves a trailing checksum unverified
+/// and therefore rejected at EOF.
+fn trailing_checksum_value(trailer: Option<&SharedTrailerSource>, checksum_type: ChecksumType) -> Option<String> {
+    let key = checksum_type.key()?;
+    trailer?.lookup(key).into_present()
 }
 
 impl HashReaderMut for HashReader {
@@ -515,12 +518,12 @@ impl HashReaderMut for HashReader {
         &self.content_sha256
     }
 
-    fn get_trailer(&self) -> Option<&TrailingHeaders> {
-        self.trailer_s3s.as_ref()
+    fn get_trailer(&self) -> Option<&SharedTrailerSource> {
+        self.trailer.as_ref()
     }
 
-    fn set_trailer(&mut self, trailer: Option<TrailingHeaders>) {
-        self.trailer_s3s = trailer;
+    fn set_trailer(&mut self, trailer: Option<SharedTrailerSource>) {
+        self.trailer = trailer;
     }
 }
 
@@ -560,24 +563,25 @@ impl AsyncRead for HashReader {
                         let sha256 = hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower);
                         if sha256 != *expected_sha256 {
                             error!("SHA256 mismatch, expected={:?}, actual={:?}", expected_sha256, sha256);
-                            return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "SHA256 mismatch")));
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                crate::errors::Sha256Mismatch {
+                                    expected_sha256: expected_sha256.clone(),
+                                    calculated_sha256: sha256,
+                                },
+                            )));
                         }
                     }
 
                     // check content hasher
                     if let (Some(hasher), Some(expected_content_hash)) = (this.content_hasher, this.content_hash) {
                         if expected_content_hash.checksum_type.trailing()
-                            && let Some(trailer) = this.trailer_s3s.as_ref()
-                            && let Some(Some(checksum_str)) = trailer.read(|headers| {
-                                expected_content_hash
-                                    .checksum_type
-                                    .key()
-                                    .and_then(|key| headers.get(key).and_then(|value| value.to_str().ok().map(|s| s.to_string())))
-                            })
+                            && let Some(checksum_str) =
+                                trailing_checksum_value(this.trailer.as_ref(), expected_content_hash.checksum_type)
                         {
                             expected_content_hash.encoded = checksum_str;
-                            expected_content_hash.raw = general_purpose::STANDARD
-                                .decode(&expected_content_hash.encoded)
+                            expected_content_hash.raw = base64_simd::STANDARD
+                                .decode_to_vec(&expected_content_hash.encoded)
                                 .map_err(|_| std::io::Error::other("Invalid base64 checksum"))?;
 
                             if expected_content_hash.raw.is_empty() {
@@ -592,7 +596,7 @@ impl AsyncRead for HashReader {
                             && !expected_content_hash.checksum_type.trailing()
                         {
                             expected_content_hash.raw = content_hash;
-                            expected_content_hash.encoded = general_purpose::STANDARD.encode(&expected_content_hash.raw);
+                            expected_content_hash.encoded = base64_simd::STANDARD.encode_to_string(&expected_content_hash.raw);
                         } else if content_hash != expected_content_hash.raw {
                             let expected_hex = hex_simd::encode_to_string(&expected_content_hash.raw, hex_simd::AsciiCase::Lower);
                             let actual_hex = hex_simd::encode_to_string(content_hash, hex_simd::AsciiCase::Lower);
@@ -772,6 +776,30 @@ mod tests {
         let etag = hash_reader.try_resolve_etag();
         assert!(etag.is_none());
         assert_eq!(buf, data);
+    }
+
+    #[tokio::test]
+    async fn sha256_mismatch_retains_typed_io_error_source() {
+        let data = b"tampered payload";
+        let expected_sha256 = "0".repeat(64);
+        let reader = BufReader::new(Cursor::new(&data[..]));
+        let mut hash_reader =
+            HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, Some(expected_sha256.clone()), false)
+                .expect("operation should succeed");
+
+        let error = hash_reader
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("SHA256 mismatch should fail");
+        let mismatch = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<crate::Sha256Mismatch>())
+            .expect("SHA256 mismatch should remain typed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(mismatch.expected_sha256, expected_sha256);
+        assert_eq!(mismatch.calculated_sha256.len(), 64);
+        assert_ne!(mismatch.calculated_sha256, mismatch.expected_sha256);
     }
 
     #[tokio::test]
@@ -1042,5 +1070,192 @@ mod tests {
             assert_eq!(&decompressed_data, &data);
             println!("  ✓ Algorithm {algorithm:?} test passed");
         }
+    }
+}
+
+#[cfg(test)]
+mod trailer_tests {
+    use super::*;
+    use crate::{TrailerSource, TrailerValue, is_checksum_mismatch};
+    use http::HeaderValue;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::AsyncReadExt;
+
+    const TYPED: [ChecksumType; 5] = [
+        ChecksumType::CRC32,
+        ChecksumType::CRC32C,
+        ChecksumType::SHA1,
+        ChecksumType::SHA256,
+        ChecksumType::CRC64_NVME,
+    ];
+
+    /// Mirrors an aws-chunked decoder handle: `None` until the trailer section
+    /// has been published.
+    #[derive(Default)]
+    struct FakeTrailer(Mutex<Option<HashMap<String, String>>>);
+
+    impl TrailerSource for FakeTrailer {
+        fn lookup(&self, name: &str) -> TrailerValue {
+            match self.0.lock().expect("trailer lock").as_ref() {
+                None => TrailerValue::Pending,
+                Some(fields) => fields.get(name).cloned().map_or(TrailerValue::Missing, TrailerValue::Present),
+            }
+        }
+    }
+
+    /// Body that publishes `fields` (when set) only once it reaches EOF.
+    struct PublishOnEof {
+        body: Cursor<Vec<u8>>,
+        trailer: Arc<FakeTrailer>,
+        fields: Option<HashMap<String, String>>,
+    }
+
+    impl AsyncRead for PublishOnEof {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            let this = &mut *self;
+            let before = buf.filled().len();
+            let result = Pin::new(&mut this.body).poll_read(cx, buf);
+            if matches!(result, Poll::Ready(Ok(())))
+                && buf.filled().len() == before
+                && buf.remaining() > 0
+                && let Some(fields) = this.fields.clone()
+            {
+                *this.trailer.0.lock().expect("trailer lock") = Some(fields);
+            }
+            result
+        }
+    }
+
+    fn encoded(checksum_type: ChecksumType, data: &[u8]) -> String {
+        let mut hasher = checksum_type.hasher().expect("typed checksum hasher");
+        hasher.write_all(data).expect("hash data");
+        base64_simd::STANDARD.encode_to_string(hasher.finalize())
+    }
+
+    fn trailing_request(checksum_type: ChecksumType) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-trailer",
+            HeaderValue::from_static(checksum_type.key().expect("typed checksum key")),
+        );
+        headers
+    }
+
+    /// `published`: `None` never publishes (still `Pending` at EOF);
+    /// `Some(None)` publishes a trailer without the field; `Some(Some(v))`
+    /// publishes `v` under the checksum's key.
+    fn reader(checksum_type: ChecksumType, data: &[u8], published: Option<Option<String>>) -> (HashReader, Arc<FakeTrailer>) {
+        let trailer = Arc::new(FakeTrailer::default());
+        let key = checksum_type.key().expect("typed checksum key");
+        let fields = published.map(|value| value.into_iter().map(|v| (key.to_string(), v)).collect());
+        let body = PublishOnEof {
+            body: Cursor::new(data.to_vec()),
+            trailer: trailer.clone(),
+            fields,
+        };
+        let size = data.len() as i64;
+        let mut reader = HashReader::from_stream(body, size, size, None, None, false).expect("hash reader");
+        reader
+            .add_checksum(&trailing_request(checksum_type), Some(trailer.clone()), false)
+            .expect("declared trailing checksum");
+        (reader, trailer)
+    }
+
+    async fn read_all(reader: &mut HashReader) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.map(|_| out)
+    }
+
+    fn assert_checksum_mismatch(err: &std::io::Error) {
+        let inner = err.get_ref().expect("typed error source");
+        assert!(is_checksum_mismatch(inner), "expected ChecksumMismatch, got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn trailing_checksum_published_at_eof_is_verified_and_reported() {
+        let data = b"trailing checksum payload";
+        for checksum_type in TYPED {
+            let value = encoded(checksum_type, data);
+            let (mut reader, trailer) = reader(checksum_type, data, Some(Some(value.clone())));
+            let key = checksum_type.key().expect("typed checksum key");
+            assert_eq!(
+                trailer.lookup(key),
+                TrailerValue::Pending,
+                "{checksum_type}: attached before the body ends"
+            );
+
+            assert_eq!(read_all(&mut reader).await.expect("verified body"), data);
+            assert_eq!(
+                reader.content_crc(),
+                HashMap::from([(checksum_type.to_string(), value)]),
+                "{checksum_type}: verified trailer value is reported for persistence"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn trailing_checksum_mismatch_is_rejected() {
+        let data = b"trailing checksum payload";
+        for checksum_type in TYPED {
+            let wrong = encoded(checksum_type, b"different payload");
+            let (mut reader, _) = reader(checksum_type, data, Some(Some(wrong.clone())));
+            let err = read_all(&mut reader).await.expect_err("mismatched trailer must fail");
+            assert_checksum_mismatch(&err);
+            let mismatch = err
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<crate::errors::ChecksumMismatch>())
+                .expect("mismatch details");
+            let wrong_raw = base64_simd::STANDARD.decode_to_vec(&wrong).expect("valid base64");
+            assert_eq!(mismatch.want, hex_simd::encode_to_string(wrong_raw, hex_simd::AsciiCase::Lower));
+        }
+    }
+
+    #[tokio::test]
+    async fn trailing_checksum_missing_or_still_pending_at_eof_is_rejected() {
+        let data = b"trailing checksum payload";
+        for published in [None, Some(None)] {
+            let (mut reader, _) = reader(ChecksumType::CRC32C, data, published.clone());
+            let err = read_all(&mut reader).await.expect_err("unverifiable trailer must fail");
+            assert_checksum_mismatch(&err);
+            assert!(reader.content_crc().is_empty(), "{published:?}: nothing to persist");
+        }
+
+        let size = data.len() as i64;
+        let mut reader = HashReader::from_stream(Cursor::new(data.to_vec()), size, size, None, None, false).expect("hash reader");
+        reader
+            .add_checksum(&trailing_request(ChecksumType::CRC32C), None, false)
+            .expect("declared trailing checksum");
+        let err = read_all(&mut reader).await.expect_err("no trailer source must fail");
+        assert_checksum_mismatch(&err);
+        assert!(reader.content_crc().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_trailing_checksum_is_an_error_not_a_panic() {
+        let data = b"trailing checksum payload";
+        for value in ["not base64!", ""] {
+            let (mut reader, _) = reader(ChecksumType::SHA256, data, Some(Some(value.to_string())));
+            let err = read_all(&mut reader).await.expect_err("malformed trailer must fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::Other, "{value:?}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn wrapping_hash_reader_keeps_the_trailer_source() {
+        let data = b"trailing checksum payload";
+        let value = encoded(ChecksumType::CRC32, data);
+        let size = data.len() as i64;
+
+        let (inner, _) = reader(ChecksumType::CRC32, data, Some(Some(value.clone())));
+        let mut outer = HashReader::new(Box::new(inner), size, size, None, None, false).expect("outer hash reader");
+        assert!(outer.get_trailer().is_some(), "wrapping must carry the trailer source");
+        assert_eq!(read_all(&mut outer).await.expect("verified body"), data);
+        assert_eq!(outer.content_crc(), HashMap::from([("CRC32".to_string(), value)]));
+
+        let wrong = encoded(ChecksumType::CRC32, b"different payload");
+        let (inner, _) = reader(ChecksumType::CRC32, data, Some(Some(wrong)));
+        let mut outer = HashReader::new(Box::new(inner), size, size, None, None, false).expect("outer hash reader");
+        let err = read_all(&mut outer).await.expect_err("mismatch through a wrapper must fail");
+        assert_checksum_mismatch(&err);
     }
 }

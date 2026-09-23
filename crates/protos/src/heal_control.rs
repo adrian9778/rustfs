@@ -20,7 +20,7 @@
 //! contextual lease and nonce validation.
 
 use rmp_serde::Deserializer;
-use rustfs_common::heal_channel::{
+use rustfs_heal_contracts::heal_channel::{
     HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealChannelResponse,
     HealRequestSource, HealScanMode,
 };
@@ -88,6 +88,8 @@ impl From<Priority> for HealChannelPriority {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StartCommand {
     disk: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    heal_endpoints: Vec<String>,
     bucket: String,
     object_prefix: Option<String>,
     object_version_id: Option<String>,
@@ -113,6 +115,7 @@ impl TryFrom<HealChannelRequest> for StartCommand {
     fn try_from(request: HealChannelRequest) -> Result<Self, Self::Error> {
         Ok(Self {
             disk: request.disk,
+            heal_endpoints: request.heal_endpoints,
             bucket: request.bucket,
             object_prefix: request.object_prefix,
             object_version_id: request.object_version_id,
@@ -146,6 +149,7 @@ impl StartCommand {
         Ok(HealChannelRequest {
             id: request_id,
             disk: self.disk,
+            heal_endpoints: self.heal_endpoints,
             bucket: self.bucket,
             object_prefix: self.object_prefix,
             object_version_id: self.object_version_id,
@@ -349,10 +353,10 @@ pub enum Admission {
     Full,
     DroppedQueueFull,
     DroppedPolicy,
-    /// HS-06: admin start rejected because the same target is already being
-    /// healed (RUSTFS_HEAL_OVERLAP_POLICY=minio_error only).
+    /// Admin start rejected because the same target is already owned and
+    /// cannot be merged under the selected overlap policy.
     DroppedAlreadyRunning,
-    /// HS-06: admin start rejected because its path overlaps an active heal.
+    /// Admin start rejected because its scope overlaps an existing owner.
     DroppedOverlappingPaths,
 }
 
@@ -617,7 +621,7 @@ mod tests {
         Admission, ENVELOPE_MAX_SIZE, Envelope, ExecutableCommand, Outcome, RESULT_MAX_SIZE, RequestMetadata, ResultEnvelope,
         decode_envelope, decode_result, encode_result,
     };
-    use rustfs_common::heal_channel::{HealChannelRequest, HealChannelResponse, HealRequestSource};
+    use rustfs_heal_contracts::heal_channel::{HealChannelRequest, HealChannelResponse, HealRequestSource};
     use serde::de::{DeserializeSeed, SeqAccess, Visitor, value::Error as ValueError};
 
     fn test_request(request_id: String) -> HealChannelRequest {
@@ -632,6 +636,12 @@ mod tests {
         }
     }
 
+    fn replacement_test_request(request_id: String) -> HealChannelRequest {
+        let mut request = test_request(request_id);
+        request.heal_endpoints = vec!["http://node1:9000/drive2".to_string()];
+        request
+    }
+
     fn metadata(byte: u8, epoch: u64) -> RequestMetadata {
         RequestMetadata::new([byte; 16], 1_000, 2_000, epoch)
     }
@@ -639,7 +649,7 @@ mod tests {
     #[test]
     fn round_trips_all_commands_and_results() {
         let request_id = uuid::Uuid::new_v4().to_string();
-        let start = Envelope::start(test_request(request_id), metadata(1, 7)).unwrap();
+        let start = Envelope::start(replacement_test_request(request_id), metadata(1, 7)).unwrap();
         let query = Envelope::query(
             uuid::Uuid::new_v4().to_string(),
             metadata(2, 7),
@@ -850,6 +860,15 @@ mod tests {
             .insert("unknown".to_string(), serde_json::Value::Bool(true));
         let unknown = rmp_serde::to_vec_named(&unknown).unwrap();
         assert!(decode_envelope(&unknown).unwrap_err().contains("unknown field"));
+
+        let mut read_repair = serde_json::to_value(&envelope).expect("start envelope should serialize");
+        read_repair["command"]["request"]
+            .as_object_mut()
+            .expect("start request must be an object")
+            .insert("readRepair".to_string(), serde_json::Value::Bool(true));
+        let encoded = rmp_serde::to_vec_named(&read_repair).expect("invalid start fixture should encode");
+        let error = decode_envelope(&encoded).expect_err("RPC must reject an Admin readRepair field");
+        assert!(error.contains("unknown field") && error.contains("readRepair"), "{error}");
 
         let executable =
             Envelope::start(test_request(request_id.clone()), RequestMetadata::new([1; 16], 10_000, 20_000, 7)).unwrap();

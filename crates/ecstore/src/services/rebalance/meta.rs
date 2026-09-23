@@ -1,3 +1,4 @@
+use super::worker::{rebalance_max_attempts, retry_rebalance_metadata_access};
 use super::{
     EVENT_REBALANCE_BUCKET, EVENT_REBALANCE_STATE, Error, GetObjectReader, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE,
     ObjectInfo, ObjectOptions, PutObjReader, REBAL_META_FMT, REBAL_META_NAME, REBAL_META_VER,
@@ -100,7 +101,10 @@ impl RebalanceMeta {
                 PutObjectReader = PutObjReader,
             >,
     {
-        let (data, _) = read_config_with_metadata(store, REBAL_META_NAME, &opts).await?;
+        let (data, _) = retry_rebalance_metadata_access(None, rebalance_max_attempts(), || {
+            read_config_with_metadata(Arc::clone(&store), REBAL_META_NAME, &opts)
+        })
+        .await?;
         if data.is_empty() {
             debug!(
                 event = EVENT_REBALANCE_STATE,
@@ -155,7 +159,7 @@ impl RebalanceMeta {
         self.save_with_opts(store, ObjectOptions::default()).await
     }
 
-    pub async fn save_with_opts<S>(&self, store: Arc<S>, opts: ObjectOptions) -> Result<()>
+    pub async fn save_with_opts<S>(&self, store: Arc<S>, mut opts: ObjectOptions) -> Result<()>
     where
         S: ObjectIO<
                 Error = Error,
@@ -188,6 +192,14 @@ impl RebalanceMeta {
         let msg = rmp_serde::to_vec(self)?;
         data.extend(msg);
 
+        if self.stopped_at.is_none() && is_rebalance_conflicting_with_decommission(self) {
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut opts.user_defined,
+                rustfs_utils::http::metadata_compat::SUFFIX_REBALANCE_RUN_ID,
+                self.id.clone(),
+            );
+        }
+
         save_config_with_opts(store, REBAL_META_NAME, data, &opts).await?;
 
         Ok(())
@@ -204,6 +216,14 @@ pub(super) fn is_rebalance_pool_active(pool_stat: &RebalanceStats) -> bool {
 
 pub(super) fn is_rebalance_in_progress(meta: &RebalanceMeta) -> bool {
     meta.pool_stats.iter().any(is_rebalance_pool_active)
+}
+
+/// Persisted rebalance metadata requires worker activation only while it has
+/// not reached a durable terminal marker and at least one pool is still marked
+/// active. Merely finding `rebalance.bin` is not evidence that admission is
+/// required: terminal metadata is retained for status reporting.
+pub(crate) fn rebalance_requires_worker_activation(meta: &RebalanceMeta) -> bool {
+    meta.stopped_at.is_none() && is_rebalance_in_progress(meta)
 }
 
 pub(crate) fn is_rebalance_conflicting_with_decommission(meta: &RebalanceMeta) -> bool {
@@ -627,16 +647,12 @@ pub(super) fn should_skip_start_rebalance(cancel_attached: bool, in_progress: bo
     cancel_attached && in_progress
 }
 
-pub(super) fn is_rebalance_stopped_terminal_event(terminal_event: &RebalanceTerminalEvent) -> bool {
-    matches!(terminal_event, RebalanceTerminalEvent::Stopped { .. })
-}
-
 pub(super) fn should_preserve_rebalance_stopped_state(
     meta_stopped: bool,
     status: RebalStatus,
     terminal_event: &RebalanceTerminalEvent,
 ) -> bool {
-    (meta_stopped || status == RebalStatus::Stopped) && !is_rebalance_stopped_terminal_event(terminal_event)
+    (meta_stopped || status == RebalStatus::Stopped) && matches!(terminal_event, RebalanceTerminalEvent::Completed { .. })
 }
 
 pub(super) fn resolve_rebalance_participants(pool_stats: &[RebalanceStats], pool_count: usize) -> Vec<bool> {
@@ -864,10 +880,6 @@ pub(super) fn merge_rebalance_meta(remote: &mut RebalanceMeta, local: &Rebalance
     RebalanceMetaMergeOutcome::Merged
 }
 
-#[allow(
-    dead_code,
-    reason = "stop-transition helper retained beside stop_rebalance_meta_snapshot; no caller yet (backlog#1823)"
-)]
 pub(super) fn mark_started_rebalance_pools_stopped(meta: &mut RebalanceMeta, stop_time: OffsetDateTime) {
     for pool_stat in meta.pool_stats.iter_mut() {
         if pool_stat.info.status == RebalStatus::Started {
@@ -908,7 +920,7 @@ pub(super) fn clear_rebalance_cancel_token(meta: Option<&mut RebalanceMeta>) -> 
 
 pub(super) fn stop_rebalance_state(meta: &mut RebalanceMeta, now: OffsetDateTime) {
     clear_rebalance_cancel_token(Some(meta));
-    if meta.stopped_at.is_none() && is_rebalance_in_progress(meta) {
+    if meta.stopped_at.is_none() && (meta.stop_requested || is_rebalance_in_progress(meta)) {
         apply_stopped_at(meta, now);
     } else if meta.stopped_at.is_some() {
         mark_started_rebalance_pools_stopping(meta);
@@ -935,6 +947,9 @@ pub(super) fn stop_rebalance_meta_snapshot_for_id(
     }
 
     stop_rebalance_state(meta, now);
+    // The caller holds the activation writer after admission was cancelled,
+    // so all entry readers have drained and no later entry can be admitted.
+    mark_started_rebalance_pools_stopped(meta, now);
     meta.last_refreshed_at = Some(now);
     Ok(Some(meta.clone()))
 }

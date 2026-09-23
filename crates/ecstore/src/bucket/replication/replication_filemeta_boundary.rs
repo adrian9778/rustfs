@@ -12,10 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(test)]
+pub(crate) use rustfs_filemeta::ObjectPartInfo;
+/// Persisted object-metadata keys (`meta_user`); filemeta owns the on-disk spelling.
+pub(crate) use rustfs_filemeta::metadata_keys;
+
+/// `FileInfo.metadata` of the xl.meta fixture written before `metadata_keys` existed.
+#[cfg(test)]
+pub(crate) fn pre_metadata_keys_fixture_metadata() -> std::collections::HashMap<String, String> {
+    rustfs_filemeta::FileMeta::load(&rustfs_filemeta::test_data::create_pre_metadata_keys_xlmeta().expect("decode fixture hex"))
+        .expect("load fixture xl.meta")
+        .into_fileinfo("bucket", "object", "0b1e5a3a-1735-4a3a-8000-00000000a3a0", false, false, false)
+        .expect("fixture version to FileInfo")
+        .metadata
+}
+
 pub use rustfs_replication::{MrfOpKind, MrfReplicateEntry};
 pub(crate) use rustfs_replication::{
     REPLICATE_EXISTING, REPLICATE_HEAL_DELETE, ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction,
-    ReplicationWorkerOperation, ResyncDecision, get_replication_state, parse_replicate_decision,
+    ReplicationGenerationSnapshot, ReplicationWorkerOperation, ResyncDecision, get_replication_state, parse_replicate_decision,
     replicate_decision_for_admitted_targets, target_reset_header, version_purge_statuses_map,
 };
 pub use rustfs_replication::{

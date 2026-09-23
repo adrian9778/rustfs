@@ -1,7 +1,7 @@
 # e2e_test
 
 End-to-end test suite for RustFS. Each test spawns a **real `rustfs` binary**
-(built on demand from the workspace) and drives it over the network with the
+(built and identified before the test invocation) and drives it over the network with the
 AWS SDK (`aws-sdk-s3`), raw HTTP (`reqwest` / `awscurl`), or a protocol client
 (FTPS / WebDAV / SFTP). This is the black-box integration layer: exhaustive
 end-to-end behavior lives here, unit behavior stays in the source crates
@@ -25,37 +25,44 @@ Registered in [`src/lib.rs`](src/lib.rs). Grouped by concern:
 | **policy** | [`src/policy/`](src/policy), `existing_object_tag_policy_test`, `bucket_policy_check_test`, `anonymous_access_test`, `security_boundary_test`, `multipart_auth_test` | IAM / bucket-policy / STS session policy, policy variables, anonymous access, DoS/SSRF boundaries. Own guide: [`src/policy/README.md`](src/policy/README.md) |
 | **protocols** | [`src/protocols/`](src/protocols) | FTPS, WebDAV, SFTP compliance. Fixed ports, own guide: [`src/protocols/README.md`](src/protocols/README.md) |
 | **reliant** | [`src/reliant/`](src/reliant) | Tests that reuse an **externally started** server (SQL/select, conditional writes, lifecycle, deleted-object reads, node-interact). Run via [`scripts/run_e2e_tests.sh`](../../scripts/run_e2e_tests.sh); see [`src/reliant/README.md`](src/reliant/README.md) |
-| **cluster** | `cluster_concurrency_test`, `stale_multipart_cleanup_cluster_test`, `namespace_lock_quorum_test`, `admin_timeout_regression_test`, `object_lambda_test`, `replication_extension_test` | Multi-node scenarios via `RustFSTestClusterEnvironment` |
+| **cluster** | `cluster_concurrency_test`, `stale_multipart_cleanup_cluster_test`, `namespace_lock_quorum_test`, `admin_timeout_regression_test`, `object_lambda_test`, `replication_extension_test`, `tier_stats_cluster_test` | Multi-node scenarios via `RustFSTestClusterEnvironment` |
+| **distributed 4×4** | [`src/distributed/`](src/distributed) | Storage-sensitive PR and nightly `e2e-distributed` lane: S3, object lock/WORM, versioning, bucket/site replication, quota, expand/decommission/rebalance, concurrency, chaos, 4-node upgrade of historical data and IAM AK/SK. Map: [`docs/testing/distributed-e2e.md`](../../docs/testing/distributed-e2e.md) |
 | **chaos / reliability** | [`src/chaos.rs`](src/chaos.rs), `reliability_disk_fault_test`, `heal_erasure_disk_rebuild_test`, `server_startup_failfast_test` | Disk offline/replace/corrupt, EC rebuild, heal, fail-fast startup |
+| **upgrade compatibility** | `upgrade_compatibility_test` | Pinned previous-release writes followed by current-build reads on the same data directory |
+
+The external-tool `storage_metric_ownership_test` validates the OTLP/Collector/Prometheus path, including a rolling upgrade and node failures. See the [storage metrics guide](../../docs/operations/storage-metrics.md) for its required binaries and focused command.
 
 ## How to run
 
-All commands assume repo root. `cargo test` triggers an on-demand build of the
-`rustfs` binary from [`src/common.rs`](src/common.rs) (`rustfs_binary_path`) on
-first use — the first invocation is slow, later ones reuse the binary.
+All commands assume repo root and Python 3.9 or newer on Linux or macOS. Build the server once through the provenance entry point, then run the test command through the same script:
 
 ```bash
-# Whole crate (default = ignored tests skipped)
-cargo nextest run -p e2e_test
+python3 scripts/e2e_binary.py build --features e2e-test-hooks
+
+# Whole crate (ignored tests remain skipped)
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run -p e2e_test
 
 # One module
-cargo nextest run -p e2e_test -E 'test(list_objects_v2_pagination_test)'
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run -p e2e_test -E 'test(list_objects_v2_pagination_test)'
 
-# PR smoke subset (see "CI smoke subset" below)
-cargo nextest run --profile e2e-smoke -p e2e_test
-
-# ILM serial lane — ignored lifecycle tests, single-threaded (mirrors CI)
-cargo nextest run -j1 --run-ignored ignored-only -p rustfs-scanner -p rustfs \
-  -E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))'
-
+# PR smoke subset
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke -p e2e_test
 ```
 
-The protocols suite has its own contract (fixed bind ports 9022–9301,
-single-worker execution, feature-gated scheduling) documented in
-[`src/protocols/README.md`](src/protocols/README.md). `RUSTFS_BUILD_FEATURES`
-selects which features the spawned binary is built with; leave it unset to run
-every protocol entry. Use the exact profile command under
-[Troubleshooting](#troubleshooting) for CI-equivalent execution.
+Root-heal interruption scenarios use a test-only commit barrier, so build and run them with `e2e-test-hooks`:
+
+```bash
+python3 scripts/e2e_binary.py build --features e2e-test-hooks
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run -p e2e_test -E 'test(heal_erasure_disk_rebuild_test)'
+```
+
+`build` records the source contents, HEAD, resolved Cargo features, profile, toolchain, and binary SHA-256 beside the executable in `rustfs.e2e.json`. `run` validates that identity before and after the command, preserves command failures, and removes its temporary run receipt on completion. The Rust harness checks that receipt before starting each server; it never compiles a server inside a test process. Source or binary changes during a run invalidate the result, even when the test command succeeds. Use an isolated worktree and keep it unchanged until the command finishes.
+
+The additional `--features` arguments must match between `build` and `run`; Cargo defaults remain enabled. The wrapper supplies `RUSTFS_BUILD_FEATURES` from Cargo's resolved feature list, including features enabled by `full`. Protocol helpers require a subset of that list. `CARGO_TARGET_DIR` and `--profile release` are supported. An in-workspace target directory must be Git-ignored; tracked files are always included in the source identity. `build --bins` preserves CI lanes that compile all RustFS binary targets. For a downloaded artifact, copy both the executable and its sidecar, then use `run`; do not generate a new identity for an arbitrary prebuilt binary. `CARGO_BIN_EXE_rustfs` cannot override the verified executable.
+
+Each build/run holds an exclusive `rustfs.e2e.lock` marker beside the binary; concurrent wrappers fail immediately. Use a private target directory and do not run ordinary Cargo builds against it while tests are active: Cargo does not honor this marker. Interrupted runs fail and terminate their command group. After an uncatchable kill, inspect the PID recorded in a leftover marker and remove it only after confirming its owner has stopped. Embedded file symlinks are hashed through their target; embedded directory symlinks are rejected because their contents cannot be enumerated safely by this entry point.
+
+The protocols suite has its own fixed-port and single-worker contract in [`src/protocols/README.md`](src/protocols/README.md). Use its command under [Troubleshooting](#troubleshooting).
 
 ### `#[ignore]` semantics
 
@@ -72,7 +79,7 @@ The reason string on each attribute is the classifier. Current classes:
 
 - **Needs a pre-started server** — `"requires running RustFS server at
   localhost:9000"` / `"Connects to existing rustfs server"`. These are the
-  `reliant/*` and `policy/test_runner` tests; start a server first (e.g.
+  `reliant/*` tests; start a server first (e.g.
   [`scripts/run_e2e_tests.sh`](../../scripts/run_e2e_tests.sh)) or use
   `--run-ignored`.
 - **Heavy / external tool** — `"Starts a rustfs server; enable when running
@@ -121,9 +128,9 @@ via `create_s3_client(idx)` / `create_all_clients()`. See
 | `wait_for_server_ready` | Poll readiness before issuing requests |
 | `create_s3_client` / `create_test_bucket` / `delete_test_bucket` | aws-sdk-s3 client + bucket lifecycle |
 | `find_available_port` | Random free port (isolation primitive) |
-| `rustfs_binary_path` / `_with_features` | Locate/build the binary; honors `RUSTFS_BUILD_FEATURES` |
+| `rustfs_binary_path` / `_with_features` | Verify this run's binary receipt and required feature subset |
 | `requested_rustfs_build_features` / `rustfs_build_feature_enabled` | Feature-gate a test to what the binary was built with |
-| `awscurl_available` + `execute_awscurl` / `awscurl_post` / `_get` / `_put` / `_delete` / `awscurl_post_sts_form_urlencoded` | Admin/STS API calls via `awscurl` (skip gracefully when absent) |
+| `execute_awscurl` / `awscurl_post` / `_get` / `_put` / `_delete` / `awscurl_post_sts_form_urlencoded` | Admin/STS API calls via `awscurl`; missing binaries are test failures |
 | `replication_fast_env` | Env vars that shrink replication timers (from repl-4); pass to `start_rustfs_server_with_env` |
 | `local_http_client` / `init_logging` | Loopback HTTP client; idempotent tracing init |
 | `RustFSTestClusterEnvironment` (`new`/`start`/`start_node`/`stop_node`/`create_all_clients`) | Multi-node harness |
@@ -168,7 +175,9 @@ the same profile for membership and execution with one nightly worker.
 | `s3s-e2e` black-box | `e2e-tests` + `e2e-tests-rio-v2` jobs | **Active** (external conformance tool) |
 | ILM / lifecycle (ignored) | `test-ilm-integration-serial` lane, `-j1` | **Active** (backlog#1148 ilm-1) |
 | KMS suite | `e2e-full` job, merge queue + main | **Active** |
+| Direct and mixed-version rolling upgrades from pinned previous release | `e2e-upgrade.yml`, storage-sensitive PRs + release tags + weekly | **Active** |
 | Cluster faults (`e2e-nightly` profile) | consolidated nightly workflow | **Active** (backlog#1149 ci-7) |
+| Distributed 4-node 4-disk (`e2e-distributed` profile) | `.github/workflows/e2e-distributed.yml` | **Active** (storage-sensitive PR / nightly / dispatch) |
 | Protocols (FTPS/WebDAV/SFTP) | consolidated nightly workflow, serial | **Active** (backlog#1149 ci-7) |
 | Replication (fast subset) | `e2e-smoke` profile, `e2e-tests` job, every PR | **Active** (backlog#1147 repl-1) |
 | Replication (slow + multi-node) | `e2e-repl-nightly` profile, consolidated nightly workflow | **Active** (backlog#1147 repl-1) |
@@ -180,35 +189,38 @@ the wiring source of truth. Committed test-ID digests under
 
 ## Troubleshooting
 
+**Endpoint blackhole scenario skipped** — `heal_erasure_disk_rebuild_test::tests::test_cluster_root_heal_recovers_after_target_endpoint_blackhole` installs a loopback `iptables` DROP rule and therefore needs `CAP_NET_ADMIN` (root or passwordless `sudo -n iptables`). A host where `iptables` is missing or cannot read the OUTPUT chain (typical inside an unprivileged container, where the nf_tables backend reports "Permission denied" even under `sudo`) logs a `heal_interruption_skipped` warning and returns without exercising heal. Set `RUSTFS_E2E_REQUIRE_NET_FAULT_INJECTION=1` on lanes that do provision the capability so a broken runner fails instead of skipping.
+
 **Reproduce a CI failure locally** — run the exact profile/lane:
 
 ```bash
-# Smoke (e2e-tests job) — includes the 20 fast replication tests
-cargo nextest run --profile e2e-smoke -p e2e_test
-# Full single-node merge/main lane
-cargo nextest run --profile e2e-full -p e2e_test
-# Cluster fault nightly lane
-cargo nextest run --profile e2e-nightly -p e2e_test
-# Replication nightly lane; install awscurl so STS paths do not skip
-cargo nextest run --profile e2e-repl-nightly -p e2e_test
-# Fixed-port protocol nightly lane
-RUSTFS_BUILD_FEATURES=ftps,webdav,sftp \
-  cargo nextest run -j 1 --profile e2e-protocols -p e2e_test --no-capture
-# ILM serial lane
+# Smoke, full, and cluster lanes share a server with fault-test hooks.
+python3 scripts/e2e_binary.py build --features e2e-test-hooks
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke -p e2e_test
+python3 scripts/e2e_binary.py run --binary "$RUSTFS_E2E_STARTUP_CAS_BINARY" --features e2e-test-hooks -- cargo nextest run --profile e2e-full -p e2e_test
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-nightly -p e2e_test
+
+# Distributed 4-node 4-disk lane uses the default server.
+# Upgrade cases require RUSTFS_UPGRADE_SOURCE_BINARY and fail closed without it.
+python3 scripts/e2e_binary.py build
+python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-distributed -p e2e_test
+
+# Replication nightly uses the default server; awscurl is required for STS.
+python3 scripts/e2e_binary.py build
+python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-repl-nightly -p e2e_test
+
+# Protocol nightly owns fixed ports.
+python3 scripts/e2e_binary.py build --features ftps,webdav,sftp
+python3 scripts/e2e_binary.py run --features ftps,webdav,sftp -- cargo nextest run -j 1 --profile e2e-protocols -p e2e_test --no-capture
+
+# The ILM serial lane does not use this server harness.
 cargo nextest run -j1 --run-ignored ignored-only -p rustfs-scanner -p rustfs \
   -E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))'
-# s3s-e2e black box
-./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs-e2e-data
 ```
 
-**Stale binary.** Tests build the `rustfs` binary once and reuse it. To avoid
-rebuilding while iterating on tests, `common.rs` reuses an existing binary when
-running *inside* the e2e test process even if sources changed
-(`can_reuse_inside_e2e`, [`src/common.rs`](src/common.rs) line 98). Downside: if
-you changed **server** code, force a rebuild with
-`cargo build -p rustfs` (or `touch` a source file outside the reuse window)
-before re-running, or CI's freshly built artifact will diverge from your local
-one.
+The full lane also requires the startup-CAS build manifest generated by the `Build debug binary` step in `.github/workflows/ci.yml`. Preserve that binary and both sidecars as its `Preserve startup CAS binary input` step does, and use the same `RUSTFS_E2E_STARTUP_CAS_*` environment as `Run e2e full suite`. A generic local build alone does not supply that fixture evidence.
+
+**Stale or unverified binary.** Re-run the matching `build` command after changing source or features, then invoke tests through `run`. A missing receipt, copied old executable, or mismatched build identity is a prerequisite failure. Bare Cargo invocations that start a server deliberately fail; unit tests that do not start a server can still run directly.
 
 **Port already in use / orphan processes.** A hard-killed run can leak a
 `rustfs` child holding its port. Find and kill it:
@@ -221,9 +233,8 @@ The `s3s-e2e` CI job selects a random `RUSTFS_TEST_PORT` (see the `e2e-tests`
 job) to dodge this; local single-node tests already use random ports, so a
 lingering orphan is usually the cause of a spurious bind failure.
 
-**`awscurl` not found.** `awscurl`-dependent tests skip gracefully with a
-visible log line (`awscurl_available()`); install `awscurl` to actually run
-them.
+**`awscurl` not found.** `awscurl`-dependent tests fail closed with a process
+spawn error. Install the pinned CI version before running their profiles.
 
 ## Related
 
@@ -232,8 +243,8 @@ them.
   [`src/policy/README.md`](src/policy/README.md),
   [`src/protocols/README.md`](src/protocols/README.md),
   [`src/reliant/README.md`](src/reliant/README.md)
-- Authoritative per-module counts:
-  [`docs/testing/e2e-suite-inventory.md`](../../docs/testing/e2e-suite-inventory.md)
+- Per-module counts: `cargo nextest list -p e2e_test --profile <profile>`
+  (one-liner in [`docs/testing/README.md`](../../docs/testing/README.md))
 - Test pyramid & flake policy: [`docs/testing/README.md`](../../docs/testing/README.md)
 
 ## CI smoke subset (`--profile e2e-smoke`)
@@ -241,7 +252,8 @@ them.
 A subset of this crate runs on every PR via the `e2e-tests` job:
 
 ```bash
-cargo nextest run --profile e2e-smoke -p e2e_test
+python3 scripts/e2e_binary.py build --features e2e-test-hooks
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke -p e2e_test
 ```
 
 The selection lives in `.config/nextest.toml` under `[profile.e2e-smoke]`
@@ -258,10 +270,9 @@ A test module may join the smoke filter only if every test in it is:
 2. **Single-node** — spawns its own server via
    `RustFSTestEnvironment`/`start_rustfs_server` on a random port with an
    isolated temp dir. No `RustFSTestClusterEnvironment`, no fixed ports.
-3. **Dependency-free** — no pre-started server at `localhost:9000`, no Vault,
-   no fixed protocol ports. Tools that may be absent on the runner (e.g.
-   `awscurl`) are acceptable only when the test skips gracefully with a
-   visible log line (see `bucket_policy_check_test.rs`).
+3. **Hermetic dependencies** — no pre-started server at `localhost:9000`, no
+   Vault, and no fixed protocol ports. Any required CLI must be pinned and
+   installed by the workflow; a missing CLI must fail the test.
 4. **Not `#[ignore]`** — ignored tests are activation work (backlog#1149
    ci-13 / backlog#1148 ilm-3), not smoke candidates.
 
@@ -271,11 +282,16 @@ Note on `#[serial]`: nextest runs each test in its own process, so
 parallel-safe by construction (random port + isolated temp dir), which the
 current subset is.
 
-### Authoritative test inventory
+### Test inventory
 
-`docs/testing/e2e-suite-inventory.md` records the per-module test counts as
-listed by `cargo nextest list -p e2e_test`. Regenerate it when adding or
-moving e2e tests so acceptance numbers in the test-strategy issues
-(backlog#1147–#1155) stay auditable. When a profile membership change is
+Per-module counts are not committed; list them with
+`cargo nextest list -p e2e_test --profile <profile>` (the result is
+platform-dependent because some modules are linux-only; the `jq` one-liner is
+in `docs/testing/README.md`). When a profile membership change is
 intentional, review its JSON listing before updating the matching
-`.config/e2e-*-selection.txt` test-ID digest.
+`.config/e2e-*-selection.txt` test-ID digest. Update only the platform that
+produced the listing:
+
+```bash
+python3 scripts/check_test_wiring.py --update-profile e2e-full /path/to/listing.json linux
+```

@@ -17,6 +17,7 @@
 
 use super::common::{
     LocalKMSTestEnvironment, VAULT_KEY_NAME, VaultTestEnvironment, configure_kms, get_kms_status, kms_admin_request, start_kms,
+    test_sse_kms_encryption,
 };
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, ServerSideEncryption, VersioningConfiguration};
@@ -432,7 +433,38 @@ async fn test_configured_local_kms_admin_and_versioned_cleanup() -> TestResult {
 }
 
 #[tokio::test]
-#[ignore = "requires a Vault binary"]
+async fn test_admin_configured_local_kms_is_restored_after_restart() -> TestResult {
+    let mut env = LocalKMSTestEnvironment::new().await?;
+    env.base_env.start_rustfs_server(Vec::new()).await?;
+
+    let default_key_id = env.configure_local_kms().await?;
+    start_kms(&env.base_env.url, &env.base_env.access_key, &env.base_env.secret_key).await?;
+
+    env.base_env.restart_server_preserving_data(Vec::new(), &[]).await?;
+    assert_configured_status(
+        &env.base_env.url,
+        &env.base_env.access_key,
+        &env.base_env.secret_key,
+        "local",
+        &default_key_id,
+    )
+    .await?;
+
+    let bucket = format!("kms-restart-{}", Uuid::new_v4());
+    env.base_env.create_test_bucket(&bucket).await?;
+    let client = env.base_env.create_s3_client();
+    test_sse_kms_encryption(&client, &bucket).await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key("test-sse-kms-object")
+        .send()
+        .await?;
+    env.base_env.delete_test_bucket(&bucket).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_configured_vault_kms_admin_and_versioned_cleanup() -> TestResult {
     let mut env = VaultTestEnvironment::new().await?;
     env.start_vault().await?;

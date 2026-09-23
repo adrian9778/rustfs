@@ -6,6 +6,7 @@ cd "$repo_root"
 
 checked_files=(
   "rustfs/src/main.rs"
+  "rustfs/src/startup_entrypoint.rs"
   "rustfs/src/init.rs"
   "rustfs/src/profiling.rs"
   "rustfs/src/startup_iam.rs"
@@ -28,6 +29,15 @@ checked_files=(
   "rustfs/src/admin/handlers/kms_keys.rs"
   "rustfs/src/admin/handlers/kms_key_lifecycle.rs"
   "rustfs/src/admin/handlers/site_replication.rs"
+  "rustfs/src/site_replication/mod.rs"
+  "rustfs/src/site_replication/identity.rs"
+  "rustfs/src/site_replication/state_lock.rs"
+  "rustfs/src/site_replication/state.rs"
+  "rustfs/src/site_replication/transport.rs"
+  "rustfs/src/site_replication/retry.rs"
+  "rustfs/src/site_replication/repair.rs"
+  "rustfs/src/site_replication/hooks.rs"
+  "rustfs/src/site_replication/tests.rs"
   "rustfs/src/admin/handlers/group.rs"
   "rustfs/src/admin/handlers/quota.rs"
   "rustfs/src/admin/handlers/rebalance.rs"
@@ -59,7 +69,12 @@ checked_files=(
   "crates/targets/src/target/webhook.rs"
   "crates/ecstore/src/store/peer.rs"
   "crates/ecstore/src/store/init.rs"
-  "crates/ecstore/src/client/transition_api.rs"
+  "crates/ecstore/src/store/mod.rs"
+  "crates/ecstore/src/object_api/types.rs"
+  "crates/ecstore/src/core/sets.rs"
+  "crates/ecstore/src/set_disk/ops/object.rs"
+  "crates/ecstore/src/bucket/replication/replication_pool.rs"
+  "crates/s3-client/src/transition_api.rs"
   "crates/ecstore/src/services/tier/tier.rs"
   "crates/heal/src/heal/manager.rs"
   "crates/heal/src/heal/storage.rs"
@@ -113,6 +128,8 @@ checked_files=(
   "crates/obs/src/telemetry/dial9/config.rs"
   "crates/obs/src/telemetry/dial9/enabled.rs"
   "crates/obs/src/telemetry/local.rs"
+  "crates/obs/src/telemetry/guard.rs"
+  "crates/obs/src/telemetry/rolling.rs"
   "crates/obs/src/metrics/scheduler.rs"
   "crates/obs/src/cleaner/core.rs"
   "crates/obs/src/cleaner/compress.rs"
@@ -144,17 +161,17 @@ forbidden_patterns=(
   'debug!("http_client headers: {:?}"'
   'warn!("err_body: {}"'
   'debug!("config: {:?}"'
-  'warn!("No audit targets configured for dispatch"'
-  'warn!("No audit targets configured for batch dispatch"'
-  'info!("Event stream processing for target {} is started successfully"'
-  'info!("Target {} has no replay worker to start"'
-  'info!("Sending event to targets: {:?}"'
-  'info!("Event processing initiated for {} targets for bucket: {}"'
+  '"No audit targets configured for dispatch"'
+  '"No audit targets configured for batch dispatch"'
+  '"Event stream processing for target {} is started successfully"'
+  '"Target {} has no replay worker to start"'
+  '"Sending event to targets: {:?}"'
+  '"Event processing initiated for {} targets for bucket: {}"'
   'warn!("{}", notify_configuration_hint())'
-  'info!("Available ARNs: {:?}"'
-  'info!("Loaded notification config for bucket: {}"'
-  'info!("Updated notification rules for bucket: {}"'
-  'info!("Removed all notification rules for bucket: {}"'
+  '"Available ARNs: {:?}"'
+  '"Loaded notification config for bucket: {}"'
+  '"Updated notification rules for bucket: {}"'
+  '"Removed all notification rules for bucket: {}"'
   'info!(event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,'
   'info!("Notification system instance is being dropped"'
   'info!("Notification shutdown metric snapshot"'
@@ -174,9 +191,9 @@ forbidden_patterns=(
   'info!(target_id = %self.id, "MQTT target close method finished.")'
   'debug!("Wrote event to store: {}"'
   'debug!("Deleted event from store: {}"'
-  'info!("Audit configuration reloaded"'
-  'info!("Audit system started"'
-  'info!("Audit metrics reset"'
+  '"Audit configuration reloaded"'
+  '"Audit system started"'
+  '"Audit metrics reset"'
   'error!("Failed to set global observability guard: {}"'
   'error!("Failed to initialize TLS from {}: {}"'
   'error!("Server encountered an error and is shutting down: {}"'
@@ -661,12 +678,92 @@ forbidden_patterns=(
   'error!("{} cache write lock poisoned: {}"'
   'error!("metrics_metadata lock poisoned: {}"'
   'warn!("Could not get GPU stats, recording 0 for GPU memory usage"'
+  # Migrated from the retired source-text tests in crates/obs/src/logging.rs
+  # (rustfs/backlog#1884): unmasked access-key interpolation, retired startup
+  # noise, and stderr prints that were converted to tracing events.
+  'access_key: {access_key}'
+  '"Successfully sent audit entry, target: {}, key: {}"'
+  '"Target {} not connected, retrying..."'
+  '"Timeout sending to target {}, retrying..."'
+  '"[WARN] Failed to initialize file observability logging'
+  '"Falling back to stdout logging.'
+  'eprintln!("Tracer shutdown error: {err:?}")'
+  'eprintln!("Meter shutdown error: {err:?}")'
+  'eprintln!("Logger shutdown error: {err:?}")'
+  'eprintln!("Log cleanup task stopped")'
+  'eprintln!("Tracing guard dropped, flushing logs.")'
+  'eprintln!("Stdout guard dropped, flushing logs.")'
 )
 
 for pattern in "${forbidden_patterns[@]}"; do
   if rg -n -F -- "$pattern" "${checked_files[@]}" >/dev/null; then
     echo "❌ logging guardrail violation: found forbidden pattern '$pattern'" >&2
     rg -n -F -- "$pattern" "${checked_files[@]}" >&2
+    exit 1
+  fi
+done
+
+# Positive structure guards migrated from the retired source-text tests in
+# crates/obs/src/logging.rs (rustfs/backlog#1884). Each pattern below must keep
+# existing: the single fatal-stderr formatter used before observability is up,
+# the structured tracing fields that replaced eprintln! in telemetry
+# fallback/shutdown paths, and the explicit stderr exceptions in the low-level
+# rolling appender (which cannot log through the sink it implements).
+require_patterns() {
+  local file="$1"
+  shift
+  for pattern in "$@"; do
+    if ! rg -n -F -- "$pattern" "$file" >/dev/null; then
+      echo "❌ logging guardrail violation: required pattern '$pattern' is missing from $file" >&2
+      exit 1
+    fi
+  done
+}
+
+require_patterns "rustfs/src/startup_entrypoint.rs" \
+  'fn format_fatal_stderr_message(context: &str, error: impl std::fmt::Display) -> String' \
+  'fn emit_fatal_stderr(context: &str, error: impl std::fmt::Display)' \
+  'emit_fatal_stderr("Server runtime failed", e)' \
+  'emit_fatal_stderr("Command parse failed", e)' \
+  'emit_fatal_stderr("Observability initialization failed", err)'
+
+require_patterns "crates/obs/src/telemetry/local.rs" \
+  'warn!(' \
+  'state = "fallback_to_stdout"' \
+  'failed_sink = "file"' \
+  'sink = "stdout"'
+
+require_patterns "crates/obs/src/telemetry/guard.rs" \
+  'EVENT_OBS_GUARD_SHUTDOWN' \
+  'resource = "tracer_provider"' \
+  'resource = "meter_provider"' \
+  'resource = "logger_provider"' \
+  'resource = "log_cleaner"' \
+  'resource = "tracing_guard"' \
+  'resource = "stdout_guard"'
+
+require_patterns "crates/obs/src/telemetry/rolling.rs" \
+  'Failed to flush log file before rotation' \
+  'RollingAppender: Failed to rotate log file after' \
+  'RollingAppender: failed to rotate log file'
+
+for raw_ecstore_debug_field in \
+  '.field("disk_map",' \
+  '.field("pools",' \
+  '.field("pool_meta",'; do
+  if rg -n -F -- "$raw_ecstore_debug_field" crates/ecstore/src/store/mod.rs >/dev/null; then
+    echo "❌ logging guardrail violation: ECStore Debug must stay bounded and must not render disk_map, pools, or pool_meta" >&2
+    exit 1
+  fi
+done
+
+for raw_object_options_debug_field in \
+  '.field("tier_delete_journal_api", &self.tier_delete_journal_api)' \
+  '.field("user_defined", &self.user_defined)' \
+  '.field("eval_metadata", &self.eval_metadata)' \
+  '.field("http_preconditions", &self.http_preconditions)'; do
+  if rg -n -F -- "$raw_object_options_debug_field" crates/ecstore/src/object_api/types.rs >/dev/null; then
+    echo "❌ logging guardrail violation: ObjectOptions Debug must summarize large or request-derived fields" >&2
     exit 1
   fi
 done
@@ -952,7 +1049,7 @@ if rg -n -U '(info|warn)!\(\s*target: "rustfs::heal::manager",[\s\S]{0,1000}"Hea
   exit 1
 fi
 
-if rg -n -U 'info!\([\s\S]{0,1000}"GetObject streaming body resumed from a reopened object read"' rustfs/src/app/object_usecase.rs >/dev/null; then
+if rg -n -U 'info!\([\s\S]{0,1000}"GetObject streaming body resumed from a reopened object read"' rustfs/src/app/object >/dev/null; then
   echo "❌ logging guardrail violation: successful per-object GetObject resume events must stay below INFO" >&2
   exit 1
 fi
@@ -994,7 +1091,7 @@ trace_hot_spans=(
   "crates/ecstore/src/core/sets.rs:list_objects_v2"
   "crates/ecstore/src/set_disk/ops/list.rs:list_objects_v2"
   "rustfs/src/app/bucket_usecase.rs:execute_list_objects_v2"
-  "rustfs/src/app/object_usecase.rs:execute_get_object"
+  "rustfs/src/app/object:execute_get_object"
 )
 
 for hot_span in "${trace_hot_spans[@]}"; do

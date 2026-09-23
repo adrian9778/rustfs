@@ -355,6 +355,7 @@ pub(crate) struct TestCatalogObjectBackend {
     pub(crate) corrupt_put_object_path: Arc<tokio::sync::Mutex<Option<String>>>,
     pub(crate) missing_read_object_path: Arc<tokio::sync::Mutex<Option<String>>>,
     pub(crate) fail_read_object_path: Arc<tokio::sync::Mutex<Option<String>>>,
+    pub(crate) fail_write_lock_path: Arc<tokio::sync::Mutex<Option<(String, TableCatalogStoreError)>>>,
     pub(crate) lock_attempts: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
     pub(crate) reject_reads_while_write_locked: bool,
     /// Content-addressed (sha256) etags instead of the store fake's counter.
@@ -641,12 +642,26 @@ impl TestCatalogObjectBackend {
         let mut state = self.state.lock().await;
         let key = (bucket.to_string(), object.to_string());
         let next_attempt = state.put_attempts.get(&key).copied().unwrap_or_default() + 1;
+        Self::pause_put_attempt_unlocked(&mut state, key, next_attempt)
+    }
+
+    pub(crate) async fn pause_put_attempt(&self, bucket: &str, object: &str, attempt: usize) -> TestCatalogObjectPause {
+        let mut state = self.state.lock().await;
+        let key = (bucket.to_string(), object.to_string());
+        Self::pause_put_attempt_unlocked(&mut state, key, attempt)
+    }
+
+    fn pause_put_attempt_unlocked(
+        state: &mut TestCatalogObjectState,
+        key: (String, String),
+        attempt: usize,
+    ) -> TestCatalogObjectPause {
         let pause = TestCatalogObjectPause::default();
         state
             .pause_put_attempts
             .entry(key)
             .or_default()
-            .insert(next_attempt, pause.clone());
+            .insert(attempt, pause.clone());
         pause
     }
 
@@ -939,6 +954,17 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
                 .entry((bucket.to_string(), object.to_string()))
                 .or_default() += 1;
         }
+        let injected_error = {
+            let mut failure = self.fail_write_lock_path.lock().await;
+            if failure.as_ref().is_some_and(|(path, _)| path == object) {
+                failure.take().map(|(_, error)| error)
+            } else {
+                None
+            }
+        };
+        if let Some(error) = injected_error {
+            return Err(error);
+        }
         let lock = {
             let mut locks = self.locks.lock().await;
             locks
@@ -1052,6 +1078,10 @@ impl TestCatalogObjectBackend {
         })
         .await
         .expect("lock acquisition attempts should be observable");
+    }
+
+    pub(crate) async fn fail_next_write_lock(&self, object: impl Into<String>, error: TableCatalogStoreError) {
+        *self.fail_write_lock_path.lock().await = Some((object.into(), error));
     }
 }
 

@@ -14,21 +14,27 @@
 
 use crate::{Error, Result};
 use async_trait::async_trait;
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rustfs_common::heal_channel::{HealOpts, HealScanMode};
+use base64_simd::URL_SAFE_NO_PAD;
+use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
+use rustfs_heal_contracts::heal_channel::{DriveState, HealOpts, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use tracing::{debug, error, warn};
+use uuid::Uuid;
 
+use super::outcome::{HealObjectDisposition, HealObjectIdentity, HealObjectKind, HealObjectReceipt};
 use super::progress::stable_generation;
+pub use super::replacement_execution::ReplacementExecution;
 use super::storage_api::owner::{EcstoreHealLifecycleExpiryContext, ecstore_load_admin_data_usage_from_backend_cached};
 use super::storage_api::storage::{
-    BucketInfo, BucketOperations, DiskSetSelector, HealOperations as _, ListOperations as _, ObjectIO as _,
-    ObjectOperations as _, StorageAdminApi,
+    BucketInfo, BucketOperations, DiskSetSelector, EcstoreHealObjectStorageResult, HealOperations as _, ListOperations as _,
+    ObjectIO as _, ObjectOperations as _, StorageAdminApi,
 };
-use super::{DiskStore, ECStore, HealDiskExt as _, StorageError, resume::ReplacementTargetIdentity};
+use super::{
+    DiskError, DiskStore, ECStore, HealDiskExt as _, StorageError, local_disk_map_read,
+    resume::{ReplacementRecoveryCandidate, ReplacementTargetIdentity, merge_replacement_recovery_candidate},
+};
 pub use super::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -68,6 +74,88 @@ impl HealLifecycleExpiryContext {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct HealStorageObjectResult {
+    pub item: HealResultItem,
+    pub error: Option<Error>,
+    pub receipt: Option<HealObjectReceipt>,
+}
+
+fn incarnation_storage_error(bucket: &str, expected: Uuid, error: StorageError) -> Error {
+    match error {
+        StorageError::BucketNotFound(_) => Error::StaleBucketIncarnation {
+            bucket: bucket.to_owned(),
+            expected: Some(expected),
+        },
+        error => Error::Storage(error),
+    }
+}
+
+impl From<(HealResultItem, Option<Error>)> for HealStorageObjectResult {
+    fn from((item, error): (HealResultItem, Option<Error>)) -> Self {
+        Self {
+            item,
+            error,
+            receipt: None,
+        }
+    }
+}
+
+fn verified_object_receipt(
+    bucket: &str,
+    object: &str,
+    version_id: Option<&str>,
+    opts: &HealOpts,
+    item: &HealResultItem,
+    bucket_incarnation_id: Uuid,
+) -> Option<HealObjectReceipt> {
+    if opts.dry_run
+        || (!item.integrity_verified && !item.repair_verified && !item.metadata_verified && !item.metadata_repair_verified)
+    {
+        return None;
+    }
+    let resolved_version = Uuid::from_bytes(item.resolved_version_id?);
+    if let Some(requested) = version_id.filter(|version| !version.is_empty())
+        && Uuid::parse_str(requested).ok()? != resolved_version
+    {
+        return None;
+    }
+    item.drives_reported()?;
+    let drives_healed = item.drives_healed()?;
+    if (item.repair_verified || item.metadata_repair_verified) && drives_healed == 0 {
+        return None;
+    }
+    let ok_drive_state = DriveState::Ok.to_string();
+    if !item.after.drives.iter().all(|drive| drive.state == ok_drive_state) {
+        return None;
+    }
+    let receipt_version_id = if resolved_version.is_nil() {
+        version_id.filter(|version| !version.is_empty()).map(ToOwned::to_owned)
+    } else {
+        Some(resolved_version.to_string())
+    };
+    Some(HealObjectReceipt {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Object,
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            version_id: receipt_version_id,
+            bucket_incarnation_id: Some(bucket_incarnation_id),
+            pool_index: opts.pool,
+            set_index: opts.set,
+        },
+        disposition: if drives_healed > 0 && (item.integrity_verified || item.repair_verified || item.metadata_repair_verified) {
+            HealObjectDisposition::Repaired
+        } else if drives_healed == 0 && item.integrity_verified {
+            HealObjectDisposition::VerifiedHealthy
+        } else if drives_healed == 0 && item.metadata_verified {
+            HealObjectDisposition::MetadataHealthy
+        } else {
+            return None;
+        },
+    })
+}
+
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_STORAGE: &str = "storage";
 const EVENT_HEAL_STORAGE_OBJECT_IO: &str = "heal_storage_object_io";
@@ -78,6 +166,19 @@ const EVENT_HEAL_STORAGE_REPAIR_OP: &str = "heal_storage_repair_op";
 pub enum ReplacementResumeDisk {
     Fresh,
     Existing(DiskStore),
+}
+
+fn replacement_resume_conflict_for_other_tasks(
+    requested_task_id: &str,
+    observed_other_tasks: &std::collections::HashSet<String>,
+    set_disk_id: &str,
+) -> Option<Error> {
+    let mut task_ids = observed_other_tasks.iter().collect::<Vec<_>>();
+    task_ids.sort_unstable();
+    task_ids.first().map(|other_task_id| Error::ReplacementGenerationConflict {
+        task_id: requested_task_id.to_string(),
+        reason: format!("durable generation {other_task_id} already owns set {set_disk_id}"),
+    })
 }
 
 pub(crate) fn next_heal_listing_token(
@@ -147,7 +248,7 @@ pub(crate) fn encode_heal_token(marker: Option<&str>, version_marker: Option<&st
     // serde_json of a simple two-Option struct cannot fail; fall back to an
     // empty object rather than panicking if it somehow does.
     let json = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
-    format!("{HEAL_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(json))
+    format!("{HEAL_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode_to_string(json))
 }
 
 /// Decode an opaque heal continuation token back into `(marker, version_marker)`.
@@ -174,7 +275,7 @@ pub(crate) fn decode_heal_token(token: &str) -> (Option<String>, Option<String>)
         return (None, None);
     };
 
-    let bytes = match URL_SAFE_NO_PAD.decode(encoded) {
+    let bytes = match URL_SAFE_NO_PAD.decode_to_vec(encoded) {
         Ok(bytes) => bytes,
         Err(e) => {
             warn!(
@@ -234,7 +335,7 @@ const DISK_WALK_TOKEN_PREFIX: &str = "dw1:";
 /// enumerators can never misread each other's cursor: a `dw1:` token decodes to
 /// `(None, None)` under the B5 decoder, and a `v1:` token decodes to `None` here.
 pub(crate) fn encode_disk_walk_token(next_forward: &str) -> String {
-    format!("{DISK_WALK_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(next_forward.as_bytes()))
+    format!("{DISK_WALK_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode_to_string(next_forward.as_bytes()))
 }
 
 /// Decode a disk-walk continuation token back into the `next_forward` object key.
@@ -261,7 +362,7 @@ pub(crate) fn decode_disk_walk_token(token: &str) -> Option<String> {
         return None;
     };
 
-    let bytes = match URL_SAFE_NO_PAD.decode(encoded) {
+    let bytes = match URL_SAFE_NO_PAD.decode_to_vec(encoded) {
         Ok(bytes) => bytes,
         Err(e) => {
             warn!(
@@ -302,13 +403,13 @@ pub(crate) fn decode_disk_walk_token(token: &str) -> Option<String> {
 /// `is_delete_marker` is OBSERVABILITY-ONLY (metrics / logging / e2e
 /// assertions); it MUST NOT gate healing logic. Whether the delete-marker path
 /// or the data path is taken is decided internally in `ops/heal.rs` from
-/// `latest_meta.deleted`. `version_id` is normalized (nil/absent UUID => `None`)
-/// at the single construction point in `list_objects_for_heal_page`.
+/// `latest_meta.deleted`. Every enumerated version has an exact selector:
+/// nil/absent metadata UUIDs select the nil UUID, never an unspecified latest.
 #[derive(Debug, Clone)]
 pub struct HealListItem {
     /// object key
     pub name: String,
-    /// normalized version id (`None` when the version is nil/absent)
+    /// Exact version id, including the nil UUID for the null slot.
     pub version_id: Option<String>,
     /// version modification time as Unix nanoseconds
     pub mod_time_unix_nanos: Option<i128>,
@@ -321,6 +422,18 @@ pub struct HealListItem {
 /// Heal storage layer interface
 #[async_trait]
 pub trait HealStorageAPI: Send + Sync {
+    /// Delete one exact marker from every member of its original erasure set.
+    async fn purge_delete_marker(
+        &self,
+        _bucket: &str,
+        _object: &str,
+        _version_id: &str,
+        _purge: &MrfDeleteMarkerPurge,
+        _opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        Err(Error::other("delete-marker purge is unsupported by this heal storage backend"))
+    }
+
     /// Get object meta
     ///
     /// Reserved for HS-01 MRF wiring (rustfs/backlog#1865): MRF intents
@@ -337,6 +450,14 @@ pub trait HealStorageAPI: Send + Sync {
 
     /// Get bucket info
     async fn get_bucket_info(&self, bucket: &str) -> Result<Option<BucketInfo>>;
+
+    /// Return the current bucket incarnation for exact MRF durable proof
+    /// matching. Alternate backends that cannot expose this must return
+    /// `None`, leaving replay anchors retained instead of acknowledged with an
+    /// incomplete identity.
+    async fn mrf_bucket_incarnation_id(&self, _bucket: &str) -> Result<Option<Uuid>> {
+        Ok(None)
+    }
 
     /// Aggregate usage-cache baselines for the requested buckets.
     async fn erasure_set_usage_baseline(&self, _buckets: &[String]) -> Result<Option<HealBucketUsageBaseline>> {
@@ -366,6 +487,64 @@ pub trait HealStorageAPI: Send + Sync {
     /// Check object exists
     async fn object_exists(&self, bucket: &str, object: &str) -> Result<bool>;
 
+    /// Stable bucket incarnation observed before an object heal starts.
+    async fn bucket_incarnation_id(&self, _bucket: &str) -> Result<Option<Uuid>> {
+        Ok(None)
+    }
+
+    /// Admission must use authoritative metadata, not an outcome cache.
+    async fn admit_bucket_incarnation(&self, bucket: &str) -> Result<Uuid> {
+        self.bucket_incarnation_id(bucket)
+            .await?
+            .filter(|id| !id.is_nil())
+            .ok_or_else(|| Error::StaleBucketIncarnation {
+                bucket: bucket.to_owned(),
+                expected: None,
+            })
+    }
+
+    async fn validate_bucket_incarnation(&self, bucket: &str, expected: Option<Uuid>) -> Result<()> {
+        let stale = || Error::StaleBucketIncarnation {
+            bucket: bucket.to_owned(),
+            expected,
+        };
+        let expected = expected.filter(|id| !id.is_nil()).ok_or_else(stale)?;
+        match self.admit_bucket_incarnation(bucket).await {
+            Ok(current) if current == expected => Ok(()),
+            Ok(_) | Err(Error::StaleBucketIncarnation { .. }) => Err(stale()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Implementations must retain the bucket lifecycle fence through storage mutation.
+    async fn heal_bucket_at_incarnation(&self, _bucket: &str, _expected: Uuid, _opts: &HealOpts) -> Result<HealResultItem> {
+        Err(Error::other("storage does not support incarnation-bound bucket healing"))
+    }
+
+    async fn heal_object_at_incarnation(
+        &self,
+        _bucket: &str,
+        _object: &str,
+        _version_id: Option<&str>,
+        _expected: Uuid,
+        _opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        Err(Error::other("storage does not support incarnation-bound object healing"))
+    }
+
+    /// Durable MRF repair may request an authoritative unversioned absence proof.
+    async fn heal_mrf_object_at_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        expected: Uuid,
+        opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        self.heal_object_at_incarnation(bucket, object, version_id, expected, opts)
+            .await
+    }
+
     /// Heal object using ecstore
     async fn heal_object(
         &self,
@@ -374,6 +553,16 @@ pub trait HealStorageAPI: Send + Sync {
         version_id: Option<&str>,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)>;
+
+    async fn heal_object_with_receipt(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        self.heal_object(bucket, object, version_id, opts).await.map(Into::into)
+    }
 
     /// Heal bucket using ecstore
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem>;
@@ -395,9 +584,16 @@ pub trait HealStorageAPI: Send + Sync {
         Err(Error::other("target-scoped replacement format is unsupported"))
     }
 
-    /// Recheck admitted replacement targets immediately before destructive work.
-    async fn replacement_targets_ready(&self, _targets: &[String]) -> Result<bool> {
-        Ok(false)
+    /// Whether the explicitly scoped replacement set owns its pool's metadata.
+    /// Backends must use authoritative placement, not treat missing shards as
+    /// evidence that metadata is unnecessary. Unknown placement fails closed.
+    fn replacement_pool_metadata_required(&self, _opts: &HealOpts) -> Result<bool> {
+        Err(Error::other("replacement pool metadata placement is unsupported"))
+    }
+
+    /// Heal and physically verify bucket configuration on its replacement targets.
+    async fn heal_replacement_bucket_metadata(&self, _bucket: &str, _opts: &HealOpts, _targets: &[String]) -> Result<()> {
+        Err(Error::Storage(StorageError::PreconditionFailed))
     }
 
     /// Read target-specific physical evidence for one replacement version.
@@ -427,6 +623,16 @@ pub trait HealStorageAPI: Send + Sync {
         continuation_token: Option<&str>,
         include_lifecycle_object_info: bool,
     ) -> Result<(Vec<HealListItem>, Option<String>, bool)>;
+
+    /// Return the live erasure sets selected by this heal request.
+    ///
+    /// Recursive admin heals use these scopes with the cross-disk union walk so
+    /// objects surviving on only one returning disk are still discovered. The
+    /// `None` default preserves the read-quorum listing for alternate backends;
+    /// `Some(Vec::new())` means the selected topology currently has no live set.
+    async fn heal_erasure_set_scopes(&self, _opts: &HealOpts) -> Result<Option<Vec<(usize, usize)>>> {
+        Ok(None)
+    }
 
     /// List versions for healing via a per-erasure-set DISK-WALK union enumerator
     /// (backlog#920). Unlike `list_objects_for_heal_page` (which reflects only the
@@ -458,6 +664,13 @@ pub trait HealStorageAPI: Send + Sync {
         Err(Error::other("target-excluding resume disk selection is unsupported"))
     }
 
+    /// Return every formatted disk that may durably host or expose a
+    /// replacement intent. Implementations should order local disks first so
+    /// discovery remains deterministic and preserves the local preference.
+    async fn replacement_intent_disks(&self, _set_disk_id: &str) -> Result<Vec<DiskStore>> {
+        Ok(Vec::new())
+    }
+
     /// Reopen the exact surviving disk that owns an existing replacement
     /// intent. Falling back to another disk would create a second copy of the
     /// same generation and split its progress.
@@ -474,6 +687,24 @@ pub trait HealStorageAPI: Send + Sync {
     async fn replacement_target_identities(&self, _targets: &[String]) -> Result<Vec<ReplacementTargetIdentity>> {
         Err(Error::other("replacement target identity collection is unsupported"))
     }
+
+    /// Check whether a replacement generation may consume another retry.
+    /// Implementations must verify the mounted incarnation and that every
+    /// target is formatted in the expected erasure-set slot.  The default is
+    /// deliberately permissive for alternate/mock backends that do not expose
+    /// those disk-level probes.
+    async fn replacement_targets_ready_for_retry(
+        &self,
+        _set_disk_id: &str,
+        _targets: &[String],
+        _expected_identities: &[ReplacementTargetIdentity],
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn replacement_execution(&self, _targets: &[String]) -> Result<Arc<ReplacementExecution>> {
+        Err(Error::other("replacement execution lease acquisition is unsupported"))
+    }
 }
 
 /// ECStore Heal storage layer implementation
@@ -484,6 +715,79 @@ pub struct ECStoreHealStorage {
 impl ECStoreHealStorage {
     pub fn new(ecstore: Arc<ECStore>) -> Self {
         Self { ecstore }
+    }
+
+    async fn resume_disk_inventory(&self, set_disk_id: &str) -> Result<Vec<DiskStore>> {
+        let (pool_idx, set_idx) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
+        let disks = StorageAdminApi::disk_set_inventory(self.ecstore.as_ref(), DiskSetSelector::new(pool_idx, set_idx))
+            .await
+            .map_err(|e| Error::TaskExecutionFailed {
+                message: format!("Failed to get disks for pool {pool_idx} set {set_idx}: {e}"),
+            })?;
+        Ok(disks.into_iter().flatten().collect())
+    }
+
+    async fn object_result_with_receipt(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        opts: &HealOpts,
+        result: EcstoreHealObjectStorageResult,
+        expected: Option<Uuid>,
+    ) -> HealStorageObjectResult {
+        let item = result.item;
+        let error = result.error.map(Error::Storage);
+        let receipt = if let Some(proof) = result.absence {
+            if error.is_none()
+                && !opts.dry_run
+                && proof.bucket == bucket
+                && proof.object == object
+                && proof.version_id == version_id.unwrap_or("")
+                && proof.pool_index == opts.pool
+                && proof.set_index == opts.set
+                && !proof.bucket_incarnation_id.is_nil()
+                && expected.is_none_or(|expected| expected == proof.bucket_incarnation_id)
+                && !proof.locations.is_empty()
+                && proof.locations.iter().all(|(pool, set)| {
+                    opts.pool.is_none_or(|expected| expected == *pool) && opts.set.is_none_or(|expected| expected == *set)
+                })
+            {
+                Some(HealObjectReceipt {
+                    identity: HealObjectIdentity {
+                        kind: HealObjectKind::Object,
+                        bucket: proof.bucket,
+                        object: proof.object,
+                        version_id: version_id.map(ToOwned::to_owned),
+                        bucket_incarnation_id: Some(proof.bucket_incarnation_id),
+                        pool_index: proof.pool_index,
+                        set_index: proof.set_index,
+                    },
+                    // A committed cleanup repaired the stale replica. A replay
+                    // observing an already absent version made no new repair.
+                    disposition: if proof.removed {
+                        HealObjectDisposition::Repaired
+                    } else {
+                        HealObjectDisposition::AuthoritativelyAbsent
+                    },
+                })
+            } else {
+                None
+            }
+        } else if error.is_none()
+            && !opts.dry_run
+            && (item.integrity_verified || item.repair_verified || item.metadata_verified || item.metadata_repair_verified)
+        {
+            let bucket_incarnation_id = match expected {
+                Some(expected) => Some(expected),
+                None => self.ecstore.bucket_incarnation_id(bucket).await.ok(),
+            };
+            bucket_incarnation_id
+                .and_then(|incarnation| verified_object_receipt(bucket, object, version_id, opts, &item, incarnation))
+        } else {
+            None
+        };
+        HealStorageObjectResult { item, error, receipt }
     }
 
     /// Read back an object's bytes, capped to bound memory.
@@ -610,6 +914,95 @@ fn is_transient_object_exists_error(err: &StorageError) -> bool {
 
 #[async_trait]
 impl HealStorageAPI for ECStoreHealStorage {
+    async fn purge_delete_marker(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        purge: &MrfDeleteMarkerPurge,
+        opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        let removed = self
+            .ecstore
+            .purge_delete_marker_with_proof(bucket, object, version_id, purge, opts)
+            .await
+            .map_err(Error::Storage)?;
+        Ok(HealStorageObjectResult {
+            item: HealResultItem::default(),
+            error: None,
+            receipt: Some(HealObjectReceipt {
+                identity: HealObjectIdentity {
+                    kind: HealObjectKind::DeleteMarkerPurge,
+                    bucket: bucket.to_owned(),
+                    object: object.to_owned(),
+                    version_id: Some(version_id.to_owned()),
+                    bucket_incarnation_id: Some(purge.bucket_incarnation_id),
+                    pool_index: opts.pool,
+                    set_index: opts.set,
+                },
+                disposition: if removed {
+                    HealObjectDisposition::Repaired
+                } else {
+                    HealObjectDisposition::AuthoritativelyAbsent
+                },
+            }),
+        })
+    }
+
+    async fn admit_bucket_incarnation(&self, bucket: &str) -> Result<Uuid> {
+        match self.ecstore.bucket_incarnation_id_from_disk(bucket).await {
+            Ok(id) if !id.is_nil() => Ok(id),
+            Ok(_) | Err(StorageError::BucketNotFound(_)) => Err(Error::StaleBucketIncarnation {
+                bucket: bucket.to_owned(),
+                expected: None,
+            }),
+            Err(error) => Err(Error::Storage(error)),
+        }
+    }
+
+    async fn heal_bucket_at_incarnation(&self, bucket: &str, expected: Uuid, opts: &HealOpts) -> Result<HealResultItem> {
+        self.ecstore
+            .heal_bucket_at_incarnation(bucket, expected, opts)
+            .await
+            .map_err(|error| incarnation_storage_error(bucket, expected, error))
+    }
+
+    async fn heal_object_at_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        expected: Uuid,
+        opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        let result = self
+            .ecstore
+            .heal_object_at_incarnation(bucket, object, version_id.unwrap_or_default(), expected, opts)
+            .await
+            .map_err(|error| incarnation_storage_error(bucket, expected, error))?;
+        Ok(self
+            .object_result_with_receipt(bucket, object, version_id, opts, result, Some(expected))
+            .await)
+    }
+
+    async fn heal_mrf_object_at_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        expected: Uuid,
+        opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        let result = self
+            .ecstore
+            .heal_mrf_object_at_incarnation(bucket, object, version_id.unwrap_or_default(), expected, opts)
+            .await
+            .map_err(|error| incarnation_storage_error(bucket, expected, error))?;
+        Ok(self
+            .object_result_with_receipt(bucket, object, version_id, opts, result, Some(expected))
+            .await)
+    }
+
     async fn get_object_meta(&self, bucket: &str, object: &str) -> Result<Option<HealObjectInfo>> {
         debug!(
             target: "rustfs::heal::storage",
@@ -680,6 +1073,7 @@ impl HealStorageAPI for ECStoreHealStorage {
             scan_mode: HealScanMode::Deep,
             update_parity: true,
             no_lock: false,
+            read_repair: false,
             pool: None,
             set: None,
         };
@@ -774,6 +1168,14 @@ impl HealStorageAPI for ECStoreHealStorage {
                 Err(Error::other(e))
             }
         }
+    }
+
+    async fn mrf_bucket_incarnation_id(&self, bucket: &str) -> Result<Option<Uuid>> {
+        self.ecstore
+            .bucket_incarnation_id(bucket)
+            .await
+            .map(Some)
+            .map_err(Error::Storage)
     }
 
     async fn erasure_set_usage_baseline(&self, buckets: &[String]) -> Result<Option<HealBucketUsageBaseline>> {
@@ -995,6 +1397,14 @@ impl HealStorageAPI for ECStoreHealStorage {
         }
     }
 
+    async fn bucket_incarnation_id(&self, bucket: &str) -> Result<Option<Uuid>> {
+        self.ecstore
+            .bucket_incarnation_id(bucket)
+            .await
+            .map(Some)
+            .map_err(Error::Storage)
+    }
+
     async fn heal_object(
         &self,
         bucket: &str,
@@ -1055,6 +1465,23 @@ impl HealStorageAPI for ECStoreHealStorage {
                 Err(Error::Storage(e))
             }
         }
+    }
+
+    async fn heal_object_with_receipt(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        let result = self
+            .ecstore
+            .heal_object_with_proof(bucket, object, version_id.unwrap_or(""), opts)
+            .await
+            .map_err(Error::Storage)?;
+        Ok(self
+            .object_result_with_receipt(bucket, object, version_id, opts, result, None)
+            .await)
     }
 
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
@@ -1161,8 +1588,23 @@ impl HealStorageAPI for ECStoreHealStorage {
             .map_err(Error::Storage)
     }
 
-    async fn replacement_targets_ready(&self, targets: &[String]) -> Result<bool> {
-        Ok(super::replacement_readiness::auto_replacement_targets_ready(targets).await)
+    fn replacement_pool_metadata_required(&self, opts: &HealOpts) -> Result<bool> {
+        let pool_index = opts
+            .pool
+            .ok_or_else(|| Error::other("replacement pool metadata placement is missing pool scope"))?;
+        let set_index = opts
+            .set
+            .ok_or_else(|| Error::other("replacement pool metadata placement is missing set scope"))?;
+        self.ecstore
+            .replacement_pool_metadata_required(pool_index, set_index)
+            .map_err(Error::Storage)
+    }
+
+    async fn heal_replacement_bucket_metadata(&self, bucket: &str, opts: &HealOpts, targets: &[String]) -> Result<()> {
+        self.ecstore
+            .heal_replacement_bucket_metadata(bucket, opts, targets)
+            .await
+            .map_err(Error::Storage)
     }
 
     async fn replacement_targets_have_version(
@@ -1237,14 +1679,14 @@ impl HealStorageAPI for ECStoreHealStorage {
             }
         };
 
-        // Collect versions from this page. version_id is normalized to Option<String>
-        // here at the single construction point: nil/absent UUID => None.
+        // Listing has already selected a concrete version. Preserve the null
+        // slot's identity even when a newer UUID has become latest.
         let page_objects: Vec<HealListItem> = list_info
             .objects
             .into_iter()
             .map(|mut obj| {
+                let version_id = Some(obj.version_id.unwrap_or_default().to_string());
                 obj.version_id = obj.version_id.filter(|u| !u.is_nil());
-                let version_id = obj.version_id.map(|u| u.to_string());
                 let mod_time_unix_nanos = obj.mod_time.map(|mod_time| mod_time.unix_timestamp_nanos());
                 let is_delete_marker = obj.delete_marker;
                 if include_lifecycle_object_info {
@@ -1292,6 +1734,14 @@ impl HealStorageAPI for ECStoreHealStorage {
         );
 
         Ok((page_objects, next_token, list_info.is_truncated))
+    }
+
+    async fn heal_erasure_set_scopes(&self, opts: &HealOpts) -> Result<Option<Vec<(usize, usize)>>> {
+        self.ecstore
+            .heal_erasure_set_scopes(opts)
+            .await
+            .map(Some)
+            .map_err(Error::Storage)
     }
 
     async fn list_versions_for_heal_page_disk_walk(
@@ -1394,7 +1844,14 @@ impl HealStorageAPI for ECStoreHealStorage {
     }
 
     async fn get_disk_for_resume(&self, set_disk_id: &str) -> Result<DiskStore> {
-        self.get_disk_for_resume_excluding(set_disk_id, &[]).await
+        for disk in self.resume_disk_inventory(set_disk_id).await? {
+            if disk.endpoint().is_local && matches!(disk.get_disk_id().await, Ok(Some(id)) if !id.is_nil()) {
+                return Ok(disk);
+            }
+        }
+        Err(Error::TaskExecutionFailed {
+            message: format!("No available disk found for set_disk_id: {set_disk_id}"),
+        })
     }
 
     async fn get_disk_for_resume_excluding(&self, set_disk_id: &str, excluded_targets: &[String]) -> Result<DiskStore> {
@@ -1409,45 +1866,60 @@ impl HealStorageAPI for ECStoreHealStorage {
             "Heal storage admin operation started"
         );
 
-        // Parse set_disk_id to extract pool and set indices
-        let (pool_idx, set_idx) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
-
-        // Get the first available disk from the set
-        let disks = StorageAdminApi::disk_set_inventory(self.ecstore.as_ref(), DiskSetSelector::new(pool_idx, set_idx))
-            .await
-            .map_err(|e| Error::TaskExecutionFailed {
-                message: format!("Failed to get disks for pool {pool_idx} set {set_idx}: {e}"),
-            })?;
-
         // The replacement target is unformatted before repair and must never
         // host the intent that authorizes its own formatting.
-        for disk_store in disks.into_iter().flatten() {
-            if !disk_store.endpoint().is_local {
-                continue;
+        let disks = self.resume_disk_inventory(set_disk_id).await?;
+        for prefer_local in [true, false] {
+            for disk_store in &disks {
+                if disk_store.endpoint().is_local != prefer_local
+                    || excluded_targets.contains(&disk_store.endpoint().to_string())
+                    || !matches!(disk_store.get_disk_id().await, Ok(Some(id)) if !id.is_nil())
+                {
+                    continue;
+                }
+                debug!(
+                    target: "rustfs::heal::storage",
+                    event = EVENT_HEAL_STORAGE_ADMIN_OP,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_STORAGE,
+                    operation = "get_disk_for_resume",
+                    set_disk_id,
+                    result = "ok",
+                    disk = ?disk_store,
+                    "Heal storage resume disk resolved"
+                );
+                return Ok(disk_store.clone());
             }
-            if excluded_targets.contains(&disk_store.endpoint().to_string()) {
-                continue;
-            }
-            if !matches!(disk_store.get_disk_id().await, Ok(Some(id)) if !id.is_nil()) {
-                continue;
-            }
-            debug!(
-                target: "rustfs::heal::storage",
-                event = EVENT_HEAL_STORAGE_ADMIN_OP,
-                component = LOG_COMPONENT_HEAL,
-                subsystem = LOG_SUBSYSTEM_STORAGE,
-                operation = "get_disk_for_resume",
-                set_disk_id,
-                result = "ok",
-                disk = ?disk_store,
-                "Heal storage resume disk resolved"
-            );
-            return Ok(disk_store);
         }
 
         Err(Error::TaskExecutionFailed {
             message: format!("No available disk found for set_disk_id: {set_disk_id}"),
         })
+    }
+
+    async fn replacement_intent_disks(&self, set_disk_id: &str) -> Result<Vec<DiskStore>> {
+        let disks = self.resume_disk_inventory(set_disk_id).await?;
+        let mut formatted = Vec::with_capacity(disks.len());
+        for prefer_local in [true, false] {
+            for disk in &disks {
+                if disk.endpoint().is_local != prefer_local {
+                    continue;
+                }
+                match disk.get_disk_id().await {
+                    Ok(Some(id)) if !id.is_nil() => formatted.push(disk.clone()),
+                    Ok(_) | Err(DiskError::UnformattedDisk) => {}
+                    Err(error) => {
+                        return Err(Error::TaskExecutionFailed {
+                            message: format!(
+                                "Failed to inspect replacement intent disk {} for set_disk_id {set_disk_id}: {error}",
+                                disk.endpoint()
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(formatted)
     }
 
     async fn get_replacement_resume_disk(
@@ -1456,35 +1928,111 @@ impl HealStorageAPI for ECStoreHealStorage {
         task_id: &str,
         excluded_targets: &[String],
     ) -> Result<ReplacementResumeDisk> {
-        let (pool_idx, set_idx) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
-        let disks = StorageAdminApi::disk_set_inventory(self.ecstore.as_ref(), DiskSetSelector::new(pool_idx, set_idx))
-            .await
-            .map_err(|e| Error::TaskExecutionFailed {
-                message: format!("Failed to get disks for pool {pool_idx} set {set_idx}: {e}"),
-            })?;
-        let mut existing = None;
-        for disk_store in disks.into_iter().flatten() {
-            if !disk_store.endpoint().is_local || excluded_targets.contains(&disk_store.endpoint().to_string()) {
-                continue;
-            }
-            if !matches!(disk_store.get_disk_id().await, Ok(Some(id)) if !id.is_nil()) {
-                continue;
-            }
-            if super::resume::ResumeManager::has_replacement_intent(&disk_store, task_id).await
-                && existing.replace(disk_store).is_some()
+        let disks = self.resume_disk_inventory(set_disk_id).await?;
+        let mut selected = None;
+        let mut observed_other_tasks = HashSet::new();
+        for disk_store in &disks {
+            if excluded_targets.contains(&disk_store.endpoint().to_string())
+                || !matches!(disk_store.get_disk_id().await, Ok(Some(id)) if !id.is_nil())
             {
-                return Err(Error::TaskExecutionFailed {
-                    message: format!("Replacement resume intent is duplicated for set_disk_id: {set_disk_id}"),
-                });
+                continue;
+            }
+            let mut replacement_tasks = super::resume::ResumeUtils::get_replacement_intent_tasks(disk_store).await?;
+            if !replacement_tasks.iter().any(|candidate| candidate == task_id)
+                && super::resume::ResumeManager::has_replacement_intent(disk_store, task_id).await
+            {
+                replacement_tasks.push(task_id.to_string());
+            }
+            if replacement_tasks.is_empty() {
+                continue;
+            }
+            for candidate_task_id in replacement_tasks {
+                // A request with a fresh UUID must not silently create a new
+                // generation while another durable intent already owns this
+                // set. Inspect one copy of each other task and let the
+                // caller reconcile it through the normal recovery scanner.
+                if candidate_task_id != task_id && !observed_other_tasks.insert(candidate_task_id.clone()) {
+                    continue;
+                }
+                let manager =
+                    super::resume::ResumeManager::load_replacement_intent(disk_store.clone(), &candidate_task_id).await?;
+                let state = manager.get_state().await;
+                if state.set_disk_id != set_disk_id {
+                    return Err(Error::ReplacementGenerationConflict {
+                        task_id: candidate_task_id,
+                        reason: format!("replacement intent belongs to {}, not {set_disk_id}", state.set_disk_id),
+                    });
+                }
+                if candidate_task_id != task_id {
+                    continue;
+                }
+                let candidate =
+                    ReplacementRecoveryCandidate::new(state, disk_store.endpoint().to_string(), disk_store.endpoint().is_local)?;
+                merge_replacement_recovery_candidate(&mut selected, candidate)?;
             }
         }
-        Ok(existing.map_or(ReplacementResumeDisk::Fresh, ReplacementResumeDisk::Existing))
+
+        let Some(candidate) = selected else {
+            if let Some(error) = replacement_resume_conflict_for_other_tasks(task_id, &observed_other_tasks, set_disk_id) {
+                return Err(error);
+            }
+            return Ok(ReplacementResumeDisk::Fresh);
+        };
+        let disk = disks
+            .iter()
+            .find(|disk| disk.endpoint().to_string() == candidate.anchor)
+            .ok_or_else(|| Error::TaskExecutionFailed {
+                message: format!("Selected replacement resume anchor disappeared for set_disk_id: {set_disk_id}"),
+            })?;
+        Ok(ReplacementResumeDisk::Existing(disk.clone()))
     }
 
     async fn replacement_target_identities(&self, targets: &[String]) -> Result<Vec<ReplacementTargetIdentity>> {
         super::replacement_readiness::auto_replacement_target_identities(targets)
             .await
-            .ok_or_else(|| Error::other("replacement target is not a stable mounted disk"))
+            .ok_or_else(|| Error::ReplacementTargetNotReady("replacement target is not a stable mounted disk".to_string()))
+    }
+
+    async fn replacement_targets_ready_for_retry(
+        &self,
+        set_disk_id: &str,
+        targets: &[String],
+        expected_identities: &[ReplacementTargetIdentity],
+    ) -> Result<bool> {
+        let identities = match self.replacement_target_identities(targets).await {
+            Ok(identities) => identities,
+            Err(_) => return Ok(false),
+        };
+        if identities != expected_identities {
+            return Ok(false);
+        }
+
+        let local_disks = local_disk_map_read()
+            .await
+            .values()
+            .flatten()
+            .filter(|disk| disk.endpoint().is_local)
+            .cloned()
+            .collect::<Vec<_>>();
+        for target in targets {
+            let Some(disk) = local_disks.iter().find(|disk| disk.endpoint().to_string() == *target) else {
+                return Ok(false);
+            };
+            let endpoint = disk.endpoint();
+            if crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx).as_deref()
+                != Some(set_disk_id)
+            {
+                return Ok(false);
+            }
+            if !matches!(disk.get_disk_id().await, Ok(Some(id)) if !id.is_nil()) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn replacement_execution(&self, targets: &[String]) -> Result<Arc<ReplacementExecution>> {
+        ReplacementExecution::acquire(targets).await
     }
 }
 
@@ -1493,9 +2041,141 @@ mod tests {
     use super::super::StorageError;
     use super::{
         decode_disk_walk_token, decode_heal_token, encode_disk_walk_token, encode_heal_token, is_transient_object_exists_error,
-        is_transient_object_exists_message, next_heal_listing_token,
+        is_transient_object_exists_message, next_heal_listing_token, replacement_resume_conflict_for_other_tasks,
     };
-    use base64::Engine as _;
+    use std::collections::HashSet;
+
+    #[test]
+    fn object_receipt_requires_integrity_and_resolved_version_evidence() {
+        use super::{HealObjectDisposition, HealOpts, HealResultItem, Uuid, verified_object_receipt};
+        use rustfs_madmin::heal_commands::HealDriveInfo;
+        let incarnation = Uuid::new_v4();
+        let null = Uuid::nil().to_string();
+        let latest = Uuid::new_v4();
+        let latest_version = latest.to_string();
+        let options = HealOpts::default();
+        let mut item = HealResultItem {
+            integrity_verified: true,
+            version_id: null.clone(),
+            resolved_version_id: Some(*latest.as_bytes()),
+            ..Default::default()
+        };
+        let healthy = HealDriveInfo {
+            state: "ok".to_string(),
+            ..Default::default()
+        };
+        item.before.drives.push(healthy.clone());
+        item.after.drives.push(healthy);
+        assert!(
+            verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation).is_none(),
+            "echoing null cannot certify a different resolved version"
+        );
+        let receipt = verified_object_receipt("bucket", "object", None, &options, &item, incarnation)
+            .expect("an omitted selector still means latest");
+        assert_eq!(receipt.identity.version_id.as_deref(), Some(latest_version.as_str()));
+        let receipt = verified_object_receipt("bucket", "object", Some(""), &options, &item, incarnation)
+            .expect("an empty selector still means latest");
+        assert_eq!(receipt.identity.version_id.as_deref(), Some(latest_version.as_str()));
+        assert!(
+            verified_object_receipt("bucket", "object", Some("null"), &options, &item, incarnation).is_none(),
+            "the internal boundary requires a UUID, not an S3 spelling"
+        );
+        let requested_latest = latest_version.to_uppercase();
+        let receipt = verified_object_receipt("bucket", "object", Some(&requested_latest), &options, &item, incarnation)
+            .expect("the exact UUID selector should be certifiable");
+        assert_eq!(receipt.identity.version_id.as_deref(), Some(latest_version.as_str()));
+
+        item.resolved_version_id = Some([0; 16]);
+        let receipt = verified_object_receipt("bucket", "object", None, &options, &item, incarnation)
+            .expect("an omitted selector should preserve unversioned identity");
+        assert_eq!(receipt.identity.version_id, None);
+        let receipt = verified_object_receipt("bucket", "object", Some(""), &options, &item, incarnation)
+            .expect("an empty selector should preserve unversioned identity");
+        assert_eq!(receipt.identity.version_id, None);
+        let receipt = verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation)
+            .expect("the exact healthy null version should be certifiable");
+        assert_eq!(receipt.identity.version_id.as_deref(), Some(null.as_str()));
+        assert_eq!(receipt.disposition, HealObjectDisposition::VerifiedHealthy);
+        item.before.drives[0].state = "missing".to_string();
+        assert_eq!(
+            verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation)
+                .expect("the restored null version should be certifiable")
+                .disposition,
+            HealObjectDisposition::Repaired
+        );
+        item.integrity_verified = false;
+        assert!(
+            verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation).is_none(),
+            "the exact version cannot certify unverified shard integrity"
+        );
+        assert!(verified_object_receipt("bucket", "object", None, &options, &item, incarnation).is_none());
+        item.repair_verified = true;
+        item.resolved_version_id = Some([0; 16]);
+        assert_eq!(
+            verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation)
+                .expect("a protected repaired shard should carry a repair receipt")
+                .disposition,
+            HealObjectDisposition::Repaired
+        );
+        item.before.drives[0].state = "ok".to_string();
+        assert!(
+            verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation).is_none(),
+            "repair proof without a repaired drive must remain unresolved"
+        );
+        item.repair_verified = false;
+        item.integrity_verified = true;
+        item.resolved_version_id = None;
+        assert!(
+            verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation).is_none(),
+            "legacy results cannot prove the selected version"
+        );
+        assert!(verified_object_receipt("bucket", "object", None, &options, &item, incarnation).is_none());
+    }
+
+    #[test]
+    fn metadata_health_and_marker_repair_have_distinct_receipts() {
+        use super::{HealObjectDisposition, HealOpts, HealResultItem, Uuid, verified_object_receipt};
+        use rustfs_madmin::heal_commands::HealDriveInfo;
+
+        let incarnation = Uuid::new_v4();
+        let version = Uuid::new_v4().to_string();
+        let options = HealOpts::default();
+        let healthy = HealDriveInfo {
+            state: "ok".to_string(),
+            ..Default::default()
+        };
+        let mut item = HealResultItem {
+            metadata_verified: true,
+            version_id: version.clone(),
+            resolved_version_id: Some(*Uuid::parse_str(&version).expect("version UUID").as_bytes()),
+            ..Default::default()
+        };
+        item.before.drives.push(healthy.clone());
+        item.after.drives.push(healthy);
+
+        let receipt = verified_object_receipt("bucket", "object", Some(&version), &options, &item, incarnation)
+            .expect("metadata quorum should certify metadata health");
+        assert_eq!(receipt.disposition, HealObjectDisposition::MetadataHealthy);
+
+        item.integrity_verified = true;
+        let receipt = verified_object_receipt("bucket", "object", Some(&version), &options, &item, incarnation)
+            .expect("stronger integrity proof should remain available");
+        assert_eq!(receipt.disposition, HealObjectDisposition::VerifiedHealthy);
+
+        item.integrity_verified = false;
+        item.metadata_verified = false;
+        item.metadata_repair_verified = true;
+        item.before.drives[0].state = "missing".to_string();
+        let receipt = verified_object_receipt("bucket", "object", Some(&version), &options, &item, incarnation)
+            .expect("a committed metadata repair should certify the marker/version");
+        assert_eq!(receipt.disposition, HealObjectDisposition::Repaired);
+
+        item.before.drives[0].state = "ok".to_string();
+        assert!(
+            verified_object_receipt("bucket", "object", Some(&version), &options, &item, incarnation).is_none(),
+            "repair proof without a repaired drive must fail closed"
+        );
+    }
 
     #[test]
     fn next_heal_listing_token_returns_none_for_complete_page() {
@@ -1546,7 +2226,7 @@ mod tests {
         assert_eq!(decode_heal_token("no-prefix-here"), (None, None));
         assert_eq!(decode_heal_token("v1:!!!not-base64!!!"), (None, None));
         // valid base64 of non-JSON bytes.
-        let bad_json = format!("v1:{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json"));
+        let bad_json = format!("v1:{}", base64_simd::URL_SAFE_NO_PAD.encode_to_string(b"not json"));
         assert_eq!(decode_heal_token(&bad_json), (None, None));
         // a raw v2-style list_objects_v2 token (no "v1:" prefix) resets cleanly.
         assert_eq!(decode_heal_token("some-opaque-legacy-token"), (None, None));
@@ -1558,7 +2238,7 @@ mod tests {
         // list_object_versions returns NotImplemented for that pairing.
         // Craft a token whose JSON encodes (None, Some) directly and confirm coercion.
         let json = br#"{"m":null,"v":"orphan-version"}"#;
-        let token = format!("v1:{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json));
+        let token = format!("v1:{}", base64_simd::URL_SAFE_NO_PAD.encode_to_string(json));
         assert_eq!(decode_heal_token(&token), (None, None), "version-only marker must coerce to (None, None)");
     }
 
@@ -1616,5 +2296,16 @@ mod tests {
             "bucket".to_string(),
             "object".to_string(),
         )));
+    }
+
+    #[test]
+    fn fresh_replacement_cannot_ignore_another_durable_generation() {
+        let other = "00000000-0000-4000-8000-000000000001".to_string();
+        let observed = HashSet::from([other]);
+        let error =
+            replacement_resume_conflict_for_other_tasks("00000000-0000-4000-8000-000000000002", &observed, "pool_0_set_0")
+                .expect("an unmatched durable owner must produce a conflict");
+        assert!(matches!(error, crate::Error::ReplacementGenerationConflict { .. }));
+        assert!(replacement_resume_conflict_for_other_tasks("task", &HashSet::new(), "pool_0_set_0").is_none());
     }
 }

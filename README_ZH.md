@@ -12,12 +12,11 @@
 
 
 <p align="center">
-<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://trendshift.io/api/badge/repositories/14181" alt="rustfs%2Frustfs | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a> 
-<a href="https://runacap.com/ross-index/q4-2025/" target="_blank" rel="noopener"><img style="width: 260px; height: 55px" src="https://runacap.com/wp-content/uploads/2026/01/ROSS_badge_white_Q4_2025.svg" alt="ROSS Index - Fastest Growing Open-Source Startups in Q4 2025 | Runa Capital" height="55" /></a>
+<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://trendshift.io/api/badge/repositories/14181" alt="rustfs%2Frustfs | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </p>
 
 <p align="center">
-  <a href="https://docs.rustfs.com/installation/">快速开始</a>
+  <a href="https://docs.rustfs.com/zh/installation">快速开始</a>
   · <a href="https://docs.rustfs.com/">文档</a>
   · <a href="https://github.com/rustfs/rustfs/issues">报告 Bug</a>
   · <a href="https://github.com/rustfs/rustfs/discussions">社区讨论</a>
@@ -47,14 +46,31 @@ RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。Rust
 - **完全开源**：采用 Apache 2.0 许可证，鼓励社区贡献和商业使用。
 - **简单易用**：设计简洁，易于部署和管理。
 
-| 功能               | 状态    | 功能                    | 状态      |
-| :----------------- | :------ | :---------------------- | :-------- |
-| **S3 核心功能**    | ✅ 可用 | **Bitrot (防数据腐烂)** | ✅ 可用   |
-| **上传 / 下载**    | ✅ 可用 | **单机模式**            | ✅ 可用   |
-| **版本控制**       | ✅ 可用 | **存储桶复制**          | ✅ 可用   |
-| **日志功能**       | ✅ 可用 | **生命周期管理**        | 🚧 测试中 |
-| **事件通知**       | ✅ 可用 | **分布式模式**          | 🚧 测试中 |
-| **K8s Helm Chart** | ✅ 可用 | **OPA (策略引擎)**      | 🚧 测试中 |
+状态说明：✅ 可用 —— 已发布并有 CI 门禁覆盖；🧪 预览 —— 已发布但需显式开关，或兼容性承诺有边界。
+
+| 功能                        | 状态    | 功能                     | 状态    |
+| :-------------------------- | :------ | :----------------------- | :------ |
+| **S3 核心功能**             | ✅ 可用 | **分布式模式**           | ✅ 可用 |
+| **上传 / 下载**             | ✅ 可用 | **单机模式**             | ✅ 可用 |
+| **版本控制**                | ✅ 可用 | **Bitrot (防数据腐烂)**  | ✅ 可用 |
+| **对象锁定 (WORM)**         | ✅ 可用 | **修复与扫描器**         | ✅ 可用 |
+| **服务端加密 (SSE)**        | ✅ 可用 | **存储池扩容 / 下线**    | ✅ 可用 |
+| **RustFS KMS**              | ✅ 可用 | **存储桶复制**           | ✅ 可用 |
+| **生命周期管理 (ILM)**      | ✅ 可用 | **站点复制**             | ✅ 可用 |
+| **ILM 分层 (远端 S3)**      | ✅ 可用 | **存储桶配额**           | ✅ 可用 |
+| **S3 Select**               | ✅ 可用 | **事件通知**             | ✅ 可用 |
+| **S3 Tables (Iceberg REST)**| 🧪 预览 | **审计日志**             | ✅ 可用 |
+| **IAM / 策略**              | ✅ 可用 | **日志与可观测性**       | ✅ 可用 |
+| **OIDC / SSO**              | ✅ 可用 | **Web 控制台**           | ✅ 可用 |
+| **Keystone 认证**           | ✅ 可用 | **K8s Helm Chart**       | ✅ 可用 |
+| **Swift API**               | ✅ 可用 | **FTPS / WebDAV**        | ✅ 可用 |
+| **多租户**                  | ✅ 可用 | **SFTP**                 | ✅ 可用 |
+| **MinIO 磁盘格式兼容**      | 🧪 预览 |                          |         |
+
+说明：
+
+- **服务端加密**：支持 SSE-C、SSE-S3 与 SSE-KMS。SSE-KMS 必须先配置 KMS 服务；未配置 KMS 时请求 `aws:kms` 会被拒绝，不会降级到本地主密钥。
+- **RustFS KMS**：生产环境支持 Vault（KV2 / Transit）与 AWS KMS 后端；`Local` 与 `Static` 后端仅供开发与测试使用，详见 [KMS 后端安全属性](docs/operations/kms-backend-security.md)。
 
 ## RustFS vs MinIO 性能对比
 
@@ -90,6 +106,15 @@ RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。Rust
 
 ## 快速开始
 
+> [!IMPORTANT]
+> **Pool 扩容 Notice：**
+>
+> - 单节点单盘（SNSD）部署仅支持使用本地路径独立运行，不支持原地扩容，也不能作为 Pool 加入集群。如需改为多盘拓扑，请创建新部署并通过 S3 迁移数据。
+> - 已有多盘 Pool 的端点和 Erasure Set 宽度应保持不变，扩容应追加新的 Pool。使用省略号表达式扩容时，每个 Pool 参数都必须包含省略号表达式，并展开为至少两个磁盘端点。
+> - 允许单节点多盘 Pool，也允许多节点、每节点一盘的 Pool，但必须满足 Erasure Set 布局和 EC 配置要求；配置合法不代表能够容忍整台主机故障。
+>
+> 这些拓扑规则与 MinIO 一致，但两者的默认 parity 选择方式存在差异。扩容前请阅读 [Pool 布局兼容性与回归测试说明](docs/testing/pool-layout-compatibility.md)。
+
 请按照以下步骤快速上手 RustFS：
 
 ### 1. 一键安装脚本 (选项 1)
@@ -113,7 +138,7 @@ chown -R 10001:10001 data logs
 docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
 # 使用指定版本运行
-docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-rc.3
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.1
 ```
 
 如果您通过绑定挂载启用 TLS 证书目录，也请用同样方式准备该目录：
@@ -142,7 +167,10 @@ docker compose -f docker-compose-simple.yml up -d
 
 ```bash
 # 在本地构建多架构镜像
-./docker-buildx.sh --build-arg RELEASE=latest
+./docker-buildx.sh
+
+# 在本地构建单平台镜像
+./docker-buildx.sh -p linux/amd64
 
 # 构建并推送到仓库
 ./docker-buildx.sh --push
@@ -191,6 +219,12 @@ nix build github:rustfs/rustfs
 nix build
 nix run
 ```
+
+该 Flake 同时提供 NixOS 模块和 RustFS `rc` 客户端。将
+`inputs.rustfs.nixosModules.rustfs` 加入 `imports`，并通过运行时密钥文件
+（例如 sops-nix 或 agenix）配置 `accessKeyFile` 与 `secretKeyFile`，避免密钥
+进入 Nix store。客户端包为
+`inputs.rustfs.packages.${pkgs.system}.rustfs-client`，安装后的命令名为 `rc`。
 
 ### 6\. X-CMD (Option 6)
 

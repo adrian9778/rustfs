@@ -15,12 +15,12 @@
 #![recursion_limit = "256"]
 
 use http::HeaderMap;
-use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},
     storage::{ECStoreHealStorage, HealObjectOptions as ObjectOptions, HealPutObjReader as PutObjReader, HealStorageAPI},
     task::{HealOptions, HealPriority, HealRequest, HealTaskStatus, HealType},
 };
+use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
 use serial_test::serial;
 use std::{
     path::{Path, PathBuf},
@@ -54,6 +54,32 @@ async fn wait_for_path_exists(path: &Path, timeout: Duration, interval: Duration
         }
         tokio::time::sleep(interval).await;
     }
+}
+
+fn find_part_file(obj_dir: &Path) -> Option<PathBuf> {
+    WalkDir::new(obj_dir)
+        .min_depth(2)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().is_file() && entry.file_name().to_str().is_some_and(|name| name.starts_with("part.")))
+        .map(|entry| entry.into_path())
+}
+
+async fn wait_for_object_copies(disks: &[PathBuf], bucket: &str, object: &str) {
+    tokio::time::timeout(HEAL_FORMAT_WAIT_TIMEOUT, async {
+        loop {
+            if disks.iter().all(|disk| {
+                let obj_dir = disk.join(bucket).join(object);
+                obj_dir.join("xl.meta").exists() && find_part_file(&obj_dir).is_some()
+            }) {
+                break;
+            }
+            tokio::time::sleep(HEAL_FORMAT_WAIT_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("PUT rename tails must converge before corrupting the disk fixture");
 }
 
 /// Test helper: build the shared 4-disk temp-dir ECStore environment
@@ -103,18 +129,10 @@ mod serial_tests {
 
         create_test_bucket(&ecstore, bucket_name).await;
         upload_test_object(&ecstore, bucket_name, object_name, &test_data).await;
-        let _obj_dir = disk_paths[0].join(bucket_name).join(object_name);
+        wait_for_object_copies(&disk_paths, bucket_name, object_name).await;
         // ─── 1️⃣ delete single data shard file ─────────────────────────────────────
         let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
-        // find part file at depth 2, e.g. .../<uuid>/part.1
-        let target_part = WalkDir::new(&obj_dir)
-            .min_depth(2)
-            .max_depth(2)
-            .into_iter()
-            .filter_map(Result::ok)
-            .find(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
-            .map(|e| e.into_path())
-            .expect("Failed to locate part file to delete");
+        let target_part = find_part_file(&obj_dir).expect("converged fixture must contain a part file");
 
         std::fs::remove_file(&target_part).expect("failed to delete part file");
         assert!(!target_part.exists());
@@ -171,6 +189,7 @@ mod serial_tests {
 
         create_test_bucket(&ecstore, bucket_name).await;
         upload_test_object(&ecstore, bucket_name, object_name, &test_data).await;
+        wait_for_object_copies(&disk_paths, bucket_name, object_name).await;
 
         // Plant a leaked, unreferenced UUID data dir under the object on every disk
         // that actually holds the object (i.e. has an `xl.meta`). Planting on a disk
@@ -381,15 +400,9 @@ mod serial_tests {
 
         create_test_bucket(&ecstore, bucket_name).await;
         upload_test_object(&ecstore, bucket_name, object_name, &test_data).await;
+        wait_for_object_copies(&disk_paths, bucket_name, object_name).await;
         let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
-        let target_part = WalkDir::new(&obj_dir)
-            .min_depth(2)
-            .max_depth(2)
-            .into_iter()
-            .filter_map(Result::ok)
-            .find(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
-            .map(|e| e.into_path())
-            .expect("Failed to locate part file to delete");
+        let target_part = find_part_file(&obj_dir).expect("converged fixture must contain a part file");
 
         // ─── 1️⃣ delete format.json on one disk ──────────────
         let format_path = disk_paths[0].join(".rustfs.sys").join("format.json");
@@ -484,6 +497,7 @@ mod serial_tests {
             scan_mode: HealScanMode::Normal,
             update_parity: false,
             no_lock: false,
+            read_repair: false,
             pool: None,
             set: None,
         };
@@ -505,6 +519,7 @@ mod serial_tests {
             scan_mode: HealScanMode::Normal,
             update_parity: false,
             no_lock: false,
+            read_repair: false,
             pool: None,
             set: None,
         };

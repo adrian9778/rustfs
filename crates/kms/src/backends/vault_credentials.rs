@@ -114,7 +114,7 @@ impl fmt::Debug for SecretString {
 }
 
 /// Expiry attributes of a lease-bound token.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LeaseInfo {
     /// Time-to-live granted at issue or renewal.
     pub(crate) ttl: Duration,
@@ -207,31 +207,102 @@ pub(crate) trait TokenSource: fmt::Debug + Send + Sync {
 }
 
 /// Token source for [`VaultAuthMethod::Token`]: always yields the token fixed
-/// at configuration time. The token carries no lease, so it is never renewed
-/// and never expires from the provider's point of view.
+/// at configuration time.
+///
+/// The token itself is never re-issued, but it usually still expires:
+/// `vault token create` defaults to a 768-hour TTL. Hard-coding "no lease"
+/// here left the renewal task unstarted and published no remaining-TTL gauge,
+/// so a healthy-looking cluster turned every KMS call into a 403 a month later
+/// and could only be recovered by a restart or a reconfigure (backlog#2369 P3).
+/// The source therefore asks Vault what it is holding, once per client
+/// generation, and lets the existing renewal loop take over whenever the answer
+/// carries a TTL.
+/// Map a `lookup-self` answer onto a lease.
+///
+/// A zero TTL is Vault's answer for a token that never expires (root and
+/// periodic-root tokens), which keeps the pre-probe behaviour exactly: no
+/// lease, no renewal task, no expiry gate. A response that omits `renewable`
+/// is treated as not renewable, so the renewal loop falls back to re-reading
+/// the remaining TTL instead of assuming it can extend it.
+fn static_token_lease(ttl_secs: u64, renewable: Option<bool>) -> Option<LeaseInfo> {
+    (ttl_secs > 0).then_some(LeaseInfo {
+        ttl: Duration::from_secs(ttl_secs),
+        renewable: renewable.unwrap_or(false),
+    })
+}
+
 pub(crate) struct StaticToken {
     token: TokenLease,
+    /// Client authenticated with the configured token, used only for
+    /// `lookup-self`. Per-generation renewals use the generation's own client.
+    lookup_client: VaultClient,
 }
 
 impl StaticToken {
-    pub(crate) fn new(token: String) -> Self {
-        Self {
+    pub(crate) fn new(settings: &VaultConnectionSettings, token: String) -> Result<Self> {
+        let lookup_client = settings.build_client(&token)?;
+        Ok(Self {
             token: TokenLease::new(token, None),
-        }
+            lookup_client,
+        })
     }
 }
 
 #[async_trait]
 impl TokenSource for StaticToken {
     async fn acquire(&self) -> AttemptResult<TokenLease> {
-        Ok(self.token.clone())
+        // A lookup failure must not fail the login. The token itself may well
+        // be valid: a policy can omit `lookup-self`, and Vault may simply be
+        // unreachable for the moment. Failing here would take down deployments
+        // that work today, so the probe degrades to the pre-probe behaviour —
+        // no lease, no renewal — and says so loudly instead.
+        let lease = match vaultrs::token::lookup_self(&self.lookup_client).await {
+            Ok(lookup) => static_token_lease(lookup.ttl, lookup.renewable),
+            Err(error) => {
+                warn!(
+                    event = "vault_static_token_lookup_failed",
+                    error = %error,
+                    "Could not read the configured Vault token's remaining lifetime, so it will not be \
+                     renewed and its expiry will not be tracked. Grant the token `lookup-self` (Vault's \
+                     default policy does) or switch to AppRole, Kubernetes or an agent-managed token file"
+                );
+                None
+            }
+        };
+
+        if let Some(lease) = lease
+            && !lease.renewable
+        {
+            warn!(
+                event = "vault_static_token_not_renewable",
+                ttl_secs = lease.ttl.as_secs(),
+                "The configured Vault token expires and cannot be renewed; RustFS will fail closed as it \
+                 approaches expiry. Switch to AppRole, Kubernetes or an agent-managed token file, or \
+                 reconfigure with a fresh token before it lapses"
+            );
+        }
+
+        Ok(TokenLease::new(self.token.expose().to_string(), lease))
+    }
+
+    async fn renew(&self, client: &VaultClient) -> AttemptResult<TokenLease> {
+        // Vault refuses renew-self on a non-renewable token; the renewal loop
+        // then falls back to `acquire`, which re-reads the remaining TTL and
+        // keeps the gauge honest until the fail-closed window is reached.
+        let auth = vaultrs::token::renew_self(client, None)
+            .await
+            .map_err(|error| attempt_error("token renewal", error))?;
+        Ok(TokenLease::from_auth(auth))
     }
 }
 
 impl fmt::Debug for StaticToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // TokenLease::fmt already redacts the token value.
-        f.debug_struct("StaticToken").field("token", &self.token).finish()
+        // TokenLease::fmt already redacts the token value; VaultClient embeds
+        // its settings, including the token, so it must stay out of Debug.
+        f.debug_struct("StaticToken")
+            .field("token", &self.token)
+            .finish_non_exhaustive()
     }
 }
 
@@ -541,7 +612,7 @@ pub(crate) fn token_source_for(
     settings: &VaultConnectionSettings,
 ) -> Result<Box<dyn TokenSource>> {
     match auth_method {
-        VaultAuthMethod::Token { token } => Ok(Box::new(StaticToken::new(token.clone()))),
+        VaultAuthMethod::Token { token } => Ok(Box::new(StaticToken::new(settings, token.clone())?)),
         VaultAuthMethod::AppRole {
             role_id,
             secret_id,
@@ -583,6 +654,68 @@ pub(crate) struct VaultConnectionSettings {
     /// Whether to accept an unverified Vault server certificate. Gated on
     /// `allow_insecure_dev_defaults` by `KmsConfig::validate`.
     pub(crate) skip_tls_verify: bool,
+    /// Additional CA bundle paths trusted for the Vault connection. vaultrs
+    /// reads and parses the files itself; [`vault_tls_materials`] has already
+    /// validated them so a bad path fails at configuration time.
+    pub(crate) ca_cert_paths: Vec<String>,
+    /// Client certificate + key presented to Vault for mTLS, already loaded
+    /// from disk. Built once at configuration time so every generation reuses
+    /// the same identity and a bad file fails fast instead of on refresh.
+    pub(crate) client_identity: Option<reqwest::Identity>,
+}
+
+/// Resolve TLS trust and identity material from the configured [`TlsConfig`].
+///
+/// Reads the files eagerly and fails on the first problem: vaultrs and reqwest
+/// would otherwise surface an unreadable bundle only when a client generation
+/// is built, or - worse - silently fall back to the `VAULT_CACERT` /
+/// `VAULT_CLIENT_CERT` environment variables.
+pub(crate) fn vault_tls_materials(tls: Option<&crate::config::TlsConfig>) -> Result<(Vec<String>, Option<reqwest::Identity>)> {
+    let Some(tls) = tls else {
+        return Ok((Vec::new(), None));
+    };
+
+    let mut ca_cert_paths = Vec::new();
+    if let Some(path) = &tls.ca_cert_path {
+        let content = std::fs::read(path)
+            .map_err(|e| KmsError::configuration_error(format!("failed to read Vault CA certificate {}: {e}", path.display())))?;
+        reqwest::Certificate::from_pem_bundle(&content).map_err(|e| {
+            KmsError::configuration_error(format!("Vault CA certificate {} is not a PEM bundle: {e}", path.display()))
+        })?;
+        let path = path.to_str().ok_or_else(|| {
+            KmsError::configuration_error(format!("Vault CA certificate path {} is not valid UTF-8", path.display()))
+        })?;
+        ca_cert_paths.push(path.to_string());
+    }
+
+    let client_identity = match (&tls.client_cert_path, &tls.client_key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let mut pem = std::fs::read(cert_path).map_err(|e| {
+                KmsError::configuration_error(format!("failed to read Vault client certificate {}: {e}", cert_path.display()))
+            })?;
+            pem.extend_from_slice(b"\n");
+            pem.extend_from_slice(&std::fs::read(key_path).map_err(|e| {
+                KmsError::configuration_error(format!("failed to read Vault client key {}: {e}", key_path.display()))
+            })?);
+            Some(reqwest::Identity::from_pem(&pem).map_err(|e| {
+                KmsError::configuration_error(format!(
+                    "Vault client certificate {} / key {} do not form a usable identity: {e}",
+                    cert_path.display(),
+                    key_path.display()
+                ))
+            })?)
+        }
+        (None, None) => None,
+        // `KmsConfig::validate` rejects unpaired cert/key configuration; this
+        // guard keeps the invariant for callers that skip validation.
+        _ => {
+            return Err(KmsError::configuration_error(
+                "Vault client certificate and key must be configured together for mTLS",
+            ));
+        }
+    };
+
+    Ok((ca_cert_paths, client_identity))
 }
 
 impl VaultConnectionSettings {
@@ -601,6 +734,12 @@ impl VaultConnectionSettings {
         // disable certificate verification behind the KMS configuration and its
         // insecure-defaults gate.
         settings_builder.verify(!self.skip_tls_verify);
+        // Same reasoning for trust roots and the client identity: unset, they
+        // default to VAULT_CACERT / VAULT_CAPATH and VAULT_CLIENT_CERT /
+        // VAULT_CLIENT_KEY, splicing TLS material into the connection behind
+        // the KMS configuration. An empty list / None neutralizes them.
+        settings_builder.ca_certs(self.ca_cert_paths.clone());
+        settings_builder.identity(self.client_identity.clone());
 
         if let Some(namespace) = &self.namespace {
             settings_builder.namespace(Some(namespace.clone()));
@@ -1000,6 +1139,8 @@ mod tests {
             namespace: Some("team-namespace".to_string()),
             attempt_timeout: Duration::from_secs(30),
             skip_tls_verify: false,
+            ca_cert_paths: Vec::new(),
+            client_identity: None,
         }
     }
 
@@ -1131,14 +1272,22 @@ mod tests {
         (Arc::new(provider), state)
     }
 
+    /// A provider whose token reports no expiry, which is what `lookup-self`
+    /// answers for a root or periodic-root token. Scripted rather than backed
+    /// by [`StaticToken`] because the real source now asks Vault what it holds.
     async fn static_provider() -> VaultCredentialProvider {
         VaultCredentialProvider::new(
             test_settings(),
-            Box::new(StaticToken::new(TEST_TOKEN.to_string())),
+            Box::new(ScriptedSource {
+                state: Arc::new(ScriptedState::default()),
+                ttl: Duration::ZERO,
+                renewable: false,
+                login_delay: Duration::ZERO,
+            }),
             test_policy(Duration::from_secs(10), Duration::from_secs(5)),
         )
         .await
-        .expect("static provider must build without a live Vault")
+        .expect("a token without an expiry must build without a live Vault")
     }
 
     #[tokio::test]
@@ -1161,20 +1310,89 @@ mod tests {
         assert!(provider.spawn_renewal_task().is_none(), "a token without a lease has nothing to renew");
     }
 
-    #[tokio::test]
-    async fn test_static_token_source_yields_configured_token() {
-        let settings = test_settings();
-        let source = token_source_for(
+    #[test]
+    fn test_static_token_source_builds_without_contacting_vault() {
+        token_source_for(
             &VaultAuthMethod::Token {
                 token: TEST_TOKEN.to_string(),
             },
-            &settings,
+            &test_settings(),
         )
         .expect("token auth must map to a source");
+    }
 
-        let lease = source.acquire().await.expect("static acquire cannot fail");
-        assert_eq!(lease.expose(), TEST_TOKEN);
-        assert!(lease.lease_info().is_none(), "static tokens must not carry a lease");
+    /// A pending acquisition cannot take the returned-error fallback: the
+    /// outer login policy must cut it off before publishing a client.
+    #[tokio::test(start_paused = true)]
+    async fn test_stalled_initial_login_is_bounded_by_the_attempt_timeout() {
+        let state = Arc::new(ScriptedState::default());
+        let source = ScriptedSource {
+            state: state.clone(),
+            ttl: Duration::ZERO,
+            renewable: false,
+            login_delay: Duration::from_secs(60),
+        };
+        let policy = test_policy(Duration::from_secs(10), Duration::from_secs(5));
+        let attempt_timeout = policy.retry.attempt_timeout;
+        let started = Instant::now();
+        let result = VaultCredentialProvider::new(test_settings(), Box::new(source), policy).await;
+        assert!(
+            matches!(&result, Err(KmsError::OperationTimedOut { message }) if message.starts_with("vault_login attempt 1 timed out")),
+            "a stalled login must return its typed timeout without publishing a client"
+        );
+        assert_eq!(
+            started.elapsed(),
+            attempt_timeout,
+            "login must consume exactly one virtual attempt budget"
+        );
+        assert_eq!(state.login_calls.load(Ordering::SeqCst), 0, "the acquisition must not complete");
+        assert_eq!(
+            state.renew_calls.load(Ordering::SeqCst),
+            0,
+            "failed initialization must not start renewal"
+        );
+    }
+
+    /// backlog#2369 P3: `vault token create` defaults to a 768-hour TTL, so
+    /// hard-coding "no lease" for token auth left the renewal task unstarted
+    /// and turned a healthy cluster into one that answers 403 a month later.
+    /// The lease now comes from what Vault reports.
+    #[test]
+    fn static_token_lease_follows_what_vault_reports() {
+        assert_eq!(
+            static_token_lease(0, Some(true)),
+            None,
+            "a token Vault reports as non-expiring must keep behaving as one"
+        );
+        assert_eq!(
+            static_token_lease(0, None),
+            None,
+            "a non-expiring token stays non-expiring whatever renewable says"
+        );
+        assert_eq!(
+            static_token_lease(2_764_800, Some(true)),
+            Some(LeaseInfo {
+                ttl: Duration::from_secs(2_764_800),
+                renewable: true,
+            }),
+            "the default 768-hour token must be tracked and renewed"
+        );
+        assert_eq!(
+            static_token_lease(3_600, Some(false)),
+            Some(LeaseInfo {
+                ttl: Duration::from_secs(3_600),
+                renewable: false,
+            }),
+            "an expiring token that cannot be renewed still needs its expiry tracked"
+        );
+        assert_eq!(
+            static_token_lease(3_600, None),
+            Some(LeaseInfo {
+                ttl: Duration::from_secs(3_600),
+                renewable: false,
+            }),
+            "an omitted renewable flag must not be read as renewable"
+        );
     }
 
     #[tokio::test]
@@ -1248,6 +1466,8 @@ mod tests {
                 namespace: None,
                 attempt_timeout: Duration::from_secs(30),
                 skip_tls_verify,
+                ca_cert_paths: Vec::new(),
+                client_identity: None,
             };
 
             let authenticated = settings.build_client(TEST_TOKEN).expect("authenticated client must build");
@@ -1270,6 +1490,139 @@ mod tests {
                 "a stray VAULT_SKIP_VERIFY must not disable verification behind the KMS configuration"
             );
         });
+    }
+
+    /// Write a self-signed certificate + key pair usable both as a CA bundle
+    /// and as an mTLS client identity for TLS material tests.
+    fn write_test_cert_pair(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["vault.example.com".to_string()]).expect("cert should generate");
+        let cert_path = dir.join("client_cert.pem");
+        let key_path = dir.join("client_key.pem");
+        std::fs::write(&cert_path, cert.pem()).expect("cert should write");
+        std::fs::write(&key_path, signing_key.serialize_pem()).expect("key should write");
+        (cert_path, key_path)
+    }
+
+    /// Like `verify`, the configured trust roots and client identity have to
+    /// reach the HTTP client on every generation, or an mTLS Vault rejects the
+    /// handshake for whichever generation missed them.
+    #[test]
+    fn test_tls_materials_reach_every_vault_client_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_path, key_path) = write_test_cert_pair(dir.path());
+
+        let tls = crate::config::TlsConfig {
+            ca_cert_path: Some(cert_path.clone()),
+            client_cert_path: Some(cert_path.clone()),
+            client_key_path: Some(key_path),
+            skip_verify: false,
+        };
+        let (ca_cert_paths, client_identity) =
+            vault_tls_materials(Some(&tls)).expect("valid certificate files must produce TLS materials");
+        assert_eq!(ca_cert_paths, vec![cert_path.to_str().expect("utf-8 path").to_string()]);
+        assert!(client_identity.is_some(), "cert + key must produce a client identity");
+
+        let settings = VaultConnectionSettings {
+            address: "https://vault.example.com:8200".to_string(),
+            namespace: None,
+            attempt_timeout: Duration::from_secs(30),
+            skip_tls_verify: false,
+            ca_cert_paths: ca_cert_paths.clone(),
+            client_identity,
+        };
+
+        let authenticated = settings.build_client(TEST_TOKEN).expect("authenticated client must build");
+        assert_eq!(authenticated.settings.ca_certs, ca_cert_paths);
+        assert!(authenticated.settings.identity.is_some());
+
+        let login = settings.build_login_client().expect("login client must build");
+        assert_eq!(login.settings.ca_certs, ca_cert_paths);
+        assert!(login.settings.identity.is_some());
+    }
+
+    /// vaultrs defaults `ca_certs` from VAULT_CACERT / VAULT_CAPATH and
+    /// `identity` from VAULT_CLIENT_CERT / VAULT_CLIENT_KEY when the builder
+    /// leaves them unset, which would splice TLS material into the connection
+    /// behind the KMS configuration.
+    #[test]
+    fn test_vaultrs_tls_env_material_cannot_reach_the_client() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_path, key_path) = write_test_cert_pair(dir.path());
+        let cert = cert_path.to_str().expect("utf-8 path");
+        let key = key_path.to_str().expect("utf-8 path");
+        let ca_dir = dir.path().to_str().expect("utf-8 path");
+
+        temp_env::with_vars(
+            [
+                ("VAULT_CACERT", Some(cert)),
+                ("VAULT_CAPATH", Some(ca_dir)),
+                ("VAULT_CLIENT_CERT", Some(cert)),
+                ("VAULT_CLIENT_KEY", Some(key)),
+            ],
+            || {
+                let client = test_settings().build_client(TEST_TOKEN).expect("client must build");
+                assert!(
+                    client.settings.ca_certs.is_empty(),
+                    "stray VAULT_CACERT / VAULT_CAPATH must not add trust roots behind the KMS configuration"
+                );
+                assert!(
+                    client.settings.identity.is_none(),
+                    "stray VAULT_CLIENT_CERT / VAULT_CLIENT_KEY must not attach an mTLS identity behind the KMS configuration"
+                );
+            },
+        );
+    }
+
+    /// Misconfigured TLS material has to fail at configuration time, not on a
+    /// later credential refresh, and never by silently ignoring the files.
+    #[test]
+    fn test_tls_materials_fail_closed_on_bad_configuration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_path, _key_path) = write_test_cert_pair(dir.path());
+
+        let missing_ca = crate::config::TlsConfig {
+            ca_cert_path: Some(dir.path().join("absent.pem")),
+            client_cert_path: None,
+            client_key_path: None,
+            skip_verify: false,
+        };
+        assert!(
+            vault_tls_materials(Some(&missing_ca)).is_err(),
+            "an unreadable CA bundle must fail configuration"
+        );
+
+        let garbage_path = dir.path().join("garbage.pem");
+        std::fs::write(
+            &garbage_path,
+            b"-----BEGIN CERTIFICATE-----\nnot base64 at all!!\n-----END CERTIFICATE-----\n",
+        )
+        .expect("garbage should write");
+        let garbage_ca = crate::config::TlsConfig {
+            ca_cert_path: Some(garbage_path),
+            client_cert_path: None,
+            client_key_path: None,
+            skip_verify: false,
+        };
+        assert!(
+            vault_tls_materials(Some(&garbage_ca)).is_err(),
+            "a CA file that is not a PEM bundle must fail configuration"
+        );
+
+        let unpaired = crate::config::TlsConfig {
+            ca_cert_path: None,
+            client_cert_path: Some(cert_path),
+            client_key_path: None,
+            skip_verify: false,
+        };
+        assert!(
+            vault_tls_materials(Some(&unpaired)).is_err(),
+            "a client certificate without its key must fail configuration"
+        );
+
+        let (ca_cert_paths, client_identity) = vault_tls_materials(None).expect("absent TLS config is valid");
+        assert!(ca_cert_paths.is_empty());
+        assert!(client_identity.is_none());
     }
 
     /// The projected token is read fresh per login attempt and trimmed, so a
@@ -1554,7 +1907,7 @@ mod tests {
                 renewable: true,
             }),
         );
-        let static_source = StaticToken::new(TEST_TOKEN.to_string());
+        let static_source = StaticToken::new(&test_settings(), TEST_TOKEN.to_string()).expect("static source");
         let approle_source = AppRoleLogin::new(
             &test_settings(),
             "approle".to_string(),

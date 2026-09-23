@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::msgp_decode::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
-use super::object_lock::ObjectLockApi;
+use super::object_lock::{ObjectLockApi, ObjectLockStatusExt};
 use super::versioning::VersioningApi;
 use super::{quota::BucketQuota, target::BucketTargets};
 use crate::bucket::replication::invalid_replication_config_status_field;
@@ -38,6 +38,26 @@ use std::sync::Arc;
 use time::{Date, OffsetDateTime, PrimitiveDateTime, Time as CivilTime, UtcOffset};
 use tracing::error;
 use uuid::Uuid;
+
+// The serving-layer DTO impls for the storage-level Object Lock traits live
+// here because this module owns the persisted `ObjectLockConfiguration`
+// during the s3s ratchet migration (rustfs/backlog#1842).
+impl ObjectLockApi for ObjectLockConfiguration {
+    fn enabled(&self) -> bool {
+        self.object_lock_enabled
+            .as_ref()
+            .is_some_and(|v| v.as_str() == s3s::dto::ObjectLockEnabled::ENABLED)
+    }
+}
+
+impl ObjectLockStatusExt for s3s::dto::ObjectLockLegalHoldStatus {
+    fn valid(&self) -> bool {
+        matches!(
+            self.as_str(),
+            s3s::dto::ObjectLockLegalHoldStatus::ON | s3s::dto::ObjectLockLegalHoldStatus::OFF
+        )
+    }
+}
 
 fn read_msgp_str<R: Read>(rd: &mut R) -> Result<String> {
     let len = rmp::decode::read_str_len(rd)? as usize;
@@ -250,9 +270,145 @@ pub const BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG: &str = "public-access-block.xml";
 pub const BUCKET_ACL_CONFIG: &str = "bucket-acl.json";
 pub const BUCKET_TABLE_CONFIG: &str = "table-bucket.json";
 pub const BUCKET_DURABILITY_CONFIG: &str = "durability.json";
+pub const BUCKET_ON_DEMAND_MIGRATION_CONFIG: &str = "on-demand-migration.json";
 pub const BUCKET_TABLE_RESERVED_PREFIX: &str = ".rustfs-table";
 pub const BUCKET_TABLE_CATALOG_META_PREFIX: &str = "s3tables/catalog";
 pub const BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX: &str = "table-buckets";
+
+/// Refusal to act on a stored sub-configuration whose bytes exist but cannot
+/// be parsed. Carried inside [`Error::other`] so callers can tell it apart
+/// from a storage fault with [`is_unreadable_config_error`].
+#[derive(Debug, Clone)]
+pub struct UnreadableBucketConfig {
+    pub bucket: String,
+    pub config_file: String,
+    /// Length of the stored bytes that failed to parse.
+    pub raw_len: usize,
+}
+
+impl std::fmt::Display for UnreadableBucketConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "persisted bucket configuration {} ({} bytes) for bucket {} cannot be parsed; back up the stored bytes (rustfs inspect bucket-meta), then replace or delete the configuration",
+            self.config_file, self.raw_len, self.bucket
+        )
+    }
+}
+
+impl std::error::Error for UnreadableBucketConfig {}
+
+pub fn is_unreadable_config_error(err: &Error) -> bool {
+    unreadable_config_refusal(err).is_some()
+}
+
+pub fn unreadable_config_refusal(err: &Error) -> Option<&UnreadableBucketConfig> {
+    match err {
+        Error::Io(io) => io.get_ref().and_then(|inner| inner.downcast_ref::<UnreadableBucketConfig>()),
+        _ => None,
+    }
+}
+
+pub(crate) fn unreadable_config_error(bucket: &str, config_file: &str, raw_len: usize) -> Error {
+    Error::other(UnreadableBucketConfig {
+        bucket: bucket.to_string(),
+        config_file: config_file.to_string(),
+        raw_len,
+    })
+}
+
+/// Stored state of one sub-configuration as left by
+/// [`BucketMetadata::parse_all_configs`]: a parse failure keeps the raw bytes
+/// and leaves the typed field `None`, which is kept distinct from "no bytes".
+///
+/// Deliberately has no `Option` conversion or defaulting accessor: folding
+/// `Unreadable` into `Absent` is exactly the failure this type exists to stop.
+#[derive(Debug)]
+pub enum ConfigState<'a, T> {
+    /// No bytes are stored.
+    Absent,
+    /// The stored bytes parsed.
+    Valid(&'a T),
+    /// Bytes are stored but could not be parsed.
+    Unreadable { raw_len: usize },
+}
+
+impl<'a, T> ConfigState<'a, T> {
+    pub fn of(raw: &[u8], parsed: &'a Option<T>) -> Self {
+        match parsed {
+            Some(config) => Self::Valid(config),
+            None if raw.is_empty() => Self::Absent,
+            None => Self::Unreadable { raw_len: raw.len() },
+        }
+    }
+
+    /// `Ok(None)` when absent; a typed [`UnreadableBucketConfig`] refusal
+    /// when the stored bytes cannot be parsed.
+    pub fn require(self, bucket: &str, config_file: &str) -> Result<Option<&'a T>> {
+        match self {
+            Self::Absent => Ok(None),
+            Self::Valid(config) => Ok(Some(config)),
+            Self::Unreadable { raw_len } => Err(unreadable_config_error(bucket, config_file, raw_len)),
+        }
+    }
+}
+
+/// The XML sub-configurations whose parse failure is retained as
+/// [`ConfigState::Unreadable`].
+pub const XML_BUCKET_CONFIG_FILES: [&str; 13] = [
+    BUCKET_NOTIFICATION_CONFIG,
+    BUCKET_LIFECYCLE_CONFIG,
+    OBJECT_LOCK_CONFIG,
+    BUCKET_VERSIONING_CONFIG,
+    BUCKET_SSECONFIG,
+    BUCKET_TAGGING_CONFIG,
+    BUCKET_REPLICATION_CONFIG,
+    BUCKET_CORS_CONFIG,
+    BUCKET_LOGGING_CONFIG,
+    BUCKET_WEBSITE_CONFIG,
+    BUCKET_ACCELERATE_CONFIG,
+    BUCKET_REQUEST_PAYMENT_CONFIG,
+    BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG,
+];
+
+impl BucketMetadata {
+    /// Whether the stored XML sub-configuration `config_file` has bytes that
+    /// cannot be parsed. Non-XML config files report `false`: they carry their
+    /// own unreadable handling (policy, quota, bucket targets).
+    pub fn xml_config_unreadable(&self, config_file: &str) -> bool {
+        self.xml_config_unreadable_len(config_file).is_some()
+    }
+
+    /// Length of the stored bytes of XML sub-configuration `config_file` when
+    /// they cannot be parsed; `None` when it is absent, readable, or not an
+    /// XML config.
+    pub fn xml_config_unreadable_len(&self, config_file: &str) -> Option<usize> {
+        fn unreadable<T>(raw: &[u8], parsed: &Option<T>) -> Option<usize> {
+            match ConfigState::of(raw, parsed) {
+                ConfigState::Unreadable { raw_len } => Some(raw_len),
+                ConfigState::Absent | ConfigState::Valid(_) => None,
+            }
+        }
+        match config_file {
+            BUCKET_NOTIFICATION_CONFIG => unreadable(&self.notification_config_xml, &self.notification_config),
+            BUCKET_LIFECYCLE_CONFIG => unreadable(&self.lifecycle_config_xml, &self.lifecycle_config),
+            OBJECT_LOCK_CONFIG => unreadable(&self.object_lock_config_xml, &self.object_lock_config),
+            BUCKET_VERSIONING_CONFIG => unreadable(&self.versioning_config_xml, &self.versioning_config),
+            BUCKET_SSECONFIG => unreadable(&self.encryption_config_xml, &self.sse_config),
+            BUCKET_TAGGING_CONFIG => unreadable(&self.tagging_config_xml, &self.tagging_config),
+            BUCKET_REPLICATION_CONFIG => unreadable(&self.replication_config_xml, &self.replication_config),
+            BUCKET_CORS_CONFIG => unreadable(&self.cors_config_xml, &self.cors_config),
+            BUCKET_LOGGING_CONFIG => unreadable(&self.logging_config_xml, &self.logging_config),
+            BUCKET_WEBSITE_CONFIG => unreadable(&self.website_config_xml, &self.website_config),
+            BUCKET_ACCELERATE_CONFIG => unreadable(&self.accelerate_config_xml, &self.accelerate_config),
+            BUCKET_REQUEST_PAYMENT_CONFIG => unreadable(&self.request_payment_config_xml, &self.request_payment_config),
+            BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG => {
+                unreadable(&self.public_access_block_config_xml, &self.public_access_block_config)
+            }
+            _ => None,
+        }
+    }
+}
 
 pub fn table_catalog_path_hash(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
@@ -301,6 +457,7 @@ pub struct BucketMetadata {
     pub bucket_acl_config_json: Vec<u8>,
     pub table_bucket_config_json: Vec<u8>,
     pub durability_config_json: Vec<u8>,
+    pub on_demand_migration_config_json: Vec<u8>,
 
     pub policy_config_updated_at: OffsetDateTime,
     pub object_lock_config_updated_at: OffsetDateTime,
@@ -322,6 +479,7 @@ pub struct BucketMetadata {
     pub bucket_acl_config_updated_at: OffsetDateTime,
     pub table_bucket_config_updated_at: OffsetDateTime,
     pub durability_config_updated_at: OffsetDateTime,
+    pub on_demand_migration_config_updated_at: OffsetDateTime,
 
     pub new_field_updated_at: OffsetDateTime,
 
@@ -373,6 +531,7 @@ impl Default for BucketMetadata {
             bucket_acl_config_json: Default::default(),
             table_bucket_config_json: Default::default(),
             durability_config_json: Default::default(),
+            on_demand_migration_config_json: Default::default(),
             policy_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             object_lock_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             encryption_config_updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -393,6 +552,7 @@ impl Default for BucketMetadata {
             bucket_acl_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             table_bucket_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             durability_config_updated_at: OffsetDateTime::UNIX_EPOCH,
+            on_demand_migration_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             new_field_updated_at: OffsetDateTime::UNIX_EPOCH,
             policy_config: Default::default(),
             notification_config: Default::default(),
@@ -448,15 +608,40 @@ impl BucketMetadata {
         self.lock_enabled || self.object_lock_config.as_ref().is_some_and(|v| v.enabled())
     }
 
+    /// Whether an operation that may skip Object Lock checks must keep them.
+    /// Stored lock bytes that cannot be parsed leave the lock state unknown,
+    /// which must not be read as "no Object Lock".
+    pub fn object_lock_checks_required(&self) -> bool {
+        self.object_locking() || self.xml_config_unreadable(OBJECT_LOCK_CONFIG)
+    }
+
     pub fn table_bucket_enabled(&self) -> bool {
         !self.table_bucket_config_json.is_empty()
     }
 
-    /// Parsed per-bucket durability override, if a valid one is stored.
+    /// `bucket-targets.json` is stored for this bucket but this build cannot
+    /// decode it.
     ///
-    /// Absent/empty/unparsable payloads all mean "no override" (the bucket
-    /// follows the global durability mode); a parse failure is logged so a
-    /// corrupted entry cannot silently change fsync behavior.
+    /// Keeps "no replication targets configured" and "the target
+    /// configuration cannot be read" apart, the same distinction the
+    /// `fabricated` marker draws for the bucket metadata as a whole. Only
+    /// meaningful after [`Self::parse_all_configs`] has run; readers must fail
+    /// closed on `true` instead of serving an empty target set.
+    pub fn bucket_targets_unreadable(&self) -> bool {
+        !self.bucket_targets_config_json.is_empty() && self.bucket_target_config.is_none()
+    }
+
+    /// Opaque application-owned configuration with its persisted update time.
+    /// Empty bytes mean absent or cleared; decoding belongs to the consumer.
+    pub fn on_demand_migration_config(&self) -> Option<(&[u8], OffsetDateTime)> {
+        (!self.on_demand_migration_config_json.is_empty()).then_some((
+            self.on_demand_migration_config_json.as_slice(),
+            self.on_demand_migration_config_updated_at,
+        ))
+    }
+
+    /// Parsed per-bucket durability override, if a valid one is stored.
+    /// Invalid payloads follow the global mode after logging a parse failure.
     pub fn durability_config(&self) -> Option<super::durability::BucketDurabilityConfig> {
         if self.durability_config_json.is_empty() {
             return None;
@@ -535,6 +720,9 @@ impl BucketMetadata {
                 "BucketAclConfigJSON" | "BucketAclConfigJson" => self.bucket_acl_config_json = read_msgp_bin(rd)?,
                 "TableBucketConfigJSON" | "TableBucketConfigJson" => self.table_bucket_config_json = read_msgp_bin(rd)?,
                 "DurabilityConfigJSON" | "DurabilityConfigJson" => self.durability_config_json = read_msgp_bin(rd)?,
+                "OnDemandMigrationConfigJSON" | "OnDemandMigrationConfigJson" => {
+                    self.on_demand_migration_config_json = read_msgp_bin(rd)?
+                }
                 "CorsConfigUpdatedAt" => self.cors_config_updated_at = read_msgp_time_value(rd)?,
                 "LoggingConfigUpdatedAt" => self.logging_config_updated_at = read_msgp_time_value(rd)?,
                 "WebsiteConfigUpdatedAt" => self.website_config_updated_at = read_msgp_time_value(rd)?,
@@ -544,6 +732,7 @@ impl BucketMetadata {
                 "BucketAclConfigUpdatedAt" => self.bucket_acl_config_updated_at = read_msgp_time_value(rd)?,
                 "TableBucketConfigUpdatedAt" => self.table_bucket_config_updated_at = read_msgp_time_value(rd)?,
                 "DurabilityConfigUpdatedAt" => self.durability_config_updated_at = read_msgp_time_value(rd)?,
+                "OnDemandMigrationConfigUpdatedAt" => self.on_demand_migration_config_updated_at = read_msgp_time_value(rd)?,
                 other => {
                     tracing::debug!(field = %other, "BucketMetadata decode_from: skipping unknown field");
                     skip_msgp_value(rd)?;
@@ -556,8 +745,8 @@ impl BucketMetadata {
 
     /// Encode to msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
     pub fn encode_to<W: Write>(&self, wr: &mut W) -> Result<()> {
-        // Map size: MinIO fields (25) + RustFS extensions (19)
-        let map_len: u32 = 44;
+        // Map size: MinIO fields (25) + RustFS extensions (21)
+        let map_len: u32 = 46;
         rmp::encode::write_map_len(wr, map_len)?;
 
         // MinIO field order (same as Go struct)
@@ -617,6 +806,7 @@ impl BucketMetadata {
         write_bin_field(wr, "BucketAclConfigJSON", &self.bucket_acl_config_json)?;
         write_bin_field(wr, "TableBucketConfigJSON", &self.table_bucket_config_json)?;
         write_bin_field(wr, "DurabilityConfigJSON", &self.durability_config_json)?;
+        write_bin_field(wr, "OnDemandMigrationConfigJSON", &self.on_demand_migration_config_json)?;
         rmp::encode::write_str(wr, "CorsConfigUpdatedAt")?;
         write_msgp_time(wr, self.cors_config_updated_at)?;
         rmp::encode::write_str(wr, "LoggingConfigUpdatedAt")?;
@@ -635,6 +825,8 @@ impl BucketMetadata {
         write_msgp_time(wr, self.table_bucket_config_updated_at)?;
         rmp::encode::write_str(wr, "DurabilityConfigUpdatedAt")?;
         write_msgp_time(wr, self.durability_config_updated_at)?;
+        rmp::encode::write_str(wr, "OnDemandMigrationConfigUpdatedAt")?;
+        write_msgp_time(wr, self.on_demand_migration_config_updated_at)?;
 
         Ok(())
     }
@@ -736,11 +928,27 @@ impl BucketMetadata {
         if self.durability_config_updated_at == OffsetDateTime::UNIX_EPOCH {
             self.durability_config_updated_at = self.created
         }
+        if self.on_demand_migration_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.on_demand_migration_config_updated_at = self.created
+        }
     }
 
+    /// Replace one config payload and stamp its `*_config_updated_at` with the
+    /// local clock. This is the entry for edits that originate here: the
+    /// local write time is the edit's source time.
     pub fn update_config(&mut self, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
-        let updated = OffsetDateTime::now_utc();
+        self.update_config_at(config_file, data, OffsetDateTime::now_utc())
+    }
 
+    /// [`Self::update_config`] with an explicit `updated_at` stamp.
+    ///
+    /// For a config replicated from another site the edit's source time is
+    /// the peer's `updated_at`, not the moment it lands here: staleness of
+    /// the next incoming item is judged against the stored stamp, so stamping
+    /// the local apply time would reject a newer source edit that was merely
+    /// delivered late (backlog#2292). Only replication receivers should pass
+    /// a foreign time; local edits keep [`Self::update_config`].
+    pub fn update_config_at(&mut self, config_file: &str, data: Vec<u8>, updated: OffsetDateTime) -> Result<OffsetDateTime> {
         match config_file {
             BUCKET_POLICY_CONFIG => {
                 self.policy_config_json = data;
@@ -851,6 +1059,10 @@ impl BucketMetadata {
                 self.durability_config_json = data;
                 self.durability_config_updated_at = updated;
             }
+            BUCKET_ON_DEMAND_MIGRATION_CONFIG => {
+                self.on_demand_migration_config_json = data;
+                self.on_demand_migration_config_updated_at = updated;
+            }
             _ => return Err(Error::other(format!("config file not found : {config_file}"))),
         }
 
@@ -901,7 +1113,40 @@ impl BucketMetadata {
         Ok(())
     }
 
-    fn parse_all_configs(&mut self) -> Result<()> {
+    /// Decode every stored sub-configuration into its typed field.
+    ///
+    /// A decode failure never fails the whole load: this runs on every bucket
+    /// metadata read, including startup and peer reload, so one bucket's
+    /// corrupt sub-configuration must not make the bucket — or the node —
+    /// unloadable. Instead the failure is *retained*: the raw bytes stay
+    /// untouched and the typed field stays `None`, so `!raw.is_empty() &&
+    /// typed.is_none()` is the durable "exists but cannot be read" signal that
+    /// each accessor keys off. Which accessors must fail closed on it:
+    ///
+    /// | Config | Verdict |
+    /// |---|---|
+    /// | policy | Fails closed: `get_bucket_policy` re-parses the raw JSON and propagates the error; `get_bucket_policy_raw` returns the stored bytes. |
+    /// | object lock | Fails closed in `object_lock_config_state_from_authoritative_metadata`; a retention decision may never be taken on a guess. |
+    /// | versioning | Fails closed in `get_versioning_config` and the delete-time snapshot; guessing Unversioned would make delete markers and version ids diverge from what is on disk. Object writes lay out versions through `BucketVersioningSys::get_for_write`, which refuses in strict mode and, in the default permissive mode, keeps the historical unversioned write (see `config_parse_mode`). |
+    /// | replication | Fails closed in `get_replication_config`. |
+    /// | bucket targets | Fails closed in `get_bucket_targets_config`, and `sync_bucket_target_sys` marks the bucket unreadable in `BucketTargetSys` instead of publishing an empty target set (rustfs/backlog#2282). |
+    /// | encryption | Fails closed in `get_sse_config`: degrading to "no default encryption" stores plaintext objects the operator required to be encrypted. |
+    /// | public access block | Fails closed in `get_public_access_block_config`: degrading grants the anonymous access the operator asked to block. |
+    /// | quota | Fails closed in `get_quota_config`; the enforcement path in `quota::checker` already re-parses the raw JSON and refuses on error. |
+    /// | lifecycle | `get_lifecycle_config` fails closed, so GetBucketLifecycle reports the fault instead of NoSuchLifecycleConfiguration. ILM, scanner and expiry-header consumers still degrade to "no rules": nothing is deleted or moved on the strength of an unreadable rule set, and the bucket keeps serving reads and writes. |
+    /// | notification | `get_notification_config` fails closed, so GetBucketNotificationConfiguration reports the fault and startup leaves that one bucket's rules unchanged instead of clearing them; other buckets are unaffected. |
+    /// | tagging, CORS, logging, website, accelerate, request payment | The getter fails closed so the matching GET API reports the fault instead of "not configured". Per-request consumers (CORS response headers) still degrade to "not configured", which is the restrictive direction. |
+    /// | bucket ACL | Safe to degrade: it only shapes an optional response. |
+    ///
+    /// Independently of the table, `update_config_with` refuses a
+    /// read-modify-write of an unreadable XML config before its mutate step
+    /// runs, so the unreadable bytes are never replaced by a rewrite that saw
+    /// them as absent. Other configs of the same bucket stay writable.
+    ///
+    /// Every unreadable XML config found here is counted in
+    /// `rustfs_bucket_metadata_parse_failed_total`, reflected in
+    /// `rustfs_bucket_metadata_unparsable_current`, and logged at error level.
+    pub(super) fn parse_all_configs(&mut self) -> Result<()> {
         if let Err(e) = self.parse_policy_config() {
             tracing::warn!(
                 event = "bucket_metadata_parse_failed",
@@ -1025,20 +1270,26 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        // A stored targets blob that cannot be decoded must not collapse into
+        // the empty target set: that is indistinguishable from "no replication
+        // configured", so replication stops and no caller ever sees an error
+        // (rustfs/backlog#2282). Leaving the typed field `None` while the raw
+        // bytes stay non-empty is the retained parse failure every targets
+        // reader keys off; the bytes are preserved so the configuration is
+        // still recoverable.
+        self.bucket_target_config = None;
         if !self.bucket_targets_config_json.is_empty() {
-            if let Err(e) = serde_json::from_slice::<BucketTargets>(&self.bucket_targets_config_json)
-                .map(|t| self.bucket_target_config = Some(t))
-            {
-                tracing::warn!(
+            match serde_json::from_slice::<BucketTargets>(&self.bucket_targets_config_json) {
+                Ok(targets) => self.bucket_target_config = Some(targets),
+                Err(e) => tracing::error!(
                     event = "bucket_metadata_parse_failed",
                     component = "ecstore",
                     subsystem = "bucket_metadata",
                     bucket = %self.name,
                     config = "bucket_targets",
                     error = %e,
-                    "Failed to parse bucket metadata config"
-                );
-                self.bucket_target_config = Some(BucketTargets::default());
+                    "Bucket replication targets are unreadable; replication for this bucket fails closed"
+                ),
             }
         } else {
             self.bucket_target_config = Some(BucketTargets::default());
@@ -1138,6 +1389,14 @@ impl BucketMetadata {
             );
         }
 
+        if !self.name.is_empty() {
+            let unreadable: Vec<(&'static str, usize)> = XML_BUCKET_CONFIG_FILES
+                .iter()
+                .filter_map(|config| self.xml_config_unreadable_len(config).map(|raw_len| (*config, raw_len)))
+                .collect();
+            super::config_parse_mode::record_bucket_config_parse_state(&self.name, &unreadable);
+        }
+
         Ok(())
     }
 }
@@ -1205,9 +1464,13 @@ pub(crate) async fn load_bucket_metadata_parse_with_presence(
                 "bucket incarnation sidecar is missing for new-format metadata: {bucket}"
             )));
         }
-    } else if incarnation.is_some() {
-        return Err(Error::other("bucket incarnation sidecar exists without bucket metadata"));
     }
+    // A sidecar without `.metadata.bin` is the window between the two legacy
+    // migration writes (rustfs/rustfs#8003): the sidecar lands first, and a
+    // crash or lost namespace lease before the metadata write leaves the
+    // bucket in this state on every node. Report it as not persisted so the
+    // migration runs again; the writers adopt the stored incarnation instead
+    // of minting a new one, so the sidecar keeps its authority.
 
     bm.default_timestamps();
 
@@ -1254,6 +1517,18 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// rustfs/backlog#1734: `StorageError::clone` rebuilds I/O errors from
+    /// their text. The unreadable-config refusal must stay typed across that
+    /// clone, or a cloned error stops mapping to its retryable S3 response.
+    #[test]
+    fn unreadable_config_refusal_survives_storage_error_clone() {
+        let err = unreadable_config_error("b", BUCKET_TAGGING_CONFIG, 7);
+        let cloned = err.clone();
+        assert!(is_unreadable_config_error(&cloned), "clone lost the typed refusal: {cloned}");
+        assert_eq!(unreadable_config_refusal(&cloned).map(|r| r.raw_len), Some(7));
+        assert!(is_unreadable_config_error(&err));
+    }
 
     /// Decode a whitespace-tolerant hex fixture into bytes.
     fn decode_hex(s: &str) -> Vec<u8> {
@@ -1437,6 +1712,39 @@ mod test {
         assert_eq!(metadata.bucket_incarnation_id, incarnation);
     }
 
+    /// backlog#2292: a replicated config is stamped with the source
+    /// `updated_at` it was given, not the local clock, while the plain
+    /// `update_config` entry keeps stamping the local clock.
+    #[test]
+    fn update_config_at_stamps_the_given_time_and_update_config_stamps_now() {
+        let source_time = OffsetDateTime::now_utc() - time::Duration::hours(3);
+        let mut metadata = BucketMetadata::new("source-stamped");
+
+        let stamped = metadata
+            .update_config_at(BUCKET_POLICY_CONFIG, br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec(), source_time)
+            .unwrap();
+        assert_eq!(stamped, source_time);
+        assert_eq!(metadata.policy_config_updated_at, source_time);
+
+        let tagging = b"<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>".to_vec();
+        let stamped = metadata
+            .update_config_at(BUCKET_TAGGING_CONFIG, tagging, source_time)
+            .unwrap();
+        assert_eq!(stamped, source_time);
+        assert_eq!(metadata.tagging_config_updated_at, source_time);
+
+        let before = OffsetDateTime::now_utc();
+        let stamped = metadata
+            .update_config(BUCKET_POLICY_CONFIG, br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec())
+            .unwrap();
+        assert!(stamped >= before, "a local edit is stamped with the local clock");
+        assert_eq!(metadata.policy_config_updated_at, stamped);
+        assert_eq!(
+            metadata.tagging_config_updated_at, source_time,
+            "restamping one config must not move another config's stamp"
+        );
+    }
+
     #[test]
     fn object_locking_requires_lock_metadata_not_plain_versioning() {
         use s3s::dto::ObjectLockEnabled;
@@ -1470,6 +1778,145 @@ mod test {
         assert_eq!(bucket_targets.targets.len(), 1);
         assert_eq!(bucket_targets.targets[0].endpoint, "s3.amazonaws.com");
         assert_eq!(bucket_targets.targets[0].target_bucket, "target-bucket");
+    }
+
+    /// rustfs/backlog#2282: a stored targets blob this build cannot decode
+    /// must not become the empty target set, and must stay distinguishable
+    /// from a bucket that never configured a target.
+    #[test]
+    fn unreadable_bucket_targets_never_degrade_to_an_empty_target_set() {
+        let truncated = br#"{"targets":[{"endpoint":"s3.example.com","#.to_vec();
+        let mut corrupt = BucketMetadata::new("corrupt-targets");
+        corrupt.bucket_targets_config_json = truncated.clone();
+
+        corrupt
+            .parse_all_configs()
+            .expect("one unreadable sub-config must not fail the whole metadata load");
+
+        assert!(
+            corrupt.bucket_target_config.is_none(),
+            "an undecodable targets blob must not produce a target set at all"
+        );
+        assert!(corrupt.bucket_targets_unreadable());
+        assert_eq!(
+            corrupt.bucket_targets_config_json, truncated,
+            "the raw bytes must survive so the configuration stays recoverable"
+        );
+
+        // The genuinely-absent case is unchanged, and the two now diverge.
+        let mut absent = BucketMetadata::new("no-targets");
+        absent.parse_all_configs().expect("absent targets parse");
+        assert!(
+            absent.bucket_target_config.as_ref().is_some_and(BucketTargets::is_empty),
+            "a bucket that configured no target still reads as an empty target set"
+        );
+        assert!(!absent.bucket_targets_unreadable());
+    }
+
+    /// `Credentials` carries no struct-level `serde(default)`, so one target
+    /// missing `secretKey` is a hard parse error for the whole document. That
+    /// must surface as "unreadable", never as "no targets configured".
+    #[test]
+    fn bucket_targets_missing_secret_key_are_unreadable_not_empty() {
+        let mut bm = BucketMetadata::new("missing-secret-key");
+        bm.bucket_targets_config_json = br#"{"targets":[{"endpoint":"s3.example.com","targetbucket":"remote","arn":"arn:rustfs:replication:us-east-1:src:1","credentials":{"accessKey":"AKIAEXAMPLE"}}]}"#.to_vec();
+
+        bm.parse_all_configs()
+            .expect("a rejected targets document must not fail the whole metadata load");
+
+        assert!(
+            bm.bucket_targets_unreadable(),
+            "a targets document rejected for a missing secretKey is unreadable, not empty"
+        );
+        assert!(bm.bucket_target_config.is_none());
+    }
+
+    /// rustfs/backlog#2309: the MinIO-origin `.metadata.bin` this repository
+    /// already carries as a compatibility fixture stores
+    /// `BucketTargetsConfigJSON` as a bare JSON array, which `BucketTargets`
+    /// (a `{"targets":[…]}` struct with no array fallback) cannot decode. The
+    /// bytes below are the exact payload the fixture in
+    /// `metadata_test.rs::TEST_BUCKET_METADATA_HEX` decodes to, so if RustFS
+    /// ever grows the array-shaped compatibility parse, this test is where the
+    /// upgrade break is pinned and where the decision has to be recorded.
+    #[test]
+    fn minio_array_shaped_bucket_targets_are_unreadable() {
+        let minio_array = br#"[{"endpoint":"http://target.example.com","targetBucket":"tb","region":"us-east-1"}]"#.to_vec();
+        let mut bm = BucketMetadata::new("minio-array-targets");
+        bm.bucket_targets_config_json = minio_array.clone();
+
+        bm.parse_all_configs()
+            .expect("a MinIO-shaped targets blob must not fail the whole metadata load");
+
+        assert!(
+            bm.bucket_targets_unreadable(),
+            "an array-shaped MinIO targets blob is unreadable, not an empty target set"
+        );
+        assert!(bm.bucket_target_config.is_none());
+        assert_eq!(
+            bm.bucket_targets_config_json, minio_array,
+            "the raw MinIO bytes must survive so the configuration stays recoverable"
+        );
+    }
+
+    /// The invariant every branch of `parse_all_configs` shares: a stored but
+    /// undecodable payload keeps its raw bytes and leaves the typed field
+    /// `None`, so no branch fabricates a value. What a reader may then do with
+    /// that state is decided per config; see the table on `parse_all_configs`.
+    #[test]
+    fn every_config_branch_retains_its_parse_failure_instead_of_defaulting() {
+        let malformed_xml = b"<not-a-valid-document".to_vec();
+        let malformed_json = b"{not-json".to_vec();
+
+        let mut bm = BucketMetadata::new("all-configs-malformed");
+        bm.policy_config_json = malformed_json.clone();
+        bm.quota_config_json = malformed_json.clone();
+        bm.bucket_targets_config_json = malformed_json.clone();
+        bm.notification_config_xml = malformed_xml.clone();
+        bm.lifecycle_config_xml = malformed_xml.clone();
+        bm.object_lock_config_xml = malformed_xml.clone();
+        bm.versioning_config_xml = malformed_xml.clone();
+        bm.encryption_config_xml = malformed_xml.clone();
+        bm.tagging_config_xml = malformed_xml.clone();
+        bm.replication_config_xml = malformed_xml.clone();
+        bm.cors_config_xml = malformed_xml.clone();
+        bm.logging_config_xml = malformed_xml.clone();
+        bm.website_config_xml = malformed_xml.clone();
+        bm.accelerate_config_xml = malformed_xml.clone();
+        bm.request_payment_config_xml = malformed_xml.clone();
+        bm.public_access_block_config_xml = malformed_xml.clone();
+        // `bucket_acl_config_json` is only checked for UTF-8, so only invalid
+        // UTF-8 exercises its failure branch.
+        bm.bucket_acl_config_json = vec![0xff, 0xfe];
+
+        bm.parse_all_configs()
+            .expect("a bucket whose every config is corrupt must still load its metadata");
+
+        let cleared: [(&str, bool); 17] = [
+            ("policy", bm.policy_config.is_none()),
+            ("quota", bm.quota_config.is_none()),
+            ("bucket_targets", bm.bucket_target_config.is_none()),
+            ("notification", bm.notification_config.is_none()),
+            ("lifecycle", bm.lifecycle_config.is_none()),
+            ("object_lock", bm.object_lock_config.is_none()),
+            ("versioning", bm.versioning_config.is_none()),
+            ("encryption", bm.sse_config.is_none()),
+            ("tagging", bm.tagging_config.is_none()),
+            ("replication", bm.replication_config.is_none()),
+            ("cors", bm.cors_config.is_none()),
+            ("logging", bm.logging_config.is_none()),
+            ("website", bm.website_config.is_none()),
+            ("accelerate", bm.accelerate_config.is_none()),
+            ("request_payment", bm.request_payment_config.is_none()),
+            ("public_access_block", bm.public_access_block_config.is_none()),
+            ("bucket_acl", bm.bucket_acl_config.is_none()),
+        ];
+        for (config, is_cleared) in cleared {
+            assert!(is_cleared, "{config}: a corrupt payload must not be replaced by a default");
+        }
+
+        assert_eq!(bm.bucket_targets_config_json, malformed_json, "raw bytes are retained");
+        assert_eq!(bm.lifecycle_config_xml, malformed_xml, "raw bytes are retained");
     }
 
     #[test]
@@ -1757,6 +2204,96 @@ mod test {
 
         bm.update_config(BUCKET_TABLE_CONFIG, Vec::new()).unwrap();
         assert!(!bm.table_bucket_enabled());
+    }
+
+    const ODM_JSON: &[u8] = br#"{"version":1,"enabled":true,"source":{"provider":"minio","endpoint":"https://legacy.example.com:9000","region":"auto","bucket":"legacy-bucket","credentials":{"access_key":"AK","secret_key":"SK"}}}"#;
+
+    /// The metadata codec preserves application-owned bytes and timestamps.
+    #[test]
+    fn on_demand_migration_config_round_trips_and_tracks_updates() {
+        let mut bm = BucketMetadata::new("odm-bucket");
+        assert_eq!(bm.on_demand_migration_config(), None, "fresh metadata carries no config");
+        bm.update_config(BUCKET_ON_DEMAND_MIGRATION_CONFIG, ODM_JSON.to_vec())
+            .expect("opaque config is accepted");
+        let stamped = bm.on_demand_migration_config_updated_at;
+        assert_ne!(stamped, OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(bm.on_demand_migration_config(), Some((ODM_JSON, stamped)));
+        let back = BucketMetadata::unmarshal(&bm.marshal_msg().unwrap()).unwrap();
+        assert_eq!(back.on_demand_migration_config_json, bm.on_demand_migration_config_json);
+        assert_eq!(back.on_demand_migration_config_updated_at.unix_timestamp(), stamped.unix_timestamp());
+        bm.update_config(BUCKET_ON_DEMAND_MIGRATION_CONFIG, Vec::new()).unwrap();
+        assert!(bm.on_demand_migration_config_json.is_empty());
+        assert_eq!(bm.on_demand_migration_config(), None);
+        assert!(bm.on_demand_migration_config_updated_at >= stamped);
+        bm.update_config(BUCKET_ON_DEMAND_MIGRATION_CONFIG, b"not-json".to_vec())
+            .unwrap();
+        let back = BucketMetadata::unmarshal(&bm.marshal_msg().unwrap()).unwrap();
+        assert_eq!(
+            back.on_demand_migration_config_json, b"not-json",
+            "metadata must not reinterpret application bytes"
+        );
+    }
+
+    /// rustfs/backlog#2148: a `.metadata.bin` written before the on-demand
+    /// migration keys existed decodes with an empty blob and an epoch
+    /// timestamp that `default_timestamps` back-fills from `created`.
+    #[test]
+    fn on_demand_migration_config_absent_in_legacy_blob_defaults_to_created() {
+        let blob = decode_hex(include_str!("../../tests/fixtures/minio/bucket_metadata.blob.hex"));
+        let mut bm = BucketMetadata::unmarshal(&blob[4..]).expect("unmarshal MinIO bucket metadata");
+        assert!(bm.on_demand_migration_config_json.is_empty());
+        assert_eq!(bm.on_demand_migration_config_updated_at, OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(bm.on_demand_migration_config(), None);
+
+        bm.default_timestamps();
+        assert_ne!(bm.created, OffsetDateTime::UNIX_EPOCH, "fixture must carry a real creation time");
+        assert_eq!(bm.on_demand_migration_config_updated_at, bm.created);
+
+        // A metadata blob from this build with no config set stays
+        // indistinguishable from the legacy one for these fields.
+        let fresh = BucketMetadata::unmarshal(&BucketMetadata::new("fresh").marshal_msg().unwrap()).unwrap();
+        assert!(fresh.on_demand_migration_config_json.is_empty());
+        assert_eq!(fresh.on_demand_migration_config_updated_at, OffsetDateTime::UNIX_EPOCH);
+    }
+
+    /// rustfs/backlog#2148: a reader that predates the two on-demand
+    /// migration keys takes `decode_from`'s unknown-field branch, which is
+    /// `skip_msgp_value`. Walk the new-format blob with exactly that
+    /// primitive and prove both keys are skipped without desynchronising the
+    /// stream, so the fields that follow them still decode.
+    #[test]
+    fn old_decoder_skips_on_demand_migration_fields_without_desync() {
+        let mut bm = BucketMetadata::new("odm-skip");
+        bm.update_config(BUCKET_ON_DEMAND_MIGRATION_CONFIG, ODM_JSON.to_vec())
+            .unwrap();
+        bm.update_config(BUCKET_DURABILITY_CONFIG, br#"{"mode":"relaxed"}"#.to_vec())
+            .unwrap();
+        let buf = bm.marshal_msg().unwrap();
+
+        let mut rd = std::io::Cursor::new(buf.as_slice());
+        let fields = rmp::decode::read_map_len(&mut rd).unwrap();
+        let mut skipped = Vec::new();
+        let mut durability_json = Vec::new();
+        for _ in 0..fields {
+            let key_len = rmp::decode::read_str_len(&mut rd).unwrap();
+            let mut key = vec![0u8; key_len as usize];
+            rd.read_exact(&mut key).unwrap();
+            let key = String::from_utf8(key).unwrap();
+            match key.as_str() {
+                // The field an old reader knows that is encoded *after* the
+                // unknown JSON key and *before* the unknown timestamp key.
+                "DurabilityConfigJSON" => durability_json = read_msgp_bin(&mut rd).unwrap(),
+                other => {
+                    if other.starts_with("OnDemandMigration") {
+                        skipped.push(other.to_string());
+                    }
+                    skip_msgp_value(&mut rd).unwrap();
+                }
+            }
+        }
+        assert_eq!(skipped, ["OnDemandMigrationConfigJSON", "OnDemandMigrationConfigUpdatedAt"]);
+        assert_eq!(durability_json, br#"{"mode":"relaxed"}"#);
+        assert_eq!(rd.position() as usize, buf.len(), "old-style walk must consume the blob exactly");
     }
 
     /// HP-5b (rustfs/backlog#938): the durability override is a RustFS

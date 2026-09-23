@@ -39,20 +39,19 @@ use super::replication_resync_boundary::{
 };
 use super::replication_resyncer::{
     ReplicationResyncer, get_heal_replicate_object_info, replicate_delete, replicate_delete_with_outcome, replicate_object,
-    replicate_object_with_outcome, save_resync_status,
+    replicate_object_with_outcome, update_resync_status_cas,
 };
 use super::replication_state::ReplicationStats;
 use super::replication_storage_boundary::{
     HTTPPreconditions, ObjectInfo, ObjectOptions, ObjectToDelete, ReplicationDeletedObject, ReplicationObjectIO,
     ReplicationStorage,
 };
-use super::replication_target_boundary::{ReplicationTargetStore, replication_object_is_ssec_encrypted};
+use super::replication_target_boundary::{BucketTargetError, ReplicationTargetStore, replication_object_is_ssec_encrypted};
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
 use futures_util::stream::{self, StreamExt};
 use metrics::{counter, histogram};
 use rustfs_utils::hash::HashAlgorithm;
-use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
@@ -76,6 +75,7 @@ use tracing::{debug, info, instrument, warn};
 const EVENT_REPLICATION_WORKER_RESIZE_SKIPPED: &str = "replication_worker_resize_skipped";
 const EVENT_REPLICATION_WORKER_RESIZED: &str = "replication_worker_resized";
 const EVENT_REPLICATION_BACKPRESSURE: &str = "replication_backpressure";
+const EVENT_REPLICATION_IN_FLIGHT_SKIPPED: &str = "replication_in_flight_skipped";
 const EVENT_REPLICATION_RESYNC_LOAD_SKIPPED: &str = "replication_resync_load_skipped";
 const EVENT_REPLICATION_RESYNC_RECOVERED: &str = "replication_resync_recovered";
 const EVENT_REPLICATION_MRF_QUEUE_UNAVAILABLE: &str = "replication_mrf_queue_unavailable";
@@ -883,6 +883,20 @@ fn reconstructed_heal_delete_info(
 ) -> DeletedObjectReplicationInfo {
     let mut rstate = oi.replication_state();
     rstate.replicate_decision_str = dsc.to_string();
+    // The caller hands us a blank ObjectInfo (the source marker may already be
+    // gone), so the state above carries no target-assigned marker version ids.
+    // Restore them from the journal: `delete_marker_purge_version_id` must hit
+    // the id the target reported, not fall back to the source marker id, which
+    // a target that mints its own ids answers with an idempotent 204 that would
+    // acknowledge the intent while the real marker stays behind (backlog#2290).
+    // The corrupt flag rides along so a refusal stays a refusal after restart.
+    for (arn, version_id) in &entry.target_delete_marker_version_ids {
+        rstate
+            .target_delete_marker_version_ids
+            .entry(arn.clone())
+            .or_insert_with(|| version_id.clone());
+    }
+    rstate.target_delete_marker_version_ids_corrupt |= entry.target_delete_marker_version_ids_corrupt;
 
     let delete_marker_mtime = entry
         .delete_marker_mtime
@@ -939,7 +953,11 @@ async fn replay_mrf_object_entry<S: ReplicationStorage>(
         Some(queue_replication_heal(&entry.bucket, oi, entry.retry_count.max(0) as u32).await)
     } else {
         let roi = admitted_mrf_replicate_object(oi, entry, entry.op.replication_type());
-        if replicate_object_with_outcome(roi, storage.clone()).await.1 {
+        if replicate_object_with_outcome(roi, storage.clone())
+            .await
+            .1
+            .consumes_mrf_entry()
+        {
             Some(ReplicationQueueAdmission::Queued)
         } else {
             Some(ReplicationQueueAdmission::Missed)
@@ -978,7 +996,11 @@ async fn replay_mrf_metadata_entry<S: ReplicationStorage>(
         Some(queue_replication_metadata(&entry.bucket, oi, entry.retry_count.max(0) as u32).await)
     } else {
         let roi = admitted_mrf_replicate_object(oi, entry, ReplicationType::Metadata);
-        if replicate_object_with_outcome(roi, storage.clone()).await.1 {
+        if replicate_object_with_outcome(roi, storage.clone())
+            .await
+            .1
+            .consumes_mrf_entry()
+        {
             Some(ReplicationQueueAdmission::Queued)
         } else {
             Some(ReplicationQueueAdmission::Missed)
@@ -1048,7 +1070,6 @@ pub fn resync_start_conflict_id(error: &EcstoreError) -> Option<&str> {
 }
 
 /// Main replication pool structure
-#[derive(Debug)]
 pub struct ReplicationPool<S: ReplicationStorage> {
     // Atomic counters for active workers
     active_workers: Arc<AtomicI32>,
@@ -1068,6 +1089,9 @@ pub struct ReplicationPool<S: ReplicationStorage> {
     // Worker channels
     workers: RwLock<Vec<Sender<ReplicationOperation>>>,
     lrg_workers: RwLock<Vec<Sender<ReplicationOperation>>>,
+
+    /// Object versions queued or being replicated right now (backlog#2362).
+    in_flight: Arc<ReplicationInFlight>,
 
     // MRF (Most Recent Failures) channels
     mrf_replica_tx: Sender<ReplicationOperation>,
@@ -1094,6 +1118,16 @@ pub struct ReplicationPool<S: ReplicationStorage> {
     resyncer: Arc<ReplicationResyncer>,
 }
 
+impl<S: ReplicationStorage> std::fmt::Debug for ReplicationPool<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplicationPool")
+            .field("active_workers", &self.active_workers.load(Ordering::Relaxed))
+            .field("active_lrg_workers", &self.active_lrg_workers.load(Ordering::Relaxed))
+            .field("active_mrf_workers", &self.active_mrf_workers.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
 impl<S: ReplicationStorage> ReplicationPool<S> {
     /// Creates a new replication pool with specified options
     pub async fn new(opts: ReplicationPoolOpts, stats: Arc<ReplicationStats>, storage: Arc<S>) -> Arc<Self> {
@@ -1117,6 +1151,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             storage,
             workers: RwLock::new(Vec::new()),
             lrg_workers: RwLock::new(Vec::new()),
+            in_flight: Arc::new(ReplicationInFlight::default()),
             mrf_replica_tx,
             mrf_replica_rx: Arc::new(Mutex::new(mrf_replica_rx)),
             mrf_save_tx,
@@ -1172,12 +1207,13 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             let active_counter = self.active_lrg_workers.clone();
             let storage = self.storage.clone();
             let stats = self.stats.clone();
+            let in_flight = self.in_flight.clone();
 
             let handle = tokio::spawn(async move {
                 let mut rx = rx;
                 while let Some(operation) = rx.recv().await {
                     let _active = ActiveWorkerGuard::new(active_counter.clone());
-                    process_replication_operation(operation, stats.clone(), storage.clone()).await;
+                    process_replication_operation(operation, stats.clone(), storage.clone(), in_flight.clone()).await;
                 }
             });
 
@@ -1231,12 +1267,13 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             let active_counter = self.active_workers.clone();
             let stats = self.stats.clone();
             let storage = self.storage.clone();
+            let in_flight = self.in_flight.clone();
 
             let handle = tokio::spawn(async move {
                 let mut rx = rx;
                 while let Some(operation) = rx.recv().await {
                     let _active = ActiveWorkerGuard::new(active_counter.clone());
-                    process_replication_operation(operation, stats.clone(), storage.clone()).await;
+                    process_replication_operation(operation, stats.clone(), storage.clone(), in_flight.clone()).await;
                 }
             });
 
@@ -1275,6 +1312,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             let active_counter = self.active_mrf_workers.clone();
             let stats = self.stats.clone();
             let storage = self.storage.clone();
+            let in_flight = self.in_flight.clone();
             let mrf_rx = Arc::clone(&self.mrf_replica_rx);
 
             let handle = tokio::spawn(async move {
@@ -1294,7 +1332,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     let Some(operation) = operation else { break };
 
                     let _active = ActiveWorkerGuard::new(active_counter.clone());
-                    process_replication_operation(operation, stats.clone(), storage.clone()).await;
+                    process_replication_operation(operation, stats.clone(), storage.clone(), in_flight.clone()).await;
                 }
             });
             self.task_handles.lock().await.push(handle);
@@ -1424,6 +1462,24 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
     /// Queues a replica task
     pub async fn queue_replica_task(&self, ri: ReplicateObjectInfo) -> ReplicationQueueAdmission {
+        // A version that is already queued or being uploaded is not driven a
+        // second time: the scanner heal pass sees it as PENDING until the
+        // first upload lands and would otherwise re-queue it every cycle
+        // (backlog#2362). The key is released when the worker finishes, or
+        // below when no worker accepts the task.
+        if !self.in_flight.try_begin(&ri) {
+            debug!(
+                event = EVENT_REPLICATION_IN_FLIGHT_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket = %ri.bucket,
+                object = %ri.name,
+                version_id = ?ri.version_id,
+                op_type = ?ri.op_type,
+                "Replication task already in flight; not queued again"
+            );
+            return ReplicationQueueAdmission::Skipped;
+        }
         let target_arns = ri.dsc.replicate_target_arns();
         // If object is large, queue it to a static set of large workers
         if should_queue_large_object(ri.size) {
@@ -1454,7 +1510,9 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     let resize = large_worker_backpressure_resize(existing, self.active_lrg_workers(), max_l_workers);
                     drop(lrg_workers);
 
-                    // Queue to MRF if worker is busy.
+                    // Queue to MRF if worker is busy. The MRF replay re-enters
+                    // this function, so the version is no longer in flight.
+                    self.in_flight.finish(&ri);
                     let admission = self.queue_mrf_save_admission(ri.to_mrf_entry(), "large_object").await;
 
                     if let Some(resize) = resize {
@@ -1463,6 +1521,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     return admission;
                 }
             }
+            self.in_flight.finish(&ri);
             return ReplicationQueueAdmission::Missed;
         }
 
@@ -1471,6 +1530,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         let ch = self.worker_queue_channel(&ri.op_type, &ri.bucket, &ri.name, ri.size).await;
 
         let Some(channel) = ch else {
+            self.in_flight.finish(&ri);
             return ReplicationQueueAdmission::Missed;
         };
 
@@ -1482,7 +1542,9 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         self.stats.dec_q(&ri.bucket, ri.size, ri.delete_marker, ri.op_type);
         self.stats.dec_target_q(&ri.bucket, &target_arns, ri.size);
 
-        // Queue to MRF if all workers are busy.
+        // Queue to MRF if all workers are busy. The MRF replay re-enters this
+        // function, so the version is no longer in flight.
+        self.in_flight.finish(&ri);
         let admission = self.queue_mrf_save_admission(ri.to_mrf_entry(), "object").await;
 
         // Try to scale up workers based on priority
@@ -1781,7 +1843,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     ) {
         while let Some(operation) = rx.recv().await {
             let _active = ActiveWorkerGuard::new(active_counter.clone());
-            process_replication_operation(operation, stats.clone(), self.storage.clone()).await;
+            process_replication_operation(operation, stats.clone(), self.storage.clone(), self.in_flight.clone()).await;
         }
     }
 
@@ -1799,7 +1861,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     ) {
         while let Some(operation) = rx.recv().await {
             let _active = ActiveWorkerGuard::new(active_counter.clone());
-            process_replication_operation(operation, stats.clone(), storage.clone()).await;
+            process_replication_operation(operation, stats.clone(), storage.clone(), self.in_flight.clone()).await;
         }
     }
 
@@ -1816,7 +1878,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     ) {
         while let Some(operation) = rx.recv().await {
             let _active = ActiveWorkerGuard::new(active_counter.clone());
-            process_replication_operation(operation, stats.clone(), self.storage.clone()).await;
+            process_replication_operation(operation, stats.clone(), self.storage.clone(), self.in_flight.clone()).await;
         }
     }
 
@@ -1862,6 +1924,12 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         Ok(status)
     }
 
+    /// Read `resync.bin` directly without consulting or replacing this node's
+    /// progress cache when the persisted cross-node intent is authoritative.
+    pub async fn read_durable_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError> {
+        load_bucket_resync_metadata(bucket, self.storage.clone()).await
+    }
+
     pub async fn cancel_bucket_resync(&self, opts: ResyncOpts) -> Result<(), EcstoreError> {
         self.resyncer.cancel(&opts).await;
         self.resyncer
@@ -1898,7 +1966,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             }
         };
 
-        let mut bucket_status = load_bucket_resync_metadata(&opts.bucket, self.storage.clone()).await?;
+        let bucket_status = load_bucket_resync_metadata(&opts.bucket, self.storage.clone()).await?;
         if let Some(active) = bucket_status.targets_map.get(&opts.arn) {
             if active.resync_id == opts.resync_id {
                 self.resyncer
@@ -1924,26 +1992,43 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         }
 
         let now = OffsetDateTime::now_utc();
-        bucket_status.last_update = Some(now);
-        bucket_status.targets_map.insert(
-            opts.arn.clone(),
-            TargetReplicationResyncStatus {
-                start_time: Some(now),
-                last_update: Some(now),
-                resync_id: opts.resync_id.clone(),
-                resync_before_date: opts.resync_before,
-                resync_status: ResyncStatusType::ResyncPending,
-                failed_size: 0,
-                failed_count: 0,
-                replicated_size: 0,
-                replicated_count: 0,
-                bucket: opts.bucket.clone(),
-                object: String::new(),
-                error: None,
-            },
-        );
+        let admitted = TargetReplicationResyncStatus {
+            start_time: Some(now),
+            last_update: Some(now),
+            resync_id: opts.resync_id.clone(),
+            resync_before_date: opts.resync_before,
+            resync_status: ResyncStatusType::ResyncPending,
+            failed_size: 0,
+            failed_count: 0,
+            replicated_size: 0,
+            replicated_count: 0,
+            bucket: opts.bucket.clone(),
+            object: String::new(),
+            error: None,
+        };
 
-        save_resync_status(&opts.bucket, &bucket_status, self.storage.clone()).await?;
+        // The admission lock serializes competing admissions, but status
+        // writers (mark_status, the periodic saver) do not take it — write
+        // through the CAS so their concurrent updates to other targets are
+        // never lost, re-checking the conflict gate on each retry.
+        let (bucket_status, _) = update_resync_status_cas(&opts.bucket, self.storage.clone(), |persisted| {
+            if let Some(active) = persisted.targets_map.get(&opts.arn) {
+                if active.resync_id == opts.resync_id {
+                    return Ok(false);
+                }
+                if should_auto_resume_resync(active.resync_status) {
+                    return Err(EcstoreError::other(ResyncActiveConflictError {
+                        bucket: opts.bucket.clone(),
+                        arn: opts.arn.clone(),
+                        active_resync_id: active.resync_id.clone(),
+                    }));
+                }
+            }
+            persisted.last_update = Some(now);
+            persisted.targets_map.insert(opts.arn.clone(), admitted.clone());
+            Ok(true)
+        })
+        .await?;
         self.resyncer
             .status_map
             .write()
@@ -1951,6 +2036,83 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             .insert(opts.bucket.clone(), bucket_status);
 
         Ok(true)
+    }
+
+    /// Cancel the pending/started resync intent recorded for `arn`, if any,
+    /// because its remote target is being removed. Returns the canceled run.
+    ///
+    /// Runs under the bucket admission lock and reloads `resync.bin` from disk
+    /// before writing, like admission does: this node's `status_map` entry may
+    /// be stale relative to intents admitted by other nodes, and persisting it
+    /// would silently drop their durable restart intents.
+    pub async fn cancel_bucket_resync_for_removed_target(
+        self: Arc<Self>,
+        bucket: &str,
+        arn: &str,
+    ) -> Result<Option<ResyncOpts>, EcstoreError> {
+        let bucket = bucket.to_string();
+        let arn = arn.to_string();
+        tokio::spawn(async move { self.cancel_bucket_resync_for_removed_target_transaction(bucket, arn).await })
+            .await
+            .map_err(|error| EcstoreError::other(format!("replication resync cancellation task failed: {error}")))?
+    }
+
+    async fn cancel_bucket_resync_for_removed_target_transaction(
+        self: Arc<Self>,
+        bucket: String,
+        arn: String,
+    ) -> Result<Option<ResyncOpts>, EcstoreError> {
+        let admission_lock_key = ReplicationMetadataStore::resync_admission_lock_key(&bucket);
+        let admission_lock = self
+            .storage
+            .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), &admission_lock_key)
+            .await?;
+        // Lock order: bucket resync admission lock -> resync status config-object lock.
+        let _admission_guard = admission_lock
+            .get_write_lock(ReplicationLockTiming::acquire_timeout())
+            .await
+            .map_err(EcstoreError::from)?;
+
+        let mut canceled: Option<ResyncOpts> = None;
+        let (final_map, _) = update_resync_status_cas(&bucket, self.storage.clone(), |persisted| {
+            canceled = None;
+            let Some(intent) = persisted.targets_map.get_mut(&arn) else {
+                return Ok(false);
+            };
+            if !should_auto_resume_resync(intent.resync_status) {
+                return Ok(false);
+            }
+            let now = OffsetDateTime::now_utc();
+            canceled = Some(ResyncOpts {
+                bucket: bucket.clone(),
+                arn: arn.clone(),
+                resync_id: intent.resync_id.clone(),
+                resync_before: intent.resync_before_date,
+            });
+            intent.resync_status = ResyncStatusType::ResyncCanceled;
+            intent.last_update = Some(now);
+            persisted.last_update = Some(now);
+            Ok(true)
+        })
+        .await?;
+
+        // Converge only the removed target's cached entry: cached progress
+        // counters for this node's other running targets stay authoritative.
+        {
+            let mut status_map = self.resyncer.status_map.write().await;
+            let cached = status_map
+                .entry(bucket.clone())
+                .or_insert_with(BucketReplicationResyncStatus::new);
+            if let Some(final_target) = final_map.targets_map.get(&arn) {
+                cached.targets_map.insert(arn.clone(), final_target.clone());
+                cached.last_update = final_map.last_update.or(cached.last_update);
+            }
+        }
+
+        if let Some(opts) = &canceled {
+            self.resyncer.cancel(opts).await;
+        }
+        Ok(canceled)
     }
 
     pub async fn activate_bucket_resync(self: Arc<Self>, opts: ResyncOpts, recovering: bool) -> Result<(), EcstoreError> {
@@ -2032,7 +2194,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     }
 
     /// Load bucket replication resync statuses into memory
-    #[instrument(skip(_cancellation_token))]
+    #[instrument(skip(self, buckets, _cancellation_token), fields(bucket_count = buckets.len()))]
     async fn load_resync(
         self: Arc<Self>,
         buckets: &[String],
@@ -2151,6 +2313,64 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     }
 }
 
+/// Object versions currently queued or being uploaded, keyed by bucket,
+/// object name and version. `queue_replica_task` admits a version only once
+/// while it is in flight; the scanner heal pass and MRF replays that arrive
+/// in the meantime are `Skipped` instead of driving a second complete upload
+/// (backlog#2362). Entries are removed when the worker finishes the task or
+/// when no worker accepted it.
+#[derive(Debug, Default)]
+pub(crate) struct ReplicationInFlight {
+    keys: std::sync::Mutex<std::collections::HashSet<(String, String, Option<uuid::Uuid>)>>,
+}
+
+impl ReplicationInFlight {
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<(String, String, Option<uuid::Uuid>)>> {
+        self.keys.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Claim `ri`; `false` when the same version is already in flight.
+    fn try_begin(&self, ri: &ReplicateObjectInfo) -> bool {
+        self.lock().insert((ri.bucket.clone(), ri.name.clone(), ri.version_id))
+    }
+
+    fn finish(&self, ri: &ReplicateObjectInfo) {
+        self.lock().remove(&(ri.bucket.clone(), ri.name.clone(), ri.version_id));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock().len()
+    }
+}
+
+/// Releases the in-flight claim when the worker is done with the task,
+/// including when replication panics.
+struct ReplicationInFlightGuard {
+    in_flight: Arc<ReplicationInFlight>,
+    key: ReplicateObjectInfo,
+}
+
+impl ReplicationInFlightGuard {
+    fn new(in_flight: Arc<ReplicationInFlight>, ri: &ReplicateObjectInfo) -> Self {
+        Self {
+            in_flight,
+            key: ReplicateObjectInfo {
+                bucket: ri.bucket.clone(),
+                name: ri.name.clone(),
+                version_id: ri.version_id,
+                ..Default::default()
+            },
+        }
+    }
+}
+
+impl Drop for ReplicationInFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight.finish(&self.key);
+    }
+}
+
 struct ActiveWorkerGuard {
     counter: Arc<AtomicI32>,
 }
@@ -2212,10 +2432,12 @@ async fn process_replication_operation<S: ReplicationStorage>(
     operation: ReplicationOperation,
     stats: Arc<ReplicationStats>,
     storage: Arc<S>,
+    in_flight: Arc<ReplicationInFlight>,
 ) {
     match operation {
         ReplicationOperation::Object(obj_info) => {
             let _backlog = ReplicationBacklogGuard::for_object(stats, obj_info.as_ref());
+            let _in_flight = ReplicationInFlightGuard::new(in_flight, obj_info.as_ref());
             replicate_object(*obj_info, storage).await;
         }
         ReplicationOperation::Delete(del_info) => {
@@ -2709,7 +2931,13 @@ pub trait ReplicationPoolTrait: std::fmt::Debug {
     async fn persist_mrf_entry(&self, entry: MrfReplicateEntry) -> ReplicationQueueAdmission;
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize);
     async fn get_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError>;
+    async fn read_durable_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError>;
     async fn cancel_bucket_resync(&self, opts: ResyncOpts) -> Result<(), EcstoreError>;
+    async fn cancel_bucket_resync_for_removed_target(
+        self: Arc<Self>,
+        bucket: &str,
+        arn: &str,
+    ) -> Result<Option<ResyncOpts>, EcstoreError>;
     async fn admit_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<bool, EcstoreError>;
     async fn activate_bucket_resync(self: Arc<Self>, opts: ResyncOpts, recovering: bool) -> Result<(), EcstoreError>;
     async fn start_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<(), EcstoreError>;
@@ -2759,8 +2987,20 @@ impl<S: ReplicationStorage> ReplicationPoolTrait for ReplicationPool<S> {
         self.get_bucket_resync_status(bucket).await
     }
 
+    async fn read_durable_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError> {
+        self.read_durable_bucket_resync_status(bucket).await
+    }
+
     async fn cancel_bucket_resync(&self, opts: ResyncOpts) -> Result<(), EcstoreError> {
         self.cancel_bucket_resync(opts).await
+    }
+
+    async fn cancel_bucket_resync_for_removed_target(
+        self: Arc<Self>,
+        bucket: &str,
+        arn: &str,
+    ) -> Result<Option<ResyncOpts>, EcstoreError> {
+        ReplicationPool::<S>::cancel_bucket_resync_for_removed_target(self, bucket, arn).await
     }
 
     async fn admit_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<bool, EcstoreError> {
@@ -2851,8 +3091,11 @@ fn replicate_object_info_from_object_info(
 ) -> ReplicateObjectInfo {
     let tgt_statuses = replication_statuses_map(&oi.replication_status_internal.clone().unwrap_or_default());
     let purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal.clone().unwrap_or_default());
-    let tm = get_str(&oi.user_defined, SUFFIX_REPLICATION_TIMESTAMP)
-        .map(|v| OffsetDateTime::parse(&v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH));
+    let replication_generation = oi.replication_generation_snapshot();
+    let tm = replication_generation
+        .timestamp
+        .as_deref()
+        .map(|value| OffsetDateTime::parse(value, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH));
     let mut rstate = oi.replication_state();
     rstate.replicate_decision_str = dsc.to_string();
     let asz = oi.get_actual_size_or_physical();
@@ -2879,6 +3122,7 @@ fn replicate_object_info_from_object_info(
         target_statuses: tgt_statuses,
         target_purge_statuses: purge_statuses,
         replication_timestamp: tm,
+        replication_generation,
         user_tags: (*oi.user_tags).clone(),
         checksum,
         retry_count: 0,
@@ -2927,7 +3171,11 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
     }
 
     let rcfg = match ReplicationMetadataStore::optional_replication_config(bucket).await {
-        Ok(Some(config)) => config,
+        Ok(Some(config)) => Some(config),
+        // A bucket without a configuration still owes its pending purges an
+        // answer: the delete worker finishes them locally as abandoned, which
+        // is what makes the bucket deletable again (rustfs/backlog#2340).
+        Ok(None) if owes_version_purge(&oi) => None,
         Ok(None) => return ReplicationQueueAdmission::Skipped,
         Err(err) => {
             debug!(
@@ -2946,6 +3194,23 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
 
     let tgts = match ReplicationTargetStore::list_bucket_targets(bucket).await {
         Ok(targets) => Some(targets),
+        // A bucket whose persisted target configuration cannot be decoded has
+        // an unknown target set, not an empty one: scheduling against `None`
+        // here would drop every heal for it without a trace
+        // (rustfs/backlog#2282). Report it missed so the object is retried
+        // once the configuration is readable again.
+        Err(BucketTargetError::BucketRemoteTargetsUnreadable { .. }) => {
+            warn!(
+                event = EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket,
+                reason = "target_config_unreadable",
+                "Bucket replication targets are unreadable; replication heal queue fails closed"
+            );
+
+            return ReplicationQueueAdmission::Missed;
+        }
         Err(err) => {
             debug!(
                 event = EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED,
@@ -2960,7 +3225,7 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
         }
     };
 
-    let rcfg_wrapper = ReplicationConfig::new(Some(rcfg), tgts);
+    let rcfg_wrapper = ReplicationConfig::new(rcfg, tgts);
     queue_replication_heal_internal(bucket, oi, rcfg_wrapper, retry_count)
         .await
         .admission
@@ -2988,6 +3253,17 @@ pub async fn queue_replication_metadata(bucket: &str, oi: ObjectInfo, retry_coun
     }
 }
 
+/// A version purge the persisted state still owes to named targets. Without
+/// the target list nothing can be settled, so such a version keeps the
+/// ordinary "no configuration, nothing to heal" skip.
+fn owes_version_purge(oi: &ObjectInfo) -> bool {
+    !oi.version_purge_status.is_empty()
+        && oi
+            .version_purge_status_internal
+            .as_deref()
+            .is_some_and(|statuses| !statuses.trim().is_empty())
+}
+
 /// queue_replication_heal_internal enqueues objects that failed replication OR eligible for resyncing through
 /// an ongoing resync operation or via existing objects replication configuration setting.
 pub(crate) async fn queue_replication_heal_internal(
@@ -3006,7 +3282,11 @@ pub(crate) async fn queue_replication_heal_internal(
         };
     }
 
-    if rcfg.config.is_none() || rcfg.remotes.is_none() {
+    // Without a configuration or targets there is nothing to replicate —
+    // except a version purge the bucket still owes: its stored decision names
+    // the targets, and the delete worker settles the ones no longer
+    // configured as abandoned (rustfs/backlog#2340).
+    if (rcfg.config.is_none() || rcfg.remotes.is_none()) && !owes_version_purge(&oi) {
         return ReplicationHealQueueResult {
             object_info: roi,
             admission: ReplicationQueueAdmission::Skipped,
@@ -3050,6 +3330,22 @@ pub(crate) async fn queue_replication_heal_internal(
             }
         }
         ReplicationHealQueueAction::QueueDelete(dv) => {
+            // A purge the peer denied under object lock cannot succeed until
+            // the lock lapses (#6850), and one whose replica cannot be told
+            // apart on a target that mints its own version ids cannot
+            // succeed until the ledger or an operator resolves it
+            // (rustfs/backlog#2340); requeuing either every heal cycle only
+            // burns bandwidth and failure counters. The backoff expires on
+            // its own, so the purge is probed again — and converges — once
+            // the condition has a chance of being over.
+            if super::replication_object_decision_boundary::is_version_delete_replication(&dv.delete_object)
+                && super::replication_resyncer::purge_backoff_active(&dv)
+            {
+                return ReplicationHealQueueResult {
+                    object_info: roi,
+                    admission: ReplicationQueueAdmission::Skipped,
+                };
+            }
             let admission = if let Some(pool) = runtime_sources::replication_pool() {
                 pool.queue_replica_delete_task(dv).await
             } else {
@@ -3241,11 +3537,17 @@ mod tests {
 
         async fn put_object(
             &self,
-            _bucket: &str,
+            bucket: &str,
             object: &str,
             data: &mut Self::PutObjectReader,
             opts: &Self::ObjectOptions,
         ) -> Result<Self::ObjectInfo, Self::Error> {
+            let _lock_guard = if opts.no_lock {
+                None
+            } else {
+                let lock = self.new_ns_lock(bucket, object).await?;
+                Some(lock.get_write_lock(Duration::from_secs(10)).await?)
+            };
             if opts.http_preconditions.is_some()
                 && let Some(replacement) = self
                     .shared
@@ -3519,6 +3821,7 @@ mod tests {
             stats: Arc::new(ReplicationStats::new()),
             workers: RwLock::new(Vec::new()),
             lrg_workers: RwLock::new(Vec::new()),
+            in_flight: Arc::new(ReplicationInFlight::default()),
             mrf_replica_tx,
             mrf_replica_rx: Arc::new(Mutex::new(mrf_replica_rx)),
             mrf_save_tx,
@@ -3583,6 +3886,90 @@ mod tests {
 
         assert_eq!(admission, ReplicationQueueAdmission::Queued);
         assert_eq!(current_queue(&pool, "admission-bucket").await, (1, 4096));
+    }
+
+    #[tokio::test]
+    async fn queue_replica_task_admits_a_version_once_while_it_is_in_flight() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        let (tx, _rx) = mpsc::channel(4);
+        pool.workers.write().await.push(tx);
+        let ri = ReplicateObjectInfo {
+            bucket: "in-flight-bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(uuid::Uuid::new_v4()),
+            size: 4096,
+            op_type: ReplicationType::Object,
+            ..Default::default()
+        };
+
+        assert_eq!(pool.queue_replica_task(ri.clone()).await, ReplicationQueueAdmission::Queued);
+        // backlog#2362: the scanner heal pass sees the version as PENDING
+        // until the worker lands it; a second request must not drive it again.
+        assert_eq!(pool.queue_replica_task(ri.clone()).await, ReplicationQueueAdmission::Skipped);
+        assert_eq!(current_queue(&pool, "in-flight-bucket").await, (1, 4096));
+
+        // Another version of the same key is independent work.
+        let newer = ReplicateObjectInfo {
+            version_id: Some(uuid::Uuid::new_v4()),
+            ..ri.clone()
+        };
+        assert_eq!(pool.queue_replica_task(newer).await, ReplicationQueueAdmission::Queued);
+        assert_eq!(pool.in_flight.len(), 2);
+
+        // Once the worker finishes, the same version may be queued again
+        // (for example after a FAILED status).
+        pool.in_flight.finish(&ri);
+        assert_eq!(pool.queue_replica_task(ri).await, ReplicationQueueAdmission::Queued);
+        assert_eq!(current_queue(&pool, "in-flight-bucket").await, (3, 3 * 4096));
+    }
+
+    #[tokio::test]
+    async fn queue_replica_task_releases_the_version_when_no_worker_accepts_it() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        let ri = ReplicateObjectInfo {
+            bucket: "no-worker-bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(uuid::Uuid::new_v4()),
+            size: 4096,
+            op_type: ReplicationType::Object,
+            ..Default::default()
+        };
+
+        // No worker channel: the task is missed and must not stay claimed.
+        assert_eq!(pool.queue_replica_task(ri.clone()).await, ReplicationQueueAdmission::Missed);
+        assert_eq!(pool.in_flight.len(), 0);
+        assert_eq!(pool.queue_replica_task(ri.clone()).await, ReplicationQueueAdmission::Missed);
+
+        // A full worker channel hands the task to the MRF save path; the MRF
+        // replay re-enters the queue, so the claim is released here too.
+        let (tx, _rx) = mpsc::channel(1);
+        pool.workers.write().await.push(tx);
+        assert_eq!(pool.queue_replica_task(ri.clone()).await, ReplicationQueueAdmission::Queued);
+        let overflow = ReplicateObjectInfo {
+            version_id: Some(uuid::Uuid::new_v4()),
+            ..ri
+        };
+        assert_eq!(pool.queue_replica_task(overflow).await, ReplicationQueueAdmission::Queued);
+        assert_eq!(pool.in_flight.len(), 1, "only the version held by the worker channel stays in flight");
+    }
+
+    #[test]
+    fn in_flight_guard_releases_the_version_on_drop() {
+        let in_flight = Arc::new(ReplicationInFlight::default());
+        let ri = ReplicateObjectInfo {
+            bucket: "guard-bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+        assert!(in_flight.try_begin(&ri));
+        assert!(!in_flight.try_begin(&ri));
+        {
+            let _guard = ReplicationInFlightGuard::new(in_flight.clone(), &ri);
+            assert_eq!(in_flight.len(), 1);
+        }
+        assert_eq!(in_flight.len(), 0);
+        assert!(in_flight.try_begin(&ri));
     }
 
     #[tokio::test]
@@ -3745,12 +4132,16 @@ mod tests {
     }
 
     fn load_resync_test_metadata() -> Vec<u8> {
+        resync_test_metadata_with_status("load-resync-lock", ResyncStatusType::ResyncCompleted)
+    }
+
+    fn resync_test_metadata_with_status(bucket: &str, resync_status: ResyncStatusType) -> Vec<u8> {
         let mut status = BucketReplicationResyncStatus::new();
         status.targets_map.insert(
             "arn:test".to_string(),
             TargetReplicationResyncStatus {
-                bucket: "load-resync-lock".to_string(),
-                resync_status: ResyncStatusType::ResyncCompleted,
+                bucket: bucket.to_string(),
+                resync_status,
                 ..Default::default()
             },
         );
@@ -3782,6 +4173,36 @@ mod tests {
             write_started: Notify::new(),
             allow_write: Notify::new(),
         })
+    }
+
+    #[tokio::test]
+    async fn durable_resync_read_observes_cancellation_after_cached_pending_intent() {
+        let bucket = "startup-cancel-race";
+        let shared = empty_resync_shared_state();
+        *shared.data.lock().expect("test data lock should not be poisoned") =
+            resync_test_metadata_with_status(bucket, ResyncStatusType::ResyncPending);
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared.clone()))).await;
+
+        let cached = pool
+            .get_bucket_resync_status(bucket)
+            .await
+            .expect("the pending intent should populate the node cache");
+        assert_eq!(cached.targets_map["arn:test"].resync_status, ResyncStatusType::ResyncPending);
+
+        *shared.data.lock().expect("test data lock should not be poisoned") =
+            resync_test_metadata_with_status(bucket, ResyncStatusType::ResyncCanceled);
+        let stale = pool
+            .get_bucket_resync_status(bucket)
+            .await
+            .expect("the ordinary status read should expose the stale-cache precondition");
+        assert_eq!(stale.targets_map["arn:test"].resync_status, ResyncStatusType::ResyncPending);
+
+        let durable = pool
+            .read_durable_bucket_resync_status(bucket)
+            .await
+            .expect("the lock-protected status read should bypass the stale cache");
+        assert_eq!(durable.targets_map["arn:test"].resync_status, ResyncStatusType::ResyncCanceled);
+        assert_eq!(shared.read_count.load(Ordering::SeqCst), 2);
     }
 
     async fn hold_resync_runtime_lock(
@@ -3889,6 +4310,157 @@ mod tests {
         assert_eq!(retried_status.start_time, first_status.start_time);
         assert_eq!(retried_status.resync_status, ResyncStatusType::ResyncPending);
         assert_eq!(pool.resyncer.cancel_tokens.read().await.len(), 1);
+    }
+
+    /// Removing a target on node A must cancel only A's intent. Node A's cached
+    /// status map predates node B's admission, so a cancel that persisted the
+    /// cache would erase B's durable restart intent for `arn:second`.
+    #[tokio::test]
+    async fn removed_target_cancel_preserves_intents_admitted_on_other_nodes() {
+        let shared = empty_resync_shared_state();
+        let node_a = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared.clone()))).await;
+        let node_b = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-b", shared.clone()))).await;
+        let bucket = "removed-target-cancel";
+
+        assert!(
+            node_a
+                .clone()
+                .admit_bucket_resync(test_resync_opts(bucket, "arn:first", "run-a"))
+                .await
+                .expect("node A admission should persist")
+        );
+        assert!(
+            node_b
+                .clone()
+                .admit_bucket_resync(test_resync_opts(bucket, "arn:second", "run-b"))
+                .await
+                .expect("node B admission should persist")
+        );
+        assert!(
+            !node_a.resyncer.status_map.read().await[bucket]
+                .targets_map
+                .contains_key("arn:second"),
+            "precondition: node A's cache must be stale relative to node B's admission"
+        );
+
+        let canceled = node_a
+            .clone()
+            .cancel_bucket_resync_for_removed_target(bucket, "arn:first")
+            .await
+            .expect("cancel should succeed");
+        assert_eq!(canceled.map(|opts| opts.resync_id), Some("run-a".to_string()));
+
+        let persisted = decode_resync_file(&shared.data.lock().expect("test data lock should not be poisoned"))
+            .expect("persisted status should decode");
+        assert_eq!(persisted.targets_map["arn:first"].resync_status, ResyncStatusType::ResyncCanceled);
+        assert_eq!(persisted.targets_map["arn:second"].resync_status, ResyncStatusType::ResyncPending);
+        assert_eq!(persisted.targets_map["arn:second"].resync_id, "run-b");
+        // Cache convergence is per-target: only the removed ARN is written
+        // back (a running target's cached progress counters stay
+        // authoritative), so node A's cache reflects the cancel while the
+        // persisted document remains the authority for `arn:second`.
+        assert_eq!(
+            node_a.resyncer.status_map.read().await[bucket].targets_map["arn:first"].resync_status,
+            ResyncStatusType::ResyncCanceled
+        );
+
+        let untouched = node_a
+            .clone()
+            .cancel_bucket_resync_for_removed_target(bucket, "arn:first")
+            .await
+            .expect("cancel of a terminal intent should be a no-op");
+        assert!(untouched.is_none());
+        assert!(
+            node_a
+                .clone()
+                .cancel_bucket_resync_for_removed_target(bucket, "arn:missing")
+                .await
+                .expect("cancel of an unknown arn should be a no-op")
+                .is_none()
+        );
+    }
+
+    /// The reviewer's resurrect scenario: after node A cancels `arn:first`, a
+    /// status write from node B — whose cache still holds the pre-cancel map —
+    /// must not flip `arn:first` back to `Pending` on disk. `mark_status` now
+    /// persists through the CAS with per-target guards instead of blind-saving
+    /// its cached whole-bucket map.
+    #[tokio::test]
+    async fn stale_peer_status_write_cannot_resurrect_canceled_intent() {
+        let shared = empty_resync_shared_state();
+        let node_a = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared.clone()))).await;
+        let node_b = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-b", shared.clone()))).await;
+        let bucket = "stale-peer-write";
+
+        assert!(
+            node_a
+                .clone()
+                .admit_bucket_resync(test_resync_opts(bucket, "arn:first", "run-a"))
+                .await
+                .expect("node A admission should persist")
+        );
+        assert!(
+            node_b
+                .clone()
+                .admit_bucket_resync(test_resync_opts(bucket, "arn:second", "run-b"))
+                .await
+                .expect("node B admission should persist")
+        );
+        // Seed node B's stale cache: it saw the map before A's cancel.
+        let pre_cancel = decode_resync_file(&shared.data.lock().expect("test data lock should not be poisoned"))
+            .expect("pre-cancel status should decode");
+        node_b
+            .resyncer
+            .status_map
+            .write()
+            .await
+            .insert(bucket.to_string(), pre_cancel);
+
+        node_a
+            .clone()
+            .cancel_bucket_resync_for_removed_target(bucket, "arn:first")
+            .await
+            .expect("cancel should succeed")
+            .expect("cancel should report the canceled run");
+
+        node_b
+            .resyncer
+            .mark_status(
+                ResyncStatusType::ResyncStarted,
+                test_resync_opts(bucket, "arn:second", "run-b"),
+                node_b.storage.clone(),
+            )
+            .await
+            .expect("peer status write should succeed");
+
+        let persisted = decode_resync_file(&shared.data.lock().expect("test data lock should not be poisoned"))
+            .expect("persisted status should decode");
+        assert_eq!(
+            persisted.targets_map["arn:first"].resync_status,
+            ResyncStatusType::ResyncCanceled,
+            "peer's stale cache must not resurrect the canceled intent"
+        );
+        assert_eq!(persisted.targets_map["arn:second"].resync_status, ResyncStatusType::ResyncStarted);
+
+        // And the reverse guard: a stale write for the canceled target itself
+        // is refused outright.
+        node_b
+            .resyncer
+            .mark_status(
+                ResyncStatusType::ResyncStarted,
+                test_resync_opts(bucket, "arn:first", "run-a"),
+                node_b.storage.clone(),
+            )
+            .await
+            .expect("guarded status write should be skipped, not fail");
+        let persisted = decode_resync_file(&shared.data.lock().expect("test data lock should not be poisoned"))
+            .expect("persisted status should decode");
+        assert_eq!(persisted.targets_map["arn:first"].resync_status, ResyncStatusType::ResyncCanceled);
+        assert_eq!(
+            node_b.resyncer.status_map.read().await[bucket].targets_map["arn:first"].resync_status,
+            ResyncStatusType::ResyncCanceled,
+            "the refused writer's cache must converge to the persisted terminal state"
+        );
     }
 
     #[tokio::test]
@@ -4028,6 +4600,77 @@ mod tests {
             pool.resyncer.status_map.read().await["canceled-start"].targets_map["arn:test"].resync_id,
             "run-a"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_resync_status_cas_preserves_both_mutations() {
+        let shared = empty_resync_shared_state();
+        let mut seeded = BucketReplicationResyncStatus::new();
+        for arn in ["arn:a", "arn:b"] {
+            seeded.targets_map.insert(
+                arn.to_string(),
+                TargetReplicationResyncStatus {
+                    bucket: "cas-race".to_string(),
+                    resync_id: format!("run-{arn}"),
+                    resync_status: ResyncStatusType::ResyncPending,
+                    ..Default::default()
+                },
+            );
+        }
+        *shared.data.lock().expect("test data lock should not be poisoned") =
+            encode_resync_file(&seeded).expect("seeded resync status should encode");
+        shared.empty_object_exists.store(true, Ordering::SeqCst);
+        shared.etag_revision.store(1, Ordering::SeqCst);
+        shared.block_next_write.store(true, Ordering::SeqCst);
+        let node_a = Arc::new(LoadResyncNodeStore::new("cas-node-a", shared.clone()));
+        let node_b = Arc::new(LoadResyncNodeStore::new("cas-node-b", shared.clone()));
+
+        let writer_a = tokio::spawn(async move {
+            update_resync_status_cas("cas-race", node_a, |status| {
+                status
+                    .targets_map
+                    .get_mut("arn:a")
+                    .expect("seeded target A should exist")
+                    .resync_status = ResyncStatusType::ResyncCanceled;
+                Ok(true)
+            })
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), shared.write_started.notified())
+            .await
+            .expect("writer A should pause after its precondition check");
+
+        let mut writer_b = tokio::spawn(async move {
+            update_resync_status_cas("cas-race", node_b, |status| {
+                status
+                    .targets_map
+                    .get_mut("arn:b")
+                    .expect("seeded target B should exist")
+                    .resync_status = ResyncStatusType::ResyncCompleted;
+                Ok(true)
+            })
+            .await
+        });
+        let writer_b_before_release = tokio::time::timeout(Duration::from_millis(250), &mut writer_b).await.ok();
+
+        shared.allow_write.notify_one();
+        writer_a
+            .await
+            .expect("writer A task should finish")
+            .expect("writer A should report a successful conditional save");
+        match writer_b_before_release {
+            Some(result) => result,
+            None => writer_b.await,
+        }
+        .expect("writer B task should finish")
+        .expect("writer B should retry and save its mutation");
+
+        let persisted = decode_resync_file(&shared.data.lock().expect("test data lock should not be poisoned"))
+            .expect("persisted resync status should decode");
+        assert_eq!(persisted.targets_map["arn:a"].resync_status, ResyncStatusType::ResyncCanceled);
+        assert_eq!(persisted.targets_map["arn:b"].resync_status, ResyncStatusType::ResyncCompleted);
+        assert!(!shared.last_put_no_lock.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -4192,6 +4835,30 @@ mod tests {
 
         assert!(ri.ssec);
         assert_eq!(ri.checksum, Some(checksum));
+    }
+
+    #[test]
+    fn metadata_mrf_roundtrip_preserves_tags_and_admitted_targets() {
+        let target = "arn:rustfs:replication:target-a";
+        let object = ObjectInfo {
+            bucket: "source".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            user_tags: Arc::new("owner=a3".to_string()),
+            ..Default::default()
+        };
+        let live =
+            replicate_object_info_from_object_info(object.clone(), test_replicate_decision(&[target]), ReplicationType::Metadata);
+        let persisted = live.to_mrf_entry();
+        let encoded = encode_mrf_file(std::slice::from_ref(&persisted)).expect("metadata MRF entry should encode");
+        let decoded = decode_mrf_file(&encoded).expect("metadata MRF entry should decode");
+
+        assert_eq!(decoded[0].op, MrfOpKind::Metadata);
+        assert_eq!(decoded[0].target_arns, vec![target.to_string()]);
+        let replayed = admitted_mrf_replicate_object(object, &decoded[0], ReplicationType::Metadata);
+        assert_eq!(replayed.op_type, ReplicationType::Metadata);
+        assert_eq!(replayed.user_tags, "owner=a3");
+        assert_eq!(replayed.admitted_target_arns(), vec![target.to_string()]);
     }
 
     #[tokio::test]
@@ -6145,6 +6812,89 @@ mod tests {
                 .await
                 .expect("newer journal data should remain readable"),
             replacement_data
+        );
+    }
+
+    /// backlog#2290: a delete-marker purge intent that survives a restart
+    /// through the MRF journal addresses the marker version the TARGET
+    /// assigned, exactly as the live watcher does (see the
+    /// `requires_delayed_purge` spawn). The journal carries the per-ARN ids
+    /// (`targetDeleteMarkerVersionIDs`) and replay restores them into the
+    /// reconstructed replication state; without that the replay would fall
+    /// back to the source marker id, which a target that mints its own ids
+    /// answers with an idempotent 204 — the entry would be acknowledged while
+    /// the real marker stayed behind.
+    #[test]
+    fn mrf_delete_marker_purge_replay_preserves_target_assigned_marker_version() {
+        use super::super::replication_object_decision_boundary::{delete_marker_purge_mrf_entry, delete_marker_purge_version_id};
+
+        let arn = "arn:minio:replication::generic-target:photos".to_string();
+        let source_marker = uuid::Uuid::new_v4();
+        let remote_marker = "remote-assigned-marker-version".to_string();
+
+        let live_oi = ObjectInfo {
+            bucket: "photos".to_string(),
+            name: "obj".to_string(),
+            version_id: Some(source_marker),
+            delete_marker: true,
+            ..Default::default()
+        };
+        let mut live_state = live_oi.replication_state();
+        live_state.replicate_decision_str = replicate_decision_for_admitted_targets(std::slice::from_ref(&arn)).to_string();
+        live_state
+            .target_delete_marker_version_ids
+            .insert(arn.clone(), remote_marker.clone());
+        let live = DeletedObjectReplicationInfo {
+            delete_object: ReplicationDeletedObject {
+                object_name: "obj".to_string(),
+                delete_marker: true,
+                delete_marker_version_id: Some(source_marker),
+                replication_state: Some(live_state),
+                ..Default::default()
+            },
+            bucket: "photos".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            delete_marker_purge_version_id(live.delete_object.replication_state.as_ref(), &arn, source_marker),
+            Some(Some(remote_marker.clone())),
+            "the live purge addresses the recorded target version"
+        );
+
+        // Watch window exhausted: persist the intent, restart, replay it.
+        let entry = delete_marker_purge_mrf_entry(&live, vec![arn.clone()]);
+        let replay_oi = ObjectInfo {
+            bucket: entry.bucket.clone(),
+            name: entry.object.clone(),
+            version_id: entry.version_id,
+            delete_marker: entry.delete_marker,
+            ..Default::default()
+        };
+        let dsc = replicate_decision_for_admitted_targets(&entry.target_arns);
+        let replayed = reconstructed_heal_delete_info(&entry, &replay_oi, &dsc);
+
+        assert_eq!(
+            delete_marker_purge_version_id(replayed.delete_object.replication_state.as_ref(), &arn, source_marker),
+            Some(Some(remote_marker)),
+            "the MRF replay must address the target-assigned marker version, not source marker {source_marker}"
+        );
+
+        // A refusal (inconsistent recorded ids) must stay a refusal across the
+        // journal round trip instead of degrading into the source-id fallback.
+        let mut refused = live;
+        refused
+            .delete_object
+            .replication_state
+            .as_mut()
+            .expect("state was set above")
+            .target_delete_marker_version_ids_corrupt = true;
+        let entry = delete_marker_purge_mrf_entry(&refused, vec![arn.clone()]);
+        assert!(entry.target_delete_marker_version_ids_corrupt);
+        let replayed = reconstructed_heal_delete_info(&entry, &replay_oi, &dsc);
+        assert_eq!(
+            delete_marker_purge_version_id(replayed.delete_object.replication_state.as_ref(), &arn, source_marker),
+            None,
+            "the MRF replay must keep refusing to guess when the recorded ids were inconsistent"
         );
     }
 }

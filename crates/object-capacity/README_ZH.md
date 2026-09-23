@@ -171,7 +171,9 @@ crate 不是“超时就直接失败”的设计：
 - 也就是系统已经完成过一次“无部分错误”的全盘刷新
 - 并且成功拿到了每盘缓存
 
-若当前还没有完整 per-disk cache，或者脏盘集合为空，就会回退到全盘刷新。
+若当前还没有任何聚合缓存，系统会先执行一次全盘刷新来建立初始值。已有聚合缓存后，定时刷新在没有脏盘时会保持 idle，不再重复遍历未变化的磁盘。若 per-disk cache 尚不完整但存在脏盘，系统仍执行全盘刷新，因为此时不能安全合并子集结果。
+
+全盘刷新达到时间预算后，可以发布估算聚合值，但不会借此建立完整 per-disk 基线。该有界估算会确认扫描开始前的脏标记；扫描过程中记录的新标记仍会保留。这样既不会把估算值当成精确值，也不会让一个旧脏标记永久触发超时循环。
 
 ### 子集刷新后的合并规则
 
@@ -280,10 +282,10 @@ get_capacity_manager()
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `RUSTFS_CAPACITY_SCHEDULED_INTERVAL` | `120s` | 定时刷新间隔 |
-| `RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY` | `5s` | 写后防抖延迟 |
-| `RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD` | `5` | 最近 60 秒写频率阈值 |
-| `RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD` | `30s` | 缓存超过该年龄后才考虑快速刷新 |
+| `RUSTFS_CAPACITY_SCHEDULED_INTERVAL` | `600s` | 定时刷新间隔 |
+| `RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY` | `30s` | 写后防抖延迟 |
+| `RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD` | `20` | 最近 60 秒写频率阈值 |
+| `RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD` | `120s` | 缓存超过该年龄后才考虑快速刷新 |
 | `RUSTFS_CAPACITY_MAX_FILES_THRESHOLD` | `200000` | 精确统计文件数阈值 |
 | `RUSTFS_CAPACITY_STAT_TIMEOUT` | `3s` | 基础扫描超时 |
 | `RUSTFS_CAPACITY_SAMPLE_RATE` | `200` | overflow 文件采样间隔 |

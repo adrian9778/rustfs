@@ -19,6 +19,11 @@ use crate::storage_api_contracts::{
         HTTPPreconditions, ObjectLockRetentionOptions, ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState,
     },
 };
+use sha2::{Digest, Sha256};
+use std::io;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use tokio::sync::{Mutex, Notify, OwnedRwLockReadGuard};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct NamespaceLockFence {
@@ -36,7 +41,7 @@ impl Debug for NamespaceLockFence {
 }
 
 impl NamespaceLockFence {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             signals: Arc::default(),
             #[cfg(test)]
@@ -84,6 +89,61 @@ impl NamespaceLockFence {
     }
 }
 
+#[cfg(test)]
+static NAMESPACE_LOCK_SIGNAL_TEST_FENCES: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, NamespaceLockFence)>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct NamespaceLockSignalTestFence {
+    signal_key: usize,
+}
+
+#[cfg(test)]
+impl NamespaceLockSignalTestFence {
+    pub(crate) fn install_with_loss_handle(
+        signal: &Arc<rustfs_lock::distributed_lock::LockLostSignal>,
+        loss_handle: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let fence = NamespaceLockFence {
+            signals: Arc::default(),
+            forced_lost: Arc::new(vec![loss_handle]),
+        };
+        let signal_key = Arc::as_ptr(signal) as usize;
+        let mut fences = NAMESPACE_LOCK_SIGNAL_TEST_FENCES
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("namespace lock signal test fence should not be poisoned");
+        assert!(
+            !fences.iter().any(|(key, _)| *key == signal_key),
+            "namespace lock signal test fence must be unique"
+        );
+        fences.push((signal_key, fence));
+        Self { signal_key }
+    }
+}
+
+#[cfg(test)]
+impl Drop for NamespaceLockSignalTestFence {
+    fn drop(&mut self) {
+        let mut fences = NAMESPACE_LOCK_SIGNAL_TEST_FENCES
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("namespace lock signal test fence should not be poisoned");
+        fences.retain(|(key, _)| *key != self.signal_key);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn namespace_lock_signal_test_fence_is_lost(signal: &Arc<rustfs_lock::distributed_lock::LockLostSignal>) -> bool {
+    NAMESPACE_LOCK_SIGNAL_TEST_FENCES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .expect("namespace lock signal test fence should not be poisoned")
+        .iter()
+        .find(|(key, _)| *key == Arc::as_ptr(signal) as usize)
+        .is_some_and(|(_, fence)| fence.is_lock_lost())
+}
+
 #[derive(Debug)]
 pub struct ObjectLockConfigSnapshot {
     store_id: Option<Uuid>,
@@ -93,7 +153,7 @@ pub struct ObjectLockConfigSnapshot {
     state: crate::bucket::metadata_sys::ObjectLockConfigState,
     lifecycle_fence: NamespaceLockFence,
     _lifecycle_guard: Option<rustfs_lock::NamespaceLockGuard>,
-    metadata_transaction_guard: Option<rustfs_lock::NamespaceLockGuard>,
+    metadata_transaction_guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
 }
 
 impl ObjectLockConfigSnapshot {
@@ -110,6 +170,7 @@ impl ObjectLockConfigSnapshot {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn for_store_bucket(
         store_id: Uuid,
         bucket: &str,
@@ -150,7 +211,7 @@ impl ObjectLockConfigSnapshot {
             state,
             lifecycle_fence,
             _lifecycle_guard: Some(lifecycle_guard),
-            metadata_transaction_guard: Some(metadata_transaction_guard),
+            metadata_transaction_guard: Some(Arc::new(metadata_transaction_guard)),
         }
     }
 
@@ -161,7 +222,7 @@ impl ObjectLockConfigSnapshot {
         config_revision: OffsetDateTime,
         state: crate::bucket::metadata_sys::ObjectLockConfigState,
         lifecycle_fence: NamespaceLockFence,
-        metadata_transaction_guard: rustfs_lock::NamespaceLockGuard,
+        metadata_transaction_guard: Arc<rustfs_lock::NamespaceLockGuard>,
     ) -> Self {
         Self {
             store_id: Some(store_id),
@@ -205,6 +266,23 @@ impl ObjectLockConfigSnapshot {
                 .is_some_and(|guard| !guard.is_lock_lost())
     }
 
+    /// Share the held transaction lock without queuing another reader behind
+    /// a metadata writer that is itself waiting for this snapshot to drop.
+    pub(crate) fn metadata_transaction_guard_for(
+        &self,
+        store_id: Uuid,
+        bucket: &str,
+        expected_incarnation_id: Option<Uuid>,
+    ) -> Option<Arc<rustfs_lock::NamespaceLockGuard>> {
+        let bucket_incarnation_id = self.bucket_incarnation_id?;
+        if expected_incarnation_id.is_some_and(|expected| expected != bucket_incarnation_id)
+            || !self.is_valid_for_destructive_put(store_id, bucket, bucket_incarnation_id)
+        {
+            return None;
+        }
+        self.metadata_transaction_guard.clone()
+    }
+
     pub(crate) fn add_lock_fences(&self, opts: &mut ObjectOptions) {
         opts.bucket_lifecycle_lock_fence
             .get_or_insert_with(NamespaceLockFence::new)
@@ -226,7 +304,7 @@ pub struct QuotaAdmission {
 pub struct LifecycleDeleteAllRequest {
     pub(crate) version_id: Option<Uuid>,
     pub(crate) delete_marker: bool,
-    pub(crate) action: rustfs_common::metrics::IlmAction,
+    pub(crate) action: rustfs_scanner_metrics::metrics::IlmAction,
     pub(crate) rule_id: String,
     pub(crate) phase: LifecycleDeleteAllPhase,
 }
@@ -243,36 +321,23 @@ pub enum LifecycleDeleteAllPhase {
 #[doc(hidden)]
 #[derive(Default)]
 pub struct LifecycleDeleteAllJournalState {
-    prepared: HashMap<String, crate::bucket::lifecycle::tier_sweeper::Jentry>,
     mutation_started: bool,
 }
 
 impl Debug for LifecycleDeleteAllJournalState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LifecycleDeleteAllJournalState")
-            .field("prepared_count", &self.prepared.len())
             .field("mutation_started", &self.mutation_started)
             .finish()
     }
 }
 
 impl LifecycleDeleteAllJournalState {
-    pub(crate) fn contains(&self, name: &str) -> bool {
-        self.prepared.contains_key(name)
-    }
-
-    pub(crate) fn insert(&mut self, name: String, entry: crate::bucket::lifecycle::tier_sweeper::Jentry) {
-        self.prepared.insert(name, entry);
-    }
-
-    pub(crate) fn prepared_entries(&self) -> Vec<crate::bucket::lifecycle::tier_sweeper::Jentry> {
-        self.prepared.values().cloned().collect()
-    }
-
     pub(crate) fn mark_mutation_started(&mut self) {
         self.mutation_started = true;
     }
 
+    #[cfg(test)]
     pub(crate) fn mutation_started(&self) -> bool {
         self.mutation_started
     }
@@ -292,7 +357,559 @@ impl QuotaAdmission {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+const SCANNER_PUBLICATION_SCOPE_ADMITTED: u8 = 0;
+const SCANNER_PUBLICATION_SCOPE_IN_FLIGHT: u8 = 1;
+const SCANNER_PUBLICATION_SCOPE_COMMITTED: u8 = 2;
+const SCANNER_PUBLICATION_SCOPE_ABORTED_BEFORE_COMMIT: u8 = 3;
+const SCANNER_PUBLICATION_SCOPE_INDETERMINATE: u8 = 4;
+
+/// The terminal result of a storage-owned scanner publication mutation.
+///
+/// This state is deliberately not serialized. It is the ownership hand-off
+/// between the scanner coordinator and the storage mutation task, so a
+/// detached rename/cleanup task can retain the movement permit until it has
+/// reported a definitive result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScannerPublicationCommitState {
+    Admitted,
+    InFlight,
+    Committed,
+    AbortedBeforeCommit,
+    Indeterminate,
+}
+
+impl ScannerPublicationCommitState {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Admitted => SCANNER_PUBLICATION_SCOPE_ADMITTED,
+            Self::InFlight => SCANNER_PUBLICATION_SCOPE_IN_FLIGHT,
+            Self::Committed => SCANNER_PUBLICATION_SCOPE_COMMITTED,
+            Self::AbortedBeforeCommit => SCANNER_PUBLICATION_SCOPE_ABORTED_BEFORE_COMMIT,
+            Self::Indeterminate => SCANNER_PUBLICATION_SCOPE_INDETERMINATE,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            SCANNER_PUBLICATION_SCOPE_IN_FLIGHT => Self::InFlight,
+            SCANNER_PUBLICATION_SCOPE_COMMITTED => Self::Committed,
+            SCANNER_PUBLICATION_SCOPE_ABORTED_BEFORE_COMMIT => Self::AbortedBeforeCommit,
+            SCANNER_PUBLICATION_SCOPE_INDETERMINATE => Self::Indeterminate,
+            _ => Self::Admitted,
+        }
+    }
+
+    /// A caller may release its remote lease only after one of these states.
+    /// `Indeterminate` is intentionally excluded: the mutation may have
+    /// committed after cancellation or a transport failure.
+    pub fn permits_lease_release(self) -> bool {
+        matches!(self, Self::Committed | Self::AbortedBeforeCommit)
+    }
+}
+
+/// Why a storage-owned publication scope could not start its mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScannerPublicationCommitStartError {
+    Cancelled,
+    DeadlineExceeded,
+    AlreadyStarted,
+    Terminal,
+}
+
+struct ScannerPublicationCommitScopeInner {
+    expected_movement_epoch: u64,
+    safe_deadline: tokio::time::Instant,
+    remote_lease_tokens: Arc<[Uuid]>,
+    cancellation: CancellationToken,
+    state: AtomicU8,
+    completed: Notify,
+    /// Set once a storage mutation task has taken ownership of the scope.
+    /// The caller-side RAII guard must not classify cancellation as
+    /// indeterminate while that owner can still report a definitive result.
+    owner_attached: AtomicBool,
+    /// The permit is storage-owned rather than borrowed from the scanner
+    /// future. A detached mutation task keeps the scope alive and therefore
+    /// keeps this guard alive until it reports a terminal state.
+    movement_permit: Mutex<Option<OwnedRwLockReadGuard<()>>>,
+    lease_release_safe: Arc<AtomicBool>,
+}
+
+/// Storage-owned ownership scope for one fenced scanner metadata mutation.
+///
+/// The scope is an in-memory capability. It is intentionally carried through
+/// [`ObjectOptions`] as a hidden field and never participates in serde, object
+/// metadata, RPC wire structures, or on-disk formats.
+#[derive(Clone)]
+pub struct ScannerPublicationCommitScope {
+    inner: Arc<ScannerPublicationCommitScopeInner>,
+}
+
+/// RAII fallback for storage paths that return before their commit closure
+/// takes ownership. An in-flight scope is never guessed to be aborted: it is
+/// marked indeterminate so remote lease release remains blocked.
+pub(crate) struct ScannerPublicationCommitScopeGuard {
+    scope: Option<ScannerPublicationCommitScope>,
+}
+
+impl ScannerPublicationCommitScopeGuard {
+    pub(crate) fn new(scope: ScannerPublicationCommitScope) -> Self {
+        Self { scope: Some(scope) }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.scope = None;
+    }
+}
+
+impl Drop for ScannerPublicationCommitScopeGuard {
+    fn drop(&mut self) {
+        let Some(scope) = self.scope.as_ref() else {
+            return;
+        };
+        if scope.owner_attached() {
+            return;
+        }
+        match scope.state() {
+            ScannerPublicationCommitState::Admitted => {
+                let _ = scope.mark_aborted_before_commit();
+            }
+            ScannerPublicationCommitState::InFlight => {
+                let _ = scope.mark_indeterminate();
+            }
+            ScannerPublicationCommitState::Committed
+            | ScannerPublicationCommitState::AbortedBeforeCommit
+            | ScannerPublicationCommitState::Indeterminate => {}
+        }
+    }
+}
+
+impl Debug for ScannerPublicationCommitScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScannerPublicationCommitScope")
+            .field("expected_movement_epoch", &self.expected_movement_epoch())
+            .field("safe_deadline", &self.safe_deadline())
+            .field("remote_lease_token_count", &self.remote_lease_tokens().len())
+            .field("state", &self.state())
+            .finish()
+    }
+}
+
+impl ScannerPublicationCommitScope {
+    /// Construct a scope after the storage layer has acquired its movement
+    /// read permit. Callers must keep the scope attached to the actual
+    /// mutation owner until [`Self::wait_for_completion`] has resolved.
+    pub(crate) fn new_storage_owned(
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+        movement_permit: OwnedRwLockReadGuard<()>,
+    ) -> Self {
+        Self::new_storage_owned_with_release_flag(
+            expected_movement_epoch,
+            safe_deadline,
+            remote_lease_tokens,
+            movement_permit,
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    pub(crate) fn new_storage_owned_with_release_flag(
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+        movement_permit: OwnedRwLockReadGuard<()>,
+        lease_release_safe: Arc<AtomicBool>,
+    ) -> Self {
+        lease_release_safe.store(false, Ordering::Release);
+        Self {
+            inner: Arc::new(ScannerPublicationCommitScopeInner {
+                expected_movement_epoch,
+                safe_deadline,
+                remote_lease_tokens: remote_lease_tokens.into(),
+                cancellation: CancellationToken::new(),
+                state: AtomicU8::new(SCANNER_PUBLICATION_SCOPE_ADMITTED),
+                completed: Notify::new(),
+                owner_attached: AtomicBool::new(false),
+                movement_permit: Mutex::new(Some(movement_permit)),
+                lease_release_safe,
+            }),
+        }
+    }
+
+    pub fn expected_movement_epoch(&self) -> u64 {
+        self.inner.expected_movement_epoch
+    }
+
+    pub fn safe_deadline(&self) -> tokio::time::Instant {
+        self.inner.safe_deadline
+    }
+
+    pub fn is_expired(&self) -> bool {
+        tokio::time::Instant::now() >= self.safe_deadline()
+    }
+
+    pub fn remote_lease_tokens(&self) -> &[Uuid] {
+        &self.inner.remote_lease_tokens
+    }
+
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.inner.cancellation.clone()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancellation.is_cancelled()
+    }
+
+    /// Whether a mutation that has already begun may still enter its durable
+    /// commit boundary. The storage owner must check this immediately before
+    /// starting each irreversible fan-out/rename operation.
+    pub fn can_commit(&self) -> bool {
+        self.state() == ScannerPublicationCommitState::InFlight && !self.is_cancelled() && !self.is_expired()
+    }
+
+    /// Transfer terminal-state responsibility from the caller to a detached
+    /// storage mutation owner. Once set, dropping a scanner waiter leaves the
+    /// scope in-flight until that owner reports committed or indeterminate.
+    pub fn attach_mutation_owner(&self) {
+        self.inner.owner_attached.store(true, Ordering::Release);
+    }
+
+    fn owner_attached(&self) -> bool {
+        self.inner.owner_attached.load(Ordering::Acquire)
+    }
+
+    pub fn state(&self) -> ScannerPublicationCommitState {
+        ScannerPublicationCommitState::from_u8(self.inner.state.load(Ordering::Acquire))
+    }
+
+    /// Request cancellation without claiming that a mutation has stopped.
+    /// The owner must still report `AbortedBeforeCommit` or `Indeterminate`.
+    pub fn cancel(&self) {
+        self.inner.cancellation.cancel();
+    }
+
+    pub fn try_begin(&self) -> std::result::Result<(), ScannerPublicationCommitStartError> {
+        if self.inner.cancellation.is_cancelled() {
+            return Err(ScannerPublicationCommitStartError::Cancelled);
+        }
+        if self.is_expired() {
+            return Err(ScannerPublicationCommitStartError::DeadlineExceeded);
+        }
+        self.inner
+            .state
+            .compare_exchange(
+                SCANNER_PUBLICATION_SCOPE_ADMITTED,
+                SCANNER_PUBLICATION_SCOPE_IN_FLIGHT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|state| {
+                if ScannerPublicationCommitState::from_u8(state).permits_lease_release() {
+                    ScannerPublicationCommitStartError::Terminal
+                } else {
+                    ScannerPublicationCommitStartError::AlreadyStarted
+                }
+            })
+    }
+
+    pub fn mark_committed(&self) -> bool {
+        self.mark_terminal(ScannerPublicationCommitState::Committed)
+    }
+
+    pub fn mark_aborted_before_commit(&self) -> bool {
+        if self
+            .inner
+            .state
+            .compare_exchange(
+                SCANNER_PUBLICATION_SCOPE_ADMITTED,
+                SCANNER_PUBLICATION_SCOPE_ABORTED_BEFORE_COMMIT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.inner.lease_release_safe.store(true, Ordering::Release);
+            self.inner.completed.notify_waiters();
+            return true;
+        }
+        false
+    }
+
+    pub fn mark_indeterminate(&self) -> bool {
+        self.mark_terminal(ScannerPublicationCommitState::Indeterminate)
+    }
+
+    fn mark_terminal(&self, terminal: ScannerPublicationCommitState) -> bool {
+        self.inner
+            .state
+            .compare_exchange(SCANNER_PUBLICATION_SCOPE_IN_FLIGHT, terminal.as_u8(), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then(|| {
+                if terminal.permits_lease_release() {
+                    self.inner.lease_release_safe.store(true, Ordering::Release);
+                }
+                self.inner.completed.notify_waiters()
+            })
+            .is_some()
+    }
+
+    /// Wait until the mutation owner has reported a definitive terminal
+    /// state. The permit remains owned by this scope until all scope clones are
+    /// dropped or [`Self::release_movement_permit`] is called safely.
+    pub async fn wait_for_completion(&self) -> ScannerPublicationCommitState {
+        loop {
+            let notified = self.inner.completed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let state = self.state();
+            if state != ScannerPublicationCommitState::Admitted && state != ScannerPublicationCommitState::InFlight {
+                return state;
+            }
+            notified.await;
+        }
+    }
+
+    /// Release the storage-owned movement permit only after a known-safe
+    /// terminal result. Returns `false` for in-flight or indeterminate work.
+    pub async fn release_movement_permit(&self) -> bool {
+        if !self.state().permits_lease_release() {
+            return false;
+        }
+        self.inner.movement_permit.lock().await.take().is_some()
+    }
+}
+
+impl Drop for ScannerPublicationCommitScopeInner {
+    fn drop(&mut self) {
+        if !ScannerPublicationCommitState::from_u8(self.state.load(Ordering::Acquire)).permits_lease_release() {
+            self.lease_release_safe.store(false, Ordering::Release);
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+#[doc(hidden)]
+pub struct DecommissionCapacityOptions {
+    pub(crate) expected_data_bytes: Option<usize>,
+    pub(crate) operation_id: Option<Uuid>,
+    pub(crate) generation: Option<u64>,
+    pub(crate) owner_nonce: Option<Uuid>,
+    pub(crate) mutation_id: Option<Uuid>,
+}
+
+/// Opaque storage-owned collection point for post-commit tier free-version
+/// cleanup receipts. This type is public only because workspace crates build
+/// [`ObjectOptions`] with struct literals; callers outside `ecstore` must leave
+/// the corresponding option unset.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct TierFreeVersionReceiptSink {
+    inner: Arc<parking_lot::Mutex<TierFreeVersionReceiptSinkState>>,
+}
+
+struct TierFreeVersionReceiptSinkState {
+    receipts: Option<HashMap<TierFreeVersionReceiptIdentity, TierFreeVersionReceiptPayload>>,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct TierFreeVersionReceiptIdentity {
+    bucket: String,
+    logical_name: String,
+    tier: String,
+    remote_name: String,
+    remote_version_state: TierFreeVersionReceiptVersionState,
+    remote_version: String,
+    backend_identity: crate::services::tier::tier::TierDestinationId,
+}
+
+struct TierFreeVersionReceiptPayload {
+    local_free_version_id: Uuid,
+    mod_time: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum TierFreeVersionReceiptVersionState {
+    KnownDisabled,
+    SuspendedNull,
+    Exact,
+}
+
+impl TierFreeVersionReceiptSink {
+    /// Only the delete wrapper may originate a sink. The public type exists so
+    /// workspace struct literals can carry it, but external crates cannot
+    /// create an undrainable collector accidentally.
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(parking_lot::Mutex::new(TierFreeVersionReceiptSinkState {
+                receipts: Some(HashMap::new()),
+            })),
+        }
+    }
+}
+
+impl std::fmt::Debug for TierFreeVersionReceiptSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.inner.lock();
+        f.debug_struct("TierFreeVersionReceiptSink")
+            .field("drained", &state.receipts.is_none())
+            .field("receipt_count", &state.receipts.as_ref().map(HashMap::len).unwrap_or_default())
+            .finish()
+    }
+}
+
+impl TierFreeVersionReceiptVersionState {
+    fn persisted(self) -> rustfs_filemeta::TransitionVersionState {
+        match self {
+            Self::KnownDisabled => rustfs_filemeta::TransitionVersionState::KnownDisabled,
+            Self::SuspendedNull => rustfs_filemeta::TransitionVersionState::SuspendedNull,
+            Self::Exact => rustfs_filemeta::TransitionVersionState::Exact,
+        }
+    }
+}
+
+impl TierFreeVersionReceiptIdentity {
+    fn into_object_info(self, payload: TierFreeVersionReceiptPayload) -> ObjectInfo {
+        let mut metadata = HashMap::with_capacity(2);
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(self.backend_identity),
+        );
+        ObjectInfo {
+            bucket: self.bucket,
+            name: self.logical_name,
+            mod_time: payload.mod_time,
+            user_defined: Arc::new(metadata),
+            version_id: Some(payload.local_free_version_id),
+            delete_marker: true,
+            transitioned_object: TransitionedObject {
+                name: self.remote_name,
+                version_id: self.remote_version,
+                tier: self.tier,
+                free_version: true,
+                status: String::new(),
+            },
+            transition_version_state: self.remote_version_state.persisted(),
+            ..Default::default()
+        }
+    }
+}
+
+fn tier_free_version_scheduling_receipt_from_source(
+    source: &ObjectInfo,
+    local_free_version_id: Uuid,
+) -> io::Result<Option<(TierFreeVersionReceiptIdentity, TierFreeVersionReceiptPayload)>> {
+    if source.transitioned_object.status != rustfs_filemeta::TRANSITION_COMPLETE
+        || source.transitioned_object.free_version
+        || source.delete_marker
+        || source.bucket.is_empty()
+        || source.name.is_empty()
+        || source.transitioned_object.tier.is_empty()
+        || source.transitioned_object.name.is_empty()
+    {
+        return Ok(None);
+    }
+    if local_free_version_id.is_nil() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tier free-version receipt has a nil local version identity",
+        ));
+    }
+
+    let remote_version = source.transitioned_object.version_id.as_str();
+    let remote_version_state = match source.transition_version_state {
+        rustfs_filemeta::TransitionVersionState::Unknown => return Ok(None),
+        rustfs_filemeta::TransitionVersionState::KnownDisabled if remote_version.is_empty() => {
+            TierFreeVersionReceiptVersionState::KnownDisabled
+        }
+        rustfs_filemeta::TransitionVersionState::SuspendedNull if remote_version == "null" => {
+            TierFreeVersionReceiptVersionState::SuspendedNull
+        }
+        rustfs_filemeta::TransitionVersionState::Exact if !remote_version.is_empty() && remote_version != "null" => {
+            TierFreeVersionReceiptVersionState::Exact
+        }
+        _ => return Ok(None),
+    };
+
+    let Some(backend_identity) = crate::services::tier::tier::tier_destination_id_from_metadata(&source.user_defined)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some((
+        TierFreeVersionReceiptIdentity {
+            bucket: source.bucket.clone(),
+            logical_name: decode_dir_object(&source.name),
+            tier: source.transitioned_object.tier.clone(),
+            remote_name: source.transitioned_object.name.clone(),
+            remote_version_state,
+            remote_version: source.transitioned_object.version_id.clone(),
+            backend_identity,
+        },
+        TierFreeVersionReceiptPayload {
+            local_free_version_id,
+            mod_time: source.mod_time,
+        },
+    )))
+}
+
+impl TierFreeVersionReceiptSink {
+    /// Record one committed free-version cleanup target. Cloned options share
+    /// this sink; tuple-equivalent physical copies collapse to one worker task.
+    /// `false` means the source cannot safely identify a destructive cleanup.
+    pub(crate) fn record(&self, source: &ObjectInfo, local_free_version_id: Uuid) -> io::Result<bool> {
+        let Some((identity, payload)) = tier_free_version_scheduling_receipt_from_source(source, local_free_version_id)? else {
+            return Ok(false);
+        };
+        let mut state = self.inner.lock();
+        let receipts = state
+            .receipts
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "tier free-version receipt sink was already drained"))?;
+        receipts.entry(identity).or_insert(payload);
+        Ok(true)
+    }
+
+    /// Consume every receipt exactly once. A second drain is a caller bug: it
+    /// could otherwise make two outer wrappers believe they own the same tasks.
+    pub(crate) fn drain(&self) -> io::Result<Vec<ObjectInfo>> {
+        let mut state = self.inner.lock();
+        let receipts = state
+            .receipts
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "tier free-version receipt sink was already drained"))?;
+        drop(state);
+        Ok(receipts
+            .into_iter()
+            .map(|(identity, payload)| identity.into_object_info(payload))
+            .collect())
+    }
+}
+
+/// Internal PUT completion boundary; this does not change fsync or write quorum.
+#[doc(hidden)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum WriteCompletion {
+    /// Return at write quorum when the commit owner can retain its guards.
+    #[default]
+    Quorum,
+    /// Drain the rename fan-out before returning. Minority failures still heal
+    /// after a successful quorum commit; this does not require every disk to succeed.
+    TailDrained,
+}
+
+/// Storage-owned write mode inherited by physical rewrites. This selects the
+/// destination format; the source reader must still validate every source byte.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardIntegrityWriteMode {
+    Legacy,
+    Protected,
+}
+
+#[derive(Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
     pub max_parity: bool,
@@ -307,11 +924,23 @@ pub struct ObjectOptions {
     pub lifecycle_delete_all: Option<LifecycleDeleteAllRequest>,
     #[doc(hidden)]
     pub lifecycle_delete_all_journal: Option<Arc<parking_lot::Mutex<LifecycleDeleteAllJournalState>>>,
+    /// Whole-operation authorization created only by consuming a validated
+    /// v6 dispatch-manifest permit. Clones share the authorization, not the
+    /// one-shot permit itself.
+    #[doc(hidden)]
+    pub tier_delete_dispatch_authorization:
+        Option<crate::bucket::lifecycle::tier_delete_journal::TierDeleteDispatchAuthorization>,
     /// RustFS-only compare-and-set condition checked under the object write lock.
     pub expected_current_version_id: Option<String>,
     /// Persisted bucket incarnation observed before authorization.
     pub expected_bucket_incarnation_id: Option<Uuid>,
     pub no_lock: bool,
+    /// Internal read-only inspection must not enqueue metadata or payload repairs.
+    pub suppress_read_repair: bool,
+    /// Control-plane writers that immediately read or CAS the same namespace
+    /// key use TailDrained without changing namespace lock ownership.
+    #[doc(hidden)]
+    pub write_completion: WriteCompletion,
     /// True when an upper layer already holds the object read lock before
     /// forwarding a no_lock read to the set layer.
     pub metadata_cache_safe: bool,
@@ -324,8 +953,34 @@ pub struct ObjectOptions {
     pub skip_rebalancing: bool,
     pub skip_free_version: bool,
 
+    /// Storage-owned, per-request hand-off for committed tier free-version
+    /// cleanup work. The outer delete wrapper installs and drains it; clones
+    /// below that boundary share the same opaque sink.
+    #[doc(hidden)]
+    pub tier_free_version_receipt_sink: Option<TierFreeVersionReceiptSink>,
+
+    /// Cooperative cancellation for an owned PutObject before authoritative
+    /// rename begins. Storage ignores it after entering the durable commit.
+    #[doc(hidden)]
+    pub put_object_cancellation: Option<tokio_util::sync::CancellationToken>,
+
+    /// Storage-owned scanner publication capability. This field is an
+    /// in-memory hand-off only; it is never copied into object metadata.
+    #[doc(hidden)]
+    pub scanner_publication_commit_scope: Option<ScannerPublicationCommitScope>,
+
     pub data_movement: bool,
     pub raw_data_movement_read: bool,
+    /// Internal, in-memory protection context. Never populated from S3 metadata.
+    /// None selects the rollout default only for a new write, not for a rewrite.
+    #[doc(hidden)]
+    pub shard_integrity_write_mode: Option<ShardIntegrityWriteMode>,
+    /// Durable reservation identity carried only by decommission writes. Other
+    /// data-movement users, including rebalance, leave it unset. Keep this
+    /// context boxed because `ObjectOptions` is passed by value through deep
+    /// storage futures.
+    #[doc(hidden)]
+    pub decommission_capacity: Option<Box<DecommissionCapacityOptions>>,
     /// Materialize the data-movement per-part checksum sidecar for APIs that
     /// return part checksums. Ordinary object reads leave it encoded.
     pub include_part_checksums: bool,
@@ -334,6 +989,9 @@ pub struct ObjectOptions {
     pub preserve_etag: Option<String>,
     pub metadata_chg: bool,
     pub http_preconditions: Option<HTTPPreconditions>,
+    /// Internal create-only writes may also preserve an acknowledged deletion.
+    /// Evaluated with `http_preconditions` under the namespace commit lock.
+    pub preserve_delete_marker: bool,
 
     pub delete_replication: Option<ReplicationState>,
     pub delete_replication_config_snapshot: Option<Arc<DeleteReplicationConfigSnapshot>>,
@@ -375,6 +1033,13 @@ pub struct ObjectOptions {
     pub lifecycle_audit_event: LcAuditEvent,
 
     pub eval_metadata: Option<HashMap<String, String>>,
+    /// Internal compare-and-set condition for replication workers publishing
+    /// terminal status after remote I/O. Storage validates it while holding
+    /// the object write lock so an older worker cannot overwrite a newer
+    /// mutation's PENDING state. Keep the condition boxed because
+    /// `ObjectOptions` is passed by value through deep storage futures.
+    #[doc(hidden)]
+    pub replication_status_writeback: Option<Box<ReplicationStatusWritebackCondition>>,
     pub object_lock_retention: Option<ObjectLockRetentionOptions>,
     pub object_lock_delete: Option<crate::storage_api_contracts::object::ObjectLockDeleteOptions>,
     /// Authoritative bucket Object Lock snapshot installed inside `ECStore`
@@ -389,9 +1054,174 @@ pub struct ObjectOptions {
     /// Storage-owned journal writer used by the atomic delete path. This is
     /// populated only by the `ECStore` wrapper that holds the namespace locks.
     pub tier_delete_journal_api: Option<Arc<crate::store::ECStore>>,
+    /// Internal staged-mutation admission supplied by `ECStore`; each local
+    /// publish is fenced namespace-first and then by decommission capacity.
+    #[doc(hidden)]
+    pub decommission_capacity_admission: Option<Arc<crate::store::ECStore>>,
+}
+
+#[derive(Clone, Debug, Default)]
+#[doc(hidden)]
+pub struct ReplicationStatusWritebackCondition {
+    pub(crate) expected_generation: ReplicationGenerationSnapshot,
+    pub(crate) mode: ReplicationStatusWritebackMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum ReplicationStatusWritebackMode {
+    #[default]
+    Update,
+    ValidateOnly,
 }
 
 impl ObjectOptions {
+    pub(crate) fn shard_integrity_write_enabled(&self) -> bool {
+        match self.shard_integrity_write_mode {
+            Some(ShardIntegrityWriteMode::Protected) => true,
+            Some(ShardIntegrityWriteMode::Legacy) => false,
+            None if self.data_movement => false,
+            None => {
+                rustfs_utils::get_env_bool(rustfs_config::ENV_SHARD_INTEGRITY_WRITE, rustfs_config::DEFAULT_SHARD_INTEGRITY_WRITE)
+                    && rustfs_utils::get_env_bool(
+                        rustfs_config::ENV_SHARD_INTEGRITY_FLEET_CONFIRMED,
+                        rustfs_config::DEFAULT_SHARD_INTEGRITY_FLEET_CONFIRMED,
+                    )
+            }
+        }
+    }
+
+    pub(crate) fn inherit_shard_integrity(&mut self, source: &ObjectInfo) {
+        self.shard_integrity_write_mode = Some(source.shard_integrity_write_mode());
+    }
+
+    pub(crate) fn with_capacity_expected_data_bytes(expected_data_bytes: Option<usize>) -> Self {
+        Self {
+            decommission_capacity: expected_data_bytes.map(|expected_data_bytes| {
+                Box::new(DecommissionCapacityOptions {
+                    expected_data_bytes: Some(expected_data_bytes),
+                    ..Default::default()
+                })
+            }),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn capacity_expected_data_bytes(&self) -> Option<usize> {
+        self.decommission_capacity
+            .as_deref()
+            .and_then(|capacity| capacity.expected_data_bytes)
+    }
+
+    pub(crate) fn has_decommission_capacity_reservation(&self) -> bool {
+        self.decommission_capacity
+            .as_deref()
+            .is_some_and(|capacity| capacity.operation_id.is_some())
+    }
+}
+
+impl std::fmt::Debug for ObjectOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectOptions")
+            .field("max_parity", &self.max_parity)
+            .field("mod_time", &self.mod_time)
+            .field("part_number", &self.part_number)
+            .field("delete_prefix", &self.delete_prefix)
+            .field("delete_prefix_object", &self.delete_prefix_object)
+            .field("version_id", &self.version_id.is_some())
+            .field("lifecycle_delete_all", &self.lifecycle_delete_all.is_some())
+            .field("lifecycle_delete_all_journal", &self.lifecycle_delete_all_journal.is_some())
+            .field("tier_delete_dispatch_authorization", &self.tier_delete_dispatch_authorization.is_some())
+            .field("expected_current_version_id", &self.expected_current_version_id.is_some())
+            .field("expected_bucket_incarnation_id", &self.expected_bucket_incarnation_id)
+            .field("no_lock", &self.no_lock)
+            .field("metadata_cache_safe", &self.metadata_cache_safe)
+            .field("versioned", &self.versioned)
+            .field("version_suspended", &self.version_suspended)
+            .field("incl_free_versions", &self.incl_free_versions)
+            .field("skip_decommissioned", &self.skip_decommissioned)
+            .field("skip_rebalancing", &self.skip_rebalancing)
+            .field("skip_free_version", &self.skip_free_version)
+            .field("tier_free_version_receipt_sink", &self.tier_free_version_receipt_sink)
+            .field("put_object_cancellation", &self.put_object_cancellation.is_some())
+            .field("scanner_publication_commit_scope", &self.scanner_publication_commit_scope)
+            .field("data_movement", &self.data_movement)
+            .field("raw_data_movement_read", &self.raw_data_movement_read)
+            .field("include_part_checksums", &self.include_part_checksums)
+            .field("src_pool_idx", &self.src_pool_idx)
+            .field("user_defined_count", &self.user_defined.len())
+            .field("preserve_etag", &self.preserve_etag.is_some())
+            .field("metadata_chg", &self.metadata_chg)
+            .field("http_preconditions", &self.http_preconditions.is_some())
+            .field("delete_replication", &self.delete_replication.is_some())
+            .field("delete_replication_config_snapshot", &self.delete_replication_config_snapshot)
+            .field("namespace_lock_fence", &self.namespace_lock_fence.is_some())
+            .field("bucket_lifecycle_lock_fence", &self.bucket_lifecycle_lock_fence.is_some())
+            .field("replication_request", &self.replication_request)
+            .field("proxy_request", &self.proxy_request)
+            .field("proxy_header_set", &self.proxy_header_set)
+            .field("replication_tagging_timestamp", &self.replication_tagging_timestamp)
+            .field("replication_retention_timestamp", &self.replication_retention_timestamp)
+            .field("replication_legalhold_timestamp", &self.replication_legalhold_timestamp)
+            .field("preserve_ciphertext", &self.preserve_ciphertext)
+            .field("delete_marker", &self.delete_marker)
+            .field("synthetic_version_id", &self.synthetic_version_id)
+            .field(
+                "transition",
+                &(self.data_movement
+                    || !self.transition.status.is_empty()
+                    || !self.transition.tier.is_empty()
+                    || self.transition.expected_data_dir.is_some()),
+            )
+            .field("expiration", &self.expiration)
+            .field(
+                "lifecycle_audit_event",
+                &(!self.lifecycle_audit_event.event.rule_id.is_empty()
+                    || !self.lifecycle_audit_event.event.storage_class.is_empty()),
+            )
+            .field("eval_metadata_count", &self.eval_metadata.as_ref().map(HashMap::len))
+            .field("replication_status_writeback", &self.replication_status_writeback.is_some())
+            .field("object_lock_retention", &self.object_lock_retention.is_some())
+            .field("object_lock_delete", &self.object_lock_delete)
+            .field("object_lock_config_snapshot", &self.object_lock_config_snapshot.is_some())
+            .field("want_checksum", &self.want_checksum)
+            .field("skip_verify_bitrot", &self.skip_verify_bitrot)
+            .field("capacity_scope_token", &self.capacity_scope_token)
+            .field("quota_admission", &self.quota_admission)
+            .field("tier_delete_journal_api", &self.tier_delete_journal_api.is_some())
+            .finish()
+    }
+}
+
+/// Transient scanner-only carrier for target-side publication lease tokens.
+/// SetDisks consumes and removes this key before constructing durable
+/// FileInfo metadata; it must never appear in an S3-visible object.
+pub const SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY: &str = "x-rustfs-internal-scanner-publication-lease-fence-v1";
+
+impl ObjectOptions {
+    /// Create a new ObjectOptions with modified no_lock field.
+    pub fn with_no_lock(&self, no_lock: bool) -> Self {
+        let mut opts = self.clone();
+        opts.no_lock = no_lock;
+        opts
+    }
+
+    /// Create commit options from base options (optimized clone).
+    pub fn as_commit_opts(&self) -> Self {
+        let mut opts = self.clone();
+        opts.no_lock = true;
+        opts.metadata_cache_safe = false;
+        opts.include_part_checksums = true;
+        opts
+    }
+
+    /// Create read options with include_part_checksums enabled.
+    pub fn as_read_opts(&self) -> Self {
+        let mut opts = self.clone();
+        opts.include_part_checksums = true;
+        opts
+    }
+
     pub fn set_quota_admission(&mut self, current_usage: u64, quota_limit: u64) -> bool {
         self.quota_admission = (current_usage <= quota_limit).then_some(QuotaAdmission {
             current_usage,
@@ -405,9 +1235,23 @@ impl ObjectOptions {
     }
 
     pub(crate) fn add_namespace_lock_lost_signal(&mut self, signal: Arc<rustfs_lock::distributed_lock::LockLostSignal>) {
+        #[cfg(test)]
+        let test_fence = NAMESPACE_LOCK_SIGNAL_TEST_FENCES
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("namespace lock signal test fence should not be poisoned")
+            .iter()
+            .find(|(key, _)| *key == Arc::as_ptr(&signal) as usize)
+            .map(|(_, fence)| fence.clone());
         self.namespace_lock_fence
             .get_or_insert_with(NamespaceLockFence::new)
             .add_signal(signal);
+        #[cfg(test)]
+        if let Some(test_fence) = test_fence {
+            self.namespace_lock_fence
+                .get_or_insert_with(NamespaceLockFence::new)
+                .extend(&test_fence);
+        }
     }
 
     pub(crate) fn ensure_namespace_lock_fence(&mut self) {
@@ -415,7 +1259,7 @@ impl ObjectOptions {
     }
 
     #[cfg(test)]
-    pub(crate) fn add_namespace_lock_fence_for_test(&mut self, fence: &NamespaceLockFence) {
+    pub(crate) fn add_namespace_lock_fence(&mut self, fence: &NamespaceLockFence) {
         self.namespace_lock_fence
             .get_or_insert_with(NamespaceLockFence::new)
             .extend(fence);
@@ -532,6 +1376,32 @@ impl ObjectOptions {
     }
 }
 
+fn replication_snapshot_internal_value(
+    metadata: &HashMap<String, String>,
+    suffix: &str,
+) -> std::result::Result<Option<String>, ()> {
+    match rustfs_utils::http::get_consistent_str(metadata, suffix) {
+        Some(value) => Ok(Some(value.to_string())),
+        None if rustfs_utils::http::contains_key_str(metadata, suffix) => Err(()),
+        None => Ok(None),
+    }
+}
+
+fn update_replication_fingerprint_bytes(hasher: &mut Sha256, value: &[u8]) {
+    let len = u64::try_from(value.len()).unwrap_or(u64::MAX);
+    hasher.update(len.to_le_bytes());
+    hasher.update(value);
+}
+
+fn update_replication_fingerprint_optional_str(hasher: &mut Sha256, value: Option<&str>) {
+    if let Some(value) = value {
+        hasher.update([1]);
+        update_replication_fingerprint_bytes(hasher, value.as_bytes());
+    } else {
+        hasher.update([0]);
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ObjectInfo {
     pub bucket: String,
@@ -620,6 +1490,160 @@ impl Clone for ObjectInfo {
 }
 
 impl ObjectInfo {
+    pub(crate) fn shard_integrity_write_mode(&self) -> ShardIntegrityWriteMode {
+        // Any declaration requires protection. Malformed declarations remain
+        // errors in the source reader and must never select the legacy path.
+        if self.parts.iter().any(|part| part.integrity.is_some())
+            || [
+                rustfs_filemeta::shard_integrity::SUFFIX_SHARD_INTEGRITY,
+                rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY,
+            ]
+            .iter()
+            .any(|suffix| rustfs_utils::http::contains_key_str(&self.user_defined, suffix))
+        {
+            ShardIntegrityWriteMode::Protected
+        } else {
+            ShardIntegrityWriteMode::Legacy
+        }
+    }
+
+    /// Capture the source mutation snapshot used by replication workers when
+    /// publishing terminal status. The semantic fingerprint is recomputed at
+    /// the storage CAS boundary, so an older writer that preserves an unknown
+    /// UUID and collides on the timestamp still cannot hide a payload change.
+    pub(crate) fn replication_generation_snapshot(&self) -> ReplicationGenerationSnapshot {
+        let timestamp = replication_snapshot_internal_value(&self.user_defined, rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP);
+        let mutation_id =
+            replication_snapshot_internal_value(&self.user_defined, rustfs_utils::http::SUFFIX_REPLICATION_GENERATION);
+        let tagging_timestamp =
+            replication_snapshot_internal_value(&self.user_defined, rustfs_utils::http::SUFFIX_TAGGING_TIMESTAMP);
+        let retention_timestamp =
+            replication_snapshot_internal_value(&self.user_defined, rustfs_utils::http::SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP);
+        let legalhold_timestamp =
+            replication_snapshot_internal_value(&self.user_defined, rustfs_utils::http::SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP);
+
+        let invalid = timestamp.is_err()
+            || mutation_id.is_err()
+            || tagging_timestamp.is_err()
+            || retention_timestamp.is_err()
+            || legalhold_timestamp.is_err();
+        let timestamp = timestamp.unwrap_or_default();
+        let mutation_id = mutation_id.unwrap_or_default();
+        let tagging_timestamp = tagging_timestamp.unwrap_or_default();
+        let retention_timestamp = retention_timestamp.unwrap_or_default();
+        let legalhold_timestamp = legalhold_timestamp.unwrap_or_default();
+        let opaque_timestamp_is_invalid = [
+            timestamp.as_deref(),
+            tagging_timestamp.as_deref(),
+            retention_timestamp.as_deref(),
+            legalhold_timestamp.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(str::is_empty);
+        let mutation_id_is_invalid = mutation_id.as_deref().is_some_and(|value| {
+            Uuid::parse_str(value)
+                .ok()
+                .filter(|generation| !generation.is_nil())
+                .is_none()
+        });
+        let invalid =
+            invalid || opaque_timestamp_is_invalid || mutation_id_is_invalid || (mutation_id.is_some() && timestamp.is_none());
+
+        let payload_fingerprint = (!invalid).then(|| {
+            self.replication_payload_fingerprint(
+                tagging_timestamp.as_deref(),
+                retention_timestamp.as_deref(),
+                legalhold_timestamp.as_deref(),
+            )
+        });
+
+        ReplicationGenerationSnapshot {
+            timestamp,
+            mutation_id,
+            payload_fingerprint,
+            invalid,
+        }
+    }
+
+    fn replication_payload_fingerprint(
+        &self,
+        tagging_timestamp: Option<&str>,
+        retention_timestamp: Option<&str>,
+        legalhold_timestamp: Option<&str>,
+    ) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"rustfs-replication-payload-v1");
+
+        // A suspended bucket's current null version is represented as
+        // `Some(Uuid::nil())` at the request/queue boundary and as `None`
+        // when the same xl.meta is reread without versioning flags. They are
+        // one persisted identity, so do not let that representation detail
+        // make a worker permanently supersede its own terminal write-back.
+        if let Some(version_id) = self.version_id.filter(|version_id| !version_id.is_nil()) {
+            hasher.update([1]);
+            hasher.update(version_id.as_bytes());
+        } else {
+            hasher.update([0]);
+        }
+        if let Some(data_dir) = self.data_dir {
+            hasher.update([1]);
+            hasher.update(data_dir.as_bytes());
+        } else {
+            hasher.update([0]);
+        }
+        if let Some(mod_time) = self.mod_time {
+            hasher.update([1]);
+            hasher.update(mod_time.unix_timestamp_nanos().to_le_bytes());
+        } else {
+            hasher.update([0]);
+        }
+
+        update_replication_fingerprint_optional_str(&mut hasher, self.content_type.as_deref());
+        update_replication_fingerprint_optional_str(&mut hasher, self.content_encoding.as_deref());
+        update_replication_fingerprint_optional_str(&mut hasher, self.storage_class.as_deref());
+        if let Some(expires) = self.expires {
+            hasher.update([1]);
+            hasher.update(expires.unix_timestamp_nanos().to_le_bytes());
+        } else {
+            hasher.update([0]);
+        }
+        update_replication_fingerprint_bytes(&mut hasher, self.user_tags.as_bytes());
+        update_replication_fingerprint_optional_str(&mut hasher, tagging_timestamp);
+        update_replication_fingerprint_optional_str(&mut hasher, retention_timestamp);
+        update_replication_fingerprint_optional_str(&mut hasher, legalhold_timestamp);
+
+        let mut target_arns = self
+            .replication_status_internal
+            .as_deref()
+            .map(replication_statuses_map)
+            .unwrap_or_default()
+            .into_keys()
+            .collect::<Vec<_>>();
+        target_arns.sort_unstable();
+        hasher.update(u64::try_from(target_arns.len()).unwrap_or(u64::MAX).to_le_bytes());
+        for arn in target_arns {
+            update_replication_fingerprint_bytes(&mut hasher, arn.as_bytes());
+        }
+        update_replication_fingerprint_bytes(&mut hasher, self.replication_decision.as_bytes());
+
+        let mut user_metadata = self
+            .user_defined
+            .iter()
+            .filter(|(key, _)| {
+                !rustfs_utils::http::is_internal_key(key) && !key.eq_ignore_ascii_case(metadata_keys::REPLICATION_STATUS)
+            })
+            .collect::<Vec<_>>();
+        user_metadata.sort_unstable_by(|left, right| left.0.cmp(right.0).then_with(|| left.1.cmp(right.1)));
+        hasher.update(u64::try_from(user_metadata.len()).unwrap_or(u64::MAX).to_le_bytes());
+        for (key, value) in user_metadata {
+            update_replication_fingerprint_bytes(&mut hasher, key.as_bytes());
+            update_replication_fingerprint_bytes(&mut hasher, value.as_bytes());
+        }
+
+        hasher.finalize().into()
+    }
+
     pub fn is_compressed(&self) -> bool {
         rustfs_utils::http::contains_key_str(&self.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION)
     }
@@ -641,7 +1665,7 @@ impl ObjectInfo {
     }
 
     pub fn is_multipart(&self) -> bool {
-        self.etag.as_ref().is_some_and(|v| v.len() != 32)
+        self.parts.len() > 1 || self.etag.as_ref().is_some_and(|v| v.len() != 32)
     }
 
     pub fn is_encrypted(&self) -> bool {
@@ -650,12 +1674,18 @@ impl ObjectInfo {
             .any(|key| rustfs_utils::http::is_object_encryption_marker(key))
     }
 
-    /// Maximum inline size for non-versioned objects (128 KiB).
-    /// Matches `DEFAULT_INLINE_BLOCK` in `storageclass.rs`.
+    /// Historical non-versioned inline size reference.
+    ///
+    /// Inline admission is layout-specific now; callers must not use this
+    /// constant to decide whether an object is eligible for the fast path.
+    #[deprecated(note = "inline eligibility is layout-specific; use persisted metadata and the read-path policy")]
     pub const INLINE_MAX_SIZE: i64 = 128 * 1024;
 
-    /// Maximum inline size for versioned objects (16 KiB).
-    /// Matches `DEFAULT_INLINE_BLOCK / 8` in `storageclass.rs`.
+    /// Historical versioned inline size reference.
+    ///
+    /// Inline admission is layout-specific now; callers must not use this
+    /// constant to decide whether an object is eligible for the fast path.
+    #[deprecated(note = "inline eligibility is layout-specific; use persisted metadata and the read-path policy")]
     pub const INLINE_MAX_SIZE_VERSIONED: i64 = 16 * 1024;
 
     /// Returns `true` when this object qualifies for the inline data fast path.
@@ -663,10 +1693,12 @@ impl ObjectInfo {
     /// The inline fast path decodes erasure-coded data entirely in memory,
     /// bypassing disk I/O, duplex pipes, and the disk-read semaphore.
     ///
-    /// The `inlined` flag is the primary signal — PUT sets it through the
-    /// captured storage-class snapshot's `Config::should_inline`, which applies
-    /// the correct version-aware threshold (128 KiB non-versioned, 16 KiB versioned).
-    /// The size check below is a safety net using the same thresholds.
+    /// The persisted `inlined` flag is the canonical size-policy decision. PUT
+    /// sets it through the captured storage-class snapshot's effective policy,
+    /// which is layout- and version-aware. Reapplying a fixed object-size limit
+    /// here would disagree with that policy for wider EC layouts and explicit
+    /// inline configurations. The direct-memory reader retains its own bounded
+    /// 128 KiB allocation gate at the call site.
     ///
     /// Additional conditions:
     /// - Single part
@@ -677,14 +1709,8 @@ impl ObjectInfo {
         if !self.inlined {
             return false;
         }
-        // Apply the same version-aware threshold as PUT (storageclass.rs).
-        let max_size = if self.version_id.is_some() {
-            Self::INLINE_MAX_SIZE_VERSIONED
-        } else {
-            Self::INLINE_MAX_SIZE
-        };
         self.parts.len() == 1
-            && self.size <= max_size
+            && self.size >= 0
             && !self.is_encrypted()
             && !self.is_compressed()
             && self.transitioned_object.tier.is_empty()
@@ -825,7 +1851,7 @@ impl ObjectInfo {
 
         let mut replication_status = replication_status_from_filemeta(fi.replication_status());
         if replication_status.is_empty()
-            && let Some(status) = fi.metadata.get(AMZ_BUCKET_REPLICATION_STATUS).cloned()
+            && let Some(status) = fi.metadata.get(metadata_keys::REPLICATION_STATUS).cloned()
             && status == ReplicationStatusType::Replica.as_str()
         {
             replication_status = ReplicationStatusType::Replica;
@@ -853,7 +1879,7 @@ impl ObjectInfo {
 
         let storage_class = Some(
             storageclass::effective_class(
-                fi.metadata.get(AMZ_STORAGE_CLASS).map(String::as_str),
+                fi.metadata.get(metadata_keys::STORAGE_CLASS).map(String::as_str),
                 (fi.transition_status == rustfs_filemeta::TRANSITION_COMPLETE && !fi.transition_tier.is_empty())
                     .then_some(fi.transition_tier.as_str()),
             )
@@ -862,7 +1888,7 @@ impl ObjectInfo {
 
         let mut restore_ongoing = false;
         let mut restore_expires = None;
-        if let Some(restore_status) = fi.metadata.get(AMZ_RESTORE).cloned()
+        if let Some(restore_status) = fi.metadata.get(metadata_keys::RESTORE).cloned()
             && let Ok(restore_status) = parse_restore_obj_status(&restore_status)
         {
             restore_ongoing = restore_status.on_going();
@@ -882,6 +1908,7 @@ impl ObjectInfo {
                 checksums: part.checksums.clone(),
                 number: part.number,
                 error: part.error.clone(),
+                integrity: part.integrity.clone(),
             })
             .collect::<Vec<_>>();
 
@@ -1097,6 +2124,18 @@ impl ObjectInfo {
         let mut prev_prefix = "";
         for entry in entries.entries() {
             if entry.is_object() {
+                let fi = match entry.to_fileinfo(bucket) {
+                    Ok(res) => Some(res),
+                    Err(err) => {
+                        warn!("file_info_versions err {:?}", err);
+                        None
+                    }
+                };
+
+                if fi.as_ref().is_some_and(|fi| !fi.version_purge_status().is_empty()) {
+                    continue;
+                }
+
                 if let Some(delimiter) = &delimiter {
                     let remaining = if entry.name.starts_with(prefix) {
                         &entry.name[prefix.len()..]
@@ -1123,15 +2162,10 @@ impl ObjectInfo {
                     }
                 }
 
-                let fi = match entry.to_fileinfo(bucket) {
-                    Ok(res) => res,
-                    Err(err) => {
-                        warn!("file_info_versions err {:?}", err);
-                        continue;
-                    }
+                let Some(fi) = fi else {
+                    continue;
                 };
 
-                // TODO(backlog): handle VersionPurgeStatus in object listing
                 let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
                 objects.push(ObjectInfo::from_file_info(&fi, bucket, &entry.name, versioned));
 
@@ -1218,9 +2252,10 @@ impl ObjectInfo {
         }
 
         if let Some(data) = &self.checksum {
-            if self.is_encrypted() {
+            if self.is_encrypted() && get_consistent_str(&self.user_defined, SUFFIX_PLAINTEXT_CHECKSUM) != Some("true") {
                 // Object-level encrypted checksum bytes require SSE decrypt material,
-                // so do not expose them as plaintext checksum headers here. The
+                // unless RustFS marked the stored bytes as plaintext. Do not expose
+                // unmarked bytes as checksum headers here. The
                 // `false` multipart flag feeds the response-path COMPOSITE
                 // fallback; callers that need accurate multipart routing must
                 // consult `is_multipart()` instead of this value.
@@ -1250,6 +2285,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn replication_status_writeback_condition_remains_indirected() {
+        fn assert_indirected(_: &Option<Box<ReplicationStatusWritebackCondition>>) {}
+
+        assert_indirected(&ObjectOptions::default().replication_status_writeback);
+    }
+
+    #[test]
     fn object_lock_config_snapshot_is_bound_to_store_bucket_and_incarnation() {
         let store_id = Uuid::new_v4();
         let incarnation_id = Uuid::new_v4();
@@ -1269,6 +2311,35 @@ mod tests {
     }
     use rustfs_filemeta::{FileInfo, FileMeta, MetaCacheEntry, TRANSITION_COMPLETE};
 
+    #[test]
+    fn multipart_identity_uses_stored_parts_and_preserves_the_etag_fallback() {
+        let plain_etag = "0123456789abcdef0123456789abcdef";
+        let multipart_etag = "0123456789abcdef0123456789abcdef-1";
+        for (case, part_count, etag, expected) in [
+            ("preserved source ETag", 2, Some(plain_etag), true),
+            ("missing ETag", 2, None, true),
+            ("ordinary PUT", 1, Some(plain_etag), false),
+            ("ordinary PUT without ETag", 1, None, false),
+            ("single-part MPU", 1, Some(multipart_etag), true),
+            ("legacy MPU without parts", 0, Some(multipart_etag), true),
+        ] {
+            let object = ObjectInfo {
+                etag: etag.map(str::to_string),
+                parts: Arc::new(
+                    (1..=part_count)
+                        .map(|number| ObjectPartInfo {
+                            number,
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            };
+
+            assert_eq!(object.is_multipart(), expected, "{case}");
+        }
+    }
+
     fn inline_fast_path_object(size: i64, versioned: bool) -> ObjectInfo {
         ObjectInfo {
             size,
@@ -1280,14 +2351,14 @@ mod tests {
     }
 
     #[test]
-    fn inline_fast_path_eligibility_preserves_exact_versioned_boundaries() {
+    fn inline_fast_path_eligibility_follows_persisted_marker() {
         for (case, size, versioned, expected) in [
             ("unversioned below", 128 * 1024 - 1, false, true),
             ("unversioned exact", 128 * 1024, false, true),
-            ("unversioned above", 128 * 1024 + 1, false, false),
+            ("unversioned above", 128 * 1024 + 1, false, true),
             ("versioned below", 16 * 1024 - 1, true, true),
             ("versioned exact", 16 * 1024, true, true),
-            ("versioned above", 16 * 1024 + 1, true, false),
+            ("versioned above", 16 * 1024 + 1, true, true),
         ] {
             assert_eq!(
                 inline_fast_path_object(size, versioned).is_inline_fast_path_eligible(),
@@ -1298,8 +2369,28 @@ mod tests {
     }
 
     #[test]
+    fn inline_fast_path_marker_allows_ec8_and_ec12_layout_specific_256kib_objects() {
+        for data_blocks in [8, 12] {
+            let object = ObjectInfo {
+                size: 256 * 1024,
+                data_blocks,
+                parity_blocks: 4,
+                inlined: true,
+                version_id: Some(Uuid::from_u128(1)),
+                parts: Arc::new(vec![ObjectPartInfo::default()]),
+                ..Default::default()
+            };
+
+            assert!(
+                object.is_inline_fast_path_eligible(),
+                "the persisted inline marker must be authoritative for EC{data_blocks}+4"
+            );
+        }
+    }
+
+    #[test]
     fn inline_fast_path_eligibility_rejects_incompatible_object_shapes() {
-        let mut object = inline_fast_path_object(ObjectInfo::INLINE_MAX_SIZE, false);
+        let mut object = inline_fast_path_object(128 * 1024, false);
 
         object.inlined = false;
         assert!(!object.is_inline_fast_path_eligible(), "non-inline objects must fall back");
@@ -1607,6 +2698,66 @@ mod tests {
         assert!(lifecycle_objects.iter().all(|object| object.num_versions == 2));
     }
 
+    #[tokio::test]
+    async fn list_objects_v2_hides_objects_pending_version_purge() {
+        let purge_version_id = Uuid::new_v4();
+        let base_time = OffsetDateTime::now_utc();
+        let mut fm = FileMeta::new();
+        let object = "folder/object";
+
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: object.to_string(),
+            version_id: Some(purge_version_id),
+            mod_time: Some(base_time),
+            ..Default::default()
+        })
+        .expect("version pending purge should be added");
+        fm.delete_version(&FileInfo {
+            volume: "bucket".to_string(),
+            name: object.to_string(),
+            version_id: Some(purge_version_id),
+            replication_state_internal: Some(crate::bucket::replication::replication_state_to_filemeta(&ReplicationState {
+                version_purge_status_internal: Some("arn:target-a=PENDING;".to_string()),
+                purge_targets: version_purge_statuses_map("arn:target-a=PENDING;"),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+        .expect("version purge status should be persisted");
+
+        let entries = MetaCacheEntriesSorted {
+            o: rustfs_filemeta::MetaCacheEntries(vec![Some(MetaCacheEntry {
+                name: object.to_string(),
+                metadata: fm.marshal_msg().expect("metadata should marshal"),
+                ..Default::default()
+            })]),
+            ..Default::default()
+        };
+
+        let list_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(&entries, "bucket", "", None).await;
+        let delimiter_objects =
+            ObjectInfo::from_meta_cache_entries_sorted_infos(&entries, "bucket", "", Some("/".to_string())).await;
+        let public_versions = ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, "bucket", "", None, None).await;
+        let lifecycle_versions =
+            ObjectInfo::from_meta_cache_entries_sorted_versions_for_lifecycle(&entries, "bucket", "", None, None).await;
+
+        assert!(
+            list_objects.is_empty(),
+            "ListObjectsV2 must not publish a key hidden from public versions"
+        );
+        assert!(
+            delimiter_objects.is_empty(),
+            "delimiter ListObjectsV2 must not synthesize a prefix from a hidden key"
+        );
+        assert!(
+            public_versions.is_empty(),
+            "public ListObjectVersions hides pending version-purge records"
+        );
+        assert_eq!(lifecycle_versions.len(), 1, "lifecycle cleanup still needs the pending purge record");
+        assert_eq!(lifecycle_versions[0].version_purge_status, VersionPurgeStatusType::Pending);
+    }
+
     #[test]
     fn get_actual_size_prefers_actual_size_field() {
         let info = ObjectInfo {
@@ -1710,7 +2861,7 @@ mod tests {
             storageclass::GLACIER,
         ] {
             let fi = FileInfo {
-                metadata: HashMap::from([(AMZ_STORAGE_CLASS.to_string(), legacy_label.to_string())]),
+                metadata: HashMap::from([(metadata_keys::STORAGE_CLASS.to_string(), legacy_label.to_string())]),
                 ..Default::default()
             };
 
@@ -1727,7 +2878,7 @@ mod tests {
     #[test]
     fn from_file_info_preserves_transitioned_tier_storage_class() {
         let fi = FileInfo {
-            metadata: HashMap::from([(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string())]),
+            metadata: HashMap::from([(metadata_keys::STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string())]),
             transition_tier: "WARM-TIER".to_string(),
             transition_status: TRANSITION_COMPLETE.to_string(),
             ..Default::default()
@@ -1742,7 +2893,7 @@ mod tests {
     #[test]
     fn from_file_info_ignores_a_tier_name_without_a_completed_transition() {
         let fi = FileInfo {
-            metadata: HashMap::from([(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string())]),
+            metadata: HashMap::from([(metadata_keys::STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string())]),
             transition_tier: "WARM-TIER".to_string(),
             ..Default::default()
         };
@@ -1907,6 +3058,31 @@ mod tests {
     }
 
     #[test]
+    fn decrypt_checksums_reads_marked_rustfs_encrypted_object_checksum() {
+        let checksum = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"encrypted-object")
+            .expect("test checksum should be valid");
+        let checksum_key = checksum.checksum_type.to_string();
+        let expected_checksum = checksum.encoded.clone();
+        let mut user_defined =
+            HashMap::from([(rustfs_utils::http::headers::AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "AES256".to_string())]);
+        rustfs_utils::http::insert_str(&mut user_defined, SUFFIX_PLAINTEXT_CHECKSUM, "true".to_string());
+        assert_eq!(user_defined.get("x-rustfs-internal-plaintext-checksum").map(String::as_str), Some("true"));
+        assert_eq!(user_defined.get("x-minio-internal-plaintext-checksum").map(String::as_str), Some("true"));
+        let info = ObjectInfo {
+            checksum: Some(checksum.to_bytes(&[])),
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+
+        let (checksums, is_multipart) = info
+            .decrypt_checksums(0, &HeaderMap::new())
+            .expect("marked RustFS checksum should decode");
+
+        assert!(!is_multipart);
+        assert_eq!(checksums.get(&checksum_key), Some(&expected_checksum));
+    }
+
+    #[test]
     fn decrypt_checksums_keeps_encrypted_multipart_flag_false_for_response_paths() {
         let checksum = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"encrypted-object")
             .expect("test checksum should be valid");
@@ -2023,11 +3199,381 @@ mod tests {
         assert!(default_cloned.parts.is_empty());
     }
 
+    fn transitioned_receipt_source(
+        bucket: &str,
+        object: &str,
+        remote_version: &str,
+        version_state: rustfs_filemeta::TransitionVersionState,
+        identity_hex: Option<&str>,
+    ) -> ObjectInfo {
+        let mut metadata = HashMap::new();
+        if let Some(identity_hex) = identity_hex {
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut metadata,
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                identity_hex.to_string(),
+            );
+        }
+        ObjectInfo {
+            bucket: bucket.to_string(),
+            name: object.to_string(),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            user_defined: Arc::new(metadata),
+            transitioned_object: TransitionedObject {
+                name: format!("remote/{object}"),
+                version_id: remote_version.to_string(),
+                tier: "WARM".to_string(),
+                status: TRANSITION_COMPLETE.to_string(),
+                ..Default::default()
+            },
+            transition_version_state: version_state,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tier_free_version_receipt_matches_persisted_free_version_worker_fields() {
+        let bucket = "receipt-bucket";
+        let object = "archive/object.bin";
+        let source_version_id = Uuid::from_u128(1);
+        let local_free_version_id = Uuid::from_u128(2);
+        let remote_version_id = Uuid::from_u128(3);
+        let source_mod_time = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(4);
+        let identity_hex = "ab".repeat(32);
+        let mut source_metadata = HashMap::from([
+            ("etag".to_string(), "source-etag".to_string()),
+            ("x-amz-meta-private".to_string(), "must-not-enter-receipt".to_string()),
+        ]);
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut source_metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            identity_hex.clone(),
+        );
+        let source_file_info = FileInfo {
+            volume: bucket.to_string(),
+            name: object.to_string(),
+            version_id: Some(source_version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/receipt-object".to_string(),
+            transition_tier: "WARM".to_string(),
+            transition_version_id: Some(remote_version_id),
+            transition_version: Some(remote_version_id.to_string()),
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            mod_time: Some(source_mod_time),
+            size: 8192,
+            data_dir: Some(Uuid::from_u128(4)),
+            metadata: source_metadata,
+            ..Default::default()
+        };
+        let source = ObjectInfo::from_file_info(&source_file_info, bucket, object, true);
+        let mut persisted = FileMeta::new();
+        persisted
+            .add_version(source_file_info)
+            .expect("transitioned receipt source should be persisted");
+        let mut delete_file_info = FileInfo {
+            volume: bucket.to_string(),
+            name: object.to_string(),
+            version_id: Some(source_version_id),
+            mod_time: Some(source_mod_time + time::Duration::minutes(1)),
+            ..Default::default()
+        };
+        delete_file_info.set_tier_free_version_id(&local_free_version_id.to_string());
+        persisted
+            .delete_version(&delete_file_info)
+            .expect("transitioned source delete should create a free-version");
+
+        let encoded = persisted.marshal_msg().expect("free-version metadata should encode");
+        let decoded = FileMeta::load(&encoded).expect("free-version metadata should decode");
+        let persisted_free_version = decoded
+            .get_all_file_info_versions(bucket, object, true)
+            .expect("decoded free-version should produce FileInfo")
+            .versions
+            .into_iter()
+            .find(|version| version.tier_free_version())
+            .expect("decoded metadata should contain the persisted free-version");
+        let persisted_object_info = ObjectInfo::from_file_info(&persisted_free_version, bucket, object, true);
+
+        let sink = TierFreeVersionReceiptSink::new();
+        assert!(
+            sink.record(&source, local_free_version_id)
+                .expect("valid transitioned source should produce a receipt")
+        );
+        let mut receipts = sink.drain().expect("receipt owner should drain exactly once");
+        assert_eq!(receipts.len(), 1);
+        let receipt = receipts.pop().expect("one receipt should be present");
+
+        assert_eq!(receipt.bucket, persisted_object_info.bucket);
+        assert_eq!(receipt.name, persisted_object_info.name);
+        assert_eq!(receipt.version_id, persisted_object_info.version_id);
+        assert_eq!(receipt.mod_time, persisted_object_info.mod_time);
+        assert_eq!(receipt.delete_marker, persisted_object_info.delete_marker);
+        assert_eq!(receipt.transitioned_object.name, persisted_object_info.transitioned_object.name);
+        assert_eq!(
+            receipt.transitioned_object.version_id,
+            persisted_object_info.transitioned_object.version_id
+        );
+        assert_eq!(receipt.transitioned_object.tier, persisted_object_info.transitioned_object.tier);
+        assert_eq!(
+            receipt.transitioned_object.free_version,
+            persisted_object_info.transitioned_object.free_version
+        );
+        assert_eq!(receipt.transitioned_object.status, persisted_object_info.transitioned_object.status);
+        assert_eq!(receipt.transition_version_state, persisted_object_info.transition_version_state);
+        assert_eq!(
+            crate::services::tier::tier::tier_destination_id_from_metadata(&receipt.user_defined)
+                .expect("receipt identity should decode"),
+            crate::services::tier::tier::tier_destination_id_from_metadata(&persisted_object_info.user_defined)
+                .expect("persisted identity should decode")
+        );
+        assert_eq!(
+            receipt.user_defined.len(),
+            2,
+            "receipt should carry only the two compatibility identity keys"
+        );
+        assert_eq!(
+            receipt.user_defined.get("x-rustfs-internal-transition-tier-destination-id"),
+            Some(&identity_hex)
+        );
+        assert_eq!(
+            receipt.user_defined.get("x-minio-internal-transition-tier-destination-id"),
+            Some(&identity_hex)
+        );
+        assert!(!receipt.user_defined.contains_key("x-amz-meta-private"));
+        assert_eq!(receipt.size, 0);
+        assert_eq!(receipt.actual_size, 0);
+        assert!(receipt.parts.is_empty());
+        assert!(receipt.etag.is_none());
+        assert!(receipt.checksum.is_none());
+        assert!(receipt.data_dir.is_none());
+    }
+
+    #[test]
+    fn tier_free_version_receipt_sink_deduplicates_remote_target_and_drains_once() {
+        let identity_hex = "11".repeat(32);
+        let source = transitioned_receipt_source(
+            "bucket",
+            "object",
+            "remote-version",
+            rustfs_filemeta::TransitionVersionState::Exact,
+            Some(&identity_hex),
+        );
+        let other_object = transitioned_receipt_source(
+            "bucket",
+            "other-object",
+            "remote-version",
+            rustfs_filemeta::TransitionVersionState::Exact,
+            Some(&identity_hex),
+        );
+        let sink = TierFreeVersionReceiptSink::new();
+        let clone = sink.clone();
+
+        assert!(
+            sink.record(&source, Uuid::from_u128(10))
+                .expect("first physical receipt should record")
+        );
+        assert!(
+            clone
+                .record(&source, Uuid::from_u128(11))
+                .expect("tuple-equivalent physical receipt should be represented")
+        );
+        assert!(
+            clone
+                .record(&other_object, Uuid::from_u128(12))
+                .expect("a different logical key should retain its own task")
+        );
+
+        let mut receipts = sink.drain().expect("owner should drain shared receipts");
+        receipts.sort_by(|left, right| left.name.cmp(&right.name));
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].name, "object");
+        assert_eq!(receipts[0].version_id, Some(Uuid::from_u128(10)));
+        assert_eq!(receipts[1].name, "other-object");
+        assert_eq!(receipts[1].version_id, Some(Uuid::from_u128(12)));
+        assert_eq!(
+            clone.drain().expect_err("a shared sink must drain only once").kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            clone
+                .record(&source, Uuid::from_u128(13))
+                .expect_err("recording after drain must fail")
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn tier_free_version_receipt_identity_covers_every_destructive_dimension() {
+        let identity_hex = "44".repeat(32);
+        let baseline = transitioned_receipt_source(
+            "bucket",
+            "directory/",
+            "remote-version",
+            rustfs_filemeta::TransitionVersionState::Exact,
+            Some(&identity_hex),
+        );
+        let mut encoded_duplicate = baseline.clone();
+        encoded_duplicate.name = "directory__XLDIR__".to_string();
+
+        let mut variants = Vec::new();
+        let mut changed = baseline.clone();
+        changed.bucket = "other-bucket".to_string();
+        variants.push(changed);
+        let mut changed = baseline.clone();
+        changed.name = "other-directory/".to_string();
+        variants.push(changed);
+        let mut changed = baseline.clone();
+        changed.transitioned_object.tier = "COLD".to_string();
+        variants.push(changed);
+        let mut changed = baseline.clone();
+        changed.transitioned_object.name = "remote/other-directory/".to_string();
+        variants.push(changed);
+        let mut changed = baseline.clone();
+        changed.transitioned_object.version_id = "other-remote-version".to_string();
+        variants.push(changed);
+        let mut changed = baseline.clone();
+        changed.transition_version_state = rustfs_filemeta::TransitionVersionState::SuspendedNull;
+        changed.transitioned_object.version_id = "null".to_string();
+        variants.push(changed);
+        let mut changed = baseline.clone();
+        rustfs_utils::http::metadata_compat::insert_str(
+            Arc::make_mut(&mut changed.user_defined),
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            "55".repeat(32),
+        );
+        variants.push(changed);
+
+        let sink = TierFreeVersionReceiptSink::new();
+        assert!(
+            sink.record(&baseline, Uuid::from_u128(20))
+                .expect("baseline receipt should record")
+        );
+        assert!(
+            sink.record(&encoded_duplicate, Uuid::from_u128(21))
+                .expect("the encoded spelling of one logical key should deduplicate")
+        );
+        for (offset, variant) in variants.iter().enumerate() {
+            assert!(
+                sink.record(variant, Uuid::from_u128(30 + offset as u128))
+                    .expect("each distinct cleanup identity should record")
+            );
+        }
+
+        let receipts = sink.drain().expect("identity matrix should drain once");
+        assert_eq!(receipts.len(), 8, "every destructive identity dimension must prevent deduplication");
+        let baseline_receipt = receipts
+            .iter()
+            .find(|receipt| {
+                receipt.bucket == "bucket"
+                    && receipt.name == "directory/"
+                    && receipt.transitioned_object.tier == "WARM"
+                    && receipt.transitioned_object.name == "remote/directory/"
+                    && receipt.transitioned_object.version_id == "remote-version"
+                    && receipt.transition_version_state == rustfs_filemeta::TransitionVersionState::Exact
+                    && crate::services::tier::tier::tier_destination_id_from_metadata(&receipt.user_defined)
+                        .is_ok_and(|identity| identity == Some([0x44; 32]))
+            })
+            .expect("baseline cleanup identity should remain present");
+        assert_eq!(
+            baseline_receipt.version_id,
+            Some(Uuid::from_u128(20)),
+            "deduplication must retain the first UUID"
+        );
+    }
+
+    #[test]
+    fn tier_free_version_receipt_source_validation_fails_closed() {
+        let identity_hex = "22".repeat(32);
+        for (state, remote_version) in [
+            (rustfs_filemeta::TransitionVersionState::KnownDisabled, ""),
+            (rustfs_filemeta::TransitionVersionState::SuspendedNull, "null"),
+            (rustfs_filemeta::TransitionVersionState::Exact, "opaque-version"),
+        ] {
+            let source = transitioned_receipt_source("bucket", "object", remote_version, state, Some(&identity_hex));
+            assert!(
+                TierFreeVersionReceiptSink::new()
+                    .record(&source, Uuid::new_v4())
+                    .expect("canonical remote-version state should be eligible"),
+                "state={state:?} remote_version={remote_version:?}"
+            );
+        }
+
+        let unknown = transitioned_receipt_source(
+            "bucket",
+            "object",
+            "opaque-version",
+            rustfs_filemeta::TransitionVersionState::Unknown,
+            Some(&identity_hex),
+        );
+        assert!(
+            !TierFreeVersionReceiptSink::new()
+                .record(&unknown, Uuid::new_v4())
+                .expect("unknown remote version state should defer to recovery")
+        );
+        let missing_identity = transitioned_receipt_source(
+            "bucket",
+            "object",
+            "opaque-version",
+            rustfs_filemeta::TransitionVersionState::Exact,
+            None,
+        );
+        assert!(
+            !TierFreeVersionReceiptSink::new()
+                .record(&missing_identity, Uuid::new_v4())
+                .expect("missing durable identity should defer to recovery")
+        );
+        let invalid_exact = transitioned_receipt_source(
+            "bucket",
+            "object",
+            "",
+            rustfs_filemeta::TransitionVersionState::Exact,
+            Some(&identity_hex),
+        );
+        assert!(
+            !TierFreeVersionReceiptSink::new()
+                .record(&invalid_exact, Uuid::new_v4())
+                .expect("conflicting remote state should defer to recovery")
+        );
+
+        let mut conflicting = transitioned_receipt_source(
+            "bucket",
+            "object",
+            "opaque-version",
+            rustfs_filemeta::TransitionVersionState::Exact,
+            Some(&identity_hex),
+        );
+        Arc::make_mut(&mut conflicting.user_defined)
+            .insert("x-minio-internal-transition-tier-destination-id".to_string(), "33".repeat(32));
+        assert_eq!(
+            TierFreeVersionReceiptSink::new()
+                .record(&conflicting, Uuid::new_v4())
+                .expect_err("conflicting identity aliases must fail closed")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let valid = transitioned_receipt_source(
+            "bucket",
+            "object",
+            "opaque-version",
+            rustfs_filemeta::TransitionVersionState::Exact,
+            Some(&identity_hex),
+        );
+        assert_eq!(
+            TierFreeVersionReceiptSink::new()
+                .record(&valid, Uuid::nil())
+                .expect_err("nil local free-version identity must be rejected")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
     #[test]
     fn object_options_default_does_not_allocate_lifecycle_delete_all_journal() {
         let mut opts = ObjectOptions::default();
 
         assert!(opts.lifecycle_delete_all_journal().is_none());
+        assert!(opts.tier_free_version_receipt_sink.is_none());
         opts.ensure_lifecycle_delete_all_journal();
         assert!(opts.lifecycle_delete_all_journal().is_some());
     }

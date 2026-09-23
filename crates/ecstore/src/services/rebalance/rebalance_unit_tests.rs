@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::control::validate_rebalance_disk_stats_coverage;
+use super::control::{fail_next_rebalance_activation_save_for_test, validate_rebalance_disk_stats_coverage};
 use super::meta::{
     RebalanceMetaMergeOutcome, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
     apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
     complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue, defer_bucket_in_rebalance_queue,
     ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, first_rebalance_bucket,
     has_deferred_rebalance_error, is_rebalance_actively_running, is_rebalance_conflicting_with_decommission,
-    is_rebalance_in_progress, is_rebalance_meta_replaceable_for_new_id, is_rebalance_stopped_terminal_event,
-    mark_rebalance_bucket_done, merge_rebalance_bucket_lists, merge_rebalance_meta, next_rebal_bucket_from_stat,
-    percent_free_ratio, rebalance_goal_reached, rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error,
-    rebalance_meta_load_unknown_version_error, record_rebalance_cleanup_warning_in_meta, remove_rebalanced_buckets_from_queue,
+    is_rebalance_in_progress, is_rebalance_meta_replaceable_for_new_id, mark_rebalance_bucket_done, merge_rebalance_bucket_lists,
+    merge_rebalance_meta, next_rebal_bucket_from_stat, percent_free_ratio, rebalance_goal_reached,
+    rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
+    rebalance_requires_worker_activation, record_rebalance_cleanup_warning_in_meta, remove_rebalanced_buckets_from_queue,
     resolve_next_rebalance_bucket, resolve_rebalance_participants, should_accept_rebalance_stats_update,
     should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
     should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
@@ -32,24 +32,31 @@ use super::migration::{
     MigrationBackend, MigrationVersionResult, migrate_entry_version, migrate_entry_version_with_retry_wait,
     rebalance_delete_marker_opts,
 };
-use super::runtime::{should_fail_repeated_rebalance_bucket_defer, source_cleanup_defer_attempt};
+use super::runtime::{
+    RebalanceLocalActivationOutcome, commit_local_rebalance_worker_activation,
+    commit_local_rebalance_worker_activation_candidate, reached_rebalance_source_cleanup_defer_limit,
+    should_fail_repeated_rebalance_bucket_defer, source_cleanup_defer_attempt, stage_local_rebalance_worker_activation,
+};
 use super::worker::{
     RebalanceEntryCleanupResult, ensure_rebalance_listing_disks_available, is_transient_rebalance_error,
     parse_rebalance_max_attempts, rebalance_listing_retry_delay, rebalance_migration_retry_delay,
     resolve_load_rebalance_stats_update_result, resolve_rebalance_bucket_error, resolve_rebalance_bucket_result,
-    resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
-    resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result, resolve_rebalance_migrate_result_error,
-    resolve_rebalance_optional_bucket_config_result, resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result,
-    resolve_rebalance_terminal_error, resolve_rebalance_worker_result, run_rebalance_listing_with_retry,
-    send_rebalance_done_signal, should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete,
-    should_defer_rebalance_entry_failure, should_retry_rebalance_listing, should_skip_rebalance_delete_marker,
-    wait_rebalance_entry_tasks, wait_rebalance_listing_retry, with_rebalance_entry_context,
+    resolve_rebalance_deferred_last_error, resolve_rebalance_entry_cleanup_delete_result,
+    resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
+    resolve_rebalance_migrate_result_error, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_save_task_result,
+    resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
+    run_rebalance_listing_with_retry, send_rebalance_done_signal, should_cleanup_rebalance_source_entry,
+    should_count_rebalance_version_complete, should_defer_rebalance_entry_failure, should_retry_rebalance_listing,
+    should_skip_rebalance_delete_marker, wait_rebalance_entry_tasks, wait_rebalance_listing_retry, with_rebalance_entry_context,
 };
 use super::{
     DiskStat, GetObjectReader, ObjectInfo, ObjectOptions, RebalSaveOpt, RebalStatus, RebalanceBucketConfigs,
-    RebalanceBucketOutcome, RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta, RebalanceStats,
+    RebalanceBucketOutcome, RebalanceCleanupWarnings, RebalanceDeferKind, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta,
+    RebalanceStats, RebalanceStopPropagationRecord,
 };
-use super::{REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX, REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX};
+use super::{
+    REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX, REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX, REBALANCE_SOURCE_CLEANUP_MAX_DEFERS,
+};
 use crate::bucket::replication::{ReplicationState, ReplicationStatusType, replication_state_to_filemeta};
 use crate::data_movement;
 use crate::data_movement::SourceCleanupError;
@@ -1672,6 +1679,30 @@ fn test_resolve_rebalance_stats_update_result_passthrough() {
 }
 
 #[test]
+fn test_rebalance_stop_preserves_cancellation_through_entry_context() {
+    let err = resolve_rebalance_stats_update_result(Err(Error::OperationCanceled), 0, "bucket", "object")
+        .expect_err("canceled stats update");
+    let err = with_rebalance_entry_context("stats", "bucket", "object", err);
+    assert!(matches!(err, Error::OperationCanceled));
+    assert!(matches!(
+        classify_rebalance_terminal_event(Some(Err(err)), OffsetDateTime::now_utc()),
+        RebalanceTerminalEvent::Stopped { .. }
+    ));
+}
+
+#[tokio::test]
+async fn test_rebalance_stop_does_not_hide_later_entry_failure() {
+    let tasks = Arc::new(tokio::sync::Mutex::new(vec![
+        tokio::spawn(async { Err(Error::OperationCanceled) }),
+        tokio::spawn(async { Err(Error::ErasureWriteQuorum) }),
+    ]));
+    let err = wait_rebalance_entry_tasks(0, tasks)
+        .await
+        .expect_err("entry I/O failure must survive sibling cancellation");
+    assert!(matches!(err, Error::ErasureWriteQuorum));
+}
+
+#[test]
 fn test_resolve_rebalance_stats_update_result_wraps_error_context() {
     let err = resolve_rebalance_stats_update_result(Err(Error::SlowDown), 2, "bucket-a", "obj.txt")
         .expect_err("stats update error should include context");
@@ -1746,12 +1777,128 @@ fn test_resolve_rebalance_entry_cleanup_delete_result_ignores_not_found() {
 
 #[test]
 fn test_resolve_rebalance_entry_cleanup_delete_result_returns_warning_for_failures() {
-    let result = resolve_rebalance_entry_cleanup_delete_result(Err(Error::SlowDown.into()), "bucket-a", "obj.txt");
+    let result = resolve_rebalance_entry_cleanup_delete_result(Err(Error::FileAccessDenied.into()), "bucket-a", "obj.txt");
     assert!(matches!(
         result,
         RebalanceEntryCleanupResult::Completed { warning: Some(ref message) }
             if message.contains("rebalance cleanup delete failed for bucket-a/obj.txt")
     ));
+}
+
+#[test]
+fn test_resolve_rebalance_entry_cleanup_delete_result_defers_transient_failures() {
+    let cases = [
+        (Error::SlowDown, "slow down"),
+        (
+            Error::Lock(rustfs_lock::LockError::timeout("bucket-a/obj.txt@latest", Duration::from_secs(5))),
+            "object lock timeout",
+        ),
+        (
+            Error::Lock(rustfs_lock::LockError::network(
+                "peer unavailable",
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+            )),
+            "object lock network failure",
+        ),
+        (Error::ErasureWriteQuorum, "write quorum"),
+        (Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)), "io timeout"),
+        (
+            Error::other("Lock error: Lock acquisition timeout for resource 'bucket-a/obj.txt@latest' after 5s"),
+            "rendered lock timeout text",
+        ),
+    ];
+
+    for (err, label) in cases {
+        match resolve_rebalance_entry_cleanup_delete_result(Err(err.into()), "bucket-a", "obj.txt") {
+            RebalanceEntryCleanupResult::Deferred { last_error } => {
+                assert!(
+                    last_error.starts_with(REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX),
+                    "{label}: {last_error}"
+                );
+                assert!(last_error.contains("bucket-a/obj.txt"), "{label}: {last_error}");
+            }
+            RebalanceEntryCleanupResult::Completed { warning } => {
+                panic!("{label} must defer source cleanup instead of completing the entry with warning {warning:?}")
+            }
+        }
+    }
+}
+
+#[test]
+fn test_resolve_rebalance_entry_cleanup_delete_result_defers_stage_wrapped_lock_timeout() {
+    let err = data_movement::data_movement_stage_error_for_test(
+        "rebalance",
+        "delete_object",
+        "bucket-a",
+        "obj.txt",
+        Error::Lock(rustfs_lock::LockError::timeout("bucket-a/obj.txt@latest", Duration::from_secs(5))),
+    );
+
+    assert!(matches!(
+        resolve_rebalance_entry_cleanup_delete_result(Err(err.into()), "bucket-a", "obj.txt"),
+        RebalanceEntryCleanupResult::Deferred { .. }
+    ));
+}
+
+#[test]
+fn test_resolve_rebalance_entry_cleanup_delete_result_ignores_stage_wrapped_not_found() {
+    let err = data_movement::data_movement_stage_error_for_test(
+        "rebalance",
+        "delete_object",
+        "bucket-a",
+        "obj.txt",
+        Error::ObjectNotFound("bucket-a".to_string(), "obj.txt".to_string()),
+    );
+
+    assert_eq!(
+        resolve_rebalance_entry_cleanup_delete_result(Err(err.into()), "bucket-a", "obj.txt"),
+        RebalanceEntryCleanupResult::Completed { warning: None }
+    );
+}
+
+#[test]
+fn test_resolve_rebalance_deferred_last_error_hides_retryable_cleanup_conflicts() {
+    let entry_error = format!("{REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX} timeout");
+    assert_eq!(
+        resolve_rebalance_deferred_last_error(RebalanceDeferKind::Entry, None, entry_error.as_str()),
+        Some(entry_error.clone()),
+        "transient migration deferrals must stay visible to the completion guards"
+    );
+
+    let cleanup_error = format!("{REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX} lock acquisition timeout");
+    assert_eq!(
+        resolve_rebalance_deferred_last_error(RebalanceDeferKind::SourceCleanup, None, cleanup_error.as_str()),
+        None,
+        "a retryable source cleanup conflict is progress, not a pool failure"
+    );
+
+    assert_eq!(
+        resolve_rebalance_deferred_last_error(
+            RebalanceDeferKind::SourceCleanup,
+            Some(entry_error.as_str()),
+            cleanup_error.as_str()
+        ),
+        Some(entry_error.clone()),
+        "a cleanup deferral for one bucket must not erase an unresolved migration deferral of the same pool"
+    );
+    assert_eq!(
+        resolve_rebalance_deferred_last_error(
+            RebalanceDeferKind::SourceCleanup,
+            Some(cleanup_error.as_str()),
+            cleanup_error.as_str()
+        ),
+        None,
+        "a stale retryable cleanup message must not survive as a pool failure"
+    );
+    assert_eq!(
+        resolve_rebalance_deferred_last_error(
+            RebalanceDeferKind::SourceCleanup,
+            Some(entry_error.as_str()),
+            entry_error.as_str()
+        ),
+        Some(entry_error),
+        "repeated cleanup deferrals must keep the pending migration deferral visible"
+    );
 }
 
 #[test]
@@ -1788,6 +1935,89 @@ fn test_source_cleanup_defer_does_not_fail_repeated_bucket_retry() {
     assert_eq!(source_cleanup_defer_attempt(&mut source_attempts, "bucket-c"), 1);
     assert_eq!(source_cleanup_defer_attempt(&mut source_attempts, "bucket-c"), 2);
     assert_eq!(source_cleanup_defer_attempt(&mut source_attempts, "bucket-c"), 3);
+
+    let mut bounded_attempts = std::collections::HashMap::new();
+    for expected in 1..REBALANCE_SOURCE_CLEANUP_MAX_DEFERS {
+        assert_eq!(source_cleanup_defer_attempt(&mut bounded_attempts, "bucket-d"), expected);
+        assert!(
+            !reached_rebalance_source_cleanup_defer_limit(expected),
+            "a retryable cleanup conflict must stay retryable at deferral {expected}"
+        );
+    }
+    assert_eq!(
+        source_cleanup_defer_attempt(&mut bounded_attempts, "bucket-d"),
+        REBALANCE_SOURCE_CLEANUP_MAX_DEFERS
+    );
+    assert!(
+        reached_rebalance_source_cleanup_defer_limit(REBALANCE_SOURCE_CLEANUP_MAX_DEFERS),
+        "an unreclaimable source replica must fail the bucket after the bounded deferral budget"
+    );
+}
+
+#[tokio::test]
+async fn test_defer_rebalance_bucket_keeps_pending_entry_defer_without_surfacing_cleanup_conflicts() {
+    let id = "rebalance-defer-last-error";
+    let meta = RebalanceMeta {
+        id: id.to_string(),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            buckets: vec!["bucket-a".to_string(), "bucket-b".to_string()],
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let store = test_store_with_rebalance_meta(meta);
+    let cleanup_error = format!("{REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX} lock acquisition timeout");
+
+    store
+        .defer_rebalance_bucket(0, "bucket-a".to_string(), cleanup_error.clone(), id, RebalanceDeferKind::SourceCleanup)
+        .await
+        .expect("a retryable cleanup conflict must be deferrable");
+    {
+        let meta = store.rebalance_meta.read().await;
+        let pool_stat = &meta.as_ref().expect("rebalance metadata should exist").pool_stats[0];
+        assert_eq!(
+            pool_stat.info.last_error, None,
+            "a retryable cleanup conflict is progress and must not surface as a pool failure"
+        );
+        assert_eq!(pool_stat.buckets, vec!["bucket-b".to_string(), "bucket-a".to_string()]);
+    }
+
+    let entry_error = format!("{REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX} slow down");
+    {
+        let mut meta = store.rebalance_meta.write().await;
+        meta.as_mut().expect("rebalance metadata should exist").pool_stats[0]
+            .info
+            .last_error = Some(entry_error.clone());
+    }
+    store
+        .defer_rebalance_bucket(0, "bucket-b".to_string(), cleanup_error, id, RebalanceDeferKind::SourceCleanup)
+        .await
+        .expect("a cleanup deferral must be accepted while another bucket still defers an entry");
+    {
+        let meta = store.rebalance_meta.read().await;
+        let pool_stat = &meta.as_ref().expect("rebalance metadata should exist").pool_stats[0];
+        assert_eq!(
+            pool_stat.info.last_error,
+            Some(entry_error),
+            "a cleanup deferral must not erase the pending migration deferral that blocks goal completion"
+        );
+        assert!(has_deferred_rebalance_error(pool_stat));
+        assert_eq!(pool_stat.buckets, vec!["bucket-a".to_string(), "bucket-b".to_string()]);
+    }
+
+    let migration_error = format!("{REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX} i/o timeout");
+    store
+        .defer_rebalance_bucket(0, "bucket-a".to_string(), migration_error.clone(), id, RebalanceDeferKind::Entry)
+        .await
+        .expect("migration deferrals must keep their last error");
+    let meta = store.rebalance_meta.read().await;
+    let pool_stat = &meta.as_ref().expect("rebalance metadata should exist").pool_stats[0];
+    assert_eq!(pool_stat.info.last_error, Some(migration_error));
 }
 
 #[test]
@@ -1876,6 +2106,124 @@ fn test_is_transient_rebalance_error_accepts_lock_and_rpc_timeouts() {
 #[test]
 fn test_is_transient_rebalance_error_accepts_wrapped_disk_timeout() {
     assert!(is_transient_rebalance_error(&Error::Io(std::io::Error::other(DiskError::Timeout))));
+}
+
+#[test]
+fn test_rebalance_stage_wrapped_transient_errors_remain_retryable() {
+    let cases = [
+        Error::Lock(rustfs_lock::LockError::timeout(".rustfs.sys/pool.bin@latest", Duration::from_secs(5))),
+        Error::Lock(rustfs_lock::LockError::network(
+            "peer unavailable",
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+        )),
+        Error::SlowDown,
+        Error::ErasureReadQuorum,
+        Error::ErasureWriteQuorum,
+        Error::Io(std::io::Error::other(DiskError::Timeout)),
+        Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+    ];
+    for mut error in cases {
+        for depth in 0..=3 {
+            assert!(is_transient_rebalance_error(&error), "transient source lost at depth {depth}: {error:?}");
+            assert!(
+                should_defer_rebalance_entry_failure(&error),
+                "exhausted transient entries must be deferred"
+            );
+            assert!(should_retry_rebalance_listing(&error, 0, 3));
+            assert!(
+                !should_retry_rebalance_listing(&error, 2, 3),
+                "wrapping must not bypass the attempt limit"
+            );
+            error = data_movement::data_movement_stage_error_for_test(
+                "rebalance_object",
+                "put_object",
+                "bucket",
+                "baseline/00042.bin",
+                error,
+            );
+        }
+    }
+}
+
+#[test]
+fn test_rebalance_stage_wrapped_terminal_errors_remain_terminal() {
+    let cases = [
+        Error::FileAccessDenied,
+        Error::FileCorrupt,
+        Error::OperationCanceled,
+        Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string()),
+        Error::Lock(rustfs_lock::LockError::already_locked("bucket/object", "owner")),
+        Error::other("permission denied"),
+    ];
+    for mut error in cases {
+        for depth in 0..=3 {
+            assert!(
+                !is_transient_rebalance_error(&error),
+                "terminal source must survive depth {depth}: {error:?}"
+            );
+            assert!(!should_defer_rebalance_entry_failure(&error));
+            // Object names are untrusted context, not evidence of a transient failure.
+            error = data_movement::data_movement_stage_error_for_test(
+                "rebalance_object",
+                "put_object",
+                "bucket",
+                "remote lock rpc timed out",
+                error,
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_rebalance_stage_wrapped_lock_timeout_retries_real_migration_loop() {
+    for succeeds_on_retry in [true, false] {
+        let backend = MigrationBackendSpy::new(None, None);
+        let attempts = AtomicUsize::new(0);
+        let waits = AtomicUsize::new(0);
+        let mut transfer = |_, _, _| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if succeeds_on_retry && attempt > 0 {
+                    return Ok(());
+                }
+                Err(data_movement::data_movement_stage_error_for_test(
+                    "rebalance_object",
+                    "put_object",
+                    "bucket",
+                    "baseline/00042.bin",
+                    Error::Lock(rustfs_lock::LockError::timeout(".rustfs.sys/pool.bin@latest", Duration::from_secs(5))),
+                ))
+            }
+        };
+        let version = version_normal();
+        let result = migrate_entry_version_with_retry_wait(
+            &backend,
+            "bucket".to_string(),
+            0,
+            &version,
+            None,
+            3,
+            false,
+            &mut transfer,
+            |_: String, _: String, _: ObjectOptions| async { Ok::<_, Error>(ObjectInfo::default()) },
+            |_| {
+                waits.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(())
+            },
+        )
+        .await;
+        assert_eq!(result.moved, succeeds_on_retry);
+        assert_eq!(result.failed, !succeeds_on_retry);
+        assert_eq!(attempts.load(Ordering::SeqCst), if succeeds_on_retry { 2 } else { 3 });
+        assert_eq!(backend.get_calls(), attempts.load(Ordering::SeqCst));
+        assert_eq!(waits.load(Ordering::SeqCst), attempts.load(Ordering::SeqCst) - 1);
+        if !succeeds_on_retry {
+            assert_eq!(result.stage, Some("write_target"));
+            assert!(should_defer_rebalance_entry_failure(
+                result.error.as_ref().expect("exhaustion must retain its source error")
+            ));
+        }
+    }
 }
 
 #[test]
@@ -2360,9 +2708,9 @@ fn test_resolve_rebalance_terminal_error_wraps_signal_failure_context() {
 }
 
 #[test]
-fn test_resolve_rebalance_bucket_error_prefers_entry_error() {
+fn test_resolve_rebalance_bucket_error_prefers_real_failure_over_entry_cancellation() {
     let err = resolve_rebalance_bucket_error(Some(Error::OperationCanceled), Some(Error::SlowDown)).unwrap_err();
-    assert!(matches!(err, Error::OperationCanceled));
+    assert!(matches!(err, Error::SlowDown));
 }
 
 #[test]
@@ -2508,19 +2856,6 @@ fn test_apply_rebalance_terminal_event_stopped_clears_error() {
 }
 
 #[test]
-fn test_is_rebalance_stopped_terminal_event_only_matches_stopped_variant() {
-    let stopped = RebalanceTerminalEvent::Stopped {
-        msg: "stopped".to_string(),
-    };
-    let completed = RebalanceTerminalEvent::Completed {
-        msg: "completed".to_string(),
-    };
-
-    assert!(is_rebalance_stopped_terminal_event(&stopped));
-    assert!(!is_rebalance_stopped_terminal_event(&completed));
-}
-
-#[test]
 fn test_should_preserve_rebalance_stopped_state_when_meta_marked_stopped() {
     let event = RebalanceTerminalEvent::Completed {
         msg: "completed".to_string(),
@@ -2530,13 +2865,14 @@ fn test_should_preserve_rebalance_stopped_state_when_meta_marked_stopped() {
 }
 
 #[test]
-fn test_should_preserve_rebalance_stopped_state_when_pool_already_stopped() {
+fn test_rebalance_stop_does_not_hide_real_terminal_failure() {
     let event = RebalanceTerminalEvent::Failed {
         msg: "failed".to_string(),
         last_error: "boom".to_string(),
     };
 
-    assert!(should_preserve_rebalance_stopped_state(false, RebalStatus::Stopped, &event));
+    assert!(!should_preserve_rebalance_stopped_state(false, RebalStatus::Stopped, &event));
+    assert!(!should_preserve_rebalance_stopped_state(true, RebalStatus::Started, &event));
 }
 
 #[test]
@@ -2680,7 +3016,10 @@ async fn test_start_rebalance_for_id_rejects_changed_metadata() {
         .await
         .expect_err("staged start must not start changed metadata");
 
-    assert!(err.to_string().contains("rebalance metadata changed before start"));
+    assert!(
+        err.to_string()
+            .contains("stale rebalance worker rejected during start rebalance")
+    );
 }
 
 #[tokio::test]
@@ -2708,6 +3047,313 @@ async fn test_start_rebalance_for_id_rejects_stopped_metadata() {
     assert!(err.to_string().contains("was stopped before start"));
 }
 
+#[test]
+fn test_rebalance_stop_intent_blocks_activation_before_durable_timestamp() {
+    let mut meta = RebalanceMeta {
+        id: "stopping".to_string(),
+        stop_requested: true,
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            buckets: vec!["pending".to_string()],
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let outcome = commit_local_rebalance_worker_activation(&mut meta, "stopping", CancellationToken::new())
+        .expect("stop must prevent activation without a new error");
+    assert_eq!(outcome, RebalanceLocalActivationOutcome::NotStartedTerminal);
+    assert!(meta.cancel.is_none());
+    assert!(meta.stopped_at.is_none());
+    let bytes = rmp_serde::to_vec_named(&meta).expect("encode legacy-compatible metadata");
+    let reloaded: RebalanceMeta = rmp_serde::from_slice(&bytes).expect("decode metadata");
+    assert!(!reloaded.stop_requested, "operator intent is local, not a new persisted field");
+}
+
+#[test]
+fn test_stopped_activation_state_prevents_worker_token_commit() {
+    let mut meta = RebalanceMeta {
+        id: "rebalance-a".to_string(),
+        stopped_at: Some(OffsetDateTime::now_utc()),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let outcome = commit_local_rebalance_worker_activation(&mut meta, "rebalance-a", tokio_util::sync::CancellationToken::new())
+        .expect("stopped metadata should produce a non-start outcome");
+    assert_eq!(outcome, RebalanceLocalActivationOutcome::NotStartedTerminal);
+    assert!(meta.cancel.is_none(), "stopped rebalance must not receive a worker token");
+}
+
+#[test]
+fn test_rebalance_activation_candidate_does_not_clobber_replacement_token() {
+    let mut local = RebalanceMeta {
+        id: "rebalance-a".to_string(),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            buckets: vec!["bucket-a".to_string()],
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (candidate, outcome, must_persist) =
+        stage_local_rebalance_worker_activation(&local, "rebalance-a", CancellationToken::new(), OffsetDateTime::UNIX_EPOCH)
+            .expect("active activation candidate should be staged");
+    assert_eq!(outcome, RebalanceLocalActivationOutcome::Started);
+    assert!(!must_persist);
+
+    let replacement = CancellationToken::new();
+    local.cancel = Some(replacement.clone());
+    let err = commit_local_rebalance_worker_activation_candidate(&mut local, "rebalance-a", None, candidate)
+        .expect_err("a replacement token must reject the stale activation candidate");
+    assert!(err.to_string().contains("worker token changed"));
+    assert_eq!(local.cancel.as_ref(), Some(&replacement));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_rebalance_start_save_failure_retries_persisted_completed_state() {
+    let active = RebalanceMeta {
+        id: "rebalance-real-save-completed".to_string(),
+        percent_free_goal: 0.5,
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            init_free_space: 400,
+            init_capacity: 1_000,
+            bytes: 100,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (_temp_dirs, store) = super::test_store_with_persisted_rebalance_meta(active).await;
+
+    fail_next_rebalance_activation_save_for_test("rebalance-real-save-completed");
+    let err = store
+        .start_rebalance_under_gate()
+        .await
+        .expect_err("the injected first activation save must fail through the real start path");
+    assert!(
+        err.to_string().contains("injected rebalance activation save failure"),
+        "unexpected activation error: {err}"
+    );
+    {
+        let local = store.rebalance_meta.read().await;
+        let local = local.as_ref().expect("local rebalance metadata should remain present");
+        assert_eq!(local.pool_stats[0].info.status, RebalStatus::Started);
+        assert!(local.cancel.is_none(), "failed persistence must not publish a worker token");
+    }
+    let mut after_failure = RebalanceMeta::new();
+    after_failure
+        .load(store.pools[0].clone())
+        .await
+        .expect("active metadata should remain readable after the failed save");
+    assert_eq!(after_failure.pool_stats[0].info.status, RebalStatus::Started);
+
+    store
+        .start_rebalance_under_gate()
+        .await
+        .expect("the real start path must retry and persist the terminal candidate");
+
+    let mut persisted = RebalanceMeta::new();
+    persisted
+        .load(store.pools[0].clone())
+        .await
+        .expect("retry-persisted completed metadata should be readable");
+    assert_eq!(persisted.pool_stats[0].info.status, RebalStatus::Completed);
+    let local = store.rebalance_meta.read().await;
+    let local = local.as_ref().expect("local rebalance metadata should remain present");
+    assert_eq!(local.pool_stats[0].info.status, RebalStatus::Completed);
+    assert!(local.cancel.is_none());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_rebalance_start_save_failure_retries_persisted_stopped_state() {
+    let active = RebalanceMeta {
+        id: "rebalance-real-save-stopped".to_string(),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (_temp_dirs, store) = super::test_store_with_persisted_rebalance_meta(active).await;
+    let stopped_at = OffsetDateTime::from_unix_timestamp(1_000).expect("test timestamp should be valid");
+    {
+        let mut local = store.rebalance_meta.write().await;
+        let local = local.as_mut().expect("local rebalance metadata should remain present");
+        local.stopped_at = Some(stopped_at);
+        local.pool_stats[0].info.status = RebalStatus::Stopped;
+        local.pool_stats[0].info.end_time = Some(stopped_at);
+    }
+
+    fail_next_rebalance_activation_save_for_test("rebalance-real-save-stopped");
+    let err = store
+        .start_rebalance_under_gate()
+        .await
+        .expect_err("the injected first stopped-state save must fail through the real start path");
+    assert!(
+        err.to_string().contains("injected rebalance activation save failure"),
+        "unexpected activation error: {err}"
+    );
+    let mut after_failure = RebalanceMeta::new();
+    after_failure
+        .load(store.pools[0].clone())
+        .await
+        .expect("active metadata should remain readable after the failed save");
+    assert_eq!(after_failure.pool_stats[0].info.status, RebalStatus::Started);
+    {
+        let local = store.rebalance_meta.read().await;
+        let local = local.as_ref().expect("local rebalance metadata should remain present");
+        assert_eq!(local.pool_stats[0].info.status, RebalStatus::Stopped);
+        assert!(local.cancel.is_none(), "failed persistence must not publish a worker token");
+    }
+
+    store
+        .start_rebalance_under_gate()
+        .await
+        .expect("the real start path must retry and persist the stopped candidate");
+
+    let mut persisted = RebalanceMeta::new();
+    persisted
+        .load(store.pools[0].clone())
+        .await
+        .expect("retry-persisted stopped metadata should be readable");
+    assert_eq!(persisted.stopped_at, Some(stopped_at));
+    assert_eq!(persisted.pool_stats[0].info.status, RebalStatus::Stopped);
+    let local = store.rebalance_meta.read().await;
+    let local = local.as_ref().expect("local rebalance metadata should remain present");
+    assert_eq!(local.pool_stats[0].info.status, RebalStatus::Stopped);
+    assert!(local.cancel.is_none());
+}
+
+#[tokio::test]
+async fn test_old_worker_cannot_mutate_replacement_rebalance_state() {
+    let meta = RebalanceMeta {
+        id: "rebalance-b".to_string(),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            buckets: vec!["bucket-a".to_string()],
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let store = test_store_with_rebalance_meta(meta);
+    let fi = FileInfo {
+        size: 128,
+        ..Default::default()
+    };
+
+    for err in [
+        store
+            .next_rebal_bucket(0, "rebalance-a")
+            .await
+            .expect_err("old worker must not read replacement work"),
+        store
+            .bucket_rebalance_done(0, "bucket-a".to_string(), "rebalance-a")
+            .await
+            .expect_err("old worker must not complete replacement bucket"),
+        store
+            .update_pool_stats_batch_for_rebalance(0, "bucket-a".to_string(), &[&fi], "rebalance-a")
+            .await
+            .expect_err("old worker must not update replacement stats"),
+        store
+            .check_if_rebalance_done(0, "rebalance-a")
+            .await
+            .expect_err("old worker must not complete replacement pool"),
+        store
+            .save_rebalance_stats_for_id(0, RebalSaveOpt::Stats, "rebalance-a")
+            .await
+            .expect_err("old save task must not persist replacement metadata"),
+        store
+            .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, "rebalance-a")
+            .await
+            .expect_err("old stop path must not persist replacement metadata"),
+    ] {
+        assert!(err.to_string().contains("stale rebalance worker rejected"));
+    }
+
+    let meta = store.rebalance_meta.read().await;
+    let meta = meta.as_ref().expect("replacement metadata should remain present");
+    assert_eq!(meta.id, "rebalance-b");
+    assert!(meta.pool_stats[0].rebalanced_buckets.is_empty());
+    assert_eq!(meta.pool_stats[0].bytes, 0);
+    assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Started);
+    assert!(meta.stopped_at.is_none());
+}
+
+#[tokio::test]
+async fn test_rebalance_metadata_reload_under_start_gate_does_not_reacquire_gate() {
+    let store = test_store_with_rebalance_meta(RebalanceMeta::default());
+    let _start_guard = store.start_gate.lock().await;
+
+    let err = store
+        .load_rebalance_meta_under_start_gate()
+        .await
+        .expect_err("empty test store should reach the metadata load without waiting on start_gate again");
+
+    assert!(err.to_string().contains("no pools available"));
+}
+
+#[tokio::test]
+async fn test_stale_stop_propagation_cannot_mutate_replacement_rebalance() {
+    let meta = RebalanceMeta {
+        id: "rebalance-b".to_string(),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let store = test_store_with_rebalance_meta(meta);
+    let record = RebalanceStopPropagationRecord {
+        stop_failures: vec!["old rebalance stop failed".to_string()],
+        ..Default::default()
+    };
+
+    let err = store
+        .record_rebalance_stop_propagation("rebalance-a", record)
+        .await
+        .expect_err("old propagation failure must not mutate replacement metadata");
+
+    assert!(err.to_string().contains("stale rebalance worker rejected"));
+    let meta = store.rebalance_meta.read().await;
+    let meta = meta.as_ref().expect("replacement metadata should remain present");
+    assert_eq!(meta.id, "rebalance-b");
+    assert!(meta.last_refreshed_at.is_none());
+    assert!(meta.pool_stats[0].info.last_error.is_none());
+}
+
 fn test_store_with_rebalance_meta(meta: RebalanceMeta) -> Arc<crate::store::ECStore> {
     let endpoint_pools: crate::layout::endpoints::EndpointServerPools = Vec::new().into();
     Arc::new(crate::store::ECStore {
@@ -2719,7 +3365,7 @@ fn test_store_with_rebalance_meta(meta: RebalanceMeta) -> Arc<crate::store::ECSt
         rebalance_meta: tokio::sync::RwLock::new(Some(meta)),
         decommission_cancelers: tokio::sync::RwLock::new(Vec::new()),
         start_gate: tokio::sync::Mutex::new(()),
-        pool_meta_save_gate: tokio::sync::Mutex::new(()),
+        pool_meta_save_gate: tokio::sync::Mutex::default(),
         ctx: crate::runtime::instance::bootstrap_ctx(),
         bucket_fence_registry: std::sync::Arc::default(),
     })
@@ -3095,6 +3741,52 @@ fn test_is_rebalance_in_progress_only_started_participants() {
     };
 
     assert!(is_rebalance_in_progress(&meta));
+}
+
+#[test]
+fn test_rebalance_requires_worker_activation_only_for_active_non_stopped_metadata() {
+    let now = OffsetDateTime::now_utc();
+    let active = RebalanceMeta {
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let stopped_active = RebalanceMeta {
+        stopped_at: Some(now),
+        pool_stats: active.pool_stats.clone(),
+        ..Default::default()
+    };
+
+    assert!(rebalance_requires_worker_activation(&active));
+    for status in [
+        RebalStatus::Completed,
+        RebalStatus::Stopped,
+        RebalStatus::Failed,
+        RebalStatus::None,
+    ] {
+        let terminal = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            !rebalance_requires_worker_activation(&terminal),
+            "terminal status {status:?} must not resume"
+        );
+    }
+    assert!(!rebalance_requires_worker_activation(&stopped_active));
 }
 
 #[test]

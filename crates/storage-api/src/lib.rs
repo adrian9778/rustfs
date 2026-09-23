@@ -46,10 +46,20 @@ pub const NS_SCANNER_SERVER_EPOCH_QUERY: &str = "ns_scanner_server_epoch";
 pub const NS_SCANNER_SESSION_ID_QUERY: &str = "ns_scanner_session_id";
 pub const NS_SCANNER_SESSION_SEQUENCE_QUERY: &str = "ns_scanner_session_sequence";
 pub const NS_SCANNER_PROTOCOL_VERSION_QUERY: &str = "ns_scanner_protocol";
+pub const NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY: &str = "ns_scanner_tier_registry_generation";
 pub const NS_SCANNER_PROTOCOL_VERSION: u16 = 3;
 pub const SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION: u32 = 0;
 pub const SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION: u32 = 5;
-pub const SCANNER_ACTIVITY_PROTOCOL_VERSION: u32 = 6;
+/// Protocol v6 carries the activity fields that predate the storage-owned
+/// movement generation.  It remains readable during the rolling upgrade, but
+/// a scanner must not use it as a publication proof because terminal movement
+/// state is not authenticated by that version.
+pub const SCANNER_ACTIVITY_V6_PROTOCOL_VERSION: u32 = 6;
+pub const SCANNER_ACTIVITY_PROTOCOL_VERSION: u32 = 7;
+pub const SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION: u32 = 2;
+pub const SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES: usize = 32;
+pub const SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES: usize = SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES;
+pub const SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE: usize = 512 * 1024;
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +67,8 @@ pub struct NsScannerCapabilityResponse {
     pub version: u16,
     pub server_epoch: uuid::Uuid,
     pub proof: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_tier_registry_generation: Option<bool>,
 }
 
 pub mod admin;
@@ -78,6 +90,7 @@ pub use error::{StorageErrorCode, StorageResult};
 pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};
 pub use object::DeleteAccounting;
 pub use object::ObjectLockDeleteOptions;
+pub use object::ObjectToDeleteIdentity;
 pub use object::{DeletedObject, ObjectToDelete};
 pub use object::{ExpirationOptions, TransitionedObject};
 pub use object::{HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, ObjectLockRetentionOptions};
@@ -88,6 +101,10 @@ pub use object::{VersionMarker, WalkOptions, WalkVersionsSortOrder};
 pub use observability::{
     MemorySamplingState, ObservabilitySnapshot, ObservabilitySnapshotProvider, PlatformSupport, UserspaceProfilingCapability,
 };
+/// Object-metadata keys persisted in xl.meta `meta_user`. filemeta owns the
+/// on-disk spelling; contract consumers that read or write persisted object
+/// metadata (lifecycle object-lock checks) take the keys from here.
+pub use rustfs_filemeta::metadata_keys;
 pub use topology::{
     DiskCapabilities, TopologyCapabilities, TopologyDisk, TopologyLabels, TopologyPool, TopologySet, TopologySnapshot,
     TopologySnapshotProvider,

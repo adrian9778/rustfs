@@ -101,6 +101,8 @@ pub(super) enum KmsAdminOperation {
     Configure,
     /// Replacement of the running configuration.
     Reconfigure,
+    /// Reload of the persisted configuration.
+    Reload,
     /// Start or restart of the KMS service.
     Start,
     /// Stop of the KMS service.
@@ -127,6 +129,7 @@ impl KmsAdminOperation {
             Self::UntagResource => "UntagResource",
             Self::Configure => "Configure",
             Self::Reconfigure => "Reconfigure",
+            Self::Reload => "Reload",
             Self::Start => "Start",
             Self::Stop => "Stop",
             Self::Backup => "Backup",
@@ -147,7 +150,7 @@ impl KmsAdminOperation {
             // operations touch neither key material nor key state. Consumers
             // separate them from a plain access by the recorded operation name.
             Self::UpdateKeyDescription | Self::TagResource | Self::UntagResource => EventName::KmsKeyAccessed,
-            Self::Configure | Self::Reconfigure => EventName::KmsServiceConfigured,
+            Self::Configure | Self::Reconfigure | Self::Reload => EventName::KmsServiceConfigured,
             Self::Start => EventName::KmsServiceStarted,
             Self::Stop => EventName::KmsServiceStopped,
             // A backup reads the material of every key, and a restore
@@ -439,7 +442,6 @@ fn dispatch(entry: AuditEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine;
     use rustfs_kms::backends::local::LocalKmsBackend;
     use rustfs_kms::config::KmsConfig;
     use rustfs_kms::types::{CreateKeyRequest, DeleteKeyRequest, DescribeKeyRequest, GenerateDataKeyRequest, KeySpec};
@@ -689,8 +691,8 @@ mod tests {
             .expect("data key should be generated");
 
         // What the endpoint hands back, and therefore what must not reappear.
-        let plaintext_b64 = base64::prelude::BASE64_STANDARD.encode(&response.plaintext_key);
-        let ciphertext_b64 = base64::prelude::BASE64_STANDARD.encode(&response.ciphertext_blob);
+        let plaintext_b64 = base64_simd::STANDARD.encode_to_string(&response.plaintext_key);
+        let ciphertext_b64 = base64_simd::STANDARD.encode_to_string(&response.ciphertext_blob);
         assert!(!response.plaintext_key.is_empty(), "the test must drive real key material");
 
         let redacted = rustfs_kms::redact_encryption_context(&std::collections::HashMap::from([

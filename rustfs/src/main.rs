@@ -12,16 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(all(feature = "hotpath", feature = "hotpath-alloc"))]
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
 use std::alloc::{GlobalAlloc, Layout};
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
+use std::ptr::NonNull;
 
-#[cfg(all(feature = "hotpath", feature = "hotpath-alloc"))]
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
 #[derive(Default)]
 struct MiMallocAllocator;
 
-#[cfg(all(feature = "hotpath", feature = "hotpath-alloc"))]
-// SAFETY: allocation operations are forwarded unchanged to MiMalloc, so
-// MiMalloc's GlobalAlloc guarantees apply to every returned pointer and layout.
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
+// SAFETY: allocation operations are forwarded to MiMalloc with the
+// corresponding GlobalAlloc size and alignment contracts.
 #[allow(unsafe_code)]
 unsafe impl GlobalAlloc for MiMallocAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -35,8 +37,10 @@ unsafe impl GlobalAlloc for MiMallocAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: ptr and layout came from this allocator and are forwarded unchanged.
-        unsafe { rustfs_mimalloc::MiMalloc.dealloc(ptr, layout) }
+        // SAFETY: ptr came from this allocator, is non-null by GlobalAlloc's
+        // dealloc contract, and layout.size() is the original allocation size.
+        let ptr = unsafe { NonNull::new_unchecked(ptr) };
+        unsafe { rustfs_mimalloc::MiMalloc::free_csize_nonnull(ptr, layout.size()) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -45,11 +49,15 @@ unsafe impl GlobalAlloc for MiMallocAllocator {
     }
 }
 
-#[cfg(all(feature = "hotpath", feature = "hotpath-alloc"))]
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
 #[global_allocator]
 static GLOBAL: hotpath::CountingAllocator<MiMallocAllocator> = hotpath::CountingAllocator::with(MiMallocAllocator);
 
-#[cfg(not(all(feature = "hotpath", feature = "hotpath-alloc")))]
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc", target_os = "windows"))]
+#[global_allocator]
+static GLOBAL: hotpath::CountingAllocator<std::alloc::System> = hotpath::CountingAllocator::with(std::alloc::System);
+
+#[cfg(all(not(all(feature = "hotpath", feature = "hotpath-alloc")), not(target_os = "windows")))]
 #[global_allocator]
 static GLOBAL: rustfs_mimalloc::MiMalloc = rustfs_mimalloc::MiMalloc;
 

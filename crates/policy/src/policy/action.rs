@@ -465,6 +465,12 @@ pub enum AdminAction {
     SetBucketTargetAction,
     #[strum(serialize = "admin:GetBucketTarget")]
     GetBucketTargetAction,
+    /// Configure, validate or clear a bucket's on-demand migration source.
+    #[strum(serialize = "admin:SetBucketOnDemandMigration")]
+    SetBucketOnDemandMigrationAction,
+    /// Read a bucket's on-demand migration configuration and status.
+    #[strum(serialize = "admin:GetBucketOnDemandMigration")]
+    GetBucketOnDemandMigrationAction,
     #[strum(serialize = "admin:GetMetrics")]
     GetMetricsAction,
     #[strum(serialize = "admin:ReplicationDiff")]
@@ -623,6 +629,8 @@ impl AdminAction {
                 | AdminAction::SetBucketQuotaAdminAction
                 | AdminAction::SetBucketTargetAction
                 | AdminAction::GetBucketTargetAction
+                | AdminAction::SetBucketOnDemandMigrationAction
+                | AdminAction::GetBucketOnDemandMigrationAction
                 | AdminAction::GetMetricsAction
                 | AdminAction::ReplicationDiff
                 | AdminAction::GetReplicationMetricsAction
@@ -712,6 +720,12 @@ pub enum KmsAction {
     /// Preflight or execute a KMS restore.
     #[strum(serialize = "kms:Restore")]
     RestoreAction,
+    /// Run the bulk rekey sweep that rewraps stored object DEK envelopes onto
+    /// current master key versions. Cluster-scoped: it walks and rewrites
+    /// object metadata across buckets, so it is never conferred by a per-key
+    /// role template.
+    #[strum(serialize = "kms:Rekey")]
+    RekeyAction,
 }
 
 #[cfg(test)]
@@ -754,6 +768,7 @@ mod tests {
             ("kms:Decrypt", KmsAction::DecryptAction),
             ("kms:Backup", KmsAction::BackupAction),
             ("kms:Restore", KmsAction::RestoreAction),
+            ("kms:Rekey", KmsAction::RekeyAction),
         ] {
             let action = Action::try_from(raw).expect("Should parse KMS action");
             assert_eq!(action, Action::KmsAction(expected));
@@ -826,6 +841,26 @@ mod tests {
     #[test]
     fn test_get_metrics_admin_action_is_valid() {
         assert!(AdminAction::GetMetricsAction.is_valid());
+    }
+
+    #[test]
+    fn test_bucket_on_demand_migration_admin_actions_are_valid() {
+        let set_action = AdminAction::try_from("admin:SetBucketOnDemandMigration").expect("parse set action");
+        let get_action = AdminAction::try_from("admin:GetBucketOnDemandMigration").expect("parse get action");
+
+        assert_eq!(set_action, AdminAction::SetBucketOnDemandMigrationAction);
+        assert_eq!(get_action, AdminAction::GetBucketOnDemandMigrationAction);
+        assert!(set_action.is_valid());
+        assert!(get_action.is_valid());
+        assert_eq!(<&str>::from(set_action), "admin:SetBucketOnDemandMigration");
+        assert_eq!(<&str>::from(get_action), "admin:GetBucketOnDemandMigration");
+
+        // `admin:*` must cover the new actions without a per-action listing,
+        // while a read-only grant must not confer the write action.
+        let all_admin = Action::AdminAction(AdminAction::AllAdminActions);
+        assert!(all_admin.is_match(&Action::AdminAction(set_action)));
+        assert!(all_admin.is_match(&Action::AdminAction(get_action)));
+        assert!(!Action::AdminAction(get_action).is_match(&Action::AdminAction(set_action)));
     }
 
     #[test]

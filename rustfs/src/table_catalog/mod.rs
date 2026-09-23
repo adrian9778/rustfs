@@ -73,8 +73,8 @@ pub(crate) use identifier::{
     default_table_bucket_publication_lock_path, default_table_data_dir_path, default_table_delete_dir_path,
     default_table_metadata_dir_path, default_table_metadata_file_path, default_table_publication_lock_path,
     default_view_metadata_file_path, is_valid_table_metadata_location, is_valid_table_metadata_location_for_entry,
-    is_valid_view_metadata_location, metadata_location_from_metadata_file_path, table_metadata_dir_path_for_entry,
-    table_metadata_file_path_for_entry, validate_bucket_object_mutation,
+    is_valid_view_metadata_location, metadata_location_from_metadata_file_path, table_identity_from_metadata_object_key,
+    table_metadata_dir_path_for_entry, table_metadata_file_path_for_entry, validate_bucket_object_mutation,
 };
 pub(crate) use maintenance::*;
 pub(crate) use model::*;
@@ -101,6 +101,7 @@ pub(crate) const TABLE_RESOURCE_MARKER_VERSION: u16 = 1;
 )]
 pub(crate) const TABLE_METADATA_POINTER_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_ENTRY_VERSION: u16 = 1;
+pub(crate) const TABLE_RENAME_INTENT_VERSION: u16 = 1;
 pub(crate) const TABLE_WAREHOUSE_INDEX_STATE_VERSION: u16 = 2;
 pub(crate) const TABLE_MAINTENANCE_CONFIG_VERSION: u16 = 1;
 pub(crate) const TABLE_EXTERNAL_CATALOG_BRIDGE_VERSION: u16 = 1;
@@ -166,7 +167,9 @@ const COMMIT_LOG_ROOT: &str = "commits";
 const COMMIT_IDEMPOTENCY_ROOT: &str = "commit-idempotency";
 const WAREHOUSE_INDEX_ROOT: &str = "warehouse-index";
 const WAREHOUSE_INDEX_STATE_FILE: &str = "state.json";
+const TABLE_RENAME_ROOT: &str = "renames";
 const WAREHOUSE_INDEX_MAX_PREFIX_DEPTH: usize = 64;
+const TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS: usize = 4096;
 const EXTERNAL_CATALOG_ROOT: &str = "external-catalog";
 const EXTERNAL_CATALOG_BRIDGE_FILE: &str = "bridge.json";
 const MAINTENANCE_ROOT: &str = "maintenance";
@@ -383,7 +386,11 @@ fn is_missing_storage_error(err: &StorageError) -> bool {
 }
 
 fn storage_error_to_catalog(action: &str, err: StorageError) -> TableCatalogStoreError {
+    if err.is_quorum_error() {
+        return TableCatalogStoreError::Unavailable(format!("{action}: {err}"));
+    }
     match err {
+        StorageError::Lock(lock_err) => store::catalog_lock_acquisition_error(action, lock_err),
         StorageError::ObjectNotFound(bucket, object) => TableCatalogStoreError::NotFound(format!("{action}: {bucket}/{object}")),
         StorageError::BucketNotFound(bucket) => TableCatalogStoreError::NotFound(format!("{action}: bucket {bucket}")),
         StorageError::PreconditionFailed => TableCatalogStoreError::Conflict(format!("{action}: precondition failed")),

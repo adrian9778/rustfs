@@ -23,6 +23,78 @@ use s3s::S3ErrorCode;
 pub type Error = StorageError;
 pub type Result<T> = core::result::Result<T, Error>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolMetadataFailure {
+    ReadUnavailable,
+    RecoveryRequired,
+    TransactionUnknown,
+    FenceLost,
+}
+
+impl PoolMetadataFailure {
+    fn recovery_hint(self) -> &'static str {
+        match self {
+            Self::ReadUnavailable => "read unavailable; retry after the replicas are readable",
+            Self::TransactionUnknown => "writes remain blocked pending fenced transaction recovery",
+            Self::RecoveryRequired | Self::FenceLost => {
+                "writes remain blocked after a recovery-required replica state; restart after all replicas are readable and consistent, with compatible formats"
+            }
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadUnavailable => "read_unavailable",
+            Self::RecoveryRequired => "recovery_required",
+            Self::TransactionUnknown => "transaction_unknown",
+            Self::FenceLost => "fence_lost",
+        }
+    }
+}
+
+/// Local control-plane context. Keep the existing storage error wire codes;
+/// the HTTP boundary recognizes this typed source, not an error-message prefix.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{operation}: pool metadata {hint} ({reason}, {phase}): {detail}", hint = kind.recovery_hint(), reason = kind.as_str(), detail = source.as_ref().map(ToString::to_string).unwrap_or_default())]
+pub struct PoolMetadataError {
+    pub kind: PoolMetadataFailure,
+    pub operation: String,
+    pub phase: &'static str,
+    pub since: time::OffsetDateTime,
+    #[source]
+    pub source: Option<std::sync::Arc<StorageError>>,
+}
+
+/// Keeps high-cardinality diagnostic detail in the error source while making
+/// the rendered `io::Error` stable for quorum aggregation.
+#[derive(Debug)]
+struct StableIoContextError {
+    message: std::borrow::Cow<'static, str>,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl std::fmt::Display for StableIoContextError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StableIoContextError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+pub(crate) fn stable_io_error<E>(message: &'static str, source: E) -> std::io::Error
+where
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    std::io::Error::other(StableIoContextError {
+        message: message.into(),
+        source: source.into(),
+    })
+}
+
 /// Storage layer error type covering disk, volume, bucket, object, multipart,
 /// erasure-coding, and operational error conditions.
 ///
@@ -119,6 +191,8 @@ pub enum StorageError {
     BucketExists(String),
     #[error("Bucket not empty: {0}")]
     BucketNotEmpty(String),
+    #[error("Bucket not empty: {bucket} ({details})")]
+    BucketNotEmptyWithDetails { bucket: String, details: String },
     #[error("Bucket name invalid: {0}")]
     BucketNameInvalid(String),
 
@@ -155,6 +229,8 @@ pub enum StorageError {
     InvalidPartNumber(usize),
     #[error("Your proposed upload is smaller than the minimum allowed size. Part {0} size {1} is less than minimum {2}")]
     EntityTooSmall(usize, i64, i64),
+    #[error("multipart upload size {0} exceeds the configured limit {1}")]
+    EntityTooLarge(u64, u64),
 
     // ── Erasure / Quorum ─────────────────────────────────────────────
     #[error("erasure read quorum")]
@@ -169,6 +245,19 @@ pub enum StorageError {
     NotFirstDisk,
     #[error("first disk wait")]
     FirstDiskWait,
+    #[error(
+        "unsupported pool expansion: an existing single-node single-drive (SNSD) deployment cannot be expanded in place (configured {configured_drives} drive endpoints); restart with the original single local path, or create a new multi-drive deployment and migrate data through S3"
+    )]
+    UnsupportedSnsdExpansion { configured_drives: usize },
+    #[error(
+        "pool topology mismatch: stored {stored_drives} drives with {stored_set_drive_count} drives per erasure set, configured {configured_drives} drives with {configured_set_drive_count} drives per erasure set; an existing pool's drive count and erasure set width cannot be changed in place; restore its original endpoints and RUSTFS_ERASURE_SET_DRIVE_COUNT setting; to expand a multi-drive deployment, append a new pool with at least 2 drive endpoints"
+    )]
+    PoolTopologyMismatch {
+        stored_drives: usize,
+        stored_set_drive_count: usize,
+        configured_drives: usize,
+        configured_set_drive_count: usize,
+    },
 
     // ── Operational ──────────────────────────────────────────────────
     #[error("Storage reached its minimum free drive threshold.")]
@@ -179,8 +268,18 @@ pub enum StorageError {
     DecommissionNotStarted,
     #[error("Decommission already running")]
     DecommissionAlreadyRunning,
+    #[error("Decommission capacity error: {0}")]
+    DecommissionCapacity(String),
+    #[error("decommission_capacity_blocked: Storage reached its minimum free drive threshold.: {message}")]
+    DecommissionCapacityBlocked { message: String },
     #[error("Rebalance already running")]
     RebalanceAlreadyRunning,
+    #[error("{operation}: stale pool metadata update rejected for pool {pool_index}; {reason}")]
+    StalePoolMetadataUpdate {
+        operation: String,
+        pool_index: usize,
+        reason: &'static str,
+    },
     #[error("Operation canceled")]
     OperationCanceled,
     #[error("No heal required")]
@@ -219,6 +318,21 @@ pub enum StorageError {
     Io(#[source] std::io::Error),
     #[error("Lock error: {0}")]
     Lock(#[from] rustfs_lock::LockError),
+
+    /// Internode RPC client acquisition failed. Mirrors
+    /// `DiskError::RemoteClientUnavailable`: the detail is diagnostic only and
+    /// excluded from equality/hashing so same-cause failures bucket together
+    /// during quorum aggregation (backlog#1845).
+    #[error("remote rpc client unavailable: {0}")]
+    RemoteClientUnavailable(String),
+
+    /// A peer answered a control-plane RPC but its storage/IAM layer is not
+    /// initialized yet. Typed form of the legacy "errServerNotInitialized"
+    /// error_info string (backlog#1845); the wire carries it as
+    /// `ControlPlaneErrorCode::ControlPlaneErrorNotInitialized` alongside the
+    /// legacy string for rolling-upgrade compatibility.
+    #[error("remote peer not initialized")]
+    RemoteNotInitialized,
 }
 
 impl From<crate::erasure::coding::ErasureConstructionError> for StorageError {
@@ -228,11 +342,34 @@ impl From<crate::erasure::coding::ErasureConstructionError> for StorageError {
 }
 
 impl StorageError {
+    pub fn pool_metadata_failure(&self) -> Option<&PoolMetadataError> {
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(self);
+        while let Some(error) = current {
+            if let Some(context) = error.downcast_ref::<PoolMetadataError>() {
+                return Some(context);
+            }
+            // io::Error::source skips its boxed context itself.
+            current = if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                io.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static))
+            } else {
+                error.source()
+            };
+        }
+        None
+    }
+
     pub fn other<E>(error: E) -> Self
     where
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         StorageError::Io(std::io::Error::other(error))
+    }
+
+    pub(crate) fn other_with_context<E>(message: &'static str, source: E) -> Self
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        StorageError::Io(stable_io_error(message, source))
     }
 
     pub fn is_not_found(&self) -> bool {
@@ -257,6 +394,25 @@ impl StorageError {
                 | StorageError::InsufficientWriteQuorum(_, _)
                 | StorageError::NamespaceLockQuorumUnavailable { .. }
         )
+    }
+
+    pub fn dangling_delete_retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Io(error) => DiskError::io_error_dangling_delete_retry_after(error),
+            _ => None,
+        }
+    }
+
+    pub fn is_dangling_delete_grace(&self) -> bool {
+        matches!(self, StorageError::Io(io_error) if DiskError::io_error_is_dangling_delete_grace(io_error))
+    }
+
+    pub fn is_retired_marker_deferred(&self) -> bool {
+        matches!(self, StorageError::Io(error) if DiskError::io_error_is_retired_marker_deferred(error))
+    }
+
+    pub fn retired_marker_deferred(reason: impl Into<String>) -> Self {
+        DiskError::retired_marker_deferred(reason).into()
     }
 }
 
@@ -313,13 +469,25 @@ impl From<DiskError> for StorageError {
             DiskError::SourceStalled => StorageError::SourceStalled,
             DiskError::Timeout => StorageError::Timeout,
             DiskError::InvalidPath => StorageError::InvalidPath,
+            DiskError::RemoteClientUnavailable(detail) => StorageError::RemoteClientUnavailable(detail),
         }
     }
 }
 
-impl From<StorageError> for DiskError {
-    fn from(val: StorageError) -> Self {
-        match val {
+impl StorageError {
+    /// Narrow a store-layer error to the disk-layer vocabulary.
+    ///
+    /// This used to be a blanket `impl From<StorageError> for DiskError`, which
+    /// let `?` silently push store-only errors across the disk boundary into
+    /// `DiskError::other`, fragmenting `reduce_errs` quorum buckets
+    /// (backlog#1845). Narrowing is now a named, fallible operation: variants
+    /// with a disk-layer identity map across (including two documented lossy
+    /// collapses kept for compatibility — `SlowDown` → `TooManyOpenFiles` and
+    /// `StorageFull` → `DiskFull`, pinned by conversion_roundtrip_tests), and
+    /// everything else comes back as `Err(self)` so the caller decides what
+    /// crossing the boundary means for it.
+    pub fn narrow_to_disk(self) -> core::result::Result<DiskError, StorageError> {
+        Ok(match self {
             StorageError::Io(io_error) => io_error.into(),
             StorageError::Unexpected => DiskError::Unexpected,
             StorageError::FileNotFound => DiskError::FileNotFound,
@@ -364,8 +532,27 @@ impl From<StorageError> for DiskError {
             StorageError::VolumeNotEmpty => DiskError::VolumeNotEmpty,
             StorageError::VolumeAccessDenied => DiskError::VolumeAccessDenied,
             StorageError::FileAccessDenied => DiskError::FileAccessDenied,
-            _ => DiskError::other(val),
-        }
+            StorageError::RemoteClientUnavailable(detail) => DiskError::RemoteClientUnavailable(detail),
+            val => return Err(val),
+        })
+    }
+
+    /// Same contract as [`StorageError::narrow_to_disk`], for the
+    /// `rustfs_filemeta::Error` vocabulary (formerly a blanket `From` impl
+    /// with an `other()` catch-all). No production path currently narrows in
+    /// this direction; the named form keeps future callers deliberate.
+    pub fn narrow_to_filemeta(self) -> core::result::Result<rustfs_filemeta::Error, StorageError> {
+        Ok(match self {
+            StorageError::Unexpected => rustfs_filemeta::Error::Unexpected,
+            StorageError::FileNotFound => rustfs_filemeta::Error::FileNotFound,
+            StorageError::FileVersionNotFound => rustfs_filemeta::Error::FileVersionNotFound,
+            StorageError::FileCorrupt => rustfs_filemeta::Error::FileCorrupt,
+            StorageError::DoneForNow => rustfs_filemeta::Error::DoneForNow,
+            StorageError::MethodNotAllowed => rustfs_filemeta::Error::MethodNotAllowed,
+            StorageError::VolumeNotFound => rustfs_filemeta::Error::VolumeNotFound,
+            StorageError::Io(io_error) => io_error.into(),
+            val => return Err(val),
+        })
     }
 }
 
@@ -416,24 +603,9 @@ impl From<rustfs_filemeta::Error> for StorageError {
             rustfs_filemeta::Error::FileVersionNotFound => StorageError::FileVersionNotFound,
             rustfs_filemeta::Error::FileCorrupt => StorageError::FileCorrupt,
             rustfs_filemeta::Error::Unexpected => StorageError::Unexpected,
+            rustfs_filemeta::Error::MaxVersionsExceeded => StorageError::MaxVersionsExceeded,
             rustfs_filemeta::Error::Io(io_error) => io_error.into(),
             _ => StorageError::Io(std::io::Error::other(e)),
-        }
-    }
-}
-
-impl From<StorageError> for rustfs_filemeta::Error {
-    fn from(val: StorageError) -> Self {
-        match val {
-            StorageError::Unexpected => rustfs_filemeta::Error::Unexpected,
-            StorageError::FileNotFound => rustfs_filemeta::Error::FileNotFound,
-            StorageError::FileVersionNotFound => rustfs_filemeta::Error::FileVersionNotFound,
-            StorageError::FileCorrupt => rustfs_filemeta::Error::FileCorrupt,
-            StorageError::DoneForNow => rustfs_filemeta::Error::DoneForNow,
-            StorageError::MethodNotAllowed => rustfs_filemeta::Error::MethodNotAllowed,
-            StorageError::VolumeNotFound => rustfs_filemeta::Error::VolumeNotFound,
-            StorageError::Io(io_error) => io_error.into(),
-            _ => rustfs_filemeta::Error::other(val),
         }
     }
 }
@@ -450,7 +622,28 @@ impl PartialEq for StorageError {
 impl Clone for StorageError {
     fn clone(&self) -> Self {
         match self {
-            StorageError::Io(e) => StorageError::Io(std::io::Error::new(e.kind(), e.to_string())),
+            StorageError::Io(e) => {
+                if let Some(error) =
+                    DiskError::clone_dangling_delete_grace(e).or_else(|| DiskError::clone_retired_marker_deferred(e))
+                {
+                    return StorageError::Io(error);
+                }
+                if let Some(context) = self.pool_metadata_failure() {
+                    Self::Io(std::io::Error::new(
+                        e.kind(),
+                        StableIoContextError {
+                            message: e.to_string().into(),
+                            source: Box::new(context.clone()),
+                        },
+                    ))
+                } else if let Some(refusal) = crate::bucket::metadata::unreadable_config_refusal(self) {
+                    // Keep the refusal typed so a cloned error still maps to
+                    // its retryable S3 response (rustfs/backlog#1734).
+                    StorageError::Io(std::io::Error::new(e.kind(), refusal.clone()))
+                } else {
+                    StorageError::Io(std::io::Error::new(e.kind(), e.to_string()))
+                }
+            }
             StorageError::FaultyDisk => StorageError::FaultyDisk,
             StorageError::DiskFull => StorageError::DiskFull,
             StorageError::VolumeNotFound => StorageError::VolumeNotFound,
@@ -493,6 +686,10 @@ impl Clone for StorageError {
             StorageError::MethodNotAllowed => StorageError::MethodNotAllowed,
             StorageError::BucketNotFound(a) => StorageError::BucketNotFound(a.clone()),
             StorageError::BucketNotEmpty(a) => StorageError::BucketNotEmpty(a.clone()),
+            StorageError::BucketNotEmptyWithDetails { bucket, details } => StorageError::BucketNotEmptyWithDetails {
+                bucket: bucket.clone(),
+                details: details.clone(),
+            },
             StorageError::BucketNameInvalid(a) => StorageError::BucketNameInvalid(a.clone()),
             StorageError::ObjectNameInvalid(a, b) => StorageError::ObjectNameInvalid(a.clone(), b.clone()),
             StorageError::BucketExists(a) => StorageError::BucketExists(a.clone()),
@@ -518,14 +715,42 @@ impl Clone for StorageError {
             StorageError::DecommissionNotStarted => StorageError::DecommissionNotStarted,
             StorageError::InvalidPart(a, b, c) => StorageError::InvalidPart(*a, b.clone(), c.clone()),
             StorageError::EntityTooSmall(a, b, c) => StorageError::EntityTooSmall(*a, *b, *c),
+            StorageError::EntityTooLarge(a, b) => StorageError::EntityTooLarge(*a, *b),
             StorageError::DoneForNow => StorageError::DoneForNow,
             StorageError::DecommissionAlreadyRunning => StorageError::DecommissionAlreadyRunning,
+            StorageError::DecommissionCapacity(message) => StorageError::DecommissionCapacity(message.clone()),
+            StorageError::DecommissionCapacityBlocked { message } => StorageError::DecommissionCapacityBlocked {
+                message: message.clone(),
+            },
             StorageError::RebalanceAlreadyRunning => StorageError::RebalanceAlreadyRunning,
+            StorageError::StalePoolMetadataUpdate {
+                operation,
+                pool_index,
+                reason,
+            } => StorageError::StalePoolMetadataUpdate {
+                operation: operation.clone(),
+                pool_index: *pool_index,
+                reason,
+            },
             StorageError::OperationCanceled => StorageError::OperationCanceled,
             StorageError::ErasureReadQuorum => StorageError::ErasureReadQuorum,
             StorageError::ErasureWriteQuorum => StorageError::ErasureWriteQuorum,
             StorageError::NotFirstDisk => StorageError::NotFirstDisk,
             StorageError::FirstDiskWait => StorageError::FirstDiskWait,
+            StorageError::UnsupportedSnsdExpansion { configured_drives } => StorageError::UnsupportedSnsdExpansion {
+                configured_drives: *configured_drives,
+            },
+            StorageError::PoolTopologyMismatch {
+                stored_drives,
+                stored_set_drive_count,
+                configured_drives,
+                configured_set_drive_count,
+            } => StorageError::PoolTopologyMismatch {
+                stored_drives: *stored_drives,
+                stored_set_drive_count: *stored_set_drive_count,
+                configured_drives: *configured_drives,
+                configured_set_drive_count: *configured_set_drive_count,
+            },
             StorageError::TooManyOpenFiles => StorageError::TooManyOpenFiles,
             StorageError::NoHealRequired => StorageError::NoHealRequired,
             StorageError::Lock(e) => StorageError::Lock(e.clone()),
@@ -552,12 +777,15 @@ impl Clone for StorageError {
                 current: *current,
                 limit: *limit,
             },
+            StorageError::RemoteClientUnavailable(detail) => StorageError::RemoteClientUnavailable(detail.clone()),
+            StorageError::RemoteNotInitialized => StorageError::RemoteNotInitialized,
         }
     }
 }
 
 impl StorageError {
-    fn code(&self) -> StorageErrorCode {
+    /// Stable classification without error payloads or storage paths.
+    pub fn code(&self) -> StorageErrorCode {
         match self {
             StorageError::Io(_) => StorageErrorCode::Io,
             StorageError::FaultyDisk => StorageErrorCode::FaultyDisk,
@@ -600,7 +828,7 @@ impl StorageError {
             StorageError::InvalidArgument(_, _, _) => StorageErrorCode::InvalidArgument,
             StorageError::MethodNotAllowed => StorageErrorCode::MethodNotAllowed,
             StorageError::BucketNotFound(_) => StorageErrorCode::BucketNotFound,
-            StorageError::BucketNotEmpty(_) => StorageErrorCode::BucketNotEmpty,
+            StorageError::BucketNotEmpty(_) | StorageError::BucketNotEmptyWithDetails { .. } => StorageErrorCode::BucketNotEmpty,
             StorageError::BucketNameInvalid(_) => StorageErrorCode::BucketNameInvalid,
             StorageError::ObjectNameInvalid(_, _) => StorageErrorCode::ObjectNameInvalid,
             StorageError::BucketExists(_) => StorageErrorCode::BucketExists,
@@ -621,12 +849,20 @@ impl StorageError {
             StorageError::InvalidPart(_, _, _) => StorageErrorCode::InvalidPart,
             StorageError::DoneForNow => StorageErrorCode::DoneForNow,
             StorageError::DecommissionAlreadyRunning => StorageErrorCode::DecommissionAlreadyRunning,
+            StorageError::DecommissionCapacity(_) => StorageErrorCode::InvalidArgument,
+            StorageError::DecommissionCapacityBlocked { .. } => StorageErrorCode::StorageFull,
             StorageError::RebalanceAlreadyRunning => StorageErrorCode::RebalanceAlreadyRunning,
+            StorageError::StalePoolMetadataUpdate { .. } => StorageErrorCode::InvalidArgument,
             StorageError::OperationCanceled => StorageErrorCode::OperationCanceled,
             StorageError::ErasureReadQuorum => StorageErrorCode::ErasureReadQuorum,
             StorageError::ErasureWriteQuorum => StorageErrorCode::ErasureWriteQuorum,
             StorageError::NotFirstDisk => StorageErrorCode::NotFirstDisk,
             StorageError::FirstDiskWait => StorageErrorCode::FirstDiskWait,
+            // Topology diagnostics reuse the existing wire code; they are
+            // not disk errors and must retain their local identity for retry classification.
+            StorageError::UnsupportedSnsdExpansion { .. } | StorageError::PoolTopologyMismatch { .. } => {
+                StorageErrorCode::InvalidArgument
+            }
             StorageError::ConfigNotFound => StorageErrorCode::ConfigNotFound,
             StorageError::TooManyOpenFiles => StorageErrorCode::TooManyOpenFiles,
             StorageError::NoHealRequired => StorageErrorCode::NoHealRequired,
@@ -635,11 +871,14 @@ impl StorageError {
             StorageError::InsufficientWriteQuorum(_, _) => StorageErrorCode::InsufficientWriteQuorum,
             StorageError::PreconditionFailed => StorageErrorCode::PreconditionFailed,
             StorageError::EntityTooSmall(_, _, _) => StorageErrorCode::EntityTooSmall,
+            StorageError::EntityTooLarge(_, _) => StorageErrorCode::EntityTooLarge,
             StorageError::InvalidRangeSpec(_) => StorageErrorCode::InvalidRangeSpec,
             StorageError::NotModified => StorageErrorCode::NotModified,
             StorageError::InvalidPartNumber(_) => StorageErrorCode::InvalidPartNumber,
             StorageError::NamespaceLockQuorumUnavailable { .. } => StorageErrorCode::NamespaceLockQuorumUnavailable,
             StorageError::QuotaExceeded { .. } => StorageErrorCode::QuotaExceeded,
+            StorageError::RemoteClientUnavailable(_) => StorageErrorCode::RemoteClientUnavailable,
+            StorageError::RemoteNotInitialized => StorageErrorCode::RemoteNotInitialized,
         }
     }
 
@@ -755,6 +994,7 @@ impl StorageError {
             StorageErrorCode::EntityTooSmall => {
                 Some(StorageError::EntityTooSmall(Default::default(), Default::default(), Default::default()))
             }
+            StorageErrorCode::EntityTooLarge => Some(StorageError::EntityTooLarge(Default::default(), Default::default())),
             StorageErrorCode::InvalidRangeSpec => Some(StorageError::InvalidRangeSpec(Default::default())),
             StorageErrorCode::NotModified => Some(StorageError::NotModified),
             StorageErrorCode::InvalidPartNumber => Some(StorageError::InvalidPartNumber(Default::default())),
@@ -769,6 +1009,8 @@ impl StorageError {
                 current: Default::default(),
                 limit: Default::default(),
             }),
+            StorageErrorCode::RemoteClientUnavailable => Some(StorageError::RemoteClientUnavailable(Default::default())),
+            StorageErrorCode::RemoteNotInitialized => Some(StorageError::RemoteNotInitialized),
         }
     }
 }
@@ -897,10 +1139,6 @@ pub fn is_err_data_movement_overwrite(err: &Error) -> bool {
     matches!(err, &StorageError::DataMovementOverwriteErr(_, _, _))
 }
 
-pub fn is_err_decommission_running(err: &Error) -> bool {
-    matches!(err, &StorageError::DecommissionAlreadyRunning)
-}
-
 #[allow(dead_code, reason = "predicate asserted by this file's tests (backlog#1823)")]
 pub fn is_err_rebalance_running(err: &Error) -> bool {
     matches!(err, &StorageError::RebalanceAlreadyRunning)
@@ -912,7 +1150,13 @@ pub fn is_err_operation_canceled(err: &Error) -> bool {
 
 #[allow(dead_code, reason = "predicate asserted by this file's tests (backlog#1823)")]
 pub fn is_err_not_initialized(err: &Error) -> bool {
-    err.to_string().contains("errServerNotInitialized") || err.to_string().contains("ServerNotInitialized")
+    // Typed-first: peers at or above the ControlPlaneErrorCode change decode to
+    // the typed variant. The substring form only matches legacy peers' string
+    // responses.
+    // RUSTFS_COMPAT_TODO(not-initialized-error-code-v1): substring fallback for peers that predate the typed wire code. Remove after the minimum supported RustFS peer version always sends error_code.
+    matches!(err, StorageError::RemoteNotInitialized)
+        || err.to_string().contains("errServerNotInitialized")
+        || err.to_string().contains("ServerNotInitialized")
 }
 
 /// Strict "not found" predicate that only matches genuine object/version/volume
@@ -1092,9 +1336,35 @@ pub struct ErrorResponse {
 }
 
 #[cfg(test)]
+mod conversion_roundtrip_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Error as IoError, ErrorKind};
+
+    #[test]
+    fn startup_topology_errors_preserve_identity_and_guidance() {
+        for error in [
+            StorageError::UnsupportedSnsdExpansion { configured_drives: 4 },
+            StorageError::PoolTopologyMismatch {
+                stored_drives: 4,
+                stored_set_drive_count: 4,
+                configured_drives: 8,
+                configured_set_drive_count: 8,
+            },
+        ] {
+            let io_error: IoError = error.clone().into();
+            let restored = StorageError::from(io_error);
+            assert_eq!(std::mem::discriminant(&restored), std::mem::discriminant(&error));
+            assert_eq!(restored.to_string(), error.to_string());
+            assert_eq!(restored.code(), StorageErrorCode::InvalidArgument);
+            assert!(
+                restored.narrow_to_disk().is_err(),
+                "startup diagnostics must not become disk/quorum errors"
+            );
+        }
+    }
 
     #[test]
     fn other_preserves_erasure_construction_source_chain() {
@@ -1102,7 +1372,7 @@ mod tests {
         use std::error::Error as _;
 
         let error = StorageError::from(ErasureConstructionError::ModernEncoder {
-            source: reed_solomon_erasure::Error::TooManyShards,
+            source: rustfs_erasure_codec::Error::TooManyShards,
         });
         let io_source = error.source().expect("StorageError::Io must expose its io::Error source");
         assert!(io_source.is::<std::io::Error>());
@@ -1113,7 +1383,7 @@ mod tests {
         let encoder_source = construction_source
             .source()
             .expect("construction error must expose the encoder error");
-        assert!(encoder_source.is::<reed_solomon_erasure::Error>());
+        assert!(encoder_source.is::<rustfs_erasure_codec::Error>());
     }
 
     // The lifecycle transition worker relies on this arm alone to suppress the
@@ -1287,9 +1557,6 @@ mod tests {
 
     #[test]
     fn test_error_running_state_helpers() {
-        assert!(is_err_decommission_running(&StorageError::DecommissionAlreadyRunning));
-        assert!(!is_err_decommission_running(&StorageError::RebalanceAlreadyRunning));
-
         assert!(is_err_rebalance_running(&StorageError::RebalanceAlreadyRunning));
         assert!(!is_err_rebalance_running(&StorageError::DecommissionAlreadyRunning));
         assert!(is_err_operation_canceled(&StorageError::OperationCanceled));
@@ -1417,7 +1684,9 @@ mod tests {
 
         for original in all_variants {
             let storage_error: StorageError = original.clone().into();
-            let round_tripped: DiskError = storage_error.into();
+            let round_tripped: DiskError = storage_error
+                .narrow_to_disk()
+                .expect("every disk-representable StorageError must narrow back");
 
             assert_eq!(
                 std::mem::discriminant(&original),
@@ -1431,7 +1700,7 @@ mod tests {
         // message must both survive the round trip.
         let io_original = DiskError::Io(IoError::new(ErrorKind::PermissionDenied, "denied"));
         let storage_error: StorageError = io_original.clone().into();
-        let io_round_tripped: DiskError = storage_error.into();
+        let io_round_tripped: DiskError = storage_error.narrow_to_disk().expect("Io narrows through the bridge");
         assert_eq!(io_original, io_round_tripped);
         match io_round_tripped {
             DiskError::Io(inner) => {
@@ -1679,8 +1948,13 @@ mod tests {
             assert_eq!(converted_storage_error, expected_storage_error);
 
             // Test reverse conversion
-            let converted_back: rustfs_filemeta::Error = converted_storage_error.into();
-            assert_eq!(converted_back, expected_storage_error.into());
+            let converted_back: rustfs_filemeta::Error = converted_storage_error
+                .narrow_to_filemeta()
+                .expect("matched variants must narrow to filemeta");
+            let expected_back: rustfs_filemeta::Error = expected_storage_error
+                .narrow_to_filemeta()
+                .expect("matched variants must narrow to filemeta");
+            assert_eq!(converted_back, expected_back);
         }
     }
 

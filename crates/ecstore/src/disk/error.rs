@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_io_metrics::internode_metrics::INTERNODE_OPERATION_PUT_FILE_STREAM;
 use rustfs_rio::{InternodeHttpError, InternodeHttpErrorKind};
 use std::error::Error as StdError;
 use std::hash::{Hash, Hasher};
@@ -22,6 +23,35 @@ pub type Error = DiskError;
 pub type Result<T> = core::result::Result<T, Error>;
 
 const METACACHE_OUTPUT_STREAM_CLOSED: &str = "metacache output stream closed";
+pub(crate) const HEAL_DANGLING_DELETE_GRACE_MESSAGE: &str = "dangling object deletion deferred by heal grace window";
+
+/// Marker carried by a shard-read `io::Error` when the underlying reader can
+/// no longer be realigned after a fresh remote open failed.  The marker is
+/// deliberately separate from the `ErrorKind`: a terminal read must retire
+/// its reader, while its original typed disk error and I/O kind still need to
+/// survive quorum/error mapping.
+#[derive(Debug)]
+pub(crate) struct TerminalReadError {
+    source: DiskError,
+}
+
+#[derive(Debug, Clone)]
+struct DanglingDeleteGraceError {
+    retry_after_secs: i64,
+    grace_secs: i64,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("retired delete marker cleanup deferred: {0}")]
+struct RetiredMarkerDeferred(String);
+
+/// Marks a conditional-file write that failed before its publication rename.
+/// Callers may choose another owner only while this marker is preserved; every
+/// unmarked error remains commit-ambiguous and must fail closed.
+#[derive(Debug)]
+struct ConditionalFileNotCommittedError {
+    source: io::Error,
+}
 
 // DiskError == StorageErr
 #[derive(Debug, thiserror::Error)]
@@ -157,6 +187,116 @@ pub enum DiskError {
 
     #[error("invalid path")]
     InvalidPath,
+
+    /// Internode RPC client acquisition failed (channel build, auth setup, or
+    /// the peer is marked offline). The detail is diagnostic only: equality and
+    /// hashing use the wire code alone, so N disks failing for this same cause
+    /// land in one `reduce_errs` quorum bucket regardless of per-peer detail
+    /// (backlog#1845). Keep the detail in the rendered message — substring
+    /// classifiers (network needles, heal recoverability) read it from there.
+    #[error("remote rpc client unavailable: {0}")]
+    RemoteClientUnavailable(String),
+}
+
+impl TerminalReadError {
+    pub(crate) fn new(source: DiskError) -> Self {
+        Self { source }
+    }
+
+    fn into_source(self) -> DiskError {
+        self.source
+    }
+}
+
+impl std::fmt::Display for TerminalReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl StdError for TerminalReadError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl std::fmt::Display for DanglingDeleteGraceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{HEAL_DANGLING_DELETE_GRACE_MESSAGE}; retry_after_secs={}; grace_secs={}",
+            self.retry_after_secs, self.grace_secs
+        )
+    }
+}
+
+impl StdError for DanglingDeleteGraceError {}
+
+impl std::fmt::Display for ConditionalFileNotCommittedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl StdError for ConditionalFileNotCommittedError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn classify_internode_disk_error(error: &InternodeHttpError) -> Option<DiskError> {
+    if error.is_remote_file_not_found() {
+        return Some(DiskError::FileNotFound);
+    }
+    if error.is_remote_volume_not_found() {
+        return Some(DiskError::VolumeNotFound);
+    }
+    if error.is_remote_file_corrupt() {
+        return Some(DiskError::FileCorrupt);
+    }
+    None
+}
+
+fn internode_write_error_is_retryable(error: &InternodeHttpError) -> bool {
+    error.kind().is_retryable()
+        || (matches!(error.kind(), InternodeHttpErrorKind::HttpStatus(status) if status.as_u16() == 409)
+            && error.context().operation() == Some(INTERNODE_OPERATION_PUT_FILE_STREAM))
+}
+
+fn io_error_contains_retryable_internode_write(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+        .is_some_and(internode_write_error_is_retryable)
+}
+
+/// Wrap a terminal shard-read failure without changing its typed
+/// classification.  Timeout-like disk errors retain `TimedOut`; other errors
+/// retain their inner I/O kind or use `Other` when no more specific kind exists.
+pub(crate) fn terminal_read_error_to_io(error: DiskError) -> io::Error {
+    let kind = match &error {
+        DiskError::Io(inner) => inner.kind(),
+        DiskError::SourceStalled | DiskError::Timeout => io::ErrorKind::TimedOut,
+        DiskError::DiskNotFound
+        | DiskError::FileNotFound
+        | DiskError::FileVersionNotFound
+        | DiskError::PathNotFound
+        | DiskError::VolumeNotFound => io::ErrorKind::NotFound,
+        DiskError::DiskAccessDenied | DiskError::FileAccessDenied | DiskError::VolumeAccessDenied => {
+            io::ErrorKind::PermissionDenied
+        }
+        DiskError::DiskFull => io::ErrorKind::StorageFull,
+        DiskError::FileCorrupt | DiskError::PartMissingOrCorrupt | DiskError::BitrotHashAlgoInvalid => io::ErrorKind::InvalidData,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, TerminalReadError::new(error))
+}
+
+/// Whether an I/O error marks a shard reader as terminal for adaptive decode.
+pub(crate) fn is_terminal_read_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.downcast_ref::<TerminalReadError>().is_some())
 }
 
 impl From<crate::erasure::coding::ErasureConstructionError> for DiskError {
@@ -171,6 +311,70 @@ impl DiskError {
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         DiskError::Io(std::io::Error::other(error))
+    }
+
+    pub(crate) fn dangling_delete_grace(retry_after_secs: i64, grace_secs: i64) -> Self {
+        DiskError::other(DanglingDeleteGraceError {
+            retry_after_secs,
+            grace_secs,
+        })
+    }
+
+    pub(crate) fn conditional_file_not_committed(source: io::Error) -> io::Error {
+        io::Error::new(source.kind(), ConditionalFileNotCommittedError { source })
+    }
+
+    /// Whether a local conditional-file replacement failed before the target
+    /// publication rename and therefore cannot have committed new owner bytes.
+    pub fn is_conditional_file_not_committed(&self) -> bool {
+        matches!(
+            self,
+            DiskError::Io(io_error)
+                if io_error
+                    .get_ref()
+                    .is_some_and(|source| source.downcast_ref::<ConditionalFileNotCommittedError>().is_some())
+        )
+    }
+
+    pub(crate) fn clone_dangling_delete_grace(error: &io::Error) -> Option<io::Error> {
+        let grace = error.get_ref()?.downcast_ref::<DanglingDeleteGraceError>()?;
+        Some(io::Error::new(error.kind(), grace.clone()))
+    }
+
+    pub(crate) fn retired_marker_deferred(reason: impl Into<String>) -> Self {
+        Self::other(RetiredMarkerDeferred(reason.into()))
+    }
+
+    pub fn io_error_is_retired_marker_deferred(error: &io::Error) -> bool {
+        error.get_ref().is_some_and(|source| source.is::<RetiredMarkerDeferred>())
+    }
+
+    pub(crate) fn clone_retired_marker_deferred(error: &io::Error) -> Option<io::Error> {
+        let deferred = error.get_ref()?.downcast_ref::<RetiredMarkerDeferred>()?;
+        Some(io::Error::other(deferred.clone()))
+    }
+
+    pub fn dangling_delete_retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Io(error) => Self::io_error_dangling_delete_retry_after(error),
+            _ => None,
+        }
+    }
+
+    pub fn io_error_dangling_delete_retry_after(error: &io::Error) -> Option<std::time::Duration> {
+        let grace = error.get_ref()?.downcast_ref::<DanglingDeleteGraceError>()?;
+        u64::try_from(grace.retry_after_secs).ok().map(std::time::Duration::from_secs)
+    }
+
+    pub fn is_dangling_delete_grace(&self) -> bool {
+        matches!(self, DiskError::Io(io_error) if Self::io_error_is_dangling_delete_grace(io_error))
+    }
+
+    pub fn io_error_is_dangling_delete_grace(io_error: &io::Error) -> bool {
+        io_error
+            .get_ref()
+            .is_some_and(|source| source.downcast_ref::<DanglingDeleteGraceError>().is_some())
+            || io_error.to_string().contains(HEAL_DANGLING_DELETE_GRACE_MESSAGE)
     }
 
     pub(crate) fn metacache_output_stream_closed() -> Self {
@@ -219,10 +423,7 @@ impl DiskError {
 
     pub fn is_retryable_internode_write_failure(&self) -> bool {
         match self {
-            DiskError::Io(io_error) => io_error
-                .get_ref()
-                .and_then(|source| source.downcast_ref::<InternodeHttpError>())
-                .is_some_and(|err| err.kind().is_retryable()),
+            DiskError::Io(io_error) => io_error_contains_retryable_internode_write(io_error),
             _ => false,
         }
     }
@@ -297,6 +498,7 @@ impl From<rustfs_filemeta::Error> for DiskError {
             rustfs_filemeta::Error::FileVersionNotFound => DiskError::FileVersionNotFound,
             rustfs_filemeta::Error::FileCorrupt => DiskError::FileCorrupt,
             rustfs_filemeta::Error::MethodNotAllowed => DiskError::MethodNotAllowed,
+            rustfs_filemeta::Error::MaxVersionsExceeded => DiskError::MaxVersionsExceeded,
             e => DiskError::other(e),
         }
     }
@@ -327,14 +529,26 @@ fn io_error_chain_contains_kind(io_error: &std::io::Error, kind: std::io::ErrorK
 
 impl From<std::io::Error> for DiskError {
     fn from(e: std::io::Error) -> Self {
-        if let Some(error) = e.get_ref().and_then(|source| source.downcast_ref::<InternodeHttpError>()) {
-            if error.is_remote_file_not_found() {
-                return DiskError::FileNotFound;
-            }
-            if error.is_remote_volume_not_found() {
-                return DiskError::VolumeNotFound;
-            }
+        if let Some(error) = e.get_ref().and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            && let Some(classified) = classify_internode_disk_error(error)
+        {
+            return classified;
         }
+        let e = match e.downcast::<TerminalReadError>() {
+            Ok(terminal_error) => {
+                let source = terminal_error.into_source();
+                if let DiskError::Io(io_error) = &source
+                    && let Some(internode_error) = io_error
+                        .get_ref()
+                        .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                    && let Some(classified) = classify_internode_disk_error(internode_error)
+                {
+                    return classified;
+                }
+                return source;
+            }
+            Err(e) => e,
+        };
         match e.downcast::<DiskError>() {
             Ok(disk_error) => disk_error,
             // Mirror `From<io::Error> for StorageError`: a StorageError boxed
@@ -342,7 +556,7 @@ impl From<std::io::Error> for DiskError {
             // classification instead of degrading to `DiskError::Io`, which
             // quorum aggregation (`reduce_errs`) would count as a distinct error.
             Err(io_error) => match io_error.downcast::<crate::error::StorageError>() {
-                Ok(storage_error) => storage_error.into(),
+                Ok(storage_error) => storage_error.narrow_to_disk().unwrap_or_else(DiskError::other),
                 Err(io_error) => DiskError::Io(io_error),
             },
         }
@@ -412,10 +626,10 @@ impl From<tonic::Status> for DiskError {
 impl From<rustfs_protos::proto_gen::node_service::Error> for DiskError {
     fn from(e: rustfs_protos::proto_gen::node_service::Error) -> Self {
         if let Some(err) = DiskError::from_u32(e.code) {
-            if matches!(err, DiskError::Io(_)) {
-                DiskError::other(e.error_info)
-            } else {
-                err
+            match err {
+                DiskError::Io(_) => DiskError::other(e.error_info),
+                DiskError::RemoteClientUnavailable(_) => DiskError::RemoteClientUnavailable(e.error_info),
+                err => err,
             }
         } else {
             DiskError::other(e.error_info)
@@ -483,7 +697,23 @@ impl From<tokio::task::JoinError> for DiskError {
 impl Clone for DiskError {
     fn clone(&self) -> Self {
         match self {
-            DiskError::Io(io_error) => DiskError::Io(std::io::Error::new(io_error.kind(), io_error.to_string())),
+            DiskError::Io(io_error) if self.is_conditional_file_not_committed() => DiskError::Io(
+                DiskError::conditional_file_not_committed(io::Error::new(io_error.kind(), io_error.to_string())),
+            ),
+            DiskError::Io(io_error) => {
+                if let Some(status) = io_error.get_ref().and_then(|source| source.downcast_ref::<RpcStatusError>()) {
+                    return DiskError::Io(io::Error::new(io_error.kind(), RpcStatusError(status.0.clone())));
+                }
+                DiskError::Io(
+                    Self::clone_dangling_delete_grace(io_error)
+                        .or_else(|| Self::clone_retired_marker_deferred(io_error))
+                        .or_else(|| rustfs_rio::clone_internode_http_io_error(io_error))
+                        .and_then(std::io::Error::into_inner)
+                        // The helper derives a kind from the source; Clone must retain the original outer kind.
+                        .map(|source| std::io::Error::new(io_error.kind(), source))
+                        .unwrap_or_else(|| std::io::Error::new(io_error.kind(), io_error.to_string())),
+                )
+            }
             DiskError::MaxVersionsExceeded => DiskError::MaxVersionsExceeded,
             DiskError::Unexpected => DiskError::Unexpected,
             DiskError::CorruptedFormat => DiskError::CorruptedFormat,
@@ -525,6 +755,7 @@ impl Clone for DiskError {
             DiskError::SourceStalled => DiskError::SourceStalled,
             DiskError::Timeout => DiskError::Timeout,
             DiskError::InvalidPath => DiskError::InvalidPath,
+            DiskError::RemoteClientUnavailable(detail) => DiskError::RemoteClientUnavailable(detail.clone()),
         }
     }
 }
@@ -574,6 +805,7 @@ impl DiskError {
             DiskError::SourceStalled => 0x28,
             DiskError::Timeout => 0x29,
             DiskError::InvalidPath => 0x2A,
+            DiskError::RemoteClientUnavailable(_) => 0x2B,
         }
     }
 
@@ -621,6 +853,7 @@ impl DiskError {
             0x28 => Some(DiskError::SourceStalled),
             0x29 => Some(DiskError::Timeout),
             0x2A => Some(DiskError::InvalidPath),
+            0x2B => Some(DiskError::RemoteClientUnavailable(String::new())),
             _ => None,
         }
     }
@@ -668,12 +901,82 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn retired_marker_deferral_survives_disk_and_storage_clones() {
+        let original = DiskError::retired_marker_deferred("missing retirement record");
+        let disk = original.clone();
+        let storage = crate::error::StorageError::from(disk);
+        let cloned = storage.clone();
+        assert!(cloned.is_retired_marker_deferred());
+        assert!(crate::error::StorageError::from(original).is_retired_marker_deferred());
+        assert!(storage.is_retired_marker_deferred());
+        assert!(!crate::error::StorageError::other(storage.to_string()).is_retired_marker_deferred());
+        assert!(!crate::error::StorageError::FileVersionNotFound.is_retired_marker_deferred());
+    }
+
+    #[test]
+    fn dangling_grace_retry_timing_survives_disk_and_storage_clones() {
+        let original = super::DiskError::dangling_delete_grace(21, 3600);
+        let disk = original.clone();
+        assert_eq!(disk.dangling_delete_retry_after(), Some(std::time::Duration::from_secs(21)));
+        let storage: crate::error::StorageError = disk.into();
+        let cloned = storage.clone();
+        assert!(cloned.is_dangling_delete_grace());
+        assert_eq!(cloned.dangling_delete_retry_after(), Some(std::time::Duration::from_secs(21)));
+        assert_eq!(original.dangling_delete_retry_after(), Some(std::time::Duration::from_secs(21)));
+        assert_eq!(storage.dangling_delete_retry_after(), Some(std::time::Duration::from_secs(21)));
+        assert_eq!(super::DiskError::dangling_delete_grace(-1, 3600).dangling_delete_retry_after(), None);
+        assert_eq!(super::DiskError::FaultyDisk.dangling_delete_retry_after(), None);
+    }
+
+    #[test]
+    fn conditional_file_not_committed_marker_is_explicit_and_clone_safe() {
+        let marked = DiskError::from(DiskError::conditional_file_not_committed(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "staging rejected",
+        )));
+        assert!(marked.is_conditional_file_not_committed());
+        assert!(marked.is_conditional_file_not_committed());
+        assert!(!DiskError::Timeout.is_conditional_file_not_committed());
+        assert!(
+            !DiskError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "rename rejected"))
+                .is_conditional_file_not_committed()
+        );
+    }
+
+    #[test]
+    fn terminal_read_error_preserves_kind_and_disk_classification() {
+        let timeout = terminal_read_error_to_io(DiskError::Timeout);
+        assert_eq!(timeout.kind(), io::ErrorKind::TimedOut);
+        assert!(is_terminal_read_error(&timeout));
+        assert!(matches!(DiskError::from(timeout), DiskError::Timeout));
+
+        let missing = terminal_read_error_to_io(DiskError::FileNotFound);
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        assert!(is_terminal_read_error(&missing));
+        assert!(matches!(DiskError::from(missing), DiskError::FileNotFound));
+
+        let reset = terminal_read_error_to_io(DiskError::Io(io::Error::new(io::ErrorKind::ConnectionReset, "connection reset")));
+        assert_eq!(reset.kind(), io::ErrorKind::ConnectionReset);
+        assert!(is_terminal_read_error(&reset));
+        assert!(matches!(DiskError::from(reset), DiskError::Io(error) if error.kind() == io::ErrorKind::ConnectionReset));
+
+        for (remote_error, expected) in [
+            (rustfs_rio::new_test_remote_file_not_found_http_io_error(), DiskError::FileNotFound),
+            (rustfs_rio::new_test_remote_volume_not_found_http_io_error(), DiskError::VolumeNotFound),
+            (rustfs_rio::new_test_remote_file_corrupt_http_io_error(), DiskError::FileCorrupt),
+        ] {
+            let wrapped = terminal_read_error_to_io(DiskError::Io(remote_error));
+            assert_eq!(DiskError::from(wrapped), expected);
+        }
+    }
+
+    #[test]
     fn other_preserves_erasure_construction_source_chain() {
         use crate::erasure::coding::ErasureConstructionError;
         use std::error::Error as _;
 
         let error = DiskError::from(ErasureConstructionError::ModernEncoder {
-            source: reed_solomon_erasure::Error::TooManyShards,
+            source: rustfs_erasure_codec::Error::TooManyShards,
         });
         let io_source = error.source().expect("DiskError::Io must expose its io::Error source");
         assert!(io_source.is::<io::Error>());
@@ -684,7 +987,7 @@ mod tests {
         let encoder_source = construction_source
             .source()
             .expect("construction error must expose the encoder error");
-        assert!(encoder_source.is::<reed_solomon_erasure::Error>());
+        assert!(encoder_source.is::<rustfs_erasure_codec::Error>());
     }
 
     #[test]
@@ -1080,16 +1383,176 @@ mod tests {
     }
 
     #[test]
-    fn test_internode_missing_errors_preserve_disk_error_types() {
+    fn test_put_file_server_epoch_conflict_is_retryable_write_failure() {
+        let conflict = DiskError::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::HttpStatus(http::StatusCode::CONFLICT),
+        ));
+        let bad_request = DiskError::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::HttpStatus(http::StatusCode::BAD_REQUEST),
+        ));
+
+        assert!(conflict.is_retryable_internode_write_failure());
+        assert!(!bad_request.is_retryable_internode_write_failure());
+    }
+
+    #[test]
+    fn test_internode_http_clone_preserves_retryability_status_and_context() {
+        use http::StatusCode;
+        use rustfs_rio::InternodeHttpErrorKind::{ConnectionRefused, ConnectionReset, HttpStatus, Unknown};
+
+        for (kind, retryable) in [
+            (ConnectionRefused, true),
+            (ConnectionReset, true),
+            (HttpStatus(StatusCode::TOO_MANY_REQUESTS), true),
+            (HttpStatus(StatusCode::SERVICE_UNAVAILABLE), true),
+            (HttpStatus(StatusCode::CONFLICT), true),
+            (Unknown, false),
+            (HttpStatus(StatusCode::BAD_REQUEST), false),
+            (HttpStatus(StatusCode::INTERNAL_SERVER_ERROR), false),
+        ] {
+            let original = DiskError::from(rustfs_rio::new_test_internode_http_io_error(kind));
+            assert_eq!(original.internode_http_error_kind(), Some(kind));
+            assert_eq!(original.is_retryable_internode_write_failure(), retryable);
+
+            let cloned = original.clone();
+            assert_eq!(cloned, original, "clone must preserve the error bucket for {kind:?}");
+            assert_eq!(
+                cloned.is_retryable_internode_write_failure(),
+                retryable,
+                "clone changed retryability for {kind:?}"
+            );
+            assert_eq!(cloned.internode_http_error_kind(), Some(kind));
+            if let HttpStatus(status) = kind {
+                assert!(cloned.is_internode_http_status(status.as_u16()));
+            }
+            let DiskError::Io(io_error) = &cloned else {
+                panic!("unmarked internode error must remain Io: {cloned:?}");
+            };
+            let source = io_error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                .expect("clone must retain the structured internode error");
+            assert_eq!(source.context().method(), "PUT");
+            assert_eq!(source.context().target(), "/rustfs/rpc/put_file_stream");
+            assert_eq!(source.context().operation(), Some(INTERNODE_OPERATION_PUT_FILE_STREAM));
+        }
+    }
+
+    #[tokio::test]
+    async fn read_stream_conflict_is_not_a_retryable_put_file_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind isolated HTTP fixture");
+            let address = listener.local_addr().expect("fixture address");
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept read request");
+                let mut request = [0_u8; 4096];
+                let mut read = 0;
+                loop {
+                    let count = stream.read(&mut request[read..]).await.expect("read HTTP request");
+                    assert!(count > 0, "request ended before its complete headers");
+                    read += count;
+                    if request[..read].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                    assert!(read < request.len(), "fixture request headers exceed their budget");
+                }
+                stream
+                    .write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .expect("send typed conflict response");
+            });
+            let error = match rustfs_rio::HttpReader::new(
+                format!("http://{address}/rustfs/rpc/read_file_stream"),
+                http::Method::GET,
+                http::HeaderMap::new(),
+                None,
+            )
+            .await
+            {
+                Ok(_) => panic!("HTTP 409 must fail the read"),
+                Err(error) => DiskError::from(error),
+            };
+            server.await.expect("fixture task should complete");
+            assert!(error.is_internode_http_status(409));
+            assert!(
+                !error.is_retryable_internode_write_failure(),
+                "read-operation 409 must not trigger put-file retry"
+            );
+            let cloned = error.clone();
+            let reduced = crate::disk::error_reduce::reduce_write_quorum_errs(&[Some(error)], &[], 1)
+                .expect("the read conflict must remain the dominant error");
+            for preserved in [&cloned, &reduced] {
+                assert!(
+                    !preserved.is_retryable_internode_write_failure(),
+                    "cloning or reducing a read conflict must not turn it into a PUT retry"
+                );
+                assert!(preserved.is_internode_http_status(409));
+                let DiskError::Io(io_error) = preserved else {
+                    panic!("read conflict must remain Io: {preserved:?}");
+                };
+                let source = io_error
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                    .expect("read conflict must retain its request context");
+                assert_eq!(source.context().method(), "GET");
+                assert_eq!(source.context().target(), "/rustfs/rpc/read_file_stream");
+                assert_eq!(
+                    source.context().operation(),
+                    Some(rustfs_io_metrics::internode_metrics::INTERNODE_OPERATION_READ_FILE_STREAM)
+                );
+            }
+        })
+        .await
+        .expect("isolated read-conflict test must finish within its budget");
+    }
+
+    #[test]
+    fn test_internode_http_clone_preserves_outer_io_kind_and_message() {
+        let source = rustfs_rio::new_test_internode_http_io_error(InternodeHttpErrorKind::ConnectionReset)
+            .into_inner()
+            .expect("the internode helper must provide a typed source");
+        let original_io = io::Error::new(io::ErrorKind::InvalidData, source);
+        let message = original_io.to_string();
+        let original = DiskError::from(original_io);
+        assert_eq!(original.internode_http_error_kind(), Some(InternodeHttpErrorKind::ConnectionReset));
+        assert!(original.is_retryable_internode_write_failure());
+
+        let cloned = original.clone();
+        let reduced = crate::disk::error_reduce::reduce_write_quorum_errs(&[Some(original)], &[], 1)
+            .expect("the wrapped internode error must remain the dominant error");
+        for preserved in [&cloned, &reduced] {
+            let DiskError::Io(io_error) = preserved else {
+                panic!("the wrapped error must remain Io: {preserved:?}");
+            };
+            assert_eq!(io_error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(io_error.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn test_internode_disk_errors_preserve_disk_error_types() {
         let file_missing = DiskError::from(rustfs_rio::new_test_remote_file_not_found_http_io_error());
         let volume_missing = DiskError::from(rustfs_rio::new_test_remote_volume_not_found_http_io_error());
+        let file_corrupt = DiskError::from(rustfs_rio::new_test_remote_file_corrupt_http_io_error());
         let unmarked_server_error = DiskError::from(rustfs_rio::new_test_internode_http_io_error(
             rustfs_rio::InternodeHttpErrorKind::HttpStatus(http::StatusCode::INTERNAL_SERVER_ERROR),
         ));
 
         assert_eq!(file_missing, DiskError::FileNotFound);
         assert_eq!(volume_missing, DiskError::VolumeNotFound);
+        assert_eq!(file_corrupt, DiskError::FileCorrupt);
         assert!(matches!(unmarked_server_error, DiskError::Io(_)));
+        for error in [file_missing, volume_missing, file_corrupt] {
+            assert_eq!(error.clone(), error);
+            assert_eq!(
+                crate::disk::error_reduce::reduce_write_quorum_errs(&[Some(error.clone()), Some(error.clone()), None], &[], 2),
+                Some(error)
+            );
+        }
     }
 
     #[test]
@@ -1119,5 +1582,80 @@ mod tests {
             // The io::Error should contain the original error message
             assert!(io_error.to_string().contains(&original_message));
         }
+    }
+
+    #[test]
+    fn remote_client_unavailable_buckets_ignore_per_peer_detail() {
+        // The reason this variant exists (backlog#1845): equality and hashing
+        // use the wire code alone, so N disks failing because their peer's
+        // client could not be built land in ONE reduce_errs bucket even though
+        // each carries different diagnostic detail.
+        let a = DiskError::RemoteClientUnavailable("connection refused to peer 1".to_string());
+        let b = DiskError::RemoteClientUnavailable("connection refused to peer 2".to_string());
+        assert_eq!(a, b);
+
+        let errors: Vec<Option<DiskError>> = (0..3)
+            .map(|peer| Some(DiskError::RemoteClientUnavailable(format!("transport error: peer {peer} unreachable"))))
+            .collect();
+        let (count, err) = crate::disk::error_reduce::reduce_errs(&errors, &[]);
+        assert_eq!(count, 3);
+        assert!(matches!(err, Some(DiskError::RemoteClientUnavailable(_))));
+    }
+
+    #[test]
+    fn remote_client_unavailable_display_keeps_detail_for_substring_classifiers() {
+        // Heal recoverability and the peer network classifiers read needles
+        // ("transport error", "connection refused", "temporarily offline")
+        // from the rendered message; the typed variant must keep feeding them.
+        let err = DiskError::RemoteClientUnavailable("transport error: connection refused".to_string());
+        let rendered = err.to_string();
+        assert!(rendered.contains("remote rpc client unavailable"));
+        assert!(rendered.contains("transport error: connection refused"));
+    }
+
+    #[test]
+    fn remote_client_unavailable_wire_roundtrip_keeps_variant_and_detail() {
+        let original = DiskError::RemoteClientUnavailable("dial tcp: connection refused".to_string());
+
+        let wire: rustfs_protos::proto_gen::node_service::Error = original.clone().into();
+        assert_eq!(wire.code, 0x2B);
+        assert_eq!(wire.error_info, "remote rpc client unavailable: dial tcp: connection refused");
+
+        let back: DiskError = wire.into();
+        // The variant (and therefore quorum bucketing) survives the hop; the
+        // detail gains the display prefix, mirroring the Io re-wrap behavior.
+        assert_eq!(back, original);
+        assert!(matches!(
+            &back,
+            DiskError::RemoteClientUnavailable(detail) if detail.contains("dial tcp: connection refused")
+        ));
+    }
+
+    #[test]
+    fn remote_client_unavailable_survives_layer_and_io_bridges() {
+        let original = DiskError::RemoteClientUnavailable("handshake timed out".to_string());
+
+        let storage: crate::error::StorageError = original.clone().into();
+        assert!(matches!(
+            &storage,
+            crate::error::StorageError::RemoteClientUnavailable(detail) if detail == "handshake timed out"
+        ));
+        let narrowed: DiskError = storage.narrow_to_disk().expect("typed variant must narrow");
+        assert_eq!(narrowed, original);
+        assert!(matches!(
+            &narrowed,
+            DiskError::RemoteClientUnavailable(detail) if detail == "handshake timed out"
+        ));
+
+        let io_err: std::io::Error = original.clone().into();
+        let recovered: DiskError = io_err.into();
+        assert_eq!(recovered, original);
+
+        let cloned = original.clone();
+        assert!(matches!(
+            &cloned,
+            DiskError::RemoteClientUnavailable(detail) if detail == "handshake timed out"
+        ));
+        assert_eq!(cloned, original);
     }
 }

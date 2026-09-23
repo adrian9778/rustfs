@@ -30,6 +30,8 @@ use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_madmin::{info_commands::DiskMetrics, metrics::TimedAction};
 #[cfg(not(test))]
 use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -195,6 +197,13 @@ fn resolve_drive_timeout_profile_from_env() -> DriveTimeoutProfile {
     DriveTimeoutProfile::parse(rustfs_config::DEFAULT_DRIVE_TIMEOUT_PROFILE).unwrap_or(DriveTimeoutProfile::Default)
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Artificial `disk_info` latency for tests that pin how the admin storage
+    /// walk composes per-drive probe time.
+    pub(crate) static DISK_INFO_PROBE_DELAY_FOR_TEST: Duration;
+}
+
 fn get_drive_timeout_profile() -> DriveTimeoutProfile {
     #[cfg(test)]
     {
@@ -250,6 +259,40 @@ pub(crate) trait DiskStoreRenameDataExt {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp>;
+
+    async fn rename_data_borrowed_with_guard(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<RenameDataResp> {
+        let _ = external_guard;
+        self.rename_data_borrowed(src_volume, src_path, fi, dst_volume, dst_path)
+            .await
+    }
+}
+
+/// Run a mutation in an owned task when a caller supplied publication guard.
+/// RPC cancellation drops only the waiter; the mutation owner keeps the guard
+/// until its operation has returned, including any detached blocking syscall.
+async fn run_owned_mutation<T, F, Fut>(external_guard: Option<Arc<dyn Send + Sync>>, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+{
+    if external_guard.is_none() {
+        return operation().await;
+    }
+    tokio::spawn(async move {
+        let _external_guard = external_guard;
+        operation().await
+    })
+    .await
+    .map_err(|_| Error::other("owned mutation task failed"))?
 }
 
 impl DiskStoreRenameDataExt for LocalDiskWrapper {
@@ -272,6 +315,172 @@ impl DiskStoreRenameDataExt for LocalDiskWrapper {
             get_max_timeout_duration(),
         )
         .await
+    }
+
+    async fn rename_data_borrowed_with_guard(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<RenameDataResp> {
+        self.rename_data_observed(src_volume, src_path, fi, dst_volume, dst_path, external_guard)
+            .await
+            .result
+    }
+}
+
+impl LocalDiskWrapper {
+    pub(in crate::disk) async fn delete_version_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        self.track_disk_health_mutation(
+            "delete_version",
+            DiskMetricMutation::Delete,
+            || async {
+                Box::pin(
+                    self.disk
+                        .delete_version_with_namespace_owner(volume, path, fi, force_del_marker, opts, namespace_owner),
+                )
+                .await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    pub(in crate::disk) async fn delete_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        self.track_disk_health_mutation(
+            "delete",
+            DiskMetricMutation::Delete,
+            || async { Box::pin(self.disk.delete_with_namespace_owner(volume, path, opts, namespace_owner)).await },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    pub(in crate::disk) async fn undo_write_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        self.track_disk_health_mutation(
+            "delete_version",
+            DiskMetricMutation::Delete,
+            || async {
+                // Preserve the old DiskAPI future's boxing boundary.
+                Box::pin(
+                    self.disk
+                        .undo_write_with_namespace_owner(volume, path, fi, opts, namespace_owner),
+                )
+                .await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    pub(in crate::disk) async fn rename_data_observed(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> super::RenameDataObservation {
+        self.rename_data_observed_with_guards(
+            src_volume,
+            src_path,
+            fi,
+            dst_volume,
+            dst_path,
+            super::RenameDataGuards {
+                external_guard,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    pub(in crate::disk) async fn rename_data_observed_with_guards(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        guards: super::RenameDataGuards,
+    ) -> super::RenameDataObservation {
+        let super::RenameDataGuards {
+            external_guard,
+            namespace_owner,
+            ..
+        } = guards;
+        let operation = self.clone();
+        let src_volume = src_volume.to_owned();
+        let src_path = src_path.to_owned();
+        let fi = fi.clone();
+        let dst_volume = dst_volume.to_owned();
+        let dst_path = dst_path.to_owned();
+        let timeout_duration = if external_guard.is_some() {
+            // A fenced mutation owns the publication guard until the storage
+            // operation returns. Timing out this waiter would cancel the
+            // LocalDisk future while a spawn_blocking namespace syscall could
+            // still be committing, reopening the movement window. The caller
+            // may drop its waiter; the owned task drains the mutation.
+            Duration::ZERO
+        } else {
+            get_max_timeout_duration()
+        };
+        let observed = run_owned_mutation(external_guard, move || async move {
+            let mut preflight_rejection = None;
+            let result = operation
+                .track_disk_health_mutation(
+                    "rename_data",
+                    DiskMetricMutation::Write,
+                    || async {
+                        // Preserve the former DiskAPI future's single boxing boundary.
+                        let observed = Box::pin(operation.disk.rename_data_observed(
+                            &src_volume,
+                            &src_path,
+                            &fi,
+                            &dst_volume,
+                            &dst_path,
+                            namespace_owner,
+                        ))
+                        .await;
+                        preflight_rejection = observed.preflight_rejection;
+                        observed.result
+                    },
+                    timeout_duration,
+                )
+                .await;
+            // Health tracking must observe the real disk error, not an Ok tuple.
+            Ok(super::RenameDataObservation {
+                result,
+                preflight_rejection,
+            })
+        })
+        .await;
+        observed.unwrap_or_else(|error| super::RenameDataObservation::unknown(Err(error)))
     }
 }
 
@@ -421,6 +630,8 @@ pub struct DiskHealthTracker {
     /// Authoritative atomically published runtime/status pair.
     state_snapshot: AtomicU64,
     transition_lock: std::sync::Mutex<()>,
+    #[cfg(test)]
+    test_forced_offline: AtomicBool,
 }
 
 fn pack_health_state(runtime_state: RuntimeDriveHealthState, status: u32) -> u64 {
@@ -678,17 +889,20 @@ impl DiskOperationMetrics {
         let elapsed_nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         let slot = &self.last_minute[(now_sec % 60) as usize];
         loop {
-            let version = slot.version.load(Ordering::Acquire);
+            // The successful CAS below is AcqRel, so it is the publication
+            // fence for the writer that owns this slot. The initial parity
+            // check does not need to acquire the slot payload.
+            let version = slot.version.load(Ordering::Relaxed);
             if !version.is_multiple_of(2) {
                 std::hint::spin_loop();
                 continue;
             }
             if slot
                 .version
-                .compare_exchange(version, version.wrapping_add(1), Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(version, version.wrapping_add(1), Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                if slot.unix_sec.load(Ordering::Acquire) != now_sec {
+                if slot.unix_sec.load(Ordering::Relaxed) != now_sec {
                     slot.count.store(0, Ordering::Relaxed);
                     slot.acc_time.store(0, Ordering::Relaxed);
                     slot.unix_sec.store(now_sec, Ordering::Release);
@@ -704,19 +918,32 @@ impl DiskOperationMetrics {
     fn last_minute_snapshot(&self, now_sec: u64) -> TimedAction {
         let mut snapshot = TimedAction::default();
         for slot in &self.last_minute {
-            let version = slot.version.load(Ordering::Acquire);
-            if !version.is_multiple_of(2) {
+            let Some((slot_sec, count, acc_time)) = slot.snapshot() else {
                 continue;
-            }
-            let slot_sec = slot.unix_sec.load(Ordering::Acquire);
-            let count = slot.count.load(Ordering::Acquire);
-            let acc_time = slot.acc_time.load(Ordering::Acquire);
-            if slot.version.load(Ordering::Acquire) == version && slot_sec <= now_sec && now_sec.saturating_sub(slot_sec) < 60 {
+            };
+            if slot_sec <= now_sec && now_sec.saturating_sub(slot_sec) < 60 {
                 snapshot.count = snapshot.count.saturating_add(count);
                 snapshot.acc_time = snapshot.acc_time.saturating_add(acc_time);
             }
         }
         snapshot
+    }
+}
+
+impl TimedActionSlot {
+    fn snapshot(&self) -> Option<(u64, u64, u64)> {
+        let version = self.version.load(Ordering::Acquire);
+        if !version.is_multiple_of(2) {
+            return None;
+        }
+
+        // The first Acquire load publishes the payload written before the
+        // matching Release store. Relaxed payload loads are sufficient while
+        // the final Acquire version load validates that no writer intervened.
+        let slot_sec = self.unix_sec.load(Ordering::Relaxed);
+        let count = self.count.load(Ordering::Relaxed);
+        let acc_time = self.acc_time.load(Ordering::Relaxed);
+        (self.version.load(Ordering::Acquire) == version).then_some((slot_sec, count, acc_time))
     }
 }
 
@@ -752,6 +979,8 @@ impl DiskHealthTracker {
             last_capacity_probe_unix_secs: AtomicI64::new(0),
             state_snapshot: AtomicU64::new(pack_health_state(RuntimeDriveHealthState::Online, DISK_HEALTH_OK)),
             transition_lock: std::sync::Mutex::new(()),
+            #[cfg(test)]
+            test_forced_offline: AtomicBool::new(false),
         }
     }
 
@@ -820,6 +1049,13 @@ impl DiskHealthTracker {
             DISK_HEALTH_OK
         };
         self.publish_state(state, status);
+    }
+
+    #[cfg(test)]
+    pub fn force_offline_for_test(&self) {
+        self.test_forced_offline.store(true, Ordering::Release);
+        let _guard = self.transition_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.publish_state(RuntimeDriveHealthState::Offline, DISK_HEALTH_FAULTY);
     }
 
     pub fn swap_ok_to_faulty(&self) -> bool {
@@ -900,6 +1136,8 @@ impl DiskHealthTracker {
     /// Remote disks are marked faulty on timeout/network errors; the init loop retries with the
     /// same [`DiskStore`] handles, which would otherwise fail immediately at `is_faulty()`.
     pub fn reset_for_store_init_retry(&self, endpoint: &Endpoint) {
+        #[cfg(test)]
+        self.test_forced_offline.store(false, Ordering::Release);
         self.reset_for_store_init_retry_at(endpoint, current_unix_time());
     }
 
@@ -919,6 +1157,10 @@ impl DiskHealthTracker {
     }
 
     pub fn mark_recovery_success(&self, endpoint: &Endpoint, reason: &'static str) -> bool {
+        #[cfg(test)]
+        if self.test_forced_offline.load(Ordering::Acquire) {
+            return false;
+        }
         let _guard = self.transition_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.runtime_state();
         let next = match current {
@@ -1097,6 +1339,37 @@ impl LocalDiskWrapper {
         )
     }
 
+    /// Run a delete under an owned coordinator task when a publication guard
+    /// is present. This keeps the guard alive if the RPC waiter is cancelled
+    /// while the local namespace mutation is still in progress.
+    pub(crate) async fn delete_with_publication_guard(
+        &self,
+        volume: &str,
+        path: &str,
+        options: DeleteOptions,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        let operation = self.clone();
+        let volume = volume.to_owned();
+        let path = path.to_owned();
+        let timeout_duration = if external_guard.is_some() {
+            Duration::ZERO
+        } else {
+            get_max_timeout_duration()
+        };
+        run_owned_mutation(external_guard, move || async move {
+            operation
+                .track_disk_health_mutation(
+                    "delete",
+                    DiskMetricMutation::Delete,
+                    || async { operation.disk.delete(&volume, &path, options).await },
+                    timeout_duration,
+                )
+                .await
+        })
+        .await
+    }
+
     pub(crate) fn new_with_reconnect_state(
         disk: Arc<LocalDisk>,
         health_check: bool,
@@ -1148,6 +1421,7 @@ impl LocalDiskWrapper {
         self.disk.get_object_path(volume, path)
     }
 
+    #[cfg(unix)]
     pub(crate) fn get_object_path_for_io(&self, volume: &str, path: &str) -> crate::disk::error::Result<std::path::PathBuf> {
         self.disk.get_object_path_for_io(volume, path)
     }
@@ -1183,6 +1457,11 @@ impl LocalDiskWrapper {
     #[cfg(test)]
     pub fn force_runtime_state_for_test(&self, state: RuntimeDriveHealthState) {
         self.health.force_runtime_state_for_test(state);
+    }
+
+    #[cfg(test)]
+    pub fn force_offline_for_test(&self) {
+        self.health.force_offline_for_test();
     }
 
     /// Same as [`DiskHealthTracker::reset_for_store_init_retry`]: undo a transient faulty mark before another format load attempt.
@@ -1342,6 +1621,7 @@ impl LocalDiskWrapper {
                     undo_write: false,
                     undo_delete: false,
                     old_data_dir: None,
+                    expected_delete_marker: None,
                 },
             )
             .await?;
@@ -1788,6 +2068,10 @@ impl DiskAPI for LocalDiskWrapper {
             .track_disk_health_with_op_and_timeout_action(
                 "disk_info",
                 || async {
+                    #[cfg(test)]
+                    if let Ok(delay) = DISK_INFO_PROBE_DELAY_FOR_TEST.try_with(|delay| *delay) {
+                        tokio::time::sleep(delay).await;
+                    }
                     let result = self.disk.disk_info(opts).await?;
 
                     if let Some(current_disk_id) = *self.disk_id.read().await
@@ -1812,11 +2096,17 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn make_volume(&self, volume: &str) -> Result<()> {
+        // Scoped heal must drain directory creation before releasing its lifecycle owner.
+        let timeout = if crate::store::bucket_heal_scope(volume).is_some() {
+            Duration::ZERO
+        } else {
+            get_max_timeout_duration()
+        };
         self.track_disk_health_mutation(
             "make_volume",
             DiskMetricMutation::Write,
             || async { self.disk.make_volume(volume).await },
-            get_max_timeout_duration(),
+            timeout,
         )
         .await
     }
@@ -1964,21 +2254,39 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn delete_data_dir(&self, volume: &str, path: &str, opts: DeleteOptions) -> Result<DataDirDeleteStatus> {
+        let scope = crate::store::bucket_heal_scope(volume);
+        if let Some(scope) = &scope {
+            scope.check()?;
+        }
+        let timeout = if scope.is_some() {
+            Duration::ZERO
+        } else {
+            get_max_timeout_duration()
+        };
         self.track_disk_health_mutation(
             "delete_data_dir",
             DiskMetricMutation::Delete,
             || async { self.disk.delete_data_dir(volume, path, opts).await },
-            get_max_timeout_duration(),
+            timeout,
         )
         .await
     }
 
     async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
+        let scope = crate::store::bucket_heal_scope(volume);
+        if let Some(scope) = &scope {
+            scope.check()?;
+        }
+        let timeout = if scope.is_some() {
+            Duration::ZERO
+        } else {
+            get_max_timeout_duration()
+        };
         self.track_disk_health_mutation(
             "write_metadata",
             DiskMetricMutation::Write,
             || async { self.disk.write_metadata(org_volume, volume, path, fi).await },
-            get_max_timeout_duration(),
+            timeout,
         )
         .await
     }
@@ -2137,6 +2445,20 @@ impl DiskAPI for LocalDiskWrapper {
         .await
     }
 
+    async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        self.track_disk_health_mutation(
+            "rename_file",
+            DiskMetricMutation::Write,
+            || async {
+                self.disk
+                    .rename_file_durable(src_volume, src_path, dst_volume, dst_path)
+                    .await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     async fn prepare_part_transaction(
         &self,
         src_volume: &str,
@@ -2247,6 +2569,44 @@ mod tests {
     };
     use tokio::io::AsyncWrite;
 
+    struct DropProbe(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_mutation_keeps_publication_guard_after_waiter_cancellation() {
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guard: Arc<dyn Send + Sync> = Arc::new(DropProbe(Arc::clone(&drops)));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+
+        let waiter = tokio::spawn(run_owned_mutation(Some(guard), move || async move {
+            started_tx.send(()).expect("mutation should signal start");
+            release_rx.await.expect("mutation should be released");
+            finished_tx.send(()).expect("mutation should signal completion");
+            Ok::<_, Error>(())
+        }));
+
+        started_rx.await.expect("mutation owner should start");
+        waiter.abort();
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        release_tx.send(()).expect("mutation owner should still be alive");
+        finished_rx.await.expect("mutation owner should finish");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while drops.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("publication guard should be released after mutation completion");
+    }
+
     struct PendingWriter;
 
     #[test]
@@ -2271,6 +2631,25 @@ mod tests {
         let window = metrics.last_minute_snapshot(70);
         assert_eq!(window.count, 2);
         assert_eq!(window.acc_time, 18_000);
+    }
+
+    #[test]
+    fn timed_action_slot_snapshot_skips_writer_owned_slot() {
+        let slot = TimedActionSlot::default();
+        slot.unix_sec.store(70, Ordering::Relaxed);
+        slot.count.store(2, Ordering::Relaxed);
+        slot.acc_time.store(18_000, Ordering::Relaxed);
+        slot.version.store(2, Ordering::Release);
+        assert_eq!(slot.snapshot(), Some((70, 2, 18_000)));
+
+        assert_eq!(slot.version.compare_exchange(2, 3, Ordering::AcqRel, Ordering::Relaxed), Ok(2));
+        slot.unix_sec.store(71, Ordering::Relaxed);
+        slot.count.store(1, Ordering::Relaxed);
+        slot.acc_time.store(11_000, Ordering::Relaxed);
+        assert_eq!(slot.snapshot(), None);
+
+        slot.version.store(4, Ordering::Release);
+        assert_eq!(slot.snapshot(), Some((71, 1, 11_000)));
     }
 
     #[test]
@@ -2405,6 +2784,46 @@ mod tests {
             .expect("legacy health wrapper call should succeed");
 
         assert_eq!(wrapper.metrics_snapshot().api_calls.get("unknown"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn rename_preflight_evidence_preserves_health_errors_and_owned_reply() {
+        for source_exists in [false, true] {
+            for guarded in [false, true] {
+                let dir = tempfile::tempdir().expect("temp dir should be created");
+                let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8"))
+                    .expect("endpoint should parse");
+                let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+                if source_exists {
+                    disk.make_volume("source").await.expect("source volume should exist");
+                }
+                let wrapper = LocalDiskWrapper::new(disk, false);
+                let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let external_guard = guarded.then(|| Arc::new(DropProbe(Arc::clone(&drops))) as Arc<dyn Send + Sync>);
+                let mut file_info = FileInfo::new("object", 1, 0);
+                file_info.mod_time = Some(::time::OffsetDateTime::now_utc());
+                file_info.erasure.index = 1;
+                let observed = wrapper
+                    .rename_data_observed("source", "object", &file_info, "missing-destination", "object", external_guard)
+                    .await;
+                assert!(observed.rejected_before_publication(), "normal access rejection must carry proof");
+                assert!(matches!(observed.result, Err(DiskError::VolumeNotFound)));
+                let snapshot = wrapper.metrics_snapshot();
+                assert_eq!(snapshot.api_calls.get("rename_data"), Some(&1));
+                assert_eq!(snapshot.total_writes, 0, "health tracking must not observe the rejection as Ok");
+                assert_eq!(drops.load(Ordering::SeqCst), usize::from(guarded));
+
+                wrapper.health.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+                let observed = wrapper
+                    .rename_data_observed("source", "object", &file_info, "missing-destination", "object", None)
+                    .await;
+                assert!(!observed.rejected_before_publication(), "wrapper errors carry no local preflight proof");
+                assert!(matches!(observed.result, Err(DiskError::FaultyDisk)));
+                let snapshot = wrapper.metrics_snapshot();
+                assert_eq!(snapshot.total_errors_availability, 1);
+                assert_eq!(snapshot.total_writes, 0);
+            }
+        }
     }
 
     #[tokio::test]

@@ -44,10 +44,17 @@ pub const SUFFIX_COMPRESSION: &str = "compression";
 pub const SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT: &str = "replication-preserve-ciphertext";
 pub const SUFFIX_COMPRESSION_SIZE: &str = "compression-size";
 pub const SUFFIX_ACTUAL_SIZE: &str = "actual-size";
+/// Maximum logical object size for a capability-bound multipart upload.
+pub const SUFFIX_MAX_TOTAL_OBJECT_SIZE: &str = "max-total-object-size";
 pub const SUFFIX_ACTUAL_OBJECT_SIZE: &str = "actual-object-size";
 /// Used by replication; key stored with capital A
 pub const SUFFIX_ACTUAL_OBJECT_SIZE_CAP: &str = "Actual-Object-Size";
 pub const SUFFIX_CRC: &str = "crc";
+/// Marks checksum bytes produced by RustFS as plaintext checksum metadata.
+///
+/// MinIO encrypts the same on-disk field for SSE objects, so readers must not
+/// decode encrypted-object checksums unless this marker is present.
+pub const SUFFIX_PLAINTEXT_CHECKSUM: &str = "plaintext-checksum";
 /// JSON-encoded per-part S3 checksum maps retained across raw data movement.
 pub const SUFFIX_PART_CHECKSUMS: &str = "part-checksums";
 pub const SUFFIX_TRANSITION_STATUS: &str = "transition-status";
@@ -58,14 +65,22 @@ pub const SUFFIX_TRANSITION_TIER: &str = "transition-tier";
 pub const SUFFIX_TRANSITION_TIER_DESTINATION_ID: &str = "transition-tier-destination-id";
 pub const SUFFIX_TRANSITION_TRANSACTION_ID: &str = "transition-transaction-id";
 pub const SUFFIX_RESTORE_OPERATION_ID: &str = "restore-operation-id";
+/// Marks restore generations whose worker owns the matching distributed
+/// liveness lock for the duration of the asynchronous copy-back.
+pub const SUFFIX_RESTORE_WORKER_LOCK: &str = "restore-worker-lock";
+pub const RESTORE_WORKER_LOCK_PROTOCOL_V1: &str = "v1";
 pub const SUFFIX_BUCKET_INCARNATION_ID: &str = "bucket-incarnation-id";
 pub const SUFFIX_OBJECT_TRANSACTION_EPOCH: &str = "object-transaction-epoch";
+/// Active rebalance run id mirrored onto `rebalance.bin` object metadata.
+pub const SUFFIX_REBALANCE_RUN_ID: &str = "rebalance-run-id";
 pub const SUFFIX_FREE_VERSION: &str = "free-version";
 pub const SUFFIX_PURGESTATUS: &str = "purgestatus";
 pub const SUFFIX_REPLICA_STATUS: &str = "replica-status";
 pub const SUFFIX_REPLICA_TIMESTAMP: &str = "replica-timestamp";
 pub const SUFFIX_REPLICATION_STATUS: &str = "replication-status";
 pub const SUFFIX_REPLICATION_TIMESTAMP: &str = "replication-timestamp";
+/// Source-local opaque mutation id fencing replication status write-back.
+pub const SUFFIX_REPLICATION_GENERATION: &str = "replication-generation";
 pub const SUFFIX_TAGGING_TIMESTAMP: &str = "tagging-timestamp";
 pub const SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP: &str = "objectlock-retention-timestamp";
 pub const SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP: &str = "objectlock-legalhold-timestamp";
@@ -78,6 +93,25 @@ pub const SUFFIX_TIER_SKIP_FV_ID: &str = "tier-skip-fvid";
 
 /// Per-target delete-marker version ids are stored one key per target ARN.
 pub const SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX: &str = "replication-delete-marker-version-";
+/// Per-target data-version ids, one key per target ARN: the version a
+/// replication target that mints its own ids assigned to this object version
+/// (rustfs/backlog#2340). Absent on targets that adopt the source id.
+pub const SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX: &str = "replication-target-version-";
+
+// On-demand migration provenance. Written by the migration write-back onto
+// every pulled object so operators and later tooling can tell a migrated
+// object from a client write and audit where it came from. Internal keys, so
+// the existing internal-key filter keeps them out of client-visible metadata.
+/// Source of a pulled object as `<provider>:<bucket>`.
+pub const SUFFIX_ODM_SOURCE: &str = "odm-source";
+/// ETag the source reported for the pulled object, verbatim.
+pub const SUFFIX_ODM_SOURCE_ETAG: &str = "odm-source-etag";
+/// Source `Last-Modified` of the pulled object, RFC 3339.
+pub const SUFFIX_ODM_SOURCE_LAST_MODIFIED: &str = "odm-source-last-modified";
+/// Source version id of the pulled object; empty for an unversioned source.
+pub const SUFFIX_ODM_SOURCE_VERSION_ID: &str = "odm-source-version-id";
+/// When the object was pulled from the source, RFC 3339.
+pub const SUFFIX_ODM_PULLED_AT: &str = "odm-pulled-at";
 
 /// Case-insensitive (ASCII) check that `s` begins with `prefix`. Equivalent to
 /// `s.to_lowercase().starts_with(prefix)` when `prefix` is ASCII (as both internal prefixes are),
@@ -284,6 +318,17 @@ pub fn strip_internal_prefix_preserving_case(key: &str) -> Option<&str> {
 /// Reads the bounded per-target delete-marker version map in one metadata scan.
 /// The boolean is set when matching metadata is malformed or compatibility keys disagree.
 pub fn target_delete_marker_versions(map: &HashMap<String, String>) -> (HashMap<String, String>, bool) {
+    internal_versions_by_arn(map, SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX)
+}
+
+/// Reads the bounded per-target data-version ledger (the id each drifting
+/// target assigned to this object version) in one metadata scan. Same
+/// bounds and corruption reporting as [`target_delete_marker_versions`].
+pub fn replication_target_versions(map: &HashMap<String, String>) -> (HashMap<String, String>, bool) {
+    internal_versions_by_arn(map, SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX)
+}
+
+fn internal_versions_by_arn(map: &HashMap<String, String>, arn_prefix: &str) -> (HashMap<String, String>, bool) {
     const MAX_ENTRIES: usize = 1_000;
     const MAX_ARN_LEN: usize = 1_024;
     const MAX_VERSION_ID_LEN: usize = 1_024;
@@ -294,13 +339,13 @@ pub fn target_delete_marker_versions(map: &HashMap<String, String>) -> (HashMap<
         let Some(suffix) = strip_internal_prefix_preserving_case(key) else {
             continue;
         };
-        let Some(prefix) = suffix.get(..SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX.len()) else {
+        let Some(prefix) = suffix.get(..arn_prefix.len()) else {
             continue;
         };
-        if !prefix.eq_ignore_ascii_case(SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX) {
+        if !prefix.eq_ignore_ascii_case(arn_prefix) {
             continue;
         }
-        let arn = &suffix[SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX.len()..];
+        let arn = &suffix[arn_prefix.len()..];
         if !arn.starts_with("arn:") || arn.len() > MAX_ARN_LEN || value.is_empty() || value.len() > MAX_VERSION_ID_LEN {
             corrupt = true;
             continue;
@@ -582,6 +627,80 @@ mod tests {
         assert!(!contains_key_bytes(&meta_sys, &long_suffix));
     }
 
+    const ODM_PROVENANCE_SUFFIXES: [&str; 5] = [
+        SUFFIX_ODM_SOURCE,
+        SUFFIX_ODM_SOURCE_ETAG,
+        SUFFIX_ODM_SOURCE_LAST_MODIFIED,
+        SUFFIX_ODM_SOURCE_VERSION_ID,
+        SUFFIX_ODM_PULLED_AT,
+    ];
+
+    #[test]
+    fn odm_provenance_suffixes_are_reserved_internal_keys_under_both_prefixes() {
+        for suffix in ODM_PROVENANCE_SUFFIXES {
+            for prefix in [RUSTFS_INTERNAL_PREFIX, MINIO_INTERNAL_PREFIX] {
+                let key = format!("{prefix}{suffix}");
+                assert!(is_internal_key(&key), "{key} must be an internal key");
+                assert!(has_internal_suffix(&key, suffix), "{key} must match its own suffix");
+                assert!(has_internal_suffix(&key.to_uppercase(), suffix), "{key} must match case-insensitively");
+                assert_eq!(strip_internal_prefix(&key).as_deref(), Some(suffix));
+            }
+            assert!(
+                !is_internal_key(&format!("x-amz-meta-{suffix}")),
+                "{suffix} must not leak as user metadata"
+            );
+            assert!(suffix.starts_with("odm-"), "{suffix} must stay in the odm- namespace");
+            assert!(
+                suffix.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'),
+                "{suffix} must be lowercase-hyphenated"
+            );
+        }
+        let distinct: std::collections::HashSet<&str> = ODM_PROVENANCE_SUFFIXES.into_iter().collect();
+        assert_eq!(distinct.len(), ODM_PROVENANCE_SUFFIXES.len(), "provenance suffixes must be distinct");
+    }
+
+    #[test]
+    fn odm_provenance_values_round_trip_under_both_prefixes() {
+        let mut metadata = HashMap::new();
+        insert_str(&mut metadata, SUFFIX_ODM_SOURCE, "s3:legacy-bucket".to_string());
+        insert_str(&mut metadata, SUFFIX_ODM_SOURCE_ETAG, "0123456789abcdef0123456789abcdef-3".to_string());
+        insert_str(&mut metadata, SUFFIX_ODM_SOURCE_LAST_MODIFIED, "2026-01-02T03:04:05Z".to_string());
+        insert_str(&mut metadata, SUFFIX_ODM_SOURCE_VERSION_ID, String::new());
+        insert_str(&mut metadata, SUFFIX_ODM_PULLED_AT, "2026-09-02T00:00:00Z".to_string());
+
+        assert_eq!(
+            metadata.len(),
+            2 * ODM_PROVENANCE_SUFFIXES.len(),
+            "every marker is written under both prefixes"
+        );
+        for suffix in ODM_PROVENANCE_SUFFIXES {
+            assert!(metadata.contains_key(&internal_key_rustfs(suffix)), "missing RustFS key for {suffix}");
+            assert!(
+                metadata.contains_key(&format!("{MINIO_INTERNAL_PREFIX}{suffix}")),
+                "missing MinIO key for {suffix}"
+            );
+            assert!(contains_key_str(&metadata, suffix));
+        }
+        assert_eq!(get_str(&metadata, SUFFIX_ODM_SOURCE).as_deref(), Some("s3:legacy-bucket"));
+        assert_eq!(get_str(&metadata, SUFFIX_ODM_SOURCE_VERSION_ID).as_deref(), Some(""));
+        assert_eq!(
+            get_consistent_str(&metadata, SUFFIX_ODM_SOURCE_ETAG),
+            Some("0123456789abcdef0123456789abcdef-3")
+        );
+
+        // A MinIO-only reader must still find the marker.
+        let minio_only: HashMap<String, String> = metadata
+            .iter()
+            .filter(|(key, _)| starts_with_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        assert_eq!(get_str(&minio_only, SUFFIX_ODM_PULLED_AT).as_deref(), Some("2026-09-02T00:00:00Z"));
+
+        remove_str(&mut metadata, SUFFIX_ODM_SOURCE);
+        assert!(!contains_key_str(&metadata, SUFFIX_ODM_SOURCE));
+        assert!(contains_key_str(&metadata, SUFFIX_ODM_SOURCE_ETAG));
+    }
+
     #[test]
     fn target_delete_marker_versions_preserve_arn_case_and_report_conflicts() {
         let arn = "arn:rustfs:replication::Target:Bucket";
@@ -596,6 +715,37 @@ mod tests {
         metadata.insert(format!("{MINIO_INTERNAL_PREFIX}{suffix}"), "other-version".to_string());
         let (versions, corrupt) = target_delete_marker_versions(&metadata);
         assert!(versions.is_empty());
+        assert!(corrupt);
+    }
+
+    #[test]
+    fn replication_target_versions_are_keyed_apart_from_delete_marker_versions() {
+        let arn = "arn:rustfs:replication::target";
+        let mut metadata = HashMap::new();
+        insert_str(
+            &mut metadata,
+            &format!("{SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX}{arn}"),
+            "data-version".to_string(),
+        );
+        insert_str(
+            &mut metadata,
+            &format!("{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}{arn}"),
+            "marker-version".to_string(),
+        );
+
+        let (data_versions, corrupt) = replication_target_versions(&metadata);
+        assert!(!corrupt);
+        assert_eq!(data_versions.get(arn).map(String::as_str), Some("data-version"));
+        let (marker_versions, corrupt) = target_delete_marker_versions(&metadata);
+        assert!(!corrupt);
+        assert_eq!(marker_versions.get(arn).map(String::as_str), Some("marker-version"));
+
+        metadata.insert(
+            format!("{MINIO_INTERNAL_PREFIX}{SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX}{arn}"),
+            "other-version".to_string(),
+        );
+        let (data_versions, corrupt) = replication_target_versions(&metadata);
+        assert!(data_versions.is_empty());
         assert!(corrupt);
     }
 

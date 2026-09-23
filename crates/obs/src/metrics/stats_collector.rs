@@ -18,6 +18,7 @@
 //! RustFS internal sources (storage layer, bucket monitor, system info)
 //! and convert them to the Stats structs used by collectors.
 
+use crate::metrics::collectors::cluster_drive::ClusterDriveStats;
 use crate::metrics::collectors::scanner::{ScannerActiveBucketDriveStats, ScannerBucketDriveResultStats, ScannerSourceWorkStats};
 use crate::metrics::collectors::{
     ApiRequestMetricSupport, ApiRequestStats, BucketReplicationBacklogStats, BucketReplicationBandwidthStats,
@@ -26,26 +27,28 @@ use crate::metrics::collectors::{
     ClusterHealthStats, ClusterStats, ClusterUsageStats, CompressionClusterStats, CpuStats, DiskStats, DriveCountStats,
     DriveDetailedStats, DriveRuntimeDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmActionTaskStats,
     IlmBackpressureStats, IlmQueueTaskStats, IlmRuntimeStats, IlmStats, IlmTaskEventStats, MemoryStats, NetworkStats,
-    ProcessStats, ProcessStatusType, ReplicationMetricsSnapshot, ResourceStats, ScannerRuntimeStats, ScannerStats,
+    OdmBackfillRuntimeStats, OnDemandMigrationBucketStats, ProcessStats, ProcessStatusType, ReplicationMetricsSnapshot,
+    ResourceStats, ScannerRuntimeStats, ScannerStats, TierRequestStats,
 };
 use crate::metrics::runtime_sources::{ObsIlmRuntimeSnapshot, bucket_monitor_handle, iam_metrics_snapshot, ilm_runtime_snapshot};
 use crate::metrics::{
     BucketOperations, BucketOptions, ObsBucketReplicationStatsSnapshot, ObsEcstoreResult, ObsStore, StorageAdminApi,
     obs_bucket_replication_stats_snapshot, obs_get_quota_config, obs_get_total_usable_capacity,
     obs_get_total_usable_capacity_free, obs_load_compression_total_from_memory, obs_load_data_usage_from_backend,
-    obs_replication_site_stats_snapshot, obs_resolve_object_store_handle,
+    obs_on_demand_migration_backfill_snapshot, obs_on_demand_migration_snapshot, obs_replication_site_stats_snapshot,
+    obs_resolve_object_store_handle,
 };
 use crate::node_identity::current_local_node_identity;
 use jiff::Timestamp;
-use rustfs_common::heal_channel::HealScanMode;
-use rustfs_common::metrics::{
-    ScannerActiveBucketDriveSnapshot, ScannerBucketDriveResultSnapshot, ScannerMetricsReport, ScannerSourceWorkSnapshot,
-    global_metrics,
-};
+use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_io_metrics::{
     ProcessResourceSnapshot, ProcessSampler, ProcessStatusSnapshot, ProcessSystemSnapshot, s3_op_metrics_snapshot,
     snapshot_process_resource_and_system, snapshot_process_resource_and_system_with,
+};
+use rustfs_scanner_metrics::metrics::{
+    ScannerActiveBucketDriveSnapshot, ScannerBucketDriveResultSnapshot, ScannerMetricsReport, ScannerSourceWorkSnapshot,
+    global_metrics,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -348,6 +351,16 @@ fn scanner_scan_mode_code(scan_mode: &str) -> u64 {
     }
 }
 
+fn scanner_usage_publication_result_code(state: &str) -> u64 {
+    match state {
+        "success" => 1,
+        "deferred" => 2,
+        "failed" => 3,
+        "no_update" => 4,
+        _ => 0,
+    }
+}
+
 fn scanner_work_rate_per_second(count: u64, seconds: f64) -> f64 {
     if seconds > 0.0 && seconds.is_finite() {
         count as f64 / seconds
@@ -485,13 +498,51 @@ pub struct ProcessMetricBundle {
     pub disk_write_bytes: u64,
 }
 
+pub(crate) struct ClusterStorageSnapshot {
+    pub cluster: ClusterStats,
+    pub health: ClusterHealthStats,
+    pub drives: Vec<ClusterDriveStats>,
+    pub erasure_sets: Vec<ErasureSetStats>,
+}
+
+fn cluster_drive_stats_from_storage(storage: &ObsStorageInfo, local_server: &str) -> Vec<ClusterDriveStats> {
+    storage
+        .disks
+        .iter()
+        .map(|disk| {
+            let (capacity_state, capacity_age_seconds) = disk_capacity_observation_state(
+                disk.capacity_observation_source.as_deref(),
+                disk.capacity_observation_age_seconds,
+            );
+            ClusterDriveStats {
+                server: drive_server_label(&disk.endpoint, local_server),
+                drive: disk.drive_path.clone(),
+                pool_index: disk_topology_label(disk.pool_index).unwrap_or_default(),
+                set_index: disk_topology_label(disk.set_index).unwrap_or_default(),
+                drive_index: disk_topology_label(disk.disk_index).unwrap_or_default(),
+                disk_id: non_empty_disk_id(&disk.uuid).unwrap_or_default(),
+                runtime_state: disk.runtime_state.as_deref().unwrap_or("unknown").to_ascii_lowercase(),
+                offline_duration_seconds: disk.offline_duration_seconds,
+                capacity_state,
+                capacity_age_seconds,
+                total_bytes: disk.total_space,
+                used_bytes: disk.used_space,
+                free_bytes: disk.available_space,
+            }
+        })
+        .collect()
+}
+
 /// Collect cluster and cluster-health statistics from a single storage snapshot.
-pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthStats) {
-    let Some(store) = resolve_obs_object_store_handle() else {
-        return (ClusterStats::default(), ClusterHealthStats::default());
-    };
+pub(crate) async fn collect_cluster_storage_snapshot() -> Option<ClusterStorageSnapshot> {
+    let store = resolve_obs_object_store_handle()?;
 
     let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
+    if storage_info.disks.is_empty() && storage_info.backend.drives_per_set.is_empty() {
+        return None;
+    }
+    let drives = cluster_drive_stats_from_storage(&storage_info, &current_local_node_identity());
+    let erasure_sets = erasure_set_stats_from_backend(&storage_info, &storage_info.backend);
     let raw_capacity: u64 = storage_info.disks.iter().map(|d| d.total_space).sum();
     let usable_capacity = obs_total_usable_capacity_bytes(&storage_info);
     let free = obs_total_usable_capacity_free_bytes(&storage_info);
@@ -534,8 +585,8 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
         }
     }
 
-    (
-        ClusterStats {
+    Some(ClusterStorageSnapshot {
+        cluster: ClusterStats {
             raw_capacity_bytes: raw_capacity,
             usable_capacity_bytes: usable_capacity,
             used_bytes: used,
@@ -545,12 +596,22 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
             objects_count,
             buckets_count,
         },
-        ClusterHealthStats {
+        health: ClusterHealthStats {
             drives_offline_count: offline,
             drives_online_count: online,
             drives_count: storage_info.disks.len() as u64,
         },
-    )
+        drives,
+        erasure_sets,
+    })
+}
+
+/// Collect cluster statistics using the same observer snapshot as topology and health.
+pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthStats) {
+    collect_cluster_storage_snapshot()
+        .await
+        .map(|snapshot| (snapshot.cluster, snapshot.health))
+        .unwrap_or_default()
 }
 
 /// Collect cluster statistics from the storage layer.
@@ -661,6 +722,16 @@ pub(crate) async fn collect_bucket_replication_stats_bundle()
     obs_bucket_replication_stats_bundle().await
 }
 
+/// Collect per-bucket on-demand migration stats from the global runtime.
+pub fn collect_on_demand_migration_stats() -> Vec<OnDemandMigrationBucketStats> {
+    obs_on_demand_migration_snapshot()
+}
+
+/// Collect this node's on-demand migration backfill job progress.
+pub fn collect_on_demand_migration_backfill_stats() -> OdmBackfillRuntimeStats {
+    obs_on_demand_migration_backfill_snapshot(current_local_node_identity())
+}
+
 /// Collect site-level replication stats from the global replication runtime.
 pub async fn collect_replication_stats() -> ReplicationMetricsSnapshot {
     obs_site_replication_stats().await
@@ -751,23 +822,31 @@ pub fn collect_system_memory_stats() -> MemoryStats {
 
 /// Collect node disk stats and drive stats from a single storage snapshot.
 pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<DriveDetailedStats>, DriveCountStats) {
-    let (disk_stats, drive_stats, drive_count_stats) = collect_disk_and_system_drive_runtime_stats().await;
+    let (disk_stats, drive_stats, drive_count_stats) = collect_disk_and_system_drive_runtime_stats().await.unwrap_or_default();
     (disk_stats, drive_stats.into_iter().map(|stat| stat.stats).collect(), drive_count_stats)
 }
 
 pub(crate) async fn collect_disk_and_system_drive_runtime_stats()
--> (Vec<DiskStats>, Vec<DriveRuntimeDetailedStats>, DriveCountStats) {
-    let Some(store) = resolve_obs_object_store_handle() else {
-        return (Vec::new(), Vec::new(), DriveCountStats::default());
-    };
+-> Option<(Vec<DiskStats>, Vec<DriveRuntimeDetailedStats>, DriveCountStats)> {
+    let store = resolve_obs_object_store_handle()?;
+    let storage_info = StorageAdminApi::local_storage_info(store.as_ref()).await;
+    Some(local_drive_stats_from_storage(&storage_info, &current_local_node_identity()))
+}
 
-    let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
-    let local_server = current_local_node_identity();
+fn local_drive_stats_from_storage(
+    storage_info: &ObsStorageInfo,
+    local_server: &str,
+) -> (Vec<DiskStats>, Vec<DriveRuntimeDetailedStats>, DriveCountStats) {
     let disk_stats = storage_info
         .disks
         .iter()
+        .filter(|disk| disk.local)
+        .filter(|disk| {
+            disk_capacity_observation_state(disk.capacity_observation_source.as_deref(), disk.capacity_observation_age_seconds).0
+                != CAPACITY_OBSERVATION_MISSING
+        })
         .map(|disk| DiskStats {
-            server: drive_server_label(&disk.endpoint, &local_server),
+            server: drive_server_label(&disk.endpoint, local_server),
             drive: disk.drive_path.clone(),
             total_bytes: disk.total_space,
             used_bytes: disk.used_space,
@@ -780,6 +859,7 @@ pub(crate) async fn collect_disk_and_system_drive_runtime_stats()
     let drive_stats = storage_info
         .disks
         .iter()
+        .filter(|disk| disk.local)
         .map(|disk| {
             let is_online = disk_is_online_for_metrics(disk.state.as_str(), disk.runtime_state.as_deref());
             let (capacity_observation_state, capacity_observation_age_seconds) = disk_capacity_observation_state(
@@ -820,7 +900,7 @@ pub(crate) async fn collect_disk_and_system_drive_runtime_stats()
                     })
                     .unwrap_or_default(),
                 stats: DriveDetailedStats {
-                    server: drive_server_label(&disk.endpoint, &local_server),
+                    server: drive_server_label(&disk.endpoint, local_server),
                     drive: disk.drive_path.clone(),
                     total_bytes: disk.total_space,
                     used_bytes: disk.used_space,
@@ -1384,6 +1464,23 @@ fn ilm_backpressure_stats(metrics: &ScannerMetricsReport) -> Vec<IlmBackpressure
     ]
 }
 
+/// Collect the remote tier request counters from the lifecycle runtime.
+///
+/// Every operation/outcome cell is reported, including zero ones, so the
+/// series set is stable from the first scrape rather than appearing one label
+/// combination at a time.
+pub fn collect_tier_request_metric_stats() -> Vec<TierRequestStats> {
+    global_metrics()
+        .tier_request_counts()
+        .into_iter()
+        .map(|count| TierRequestStats {
+            operation: count.operation.as_label(),
+            outcome: count.outcome.as_label(),
+            count: count.count,
+        })
+        .collect()
+}
+
 /// Collect ILM metrics from the current lifecycle runtime state.
 pub async fn collect_ilm_metric_stats() -> Option<IlmStats> {
     collect_ilm_runtime_metric_stats().await.map(|stats| stats.stats)
@@ -1541,6 +1638,7 @@ pub(crate) async fn collect_scanner_runtime_metric_stats() -> Option<ScannerRunt
     let current_scan_mode = scanner_scan_mode_code(&metrics.current_scan_mode);
     let current_cycle_age = current_cycle_age_seconds as f64;
     let last_cycle_duration = metrics.last_cycle_duration_seconds;
+    let usage_freshness = &metrics.usage_freshness;
 
     Some(ScannerRuntimeStats {
         server: current_local_node_identity(),
@@ -1638,6 +1736,19 @@ pub(crate) async fn collect_scanner_runtime_metric_stats() -> Option<ScannerRunt
             partial_cycles_runtime: metrics.partial_cycles_runtime,
             partial_cycles_objects: metrics.partial_cycles_objects,
             partial_cycles_directories: metrics.partial_cycles_directories,
+            dirty_usage_pending_buckets: usage_freshness.dirty_pending_buckets,
+            dirty_usage_last_mark_unix_seconds: usage_freshness.last_dirty_mark_unix_secs,
+            dirty_usage_last_clear_unix_seconds: usage_freshness.last_dirty_clear_unix_secs,
+            dirty_usage_last_cycle_buckets: usage_freshness.last_cycle_dirty_buckets,
+            dirty_usage_last_cycle_cleared_buckets: usage_freshness.last_cycle_cleared_dirty_buckets,
+            usage_last_save_unix_seconds: usage_freshness.last_usage_save_unix_secs,
+            usage_last_save_result: usage_freshness.last_usage_save_result_code,
+            usage_last_durable_success_unix_seconds: usage_freshness.last_durable_success_unix_secs,
+            usage_last_publication_unix_seconds: usage_freshness.last_publication_unix_secs,
+            usage_last_publication_result: scanner_usage_publication_result_code(&usage_freshness.last_publication_state),
+            usage_deferred_pending: usage_freshness.deferred_pending,
+            usage_deferred_total: usage_freshness.deferred_total,
+            usage_last_deferred_unix_seconds: usage_freshness.last_deferred_unix_secs,
         },
     })
 }
@@ -1667,7 +1778,7 @@ pub async fn collect_compression_cluster_stats() -> Option<CompressionClusterSta
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_common::metrics::ScannerSourceWorkSnapshot;
+    use rustfs_scanner_metrics::metrics::ScannerSourceWorkSnapshot;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::thread;
@@ -1683,6 +1794,43 @@ mod tests {
         disk.state = DRIVE_STATE_OK.to_string();
         disk.runtime_state = Some(DRIVE_STATE_ONLINE.to_string());
         info
+    }
+
+    #[test]
+    fn local_details_exclude_remote_copies_but_keep_offline_configured_slots() {
+        let mut info = storage_info_with_one_online_disk();
+        info.disks[0].local = true;
+        info.disks[0].endpoint = "http://owner:9000/data".into();
+        info.disks[0].drive_path = "/data".into();
+        info.disks[0].uuid = "disk-old".into();
+        info.disks[0].capacity_observation_source = Some("live_probe".into());
+        let mut remote = info.disks[0].clone();
+        remote.local = false;
+        remote.endpoint = "http://peer:9000/data".into();
+        remote.pool_index = 1;
+        remote.uuid = "peer-disk".into();
+        info.disks.push(remote);
+        let (disks, local, counts) = local_drive_stats_from_storage(&info, "owner:9000");
+        assert_eq!(disks.len(), 1);
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].stats.server, "owner:9000");
+        assert_eq!(local[0].disk_id.as_deref(), Some("disk-old"));
+        assert_eq!(counts.total_count, 1);
+        let global = cluster_drive_stats_from_storage(&info, "owner:9000");
+        assert_eq!(global.len(), 2);
+        assert_eq!(global[1].server, "peer:9000");
+        assert_eq!(global[1].pool_index, "1");
+        // A disconnected configured local slot has no disk ID, but is not removed.
+        info.disks[0].uuid.clear();
+        info.disks[0].state = "offline".into();
+        info.disks[0].runtime_state = Some("offline".into());
+        info.disks[0].capacity_observation_source = None;
+        let (_, local, counts) = local_drive_stats_from_storage(&info, "owner:9000");
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].disk_id, None);
+        assert_eq!(local[0].stats.capacity_observation_state, "missing");
+        assert_eq!(counts.offline_count, 1);
+        assert_eq!(counts.total_count, 1);
     }
 
     #[test]
@@ -2054,6 +2202,15 @@ mod tests {
     }
 
     #[test]
+    fn scanner_usage_publication_result_code_maps_known_states() {
+        assert_eq!(scanner_usage_publication_result_code("success"), 1);
+        assert_eq!(scanner_usage_publication_result_code("deferred"), 2);
+        assert_eq!(scanner_usage_publication_result_code("failed"), 3);
+        assert_eq!(scanner_usage_publication_result_code("no_update"), 4);
+        assert_eq!(scanner_usage_publication_result_code("future"), 0);
+    }
+
+    #[test]
     fn scanner_bucket_scans_started_uses_explicit_started_count() {
         let mut life_time_ops = HashMap::new();
         life_time_ops.insert("scan_bucket_drive_start".to_string(), 7);
@@ -2122,7 +2279,7 @@ mod tests {
     #[test]
     fn ilm_detail_stats_keep_expiry_and_transition_results_separate() {
         let report = ScannerMetricsReport {
-            lifecycle_expiry: rustfs_common::metrics::ScannerLifecycleExpirySnapshot {
+            lifecycle_expiry: rustfs_scanner_metrics::metrics::ScannerLifecycleExpirySnapshot {
                 current_queued: 2,
                 current_active: 1,
                 scanner_queued: 10,
@@ -2130,7 +2287,7 @@ mod tests {
                 delete_failed: 4,
                 ..Default::default()
             },
-            lifecycle_transition: rustfs_common::metrics::ScannerLifecycleTransitionSnapshot {
+            lifecycle_transition: rustfs_scanner_metrics::metrics::ScannerLifecycleTransitionSnapshot {
                 current_queued: 5,
                 current_active: 6,
                 queue_full: 7,

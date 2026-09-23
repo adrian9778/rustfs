@@ -1,21 +1,24 @@
 # KMS disaster-recovery drill
 
-A KMS backup that has never been restored is a hypothesis. This runbook turns it into evidence: it rehearses the complete loop — back up, lose the persistence layer, preflight, restore, and read historical objects again — and files a machine-readable evidence bundle for each run. For what each backend's backup actually covers, see [KMS backend security properties](kms-backend-security.md); for the metrics and alerts around KMS operations, see the [KMS observability runbook](kms-observability-runbook.md).
+**Use this when:** rehearsing a KMS backup-and-restore against a lost key directory (Local backend), producing an evidence bundle for an audit, or restoring a Vault-backed KMS after Vault's own snapshot restore.
+**Source of truth:** `crates/kms/examples/kms_dr_drill.rs` (operator entry point); `crates/kms/src/backup/{capability,drill,local_export,local_restore}.rs` (`DrillEvidence`, disaster matrix, restore commit marker).
 
-The acceptance criterion of a drill is not that files came back. It is that objects encrypted before the disaster decrypt after the restore. The harness keeps the ciphertext and encryption metadata of every object it sealed before the disaster and, once the restore is complete, decrypts each one through a freshly opened backend and compares against the pre-disaster digest. Anything less proves only that a bundle is well formed.
+The drill rehearses the complete loop — back up, lose the persistence layer, preflight, restore, read historical objects again — and files a machine-readable evidence bundle per run. Its acceptance criterion is not that files came back but that objects encrypted before the disaster decrypt after the restore: the harness keeps the ciphertext and encryption metadata of every object it sealed, and after the restore decrypts each through a freshly opened backend and compares against the pre-disaster digest. For what each backend's backup covers, see [KMS backend security properties](kms-backend-security.md); for KMS metrics and alerts, see the [KMS observability runbook](kms-observability-runbook.md).
 
 ## Scope
 
-The drill covers the **Local** backend, which is the only backend RustFS produces a full-material bundle for. The responsibility split is deliberate and is described in `crates/kms/src/backup/capability.rs`:
+The drill covers the **Local** backend, the only backend RustFS produces a full-material bundle for. The responsibility split is described in `crates/kms/src/backup/capability.rs`:
 
-| Backend | What a RustFS bundle carries | What restores it |
+| Backend | RustFS bundle export | What restores it |
 | --- | --- | --- |
 | Local | Key records, all stored versions, the KDF salt, sanitized configuration | The RustFS restore in this runbook |
-| Static | Non-sensitive references only | The operator re-supplies the secret out of band |
-| Vault KV2 + Transit | KV metadata and Transit ciphertext references | Vault's native snapshot restore, then the RustFS orchestration |
-| Vault Transit | Metadata, configuration references, verification data | Vault's native snapshot restore, then the RustFS orchestration |
+| Static | Refused with `501`; RustFS holds no material to export | The operator re-supplies the secret out of band |
+| Vault KV2 | Refused with `501` | Vault's native snapshot restore, then the RustFS orchestration |
+| Vault Transit | Refused with `501` | Vault's native snapshot restore, then the RustFS orchestration |
 
-For the Vault backends there is no RustFS-side export, so there is no loop for a drill to close end to end: the cryptographic root is non-exportable and comes back through Vault's own disaster-recovery flow. What RustFS owns there is the refusal to proceed before that has happened, plus the ordering of everything after it. Rehearse it with the Vault section below.
+The `501` is not a gap in this runbook: `POST /rustfs/admin/v3/kms/backup` refuses any backend other than `Local` (`rustfs/src/admin/handlers/kms_backup.rs`, `execute_backup`), so no RustFS bundle exists to plan around for the other three. Note that `capability.rs` still *declares* `FullMaterial` responsibility for Vault KV2 in storage-only mode; no export path implements it, so treat the declaration as a reservation, not a capability.
+
+For the Vault backends there is no RustFS-side export: the cryptographic root is non-exportable and comes back through Vault's own disaster-recovery flow. RustFS owns the refusal to proceed before that has happened and the ordering of everything after it — see the Vault section below.
 
 ## What the drill measures
 
@@ -45,7 +48,7 @@ Optional variables: `RUSTFS_KMS_DRILL_DISASTER` (see below), `RUSTFS_KMS_DRILL_I
 
 ## Disaster matrix
 
-Run all three; they exercise different failure surfaces and converge on the same procedure, which is the point — an operator does not have to diagnose the failure mode before acting.
+Run all three; they exercise different failure surfaces and converge on the same procedure, so an operator does not have to diagnose the failure mode before acting.
 
 | `RUSTFS_KMS_DRILL_DISASTER` | Simulates |
 | --- | --- |

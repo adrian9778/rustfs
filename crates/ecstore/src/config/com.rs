@@ -27,7 +27,6 @@ use crate::storage_api_contracts::{
 };
 use crate::store::ECStore;
 use http::HeaderMap;
-use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_config::audit::{
     AUDIT_AMQP_KEYS, AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS,
     AUDIT_MYSQL_KEYS, AUDIT_MYSQL_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_KEYS, AUDIT_POSTGRES_SUB_SYS,
@@ -46,8 +45,10 @@ use rustfs_config::{
     SCANNER_SUB_SYS,
 };
 use rustfs_filemeta::FileInfo;
+use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::LazyLock;
 use std::sync::{Arc, RwLock};
 use tokio::io::AsyncReadExt;
@@ -168,6 +169,7 @@ const EVENT_SERVER_CONFIG_READ_FAILED: &str = "server_config_read_failed";
 const EVENT_SERVER_CONFIG_HEAL_RESULT: &str = "server_config_heal_result";
 const EVENT_SERVER_CONFIG_RECOVERED: &str = "server_config_recovered_after_heal";
 const EVENT_SERVER_CONFIG_FALLBACK: &str = "server_config_corruption_fallback";
+const EVENT_SERVER_CONFIG_SCALAR_SECTION_IGNORED: &str = "server_config_scalar_section_ignored";
 
 fn config_corruption_recovery_enabled() -> bool {
     rustfs_utils::get_env_bool(ENV_CONFIG_RECOVER_ON_CORRUPTION, DEFAULT_CONFIG_RECOVER_ON_CORRUPTION)
@@ -216,6 +218,55 @@ pub fn register_server_config_decrypt_fn(decrypt_fn: ServerConfigDecryptFn) {
 
 fn server_config_decrypt_fn() -> Option<ServerConfigDecryptFn> {
     SERVER_CONFIG_DECRYPT_FN.read().ok().and_then(|guard| guard.clone())
+}
+
+/// Dedup set for [`warn_ignored_scalar_section`], keyed by (subsystem, value)
+/// hash. The persisted config is re-read on a short interval (event-notifier
+/// reconcile runs every 5s), so an undeduplicated warn would flood the log with
+/// one line per cycle for the same unchanged remnant.
+static IGNORED_SCALAR_SECTION_WARNED: LazyLock<RwLock<HashSet<u64>>> = LazyLock::new(|| RwLock::new(HashSet::new()));
+const IGNORED_SCALAR_SECTION_WARNED_CAP: usize = 64;
+
+fn should_warn_ignored_scalar_section(subsystem_key: &str, config_value: &Value) -> bool {
+    let mut hasher = DefaultHasher::new();
+    subsystem_key.hash(&mut hasher);
+    config_value.to_string().hash(&mut hasher);
+    let digest = hasher.finish();
+
+    let Ok(mut seen) = IGNORED_SCALAR_SECTION_WARNED.write() else {
+        return true;
+    };
+    if seen.contains(&digest) {
+        return false;
+    }
+    if seen.len() >= IGNORED_SCALAR_SECTION_WARNED_CAP {
+        seen.clear();
+    }
+    seen.insert(digest);
+    true
+}
+
+fn warn_ignored_scalar_section(subsystem_key: &str, config_value: &Value) {
+    if !should_warn_ignored_scalar_section(subsystem_key, config_value) {
+        return;
+    }
+    let mut rendered = config_value.to_string();
+    if rendered.len() > 128 {
+        let mut cut = 128;
+        while !rendered.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        rendered.truncate(cut);
+        rendered.push('…');
+    }
+    warn!(
+        event = EVENT_SERVER_CONFIG_SCALAR_SECTION_IGNORED,
+        component = LOG_COMPONENT_CONFIG,
+        subsystem = LOG_SUBSYSTEM_CONFIG,
+        config_subsystem = subsystem_key,
+        ignored_value = %rendered,
+        "Ignoring persisted {subsystem_key} config with a legacy scalar shape; it carries no decodable settings and is dropped on the next config save"
+    );
 }
 
 #[cfg(test)]
@@ -398,19 +449,19 @@ where
     Ok(data)
 }
 
-pub(crate) async fn read_config_limited<S>(api: Arc<S>, file: &str, max_bytes: usize) -> Result<Vec<u8>>
-where
-    S: EcstoreObjectIO,
-{
-    let (data, _obj) = read_config_with_metadata_inner(api, file, &ObjectOptions::default(), false, Some(max_bytes)).await?;
-    Ok(data)
-}
-
 pub(crate) async fn read_config_limited_preserve_empty<S>(api: Arc<S>, file: &str, max_bytes: usize) -> Result<Vec<u8>>
 where
     S: EcstoreObjectIO,
 {
     let (data, _obj) = read_config_limited_preserve_empty_with_metadata(api, file, max_bytes).await?;
+    Ok(data)
+}
+
+pub(crate) async fn read_config_limited<S>(api: Arc<S>, file: &str, max_bytes: usize) -> Result<Vec<u8>>
+where
+    S: EcstoreObjectIO,
+{
+    let (data, _obj) = read_config_with_metadata_inner(api, file, &ObjectOptions::default(), false, Some(max_bytes)).await?;
     Ok(data)
 }
 
@@ -423,6 +474,18 @@ where
     S: EcstoreObjectIO,
 {
     read_config_with_metadata_inner(api, file, &ObjectOptions::default(), true, Some(max_bytes)).await
+}
+
+pub(crate) async fn read_config_limited_preserve_empty_with_metadata_opts<S>(
+    api: Arc<S>,
+    file: &str,
+    opts: &ObjectOptions,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, ObjectInfo)>
+where
+    S: EcstoreObjectIO,
+{
+    read_config_with_metadata_inner(api, file, opts, true, Some(max_bytes)).await
 }
 
 /// Read an existing config object without treating an empty payload as absent.
@@ -704,7 +767,12 @@ where
     save_config_with_opts_inner(api, file, data, opts, false).await.map(|_| ())
 }
 
-async fn save_config_with_opts_and_metadata<S>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<ObjectInfo>
+pub(crate) async fn save_config_with_opts_and_metadata<S>(
+    api: Arc<S>,
+    file: &str,
+    data: Vec<u8>,
+    opts: &ObjectOptions,
+) -> Result<ObjectInfo>
 where
     S: ObjectIO<
             Error = Error,
@@ -744,8 +812,19 @@ where
             if log_error {
                 error!("save_config_with_opts: err: {:?}, file: {}", err, file);
             }
-            Err(err)
+            Err(map_system_metadata_write_error(err, file))
         }
+    }
+}
+
+/// A system metadata volume outage must remain retryable instead of being
+/// exposed as the user-facing bucket-not-found response.
+pub(crate) fn map_system_metadata_write_error(err: Error, file: &str) -> Error {
+    match err {
+        Error::BucketNotFound(_) | Error::VolumeNotFound => {
+            Error::InsufficientWriteQuorum(RUSTFS_META_BUCKET.to_string(), file.to_string())
+        }
+        other => other,
     }
 }
 
@@ -975,10 +1054,20 @@ fn decode_scalar_config_value(config_value: &Value, descriptor: ScalarConfigDesc
             }
             Ok(overrides)
         }
-        _ => Err(Error::other(format!(
-            "invalid external {} config shape: expected an object or KVS array",
-            descriptor.subsystem_key
-        ))),
+        // Scalar and null section shapes (`"heal": ""`, `"scanner": null`,
+        // `"heal": {"default": null}`) are legacy remnants that carry no
+        // decodable settings; failing the whole config decode over them bricks
+        // every consumer of the persisted config (startup falls back to the
+        // default config, the admin config API cannot read-modify-write, and
+        // the notify reconciler retries forever). Ignore them with a deduped
+        // warning instead; the next config save scrubs them (see
+        // `normalize_scalar_section_seed`). Malformed values inside object or
+        // KVS-array shapes stay hard errors above — those shapes are where
+        // data (including fields from newer versions) can live.
+        _ => {
+            warn_ignored_scalar_section(descriptor.subsystem_key, config_value);
+            Ok(KVS::new())
+        }
     }
 }
 
@@ -1185,6 +1274,44 @@ fn decode_server_config_blob(data: &[u8]) -> Result<Config> {
         return Err(Error::other("unrecognized external server config shape"));
     }
     Ok(cfg)
+}
+
+/// True when a persisted scanner/heal section value is a shape the decoder
+/// warn-ignores instead of decoding: a bare scalar or null, or an object whose
+/// nested `default`/`_` member is such a shape. Object and KVS-array shapes
+/// with decodable structure are never ignorable — they are where data
+/// (including fields written by newer versions) can live.
+fn scalar_section_shape_is_ignorable(value: &Value) -> bool {
+    match value {
+        Value::Object(config_obj) => config_obj
+            .get("default")
+            .or_else(|| config_obj.get(DEFAULT_DELIMITER))
+            .is_some_and(scalar_section_shape_is_ignorable),
+        Value::Array(_) => false,
+        _ => true,
+    }
+}
+
+/// Strip warn-ignored scalar section shapes (see
+/// [`scalar_section_shape_is_ignorable`]) from a scanner/heal seed value so the
+/// canonical rewrite drops the remnant instead of preserving it verbatim, which
+/// would keep tripping the decoder on every future read.
+fn normalize_scalar_section_seed(existing: Option<Value>) -> Option<Value> {
+    match existing? {
+        Value::Object(mut config_obj) => {
+            for nested_key in ["default", DEFAULT_DELIMITER] {
+                if config_obj.get(nested_key).is_some_and(scalar_section_shape_is_ignorable) {
+                    let nested = config_obj.remove(nested_key);
+                    if let Some(normalized) = normalize_scalar_section_seed(nested) {
+                        config_obj.insert(nested_key.to_string(), normalized);
+                    }
+                }
+            }
+            (!config_obj.is_empty()).then_some(Value::Object(config_obj))
+        }
+        value if scalar_section_shape_is_ignorable(&value) => None,
+        value => Some(value),
+    }
 }
 
 fn parse_object_seed(data: &[u8]) -> Option<Map<String, Value>> {
@@ -1806,10 +1933,7 @@ fn encode_server_config_blob(cfg: &Config, seed: Option<&[u8]>) -> Result<Vec<u8
     root.remove("storage_class");
 
     for descriptor in [scanner_config_descriptor(), heal_config_descriptor()] {
-        let mut existing = root.remove(descriptor.subsystem_key);
-        if descriptor.subsystem_key == HEAL_SUB_SYS && existing.as_ref().is_some_and(Value::is_null) {
-            existing = None;
-        }
+        let existing = normalize_scalar_section_seed(root.remove(descriptor.subsystem_key));
         let rendered = build_scalar_config_object(cfg, descriptor);
         if let Some(config_value) = sync_rendered_scalar_config_value(existing, &rendered, descriptor)? {
             root.insert(descriptor.subsystem_key.to_string(), config_value);
@@ -1866,7 +1990,8 @@ fn is_standard_object_server_config(data: &[u8]) -> bool {
     matches!(root.get("version"), Some(Value::String(v)) if !v.trim().is_empty())
         && matches!(root.get("storageclass"), Some(Value::Object(_)))
         && !root.contains_key("storage_class")
-        && !matches!(root.get(HEAL_SUB_SYS), Some(Value::Null))
+        && !matches!(root.get(HEAL_SUB_SYS), Some(value) if scalar_section_shape_is_ignorable(value))
+        && !matches!(root.get(SCANNER_SUB_SYS), Some(value) if scalar_section_shape_is_ignorable(value))
 }
 
 fn configs_semantically_equal(lhs: &Config, rhs: &Config) -> bool {
@@ -2259,6 +2384,7 @@ where
         scan_mode: HealScanMode::Deep,
         update_parity: false,
         no_lock: false,
+        read_repair: false,
         pool: None,
         set: None,
     };
@@ -2691,15 +2817,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        SERVER_CONFIG_LOCK, ServerConfigSnapshot, apply_dynamic_config_for_sub_sys_with, config_task_join_error,
-        configs_semantically_equal, decode_server_config_blob, encode_server_config_blob, is_standard_object_server_config,
-        lookup_configs, new_and_save_server_config, read_config, read_config_no_lock_preserve_empty_with_metadata,
-        read_config_preserve_empty, read_config_with_metadata, read_config_without_migrate, read_server_config_snapshot,
+        SERVER_CONFIG_LOCK, ServerConfigSnapshot, apply_dynamic_config_for_sub_sys_with, build_scalar_config_object,
+        config_task_join_error, configs_semantically_equal, decode_server_config_blob, encode_server_config_blob,
+        heal_config_descriptor, is_standard_object_server_config, lookup_configs, map_system_metadata_write_error,
+        new_and_save_server_config, read_config, read_config_no_lock_preserve_empty_with_metadata, read_config_preserve_empty,
+        read_config_with_metadata, read_config_without_migrate, read_server_config_snapshot, save_config_with_opts_inner,
         save_server_config, save_server_config_snapshot, save_server_config_snapshot_with_generation,
-        server_config_transaction_lock_path, storage_class_kvs_mut,
+        server_config_transaction_lock_path, should_warn_ignored_scalar_section, storage_class_kvs_mut,
     };
     use crate::config::{audit, heal, notify, oidc, scanner};
-    use crate::disk::endpoint::Endpoint;
+    use crate::disk::{RUSTFS_META_BUCKET, endpoint::Endpoint};
     use crate::error::{Error, Result};
     use crate::layout::endpoints::SetupType;
     use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
@@ -2730,6 +2857,72 @@ mod tests {
         let rendered = config_task_join_error("server config write", join_error).to_string();
         assert!(rendered.contains("panicked"));
         assert!(!rendered.contains("do-not-expose-payload"));
+    }
+
+    #[test]
+    fn system_metadata_volume_failures_map_to_retryable_write_errors() {
+        for error in [Error::VolumeNotFound, Error::BucketNotFound(RUSTFS_META_BUCKET.to_string())] {
+            assert_eq!(
+                map_system_metadata_write_error(error, "buckets/example/.metadata.bin"),
+                Error::InsufficientWriteQuorum(RUSTFS_META_BUCKET.to_string(), "buckets/example/.metadata.bin".to_string())
+            );
+        }
+
+        let other = Error::other("metadata encoding failed");
+        assert_eq!(map_system_metadata_write_error(other.clone(), "buckets/example/.metadata.bin"), other);
+    }
+
+    #[derive(Debug, Default)]
+    struct MetadataWriteStore {
+        error: Option<Error>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage_api_contracts::object::ObjectIO for MetadataWriteStore {
+        type Error = Error;
+        type RangeSpec = HTTPRangeSpec;
+        type HeaderMap = HeaderMap;
+        type ObjectOptions = ObjectOptions;
+        type ObjectInfo = ObjectInfo;
+        type GetObjectReader = GetObjectReader;
+        type PutObjectReader = PutObjReader;
+
+        async fn get_object_reader(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _range: Option<Self::RangeSpec>,
+            _headers: Self::HeaderMap,
+            _opts: &Self::ObjectOptions,
+        ) -> core::result::Result<Self::GetObjectReader, Self::Error> {
+            Err(Error::FileNotFound)
+        }
+
+        async fn put_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _data: &mut Self::PutObjectReader,
+            _opts: &Self::ObjectOptions,
+        ) -> core::result::Result<Self::ObjectInfo, Self::Error> {
+            Err(self.error.clone().expect("test store error should be configured"))
+        }
+    }
+
+    #[tokio::test]
+    async fn save_config_preserves_retryable_system_volume_errors() {
+        let store = Arc::new(MetadataWriteStore {
+            error: Some(Error::BucketNotFound(RUSTFS_META_BUCKET.to_string())),
+        });
+        let error =
+            save_config_with_opts_inner(store, "buckets/example/.metadata.bin", Vec::new(), &ObjectOptions::default(), false)
+                .await
+                .expect_err("missing metadata volume must fail");
+
+        assert_eq!(
+            error,
+            Error::InsufficientWriteQuorum(RUSTFS_META_BUCKET.to_string(), "buckets/example/.metadata.bin".to_string())
+        );
     }
     use rustfs_lock::client::LockClient;
     use rustfs_lock::client::local::LocalClient;
@@ -3439,6 +3632,31 @@ mod tests {
         cfg
     }
 
+    /// `Config::new()` (and every decode built on it) reads the process-global
+    /// `rustfs_config::server_config::DEFAULT_KVS` OnceLock at call time, and
+    /// other tests in this binary register it via `crate::config::init()`
+    /// mid-run. Equality assertions must therefore normalize both sides with
+    /// one snapshot taken after both configs exist, never against a later
+    /// `Config::new()`.
+    fn default_kvs_snapshot() -> Option<&'static std::collections::HashMap<String, KVS>> {
+        rustfs_config::server_config::DEFAULT_KVS.get()
+    }
+
+    /// Fills the default sections `cfg` is missing from an explicit
+    /// [`default_kvs_snapshot`], mirroring `Config::set_defaults`.
+    fn filled_with_default_kvs(mut cfg: Config, snapshot: Option<&std::collections::HashMap<String, KVS>>) -> Config {
+        if let Some(defaults) = snapshot {
+            for (sub_sys, kvs) in defaults {
+                cfg.0
+                    .entry(sub_sys.clone())
+                    .or_default()
+                    .entry(DEFAULT_DELIMITER.to_string())
+                    .or_insert_with(|| kvs.clone());
+            }
+        }
+        cfg
+    }
+
     #[test]
     fn test_external_scanner_config_decodes_with_defaults() {
         let cfg =
@@ -3528,7 +3746,9 @@ mod tests {
         }"#;
 
         let cfg = decode_server_config_blob(seed).expect("root heal null should mean no persisted override");
-        assert!(cfg.get_value(HEAL_SUB_SYS, DEFAULT_DELIMITER).is_none());
+        // The heal section may hold registered defaults, so assert on the
+        // semantic diff instead of the section's presence.
+        assert!(build_scalar_config_object(&cfg, heal_config_descriptor()).is_empty());
         assert!(!is_standard_object_server_config(seed));
 
         let encoded = encode_server_config_blob(&cfg, Some(seed)).expect("legacy seed should canonicalize on an authorized save");
@@ -3545,38 +3765,120 @@ mod tests {
     }
 
     #[test]
-    fn invalid_scalar_and_nested_null_config_shapes_remain_rejected() {
+    fn legacy_scalar_section_shapes_decode_as_no_override_and_canonicalize_on_save() {
+        let base = decode_server_config_blob(br#"{"version":"33","storageclass":{"standard":"","rrs":""}}"#)
+            .expect("base config should decode");
+
+        let ignorable_sections = [
+            (SCANNER_SUB_SYS, r#""scanner":null"#),
+            (SCANNER_SUB_SYS, r#""scanner":"cycle=61""#),
+            (HEAL_SUB_SYS, r#""heal":"""#),
+            (HEAL_SUB_SYS, r#""heal":false"#),
+            (HEAL_SUB_SYS, r#""heal":0"#),
+            (HEAL_SUB_SYS, r#""heal":{"default":null}"#),
+            (HEAL_SUB_SYS, r#""heal":{"_":null}"#),
+        ];
+
+        for (section_key, section) in ignorable_sections {
+            let input = format!(r#"{{"version":"33","storageclass":{{"standard":"","rrs":""}},{section}}}"#);
+            let cfg = decode_server_config_blob(input.as_bytes())
+                .unwrap_or_else(|err| panic!("legacy scalar section {section} should be ignored, got: {err}"));
+            let snapshot = default_kvs_snapshot();
+            assert_eq!(
+                filled_with_default_kvs(cfg.clone(), snapshot),
+                filled_with_default_kvs(base.clone(), snapshot),
+                "ignored section {section} must contribute no overrides"
+            );
+            assert!(
+                !is_standard_object_server_config(input.as_bytes()),
+                "seed with {section} must not count as standard so a save rewrites it"
+            );
+
+            let encoded =
+                encode_server_config_blob(&cfg, Some(input.as_bytes())).expect("legacy seed should canonicalize on save");
+            let value: Value = serde_json::from_slice(&encoded).expect("canonical config should be valid JSON");
+            assert!(
+                value.get(section_key).is_none(),
+                "canonical save must scrub the {section} remnant, got: {value}"
+            );
+            assert!(is_standard_object_server_config(&encoded));
+            decode_server_config_blob(&encoded).expect("canonicalized config must decode cleanly");
+        }
+    }
+
+    #[test]
+    fn scrubbing_ignorable_nested_member_preserves_unknown_section_fields() {
+        let input = br#"{"version":"33","storageclass":{"standard":"","rrs":""},"heal":{"_":null,"future_flag":"keep"}}"#;
+
+        let cfg = decode_server_config_blob(input).expect("ignorable nested member should not fail decode");
+        assert!(!is_standard_object_server_config(input));
+
+        let encoded = encode_server_config_blob(&cfg, Some(input)).expect("seed should canonicalize on save");
+        let value: Value = serde_json::from_slice(&encoded).expect("canonical config should be valid JSON");
+        assert!(value[HEAL_SUB_SYS].get(DEFAULT_DELIMITER).is_none(), "null member must be scrubbed");
+        assert_eq!(
+            value[HEAL_SUB_SYS]["future_flag"].as_str(),
+            Some("keep"),
+            "unknown section fields must survive the scrub"
+        );
+        assert!(is_standard_object_server_config(&encoded));
+        decode_server_config_blob(&encoded).expect("canonicalized config must decode cleanly");
+    }
+
+    #[test]
+    fn value_level_scalar_config_errors_remain_rejected() {
         let invalid_sections = [
-            r#""scanner":null"#,
-            r#""heal":"""#,
-            r#""heal":false"#,
-            r#""heal":0"#,
-            r#""heal":{"default":null}"#,
-            r#""heal":{"_":null}"#,
             r#""heal":{"bitrot_cycle":null}"#,
             r#""heal":[{"key":"bitrot_cycle","value":null}]"#,
         ];
 
         for section in invalid_sections {
             let input = format!(r#"{{"version":"33","storageclass":{{"standard":"","rrs":""}},{section}}}"#);
-            let err = decode_server_config_blob(input.as_bytes()).expect_err("invalid scalar shape must remain rejected");
+            let err = decode_server_config_blob(input.as_bytes())
+                .expect_err("value-level errors inside object/array shapes must remain rejected");
             assert!(
-                err.to_string().contains("expected"),
+                err.to_string().contains("expected a scalar"),
                 "invalid section {section} returned an unrelated error: {err}"
             );
         }
     }
 
     #[test]
+    fn ignored_scalar_sections_do_not_defeat_unrecognized_config_detection() {
+        let err = decode_server_config_blob(br#"{"scanner":"","heal":null}"#)
+            .expect_err("a config with only ignorable sections and no recognized header is still unrecognized");
+        assert!(
+            err.to_string().contains("unrecognized external server config shape"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ignored_scalar_section_warning_dedups_by_content() {
+        let value = Value::String("dedup-probe".to_string());
+        assert!(should_warn_ignored_scalar_section("dedup-test-subsystem", &value));
+        assert!(!should_warn_ignored_scalar_section("dedup-test-subsystem", &value));
+        let changed = Value::String("dedup-probe-changed".to_string());
+        assert!(should_warn_ignored_scalar_section("dedup-test-subsystem", &changed));
+    }
+
+    #[test]
     fn valid_heal_object_and_kvs_array_shapes_remain_accepted() {
         let empty_object = br#"{"version":"33","storageclass":{"standard":"","rrs":""},"heal":{}}"#;
         let cfg = decode_server_config_blob(empty_object).expect("empty heal object should decode as no override");
-        assert!(cfg.get_value(HEAL_SUB_SYS, DEFAULT_DELIMITER).is_none());
+        // The heal section may hold registered defaults, so assert on the
+        // semantic diff instead of the section's presence.
+        assert!(build_scalar_config_object(&cfg, heal_config_descriptor()).is_empty());
 
         let kvs_array =
             br#"{"version":"33","storageclass":{"standard":"","rrs":""},"heal":[{"key":"bitrot_cycle","value":"off"}]}"#;
         let cfg = decode_server_config_blob(kvs_array).expect("heal KVS array should decode");
-        assert!(cfg.get_value(HEAL_SUB_SYS, DEFAULT_DELIMITER).is_some());
+        assert_eq!(
+            build_scalar_config_object(&cfg, heal_config_descriptor())
+                .get(HEAL_BITROT_CYCLE)
+                .and_then(Value::as_str),
+            Some("off")
+        );
     }
 
     #[test]
@@ -4009,18 +4311,6 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("invalid external scanner config value for cycle: expected a scalar"),
-            "unexpected scanner decode error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_decode_rejects_scalar_scanner_section() {
-        let err = decode_server_config_blob(br#"{"version":"33","scanner":"cycle=61"}"#)
-            .expect_err("scalar scanner sections should be rejected");
-
-        assert!(
-            err.to_string()
-                .contains("invalid external scanner config shape: expected an object or KVS array"),
             "unexpected scanner decode error: {err}"
         );
     }
@@ -4705,7 +4995,7 @@ mod tests {
         decode_persisted_server_config, fallback_server_config_after_corruption, is_server_config_corrupt_error,
         read_config_without_migrate_with_recovery, replace_server_config_decrypt_fn_for_test,
     };
-    use rustfs_common::heal_channel::HealOpts;
+    use rustfs_heal_contracts::heal_channel::HealOpts;
     use std::sync::Mutex;
 
     /// Bytes mirroring issue #4156: a bitrot-corrupted `config.json` whose
@@ -4740,8 +5030,12 @@ mod tests {
     fn test_fallback_returns_default_config_when_recovery_enabled() {
         let cfg = fallback_server_config_after_corruption(corrupt_config_error(), "config/config.json", true)
             .expect("recovery enabled must fall back to the default config");
+        let snapshot = default_kvs_snapshot();
         assert!(
-            configs_semantically_equal(&cfg, &Config::new()),
+            configs_semantically_equal(
+                &filled_with_default_kvs(cfg, snapshot),
+                &filled_with_default_kvs(Config(std::collections::HashMap::new()), snapshot)
+            ),
             "fallback config should be the default server config"
         );
     }
@@ -5060,7 +5354,7 @@ mod tests {
     #[tokio::test]
     async fn server_config_snapshot_serializes_read_modify_write_transactions() {
         let baseline = encode_server_config_blob(&Config::new(), None).expect("baseline config should encode");
-        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(baseline), None));
+        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(baseline.clone()), None));
         let first = read_server_config_snapshot(store.clone())
             .await
             .expect("first config snapshot");
@@ -5074,7 +5368,11 @@ mod tests {
             .await
             .expect("second transaction should acquire after the first snapshot is dropped")
             .expect("second config snapshot");
-        assert!(configs_semantically_equal(&second.config, &Config::new()));
+        // Compare raw bytes against the baseline blob rather than a fresh
+        // Config::new(): the process-global DEFAULT_KVS can be registered by a
+        // sibling test mid-run, which would make a Config::new() evaluated here
+        // diverge from the baseline encoded above.
+        assert_eq!(second.raw.as_deref(), Some(baseline.as_slice()));
     }
 
     #[tokio::test]
@@ -5354,8 +5652,12 @@ mod tests {
             .expect("unrecoverable corruption should fall back to the default config");
 
         assert_eq!(store.heal_calls.load(Ordering::SeqCst), 1, "heal should be attempted before falling back");
+        let snapshot = default_kvs_snapshot();
         assert!(
-            configs_semantically_equal(&cfg, &Config::new()),
+            configs_semantically_equal(
+                &filled_with_default_kvs(cfg, snapshot),
+                &filled_with_default_kvs(Config(std::collections::HashMap::new()), snapshot)
+            ),
             "fallback config should be the default server config"
         );
     }

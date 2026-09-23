@@ -13,29 +13,38 @@
 // limitations under the License.
 /// ScannerIODisk implementation for Disk: get_size and the per-disk bucket scan.
 use super::*;
+use crate::UNKNOWN_TIER;
 
 ///
 /// Seed [`SizeSummary::tier_stats`] from the cached tier-name list.
 ///
-/// Preserves the original seeding semantics: with no tiers configured the map
-/// stays completely empty (STANDARD/RRS are not seeded either); otherwise the
-/// standard storage classes are seeded alongside every configured tier so
-/// per-object accounting always finds its tier key.
+/// Preserves the original no-tier shape: with no tiers configured the map
+/// stays completely empty (STANDARD/RRS/UNKNOWN are not seeded either).
+/// Otherwise the standard storage classes and one fixed unknown bucket are
+/// seeded alongside every configured tier so per-object accounting never
+/// inserts an untrusted metadata key.
 pub(super) fn tier_stats_template(tier_names: &[String]) -> HashMap<String, TierStats> {
-    let mut tier_stats = HashMap::with_capacity(tier_names.len() + 2);
+    let mut tier_stats = HashMap::with_capacity(tier_names.len() + 3);
     for tier_name in tier_names {
-        tier_stats.insert(tier_name.clone(), TierStats::default());
+        if tier_name != UNKNOWN_TIER {
+            tier_stats.insert(tier_name.clone(), TierStats::default());
+        }
     }
     if !tier_stats.is_empty() {
         tier_stats.insert(storageclass::STANDARD.to_string(), TierStats::default());
         tier_stats.insert(storageclass::RRS.to_string(), TierStats::default());
+        tier_stats.insert(UNKNOWN_TIER.to_string(), TierStats::default());
     }
     tier_stats
 }
 
 #[async_trait::async_trait]
 impl ScannerIODisk for Disk {
-    async fn get_size(&self, mut item: ScannerItem) -> Result<SizeSummary> {
+    async fn get_size(&self, item: ScannerItem) -> Result<SizeSummary> {
+        self.get_size_with_tier_names(item, &runtime_tier_names().await).await
+    }
+
+    async fn get_size_with_tier_names(&self, mut item: ScannerItem, tier_names: &[String]) -> Result<SizeSummary> {
         let done_object = Metrics::time(Metric::ScanObject);
 
         if !is_xl_meta_path(&item.path) {
@@ -105,12 +114,13 @@ impl ScannerIODisk for Disk {
             .map(|v| ObjectInfo::from_file_info(v, item.bucket.as_str(), object_path.as_str(), versioned))
             .collect::<Vec<ObjectInfo>>();
 
-        let mut size_summary = SizeSummary::default();
-
-        // Tier names come from the process-wide TTL cache; seeding from them
-        // replaces the per-object clone of every full TierConfig.
-        let tier_names = runtime_tier_names().await;
-        size_summary.tier_stats = tier_stats_template(&tier_names);
+        // The caller supplies one registry snapshot for the whole folder scan;
+        // seeding from it prevents a TTL refresh from mixing generations in a
+        // single result.
+        let mut size_summary = SizeSummary {
+            tier_stats: tier_stats_template(tier_names),
+            ..Default::default()
+        };
 
         let lock_config = object_lock_config_for_scanner_item(&item).await;
 
@@ -120,12 +130,14 @@ impl ScannerIODisk for Disk {
         // `object_infos`.
         global_metrics().record_scanner_versions_scanned(object_infos.len() as u64);
 
-        item.apply_actions(object_infos, lock_config, versioning_config, &mut size_summary)
+        item.apply_actions(object_infos, lock_config, versioning_config, tier_names, &mut size_summary)
             .await;
 
         if !free_version_infos.is_empty() {
             for oi in free_version_infos {
-                enqueue_runtime_free_version(oi).await;
+                if ScannerItem::tier_is_known(&oi, tier_names) {
+                    enqueue_runtime_free_version(oi).await;
+                }
             }
         }
 
@@ -134,7 +146,7 @@ impl ScannerIODisk for Disk {
         Ok(size_summary)
     }
 
-    #[tracing::instrument(skip(self, budget, updates, cache, set_disks))]
+    #[tracing::instrument(skip(self, budget, updates, cache, set_disks, options), fields(scan_mode = ?options.scan_mode))]
     async fn nsscanner_disk(
         self: Arc<Self>,
         ctx: CancellationToken,
@@ -142,15 +154,20 @@ impl ScannerIODisk for Disk {
         set_disks: Vec<Arc<Disk>>,
         cache: DataUsageCache,
         updates: Option<mpsc::Sender<DataUsageEntry>>,
-        scan_mode: HealScanMode,
+        options: ScannerDiskScanOptions,
     ) -> Result<ScannerDiskScanOutcome> {
+        let ScannerDiskScanOptions {
+            scan_mode,
+            prefix_scan_scope,
+            checkpoint_tx,
+        } = options;
         let done_drive = Metrics::time(Metric::ScanBucketDrive);
         let drive_start = std::time::Instant::now();
         let bucket = cache.info.name.clone();
         let disk_path = self.path().to_string_lossy().to_string();
         let source = match scan_mode {
-            HealScanMode::Deep => rustfs_common::metrics::ScannerWorkSource::Bitrot,
-            HealScanMode::Normal | HealScanMode::Unknown => rustfs_common::metrics::ScannerWorkSource::Usage,
+            HealScanMode::Deep => rustfs_scanner_metrics::metrics::ScannerWorkSource::Bitrot,
+            HealScanMode::Normal | HealScanMode::Unknown => rustfs_scanner_metrics::metrics::ScannerWorkSource::Usage,
         };
         global_metrics().record_scan_bucket_drive_start(source, &bucket, &disk_path);
         let mut failure_guard = BucketDriveFailureGuard::new(source, &bucket, &disk_path);
@@ -186,7 +203,19 @@ impl ScannerIODisk for Disk {
             cache.info.object_lock = Some(Arc::new(object_lock_config));
         }
 
-        let result = scan_data_folder(
+        // Prefix reuse never crosses semantic maintenance boundaries. A
+        // lifecycle, replication, Object Lock, or erasure health walk can
+        // make a clean data subtree require scanner-side work even without a
+        // direct object mutation in the local journal. The folder scanner
+        // separately rejects scopes in erasure mode.
+        let prefix_scan_scope = (scan_mode == HealScanMode::Normal
+            && cache.info.lifecycle.is_none()
+            && cache.info.replication.is_none()
+            && cache.info.object_lock.is_none())
+        .then_some(prefix_scan_scope)
+        .flatten();
+
+        let result = scan_data_folder_scoped(
             ctx.clone(),
             budget,
             set_disks,
@@ -195,6 +224,8 @@ impl ScannerIODisk for Disk {
             updates,
             scan_mode,
             SCANNER_SLEEPER.clone(),
+            prefix_scan_scope,
+            checkpoint_tx,
         )
         .await;
 

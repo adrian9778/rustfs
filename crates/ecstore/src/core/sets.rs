@@ -37,8 +37,9 @@ use crate::{
     runtime::instance::{InstanceContext, bootstrap_ctx},
     runtime::sources as runtime_sources,
     set_disk::{PreparedGetObjectMetadata, SetDisks},
-    store::init_format::{
-        check_format_erasure_values, load_format_erasure_all, save_format_file, select_format_erasure_in_quorum,
+    store::{
+        RemoteTuplePublicationFence,
+        init_format::{check_format_erasure_values, load_format_erasure_all, save_format_file, select_format_erasure_in_quorum},
     },
 };
 use futures::{
@@ -46,15 +47,15 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
 };
 use http::HeaderMap;
-use rustfs_common::heal_channel::HealOpts;
-use rustfs_common::heal_channel::{DriveState, HealItemType};
 use rustfs_filemeta::FileInfo;
+use rustfs_heal_contracts::heal_channel::HealOpts;
+use rustfs_heal_contracts::heal_channel::{DriveState, HealItemType};
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 use tokio::sync::RwLock;
 use tokio::sync::broadcast::{Receiver, Sender};
@@ -106,6 +107,89 @@ impl Drop for Sets {
     }
 }
 
+#[cfg(test)]
+struct HealFormatAfterSaveBarrierState {
+    pool_key: usize,
+    disk_index: usize,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static HEAL_FORMAT_AFTER_SAVE_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<HealFormatAfterSaveBarrierState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct HealFormatAfterSaveBarrier {
+    state: Arc<HealFormatAfterSaveBarrierState>,
+}
+
+#[cfg(test)]
+impl HealFormatAfterSaveBarrier {
+    pub(crate) fn install(pool: &Arc<Sets>, disk_index: usize) -> Self {
+        let state = Arc::new(HealFormatAfterSaveBarrierState {
+            pool_key: Arc::as_ptr(pool) as usize,
+            disk_index,
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut barrier = HEAL_FORMAT_AFTER_SAVE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("heal format after-save barrier should not be poisoned");
+        assert!(barrier.is_none(), "heal format after-save barrier must be unique");
+        *barrier = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("format heal should reach the after-save barrier");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for HealFormatAfterSaveBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut barrier = HEAL_FORMAT_AFTER_SAVE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("heal format after-save barrier should not be poisoned");
+        if barrier.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *barrier = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_heal_format_after_save(pool: &Sets, disk_index: usize) {
+    let pool_key = std::ptr::from_ref(pool) as usize;
+    let barrier = {
+        let mut barrier = HEAL_FORMAT_AFTER_SAVE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("heal format after-save barrier should not be poisoned");
+        if barrier
+            .as_ref()
+            .is_some_and(|state| state.pool_key == pool_key && state.disk_index == disk_index)
+        {
+            barrier.take()
+        } else {
+            None
+        }
+    };
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
 impl Sets {
     #[tracing::instrument(level = "debug", skip(disks, endpoints, fm, pool_idx, parity_count))]
     pub async fn new(
@@ -135,7 +219,10 @@ impl Sets {
 
         let mut disk_set = Vec::with_capacity(set_count);
 
-        let lock_registry = runtime_sources::lock_registry();
+        let pool_lockers = runtime_sources::lock_registry()
+            .as_ref()
+            .map(|registry| registry.clients_for_endpoints(endpoints.endpoints.as_ref()))
+            .unwrap_or_default();
 
         for i in 0..set_count {
             let mut set_drive = Vec::with_capacity(set_drive_count);
@@ -186,10 +273,6 @@ impl Sets {
                 }
             }
 
-            let lockers = lock_registry
-                .as_ref()
-                .map(|registry| registry.clients_for_endpoints(&set_endpoints))
-                .unwrap_or_default();
             let set_disks = SetDisks::new_with_instance_ctx(
                 runtime_sources::local_node_name().await,
                 Arc::new(RwLock::new(set_drive)),
@@ -199,7 +282,7 @@ impl Sets {
                 pool_idx,
                 set_endpoints,
                 fm.clone(),
-                lockers,
+                pool_lockers.clone(),
                 instance_ctx.clone(),
             )
             .await;
@@ -224,10 +307,9 @@ impl Sets {
             ctx: instance_ctx,
         });
 
-        let asets = sets.clone();
-
         let rx1 = rx.resubscribe();
-        tokio::spawn(async move { asets.monitor_and_connect_endpoints(rx1).await });
+        let weak_sets = Arc::downgrade(&sets);
+        tokio::spawn(async move { Self::monitor_and_connect_endpoints_task(weak_sets, rx1).await });
 
         Ok(sets)
     }
@@ -242,12 +324,35 @@ impl Sets {
         &self.ctx
     }
 
-    pub async fn monitor_and_connect_endpoints(&self, mut rx: Receiver<()>) {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+    /// Keep simulated peers' metadata ownership separate while sharing disks and lock clients.
+    #[cfg(test)]
+    pub(crate) fn set_instance_ctx_for_test(&mut self, ctx: Arc<InstanceContext>) {
+        for set in &mut self.disk_set {
+            Arc::make_mut(set).set_instance_ctx_for_test(Arc::clone(&ctx));
+        }
+        self.ctx = ctx;
+    }
+
+    async fn monitor_and_connect_endpoints_task(sets: Weak<Sets>, mut rx: Receiver<()>) {
+        let startup_delay = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(startup_delay);
+
+        tokio::select! {
+            _ = &mut startup_delay => {}
+            _ = rx.recv() => {
+                warn!("monitor_and_connect_endpoints ctx cancelled");
+                return;
+            }
+        }
 
         info!("start monitor_and_connect_endpoints");
 
-        self.connect_disks().await;
+        let Some(current) = sets.upgrade() else {
+            warn!("monitor_and_connect_endpoints exit");
+            return;
+        };
+        current.connect_disks().await;
+        drop(current);
 
         // TODO(backlog): make monitor_and_connect interval configurable instead of hardcoded 15s
         let mut interval = tokio::time::interval(Duration::from_secs(15));
@@ -255,7 +360,10 @@ impl Sets {
             tokio::select! {
                _= interval.tick()=>{
                 // debug!("tick...");
-                self.connect_disks().await;
+                let Some(current) = sets.upgrade() else {
+                    break;
+                };
+                current.connect_disks().await;
 
                 interval.reset();
                },
@@ -542,6 +650,19 @@ impl Sets {
             .put_object_with_old_current_size(bucket, object, data, opts)
             .await
     }
+
+    pub(crate) async fn put_object_with_old_current_size_for_data_movement(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+        publication_fence: RemoteTuplePublicationFence,
+    ) -> Result<(ObjectInfo, Option<crate::disk::OldCurrentSize>)> {
+        self.get_disks_by_key(object)
+            .put_object_with_old_current_size_for_data_movement(bucket, object, data, opts, publication_fence)
+            .await
+    }
 }
 
 #[async_trait::async_trait]
@@ -673,10 +794,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for Sets {
 
         let put_opts = ObjectOptions {
             user_defined: dst_opts.user_defined.clone(),
+            shard_integrity_write_mode: Some(src_info.shard_integrity_write_mode()),
             versioned: dst_opts.versioned,
             version_id: dst_opts.version_id.clone(),
             mod_time: dst_opts.mod_time,
             http_preconditions: dst_opts.http_preconditions.clone(),
+            quota_admission: dst_opts.quota_admission,
             ..Default::default()
         };
 
@@ -698,7 +821,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for Sets {
             .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, opts))]
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         if opts.delete_prefix && !opts.delete_prefix_object {
             self.delete_prefix(bucket, object, &opts).await?;
@@ -989,9 +1112,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for Sets {
 }
 
 impl Sets {
-    pub(crate) async fn heal_format_with_fence<F>(&self, dry_run: bool, fence_lost: F) -> Result<(HealResultItem, Option<Error>)>
+    pub(crate) async fn heal_format_with_fence<F>(
+        &self,
+        dry_run: bool,
+        mut fence_lost: F,
+    ) -> Result<(HealResultItem, Option<Error>)>
     where
-        F: Fn() -> bool + Send + Sync,
+        F: FnMut() -> bool + Send,
     {
         let (disks, init_errs) = init_storage_disks_with_errors(
             &self.endpoints.endpoints,
@@ -1074,6 +1201,11 @@ impl Sets {
                         }
                         return Ok((res, Some(err.into())));
                     }
+                    #[cfg(test)]
+                    pause_heal_format_after_save(self, index).await;
+                    if fence_lost() {
+                        return Ok((res, Some(StorageError::SlowDown)));
+                    }
                     if let Some(saved_format) = fm.as_ref() {
                         res.after.drives[index].uuid = saved_format.erasure.this.to_string();
                         res.after.drives[index].state = DriveState::Ok.to_string();
@@ -1081,8 +1213,14 @@ impl Sets {
                 }
             }
 
+            if fence_lost() {
+                return Ok((res, Some(StorageError::SlowDown)));
+            }
             for (index, fm) in tmp_new_formats.iter().enumerate() {
                 if let Some(fm) = fm {
+                    if fence_lost() {
+                        return Ok((res, Some(StorageError::SlowDown)));
+                    }
                     let (m, n) = match ref_format.find_disk_index_by_disk_id(fm.erasure.this) {
                         Ok((m, n)) => (m, n),
                         Err(_) => continue,
@@ -1094,6 +1232,9 @@ impl Sets {
                     }
 
                     if let Some(Some(disk)) = disks.get(index) {
+                        if fence_lost() {
+                            return Ok((res, Some(StorageError::SlowDown)));
+                        }
                         self.disk_set[m].renew_disk(&disk.endpoint()).await;
                     }
                 }
@@ -1241,12 +1382,29 @@ pub(crate) async fn make_local_two_set_sets() -> (Vec<tempfile::TempDir>, Arc<Se
     make_local_two_set_sets_with_ctx(bootstrap_ctx()).await
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 pub(crate) async fn make_local_two_set_sets_with_ctx(ctx: Arc<InstanceContext>) -> (Vec<tempfile::TempDir>, Arc<Sets>) {
+    make_local_two_set_sets_for_pool_with_ctx(ctx, 0).await
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) async fn make_local_two_set_sets_for_pool_with_ctx(
+    ctx: Arc<InstanceContext>,
+    pool_idx: usize,
+) -> (Vec<tempfile::TempDir>, Arc<Sets>) {
+    make_local_two_set_sets_for_pool_with_drive_count_and_ctx(ctx, pool_idx, 2).await
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) async fn make_local_two_set_sets_for_pool_with_drive_count_and_ctx(
+    ctx: Arc<InstanceContext>,
+    pool_idx: usize,
+    set_drive_count: usize,
+) -> (Vec<tempfile::TempDir>, Arc<Sets>) {
     use crate::layout::endpoint::Endpoint;
     use rustfs_lock::client::local::LocalClient;
 
-    let format = FormatV3::new(2, 2);
+    let format = FormatV3::new(2, set_drive_count);
     let mut temp_dirs = Vec::new();
     let mut all_endpoints = Vec::new();
     let mut disk_sets = Vec::new();
@@ -1254,11 +1412,11 @@ pub(crate) async fn make_local_two_set_sets_with_ctx(ctx: Arc<InstanceContext>) 
     for set_index in 0..2 {
         let mut endpoints = Vec::new();
         let mut disks = Vec::new();
-        for disk_index in 0..2 {
+        for disk_index in 0..set_drive_count {
             let temp_dir = tempfile::tempdir().expect("tempdir should be created");
             let mut endpoint = Endpoint::try_from(temp_dir.path().to_str().expect("tempdir path should be utf8"))
                 .expect("endpoint should parse");
-            endpoint.set_pool_index(0);
+            endpoint.set_pool_index(pool_idx);
             endpoint.set_set_index(set_index);
             endpoint.set_disk_index(disk_index);
             let disk = new_disk(
@@ -1280,7 +1438,7 @@ pub(crate) async fn make_local_two_set_sets_with_ctx(ctx: Arc<InstanceContext>) 
             endpoints.push(endpoint);
             disks.push(Some(disk));
         }
-        let lockers = (0..2)
+        let lockers = (0..set_drive_count)
             .map(|_| {
                 Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::Enabled(Arc::new(
                     rustfs_lock::FastObjectLockManager::new(),
@@ -1291,10 +1449,10 @@ pub(crate) async fn make_local_two_set_sets_with_ctx(ctx: Arc<InstanceContext>) 
             SetDisks::new_with_instance_ctx(
                 "test-owner".to_string(),
                 Arc::new(RwLock::new(disks)),
-                2,
+                set_drive_count,
                 1,
                 set_index,
-                0,
+                pool_idx,
                 endpoints,
                 format.clone(),
                 lockers,
@@ -1307,11 +1465,11 @@ pub(crate) async fn make_local_two_set_sets_with_ctx(ctx: Arc<InstanceContext>) 
     let sets = Arc::new(Sets {
         id: format.id,
         disk_set: disk_sets,
-        pool_idx: 0,
+        pool_idx,
         endpoints: PoolEndpoints {
             legacy: false,
             set_count: 2,
-            drives_per_set: 2,
+            drives_per_set: set_drive_count,
             endpoints: Endpoints::from(all_endpoints),
             cmd_line: String::new(),
             platform: String::new(),
@@ -1319,13 +1477,36 @@ pub(crate) async fn make_local_two_set_sets_with_ctx(ctx: Arc<InstanceContext>) 
         format,
         parity_count: 1,
         set_count: 2,
-        set_drive_count: 2,
+        set_drive_count,
         default_parity_count: 1,
         distribution_algo: DistributionAlgoVersion::V1,
         exit_signal: None,
         ctx,
     });
     (temp_dirs, sets)
+}
+
+impl Sets {
+    pub(crate) async fn heal_object_with_absence(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+        proof: crate::set_disk::AbsenceProofRequest<'_>,
+    ) -> Result<(HealResultItem, Option<Error>, Option<crate::set_disk::HealedObjectAbsence>)> {
+        let mut absence = None;
+        let (item, error) = self
+            .get_disks_for_heal_object(object, opts)?
+            .heal_object_with_retirement(bucket, object, version_id, opts, &mut absence, proof)
+            .await?;
+        // A caller-owned lock does not expose its lease to this boundary.
+        // Keep cleanup unverified when that lease cannot be checked here.
+        if opts.no_lock {
+            absence = None;
+        }
+        Ok((item, error, absence))
+    }
 }
 
 #[cfg(test)]

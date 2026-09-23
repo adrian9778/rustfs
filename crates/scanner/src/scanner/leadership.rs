@@ -13,12 +13,36 @@
 // limitations under the License.
 /// Leader-lock claiming, usage-epoch fencing, and lock-loss handling.
 use super::*;
+use crate::data_usage_define::usage_floor_primary_read_error_allows_backup;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ScannerLeadershipClaimReconcile {
     Durable,
     Changed,
     Unchanged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ScannerCycleResetPolicy {
+    None,
+    ResetAll,
+    ResetCoveragePreservingNext,
+}
+
+impl ScannerCycleResetPolicy {
+    fn apply(self, cycle_info: &mut CurrentCycle, attempted_next: u64) {
+        match self {
+            Self::None => {}
+            Self::ResetAll => *cycle_info = CurrentCycle::default(),
+            Self::ResetCoveragePreservingNext => {
+                let next = cycle_info.next.max(attempted_next);
+                *cycle_info = CurrentCycle {
+                    next,
+                    ..Default::default()
+                };
+            }
+        }
+    }
 }
 
 pub(super) async fn reconcile_scanner_leadership_claim(
@@ -60,10 +84,16 @@ pub(super) async fn reconcile_scanner_leadership_claim(
     })
 }
 
-pub(super) fn decode_usage_snapshot_for_epoch_fence(data: &[u8], path: &str) -> Result<DataUsageInfo, ScannerError> {
+pub(super) fn decode_usage_snapshot_for_epoch_fence(
+    data: &[u8],
+    path: &str,
+    allow_bootstrap_pending: bool,
+) -> Result<DataUsageInfo, ScannerError> {
     let usage: DataUsageInfo = serde_json::from_slice(data)
         .map_err(|err| ScannerError::Other(format!("failed to decode scanner usage epoch fence from {path}: {err}")))?;
-    if !data_usage_info_has_persisted_baseline_identity(&usage) {
+    if !data_usage_info_has_persisted_baseline_identity(&usage)
+        && !(allow_bootstrap_pending && path == DATA_USAGE_OBJ_NAME_PATH.as_str() && data_usage_info_is_bootstrap_pending(&usage))
+    {
         return Err(ScannerError::Other(format!(
             "scanner usage epoch fence from {path} has no persisted baseline identity"
         )));
@@ -74,9 +104,32 @@ pub(super) fn decode_usage_snapshot_for_epoch_fence(data: &[u8], path: &str) -> 
 pub(super) async fn usage_snapshot_for_epoch_fence(
     storeapi: Arc<impl ScannerObjectIO>,
     primary: Option<&[u8]>,
+    allow_bootstrap_pending: bool,
 ) -> Result<Option<DataUsageInfo>, ScannerError> {
+    // A partially written v2 primary is not itself a baseline, but a durable
+    // companion may still provide one after an interrupted upgrade. Keep the
+    // primary epoch as a fence while checking those companions; malformed
+    // bytes and bootstrap markers retain their fail-closed behavior.
+    let mut invalid_primary_epoch = None;
     if let Some(primary) = primary {
-        return decode_usage_snapshot_for_epoch_fence(primary, DATA_USAGE_OBJ_NAME_PATH.as_str()).map(Some);
+        let usage: DataUsageInfo = serde_json::from_slice(primary).map_err(|err| {
+            ScannerError::Other(format!(
+                "failed to decode scanner usage epoch fence from {}: {err}",
+                DATA_USAGE_OBJ_NAME_PATH.as_str()
+            ))
+        })?;
+        if data_usage_info_has_persisted_baseline_identity(&usage)
+            || (allow_bootstrap_pending && data_usage_info_is_bootstrap_pending(&usage))
+        {
+            return Ok(Some(usage));
+        }
+        if data_usage_info_is_bootstrap_pending(&usage) {
+            return Err(ScannerError::Other(format!(
+                "scanner usage epoch fence from {} has no persisted baseline identity",
+                DATA_USAGE_OBJ_NAME_PATH.as_str()
+            )));
+        }
+        invalid_primary_epoch = usage.scanner_epoch;
     }
 
     let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
@@ -84,19 +137,39 @@ pub(super) async fn usage_snapshot_for_epoch_fence(
         .await
         .map_err(|err| ScannerError::Other(format!("failed to read scanner usage epoch fence backup: {err}")))?;
     if let Some(backup) = backup.as_deref() {
-        return decode_usage_snapshot_for_epoch_fence(backup, &backup_path).map(Some);
+        let usage = decode_usage_snapshot_for_epoch_fence(backup, &backup_path, false)?;
+        if invalid_primary_epoch.is_none_or(|epoch| usage.scanner_epoch.unwrap_or_default() >= epoch) {
+            return Ok(Some(usage));
+        }
     }
 
-    for path in [
-        LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
-        format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
-    ] {
-        let (legacy, _) = read_config_with_revision(storeapi.clone(), &path)
-            .await
-            .map_err(|err| ScannerError::Other(format!("failed to read legacy scanner usage epoch fence: {err}")))?;
+    let legacy_primary_path = LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string();
+    let legacy_backup_path = format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let mut legacy_primary_read_error = None;
+    for path in [&legacy_primary_path, &legacy_backup_path] {
+        let legacy = match read_config_with_revision(storeapi.clone(), path).await {
+            Ok((legacy, _)) => legacy,
+            Err(err) if path == &legacy_primary_path && usage_floor_primary_read_error_allows_backup(&err) => {
+                legacy_primary_read_error = Some(format!("failed to read legacy scanner usage epoch fence from {path}: {err}"));
+                continue;
+            }
+            Err(err) => {
+                return Err(ScannerError::Other(format!(
+                    "failed to read legacy scanner usage epoch fence from {path}: {err}"
+                )));
+            }
+        };
         if let Some(legacy) = legacy.as_deref() {
-            return decode_usage_snapshot_for_epoch_fence(legacy, &path).map(Some);
+            let usage = decode_usage_snapshot_for_epoch_fence(legacy, path, false)?;
+            if invalid_primary_epoch.is_none_or(|epoch| usage.scanner_epoch.unwrap_or_default() >= epoch) {
+                return Ok(Some(usage));
+            }
         }
+    }
+    if let Some(legacy_primary_read_error) = legacy_primary_read_error {
+        return Err(ScannerError::Other(format!(
+            "{legacy_primary_read_error}; no valid legacy scanner usage epoch fence backup was available at {legacy_backup_path}"
+        )));
     }
     // A missing usage snapshot is an uninitialized state, not an empty
     // snapshot. Leadership fencing may proceed without creating a plausible
@@ -104,14 +177,35 @@ pub(super) async fn usage_snapshot_for_epoch_fence(
     Ok(None)
 }
 
+pub(super) async fn initialize_usage_baseline_bootstrap(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+) -> Result<(), ScannerError> {
+    let Some(expected_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
+        return Err(ScannerError::Other(
+            "scanner usage baseline bootstrap is blocked by data movement".to_string(),
+        ));
+    };
+    publish_scanner_usage_bootstrap_primary(
+        storeapi,
+        &DataUsageCacheRevision::Missing,
+        expected_epoch,
+        None,
+        ScannerUsageBootstrapPublishContext::Initial,
+        || true,
+    )
+    .await
+}
+
 pub(super) async fn fence_scanner_usage_epoch_with_expected_epoch(
     ctx: &CancellationToken,
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     claimed_epoch: u64,
     expected_publication_epoch: Option<u64>,
+    allow_bootstrap_pending: bool,
+    owns_fence: impl Fn() -> bool,
 ) -> Result<(), ScannerError> {
     for retry in 0..=SCANNER_PERSIST_CAS_RETRIES {
-        if ctx.is_cancelled() {
+        if ctx.is_cancelled() || !owns_fence() {
             return Err(ScannerError::Other("scanner leadership was cancelled before usage fencing".to_string()));
         }
 
@@ -131,7 +225,9 @@ pub(super) async fn fence_scanner_usage_epoch_with_expected_epoch(
         let (primary, revision) = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
             .await
             .map_err(|err| ScannerError::Other(format!("failed to read scanner usage epoch fence: {err}")))?;
-        let Some(mut usage) = usage_snapshot_for_epoch_fence(storeapi.clone(), primary.as_deref()).await? else {
+        let Some(mut usage) =
+            usage_snapshot_for_epoch_fence(storeapi.clone(), primary.as_deref(), allow_bootstrap_pending).await?
+        else {
             let Some(_publication_admission) = scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch).await else {
                 if retry < SCANNER_PERSIST_CAS_RETRIES {
                     continue;
@@ -151,6 +247,12 @@ pub(super) async fn fence_scanner_usage_epoch_with_expected_epoch(
             Some(epoch) if epoch == claimed_epoch => return Ok(()),
             Some(_) | None => {}
         }
+        // A validated pre-marker legacy baseline needs an explicit complete
+        // identity before acquiring an epoch. Otherwise the v2 reader would
+        // reject the fenced value on its next startup.
+        if !usage.usage_snapshot_bootstrap_pending {
+            usage.usage_snapshot_complete = true;
+        }
         usage.scanner_epoch = Some(claimed_epoch);
         let data = serde_json::to_vec(&usage)
             .map_err(|err| ScannerError::Other(format!("failed to encode scanner usage epoch fence: {err}")))?;
@@ -164,6 +266,9 @@ pub(super) async fn fence_scanner_usage_epoch_with_expected_epoch(
                     "scanner usage epoch fence changed while preparing its conditional write".to_string(),
                 ));
             };
+            if ctx.is_cancelled() || !owns_fence() {
+                return Err(ScannerError::Other("scanner leadership was lost before usage fencing".to_string()));
+            }
             save_config_with_preconditions(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), data, revision.preconditions())
                 .await
         };
@@ -180,7 +285,8 @@ pub(super) async fn fence_scanner_usage_epoch_with_expected_epoch(
             .await
             .map_err(|err| ScannerError::Other(format!("failed to reconcile scanner usage epoch fence: {err}")))?;
         if let Some(persisted) = persisted {
-            let persisted = decode_usage_snapshot_for_epoch_fence(&persisted, DATA_USAGE_OBJ_NAME_PATH.as_str())?;
+            let persisted =
+                decode_usage_snapshot_for_epoch_fence(&persisted, DATA_USAGE_OBJ_NAME_PATH.as_str(), allow_bootstrap_pending)?;
             match persisted.scanner_epoch {
                 Some(epoch) if epoch == claimed_epoch => return Ok(()),
                 Some(epoch) if epoch > claimed_epoch => {
@@ -210,9 +316,17 @@ pub(super) async fn complete_scanner_leadership_claim(
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     claimed_epoch: u64,
     expected_publication_epoch: Option<u64>,
+    allow_bootstrap_pending: bool,
 ) -> bool {
-    if let Err(err) =
-        fence_scanner_usage_epoch_with_expected_epoch(ctx, storeapi, claimed_epoch, expected_publication_epoch).await
+    if let Err(err) = fence_scanner_usage_epoch_with_expected_epoch(
+        ctx,
+        storeapi,
+        claimed_epoch,
+        expected_publication_epoch,
+        allow_bootstrap_pending,
+        || true,
+    )
+    .await
     {
         error!(
             target: "rustfs::scanner",
@@ -236,6 +350,8 @@ pub(super) async fn claim_scanner_leadership(
     cycle_info: &mut CurrentCycle,
     revision: &mut DataUsageCacheRevision,
     persisted_epoch: &mut u64,
+    allow_bootstrap_pending: bool,
+    cycle_reset_policy: ScannerCycleResetPolicy,
 ) -> bool {
     for retry in 0..=SCANNER_PERSIST_CAS_RETRIES {
         if ctx.is_cancelled() {
@@ -253,6 +369,7 @@ pub(super) async fn claim_scanner_leadership(
             );
             return false;
         };
+        let attempted_next = cycle_info.next;
         let data = match encode_scanner_cycle_state(cycle_info, claimed_epoch) {
             Ok(data) => data,
             Err(err) => {
@@ -290,7 +407,7 @@ pub(super) async fn claim_scanner_leadership(
                 return false;
             }
         };
-        match usage_snapshot_for_epoch_fence(storeapi.clone(), usage_primary.as_deref()).await {
+        match usage_snapshot_for_epoch_fence(storeapi.clone(), usage_primary.as_deref(), allow_bootstrap_pending).await {
             Ok(Some(_)) => {}
             Ok(None) => {
                 warn!(
@@ -333,7 +450,14 @@ pub(super) async fn claim_scanner_leadership(
                 if let Some(etag) = object_info.etag.filter(|etag| !etag.is_empty()) {
                     *revision = DataUsageCacheRevision::Etag(etag);
                     *persisted_epoch = claimed_epoch;
-                    return complete_scanner_leadership_claim(ctx, storeapi, claimed_epoch, Some(read_epoch)).await;
+                    return complete_scanner_leadership_claim(
+                        ctx,
+                        storeapi,
+                        claimed_epoch,
+                        Some(read_epoch),
+                        allow_bootstrap_pending,
+                    )
+                    .await;
                 }
 
                 match reconcile_scanner_leadership_claim(
@@ -348,9 +472,19 @@ pub(super) async fn claim_scanner_leadership(
                 .await
                 {
                     Ok(ScannerLeadershipClaimReconcile::Durable) => {
-                        return complete_scanner_leadership_claim(ctx, storeapi, claimed_epoch, Some(read_epoch)).await;
+                        return complete_scanner_leadership_claim(
+                            ctx,
+                            storeapi,
+                            claimed_epoch,
+                            Some(read_epoch),
+                            allow_bootstrap_pending,
+                        )
+                        .await;
                     }
-                    Ok(ScannerLeadershipClaimReconcile::Changed) if retry < SCANNER_PERSIST_CAS_RETRIES => continue,
+                    Ok(ScannerLeadershipClaimReconcile::Changed) if retry < SCANNER_PERSIST_CAS_RETRIES => {
+                        cycle_reset_policy.apply(cycle_info, attempted_next);
+                        continue;
+                    }
                     Ok(ScannerLeadershipClaimReconcile::Changed | ScannerLeadershipClaimReconcile::Unchanged) => {
                         error!(
                             target: "rustfs::scanner",
@@ -392,16 +526,25 @@ pub(super) async fn claim_scanner_leadership(
                 .await
                 {
                     Ok(ScannerLeadershipClaimReconcile::Durable) => {
-                        return complete_scanner_leadership_claim(ctx, storeapi, claimed_epoch, Some(read_epoch)).await;
+                        return complete_scanner_leadership_claim(
+                            ctx,
+                            storeapi,
+                            claimed_epoch,
+                            Some(read_epoch),
+                            allow_bootstrap_pending,
+                        )
+                        .await;
                     }
                     Ok(ScannerLeadershipClaimReconcile::Changed)
                         if retry < SCANNER_PERSIST_CAS_RETRIES && !ctx.is_cancelled() =>
                     {
+                        cycle_reset_policy.apply(cycle_info, attempted_next);
                         continue;
                     }
                     Ok(ScannerLeadershipClaimReconcile::Unchanged)
                         if precondition_failed && retry < SCANNER_PERSIST_CAS_RETRIES && !ctx.is_cancelled() =>
                     {
+                        cycle_reset_policy.apply(cycle_info, attempted_next);
                         continue;
                     }
                     Ok(ScannerLeadershipClaimReconcile::Changed | ScannerLeadershipClaimReconcile::Unchanged) => {

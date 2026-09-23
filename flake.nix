@@ -35,6 +35,23 @@
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in
     {
+      nixosModules.rustfs = import ./nix/rustfs-module.nix {
+        defaultPackage = system: self.packages.${system}.rustfs;
+      };
+      nixosModules.default = self.nixosModules.rustfs;
+
+      overlays.default = final: prev:
+        let
+          packages = self.packages.${prev.stdenv.hostPlatform.system};
+        in
+        {
+          rustfs = packages.rustfs;
+        }
+        // prev.lib.optionalAttrs (builtins.hasAttr "rustfs-client" packages) {
+          rustfs-client = packages.rustfs-client;
+          rc = packages.rustfs-client;
+        };
+
       packages = forAllSystems (
         system:
         let
@@ -55,11 +72,12 @@
             cargo = rustToolchain;
             rustc = rustToolchain;
           };
-        in
-        {
-          default = rustPlatform.buildRustPackage {
+
+          clientVersion = "0.1.36";
+
+          rustfs = rustPlatform.buildRustPackage {
             pname = "rustfs";
-            version = "1.0.0-rc.3";
+            version = "1.0.1";
 
             src = ./.;
 
@@ -82,7 +100,6 @@
               "rustfs"
             ];
 
-            # Set environment variables for build
             PROTOC = "${pkgs.protobuf}/bin/protoc";
 
             doCheck = false;
@@ -94,6 +111,55 @@
               mainProgram = "rustfs";
             };
           };
+
+          clientAssets = {
+            "x86_64-linux" = {
+              name = "rustfs-cli-linux-amd64-v${clientVersion}.tar.gz";
+              hash = "sha256-SoEokRzK1Oe0gfJmNaTP0ewGRBIhBSbletLHSNNW87c=";
+            };
+            "aarch64-linux" = {
+              name = "rustfs-cli-linux-arm64-v${clientVersion}.tar.gz";
+              hash = "sha256-bp3qesT4FWKt2eHjEga6YFnW9ZKa1O2SSYYiMoKzqpw=";
+            };
+          };
+
+          clientSupported = builtins.hasAttr system clientAssets;
+
+          clientPackage =
+            if clientSupported then
+              let
+                asset = clientAssets.${system};
+              in
+              pkgs.stdenvNoCC.mkDerivation {
+                pname = "rustfs-cli";
+                version = clientVersion;
+                src = pkgs.fetchurl {
+                  url = "https://github.com/rustfs/cli/releases/download/v${clientVersion}/${asset.name}";
+                  inherit (asset) hash;
+                };
+                sourceRoot = ".";
+                installPhase = ''
+                  runHook preInstall
+                  install -Dm755 rc "$out/bin/rc"
+                  runHook postInstall
+                '';
+                meta = {
+                  description = "RustFS S3-compatible command-line client";
+                  homepage = "https://github.com/rustfs/cli";
+                  license = pkgs.lib.licenses.asl20;
+                  mainProgram = "rc";
+                };
+              }
+            else
+              null;
+        in
+        {
+          inherit rustfs;
+          default = rustfs;
+        }
+        // pkgs.lib.optionalAttrs clientSupported {
+          rustfs-client = clientPackage;
+          rc = clientPackage;
         }
       );
 

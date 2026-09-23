@@ -14,6 +14,707 @@
 
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk};
 use super::*;
+use crate::heal::storage::HealStorageObjectResult;
+
+mod concurrent_delete;
+mod deferred_retry;
+
+mod canonical_outcome {
+    use super::*;
+    use crate::heal::outcome::{HealExecutionOutcome, HealTraversalCoverage};
+
+    fn bucket_task(storage: Arc<MockStorage>) -> HealTask {
+        HealTask::from_request(
+            HealRequest::new(
+                HealType::Bucket {
+                    bucket: "bucket-a".to_string(),
+                },
+                HealOptions {
+                    recursive: true,
+                    timeout: None,
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            ),
+            storage,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cluster_retries_only_the_failed_listing_page() {
+        let storage = Arc::new(MockStorage {
+            recoverable_second_page_failures: Mutex::new(Some(1)),
+            ..Default::default()
+        });
+        let task = HealTask::from_request(
+            HealRequest::new(
+                HealType::Cluster,
+                HealOptions {
+                    recursive: true,
+                    timeout: None,
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            ),
+            storage.clone(),
+        );
+        task.execute().await.expect("second-page retry succeeds");
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+        assert_eq!(outcome.counters.processed, 2);
+        assert_eq!(outcome.counters.attempt_failures, 1);
+        assert_eq!(task.get_progress().await.objects_scanned, 2);
+        assert_eq!(
+            storage.heal_object_calls.lock().expect("object calls").as_slice(),
+            ["object-a", "object-b", POOL_META_NAME]
+        );
+        assert_eq!(
+            storage.listing_tokens.lock().expect("listing tokens").as_slice(),
+            [None, Some("second".to_string()), Some("second".to_string())]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_listing_page_cannot_restart_the_bucket() {
+        let storage = Arc::new(MockStorage {
+            recoverable_second_page_failures: Mutex::new(Some(4)),
+            ..Default::default()
+        });
+        let task = HealTask::from_request(
+            HealRequest::new(
+                HealType::Cluster,
+                HealOptions {
+                    recursive: true,
+                    timeout: None,
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            ),
+            storage.clone(),
+        );
+        task.execute().await.expect_err("listing page budget exhausted");
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.execution, HealExecutionOutcome::Aborted(HealAbortReason::Untraversable));
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Partial);
+        assert_eq!(outcome.counters.processed, 1);
+        assert_eq!(outcome.counters.attempt_failures, 4);
+        assert_eq!(task.get_progress().await.objects_scanned, 1);
+        assert_eq!(storage.heal_object_calls.lock().expect("object calls").as_slice(), ["object-a"]);
+        assert_eq!(storage.bucket_heal_calls.lock().expect("bucket calls").as_slice(), ["bucket-a"]);
+    }
+
+    #[tokio::test]
+    async fn listing_failure_preserves_processed_objects_and_partial_coverage() {
+        let storage = Arc::new(MockStorage {
+            fail_second_listing_page: true,
+            ..Default::default()
+        });
+        let task = bucket_task(storage);
+        task.execute().await.expect_err("second page cannot be traversed");
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.execution, HealExecutionOutcome::Aborted(HealAbortReason::Untraversable));
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Partial);
+        assert_eq!(outcome.counters.processed, 1);
+        assert_eq!(outcome.objects[0].identity.object, "object-a");
+        assert_eq!(task.get_progress().await.objects_scanned, 1);
+    }
+
+    #[tokio::test]
+    async fn cluster_preserves_cumulative_progress_across_buckets() {
+        let storage = Arc::new(MockStorage {
+            list_each_bucket: true,
+            listed_buckets: Mutex::new(Some(vec!["bucket-a".to_string(), "bucket-b".to_string()])),
+            ..Default::default()
+        });
+        let task = HealTask::from_request(
+            HealRequest::new(
+                HealType::Cluster,
+                HealOptions {
+                    recursive: true,
+                    timeout: None,
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            ),
+            storage,
+        );
+        task.execute().await.expect("both buckets complete");
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.counters.processed, 4);
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+        let progress = task.get_progress().await;
+        assert_eq!((progress.objects_scanned, progress.objects_healed), (4, 4));
+        assert_eq!(
+            outcome
+                .objects
+                .iter()
+                .filter(|item| item.identity.bucket == "bucket-b")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_heal_records_matching_positive_storage_receipts() {
+        let incarnation = Uuid::new_v4();
+        let storage = Arc::new(MockStorage {
+            heal_object_receipts: Mutex::new(HashMap::from([
+                (
+                    "object-a".to_string(),
+                    VecDeque::from([object_receipt("object-a", None, HealObjectDisposition::Repaired, incarnation)]),
+                ),
+                (
+                    "object-b".to_string(),
+                    VecDeque::from([object_receipt("object-b", None, HealObjectDisposition::Repaired, incarnation)]),
+                ),
+            ])),
+            bucket_incarnation_id: Mutex::new(Some(incarnation)),
+            ..Default::default()
+        });
+        let task = bucket_task(storage);
+
+        task.execute()
+            .await
+            .expect("bucket heal should record verified object receipts");
+
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+        assert_eq!(outcome.counters.healed, 2);
+        assert_eq!(outcome.counters.unknown, 0);
+        assert_eq!(outcome.objects.len(), 2);
+        assert!(outcome.objects.iter().all(|item| {
+            item.identity.bucket_incarnation_id == Some(incarnation) && item.disposition == HealObjectDisposition::Repaired
+        }));
+    }
+
+    #[tokio::test]
+    async fn bucket_heal_keeps_repairing_when_bucket_incarnation_is_unavailable() {
+        let storage = Arc::new(MockStorage {
+            heal_object_receipts: Mutex::new(HashMap::from([(
+                "object-a".to_string(),
+                VecDeque::from([object_receipt(
+                    "object-a",
+                    None,
+                    HealObjectDisposition::Repaired,
+                    Uuid::new_v4(),
+                )]),
+            )])),
+            bucket_incarnation_unavailable: Mutex::new(true),
+            ..Default::default()
+        });
+        let task = bucket_task(storage.clone());
+
+        task.execute()
+            .await
+            .expect("bucket heal should continue when only proof ownership is unavailable");
+
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+        assert_eq!(outcome.counters.healed, 0);
+        assert_eq!(outcome.counters.unknown, 2);
+        assert!(
+            outcome
+                .objects
+                .iter()
+                .all(|item| item.disposition == HealObjectDisposition::Unknown)
+        );
+        assert_eq!(storage.healed_objects.lock().expect("healed objects").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn bucket_heal_rejects_stale_receipts_without_double_recording() {
+        let expected_incarnation = Uuid::new_v4();
+        let storage = Arc::new(MockStorage {
+            heal_object_receipts: Mutex::new(HashMap::from([
+                (
+                    "object-a".to_string(),
+                    VecDeque::from([object_receipt(
+                        "object-a",
+                        None,
+                        HealObjectDisposition::Repaired,
+                        Uuid::new_v4(),
+                    )]),
+                ),
+                (
+                    "object-b".to_string(),
+                    VecDeque::from([object_receipt(
+                        "object-b",
+                        None,
+                        HealObjectDisposition::Repaired,
+                        expected_incarnation,
+                    )]),
+                ),
+            ])),
+            bucket_incarnation_id: Mutex::new(Some(expected_incarnation)),
+            ..Default::default()
+        });
+        let task = bucket_task(storage);
+
+        task.execute()
+            .await
+            .expect("stale bucket receipt should not fail the legacy heal");
+
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+        assert_eq!(outcome.counters.healed, 1);
+        assert_eq!(outcome.counters.unknown, 1);
+        assert_eq!(outcome.objects.len(), 2);
+        let object_a = outcome
+            .objects
+            .iter()
+            .find(|item| item.identity.object == "object-a")
+            .expect("stale receipt object outcome");
+        assert_eq!(object_a.disposition, HealObjectDisposition::Unknown);
+        let object_b = outcome
+            .objects
+            .iter()
+            .find(|item| item.identity.object == "object-b")
+            .expect("matching receipt object outcome");
+        assert_eq!(object_b.disposition, HealObjectDisposition::Repaired);
+        assert_eq!(object_b.identity.bucket_incarnation_id, Some(expected_incarnation));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_object_does_not_abort_other_objects_or_erase_counts() {
+        let storage = Arc::new(MockStorage::default());
+        storage.heal_object_outcomes.lock().expect("outcomes").insert(
+            "object-a".to_string(),
+            (0..4).map(|_| MockHealObjectOutcome::RetryableReadQuorum).collect(),
+        );
+        let task = bucket_task(storage.clone());
+        task.execute().await.expect_err("legacy adapter retains batch failure");
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.execution, HealExecutionOutcome::CompletedWithErrors);
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+        assert_eq!((outcome.counters.processed, outcome.counters.failed, outcome.counters.unknown), (2, 1, 1));
+        assert_eq!(outcome.counters.attempt_failures, 4);
+        let failed = outcome
+            .objects
+            .iter()
+            .find(|item| item.identity.object == "object-a")
+            .expect("failed object");
+        assert_eq!(failed.disposition, HealObjectDisposition::Failed(HealFailureClass::RetryExhausted));
+        let object_b_calls = {
+            let calls = storage.heal_object_calls.lock().expect("calls");
+            calls.iter().filter(|object| object.as_str() == "object-b").count()
+        };
+        assert_eq!(object_b_calls, 1);
+        let progress = task.get_progress().await;
+        assert_eq!((progress.objects_scanned, progress.objects_healed, progress.objects_failed), (2, 1, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admin_cluster_lock_timeout_exhaustion_keeps_progress_and_retry_outcome() {
+        let storage = Arc::new(MockStorage {
+            bucket_incarnation_id: Mutex::new(Some(Uuid::new_v4())),
+            ..Default::default()
+        });
+        storage.heal_object_outcomes.lock().expect("outcomes").insert(
+            "object-a".to_string(),
+            (0..4).map(|_| MockHealObjectOutcome::RetryableLockTimeout).collect(),
+        );
+        let mut request = HealRequest::new(
+            HealType::Cluster,
+            HealOptions {
+                recursive: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Admin;
+        let task = HealTask::from_request(request, storage.clone());
+
+        let err = task
+            .execute()
+            .await
+            .expect_err("legacy adapter still returns the batch failure detail");
+        assert!(
+            err.to_string()
+                .contains("Lock error: Lock acquisition timeout for resource 'object-a' after 5s"),
+            "lock timeout must remain actionable in the retained failure detail: {err}"
+        );
+
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.execution, HealExecutionOutcome::CompletedWithErrors);
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+        assert_eq!(
+            (
+                outcome.counters.processed,
+                outcome.counters.failed,
+                outcome.counters.unknown,
+                outcome.counters.attempt_failures
+            ),
+            (2, 1, 1, 4)
+        );
+        let failed = outcome
+            .objects
+            .iter()
+            .find(|item| item.identity.object == "object-a")
+            .expect("lock-contended object outcome");
+        assert_eq!(failed.disposition, HealObjectDisposition::Failed(HealFailureClass::RetryExhausted));
+        assert!(
+            failed
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("Lock error: Lock acquisition timeout for resource 'object-a' after 5s")),
+            "exhausted lock detail stays observable"
+        );
+
+        let progress = task.get_progress().await;
+        assert_eq!((progress.objects_scanned, progress.objects_healed, progress.objects_failed), (2, 1, 1));
+        let (legacy_summary, legacy_detail) = outcome.legacy_status("finished", None);
+        assert_eq!(legacy_summary, "stopped");
+        assert_eq!(
+            legacy_detail.as_deref(),
+            Some(
+                "heal traversal completed with errors: 1 failed objects; first failed object bucket-a/object-a (retry_exhausted): Storage error: Lock error: Lock acquisition timeout for resource 'object-a' after 5s"
+            )
+        );
+        assert_eq!(
+            storage.heal_object_calls.lock().expect("object calls").as_slice(),
+            ["object-a", "object-b", "object-a", "object-a", "object-a"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_success_counts_one_terminal_outcome() {
+        let storage = Arc::new(MockStorage::default());
+        storage
+            .heal_object_outcomes
+            .lock()
+            .expect("outcomes")
+            .insert("object-a".to_string(), VecDeque::from([MockHealObjectOutcome::RetryableReadQuorum]));
+        let task = bucket_task(storage);
+        task.execute().await.expect("retry should recover");
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+        assert_eq!(outcome.counters.processed, 2);
+        assert_eq!(outcome.counters.failed, 0);
+        assert_eq!(outcome.counters.attempt_failures, 1);
+        assert_eq!(
+            outcome
+                .objects
+                .iter()
+                .filter(|item| item.identity.object == "object-a")
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcome.counters.processed,
+            outcome.counters.healed + outcome.counters.unchanged + outcome.counters.skipped + outcome.counters.failed
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_grace_and_legacy_success_keep_distinct_dispositions() {
+        let storage = Arc::new(MockStorage::default());
+        storage
+            .heal_object_outcomes
+            .lock()
+            .expect("outcomes")
+            .insert("object-a".to_string(), VecDeque::from([MockHealObjectOutcome::DanglingGraceDeferred]));
+        let task = bucket_task(storage);
+        task.execute().await.expect("grace permits traversal completion");
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+        assert_eq!(outcome.counters.processed, 2);
+        assert_eq!(outcome.counters.healed, 0, "legacy result is not a repair receipt");
+        assert!(matches!(
+            outcome.objects[0].disposition,
+            HealObjectDisposition::Deferred {
+                reason: HealDeferredReason::DanglingDeleteGrace,
+                ..
+            }
+        ));
+        assert_eq!(outcome.objects[1].disposition, HealObjectDisposition::Unknown);
+        assert!(
+            outcome
+                .objects
+                .iter()
+                .all(|item| item.identity.bucket_incarnation_id.is_none())
+        );
+        assert_eq!(
+            task.get_progress().await.objects_healed,
+            1,
+            "legacy display count remains distinct from proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_grace_and_repaired_receipt_transfer_only_repaired_responsibility() {
+        let incarnation = Uuid::new_v4();
+        let storage = Arc::new(MockStorage {
+            heal_object_outcomes: Mutex::new(HashMap::from([(
+                "object-a".to_string(),
+                VecDeque::from([MockHealObjectOutcome::DanglingGraceDeferred]),
+            )])),
+            heal_object_receipts: Mutex::new(HashMap::from([(
+                "object-b".to_string(),
+                VecDeque::from([object_receipt("object-b", None, HealObjectDisposition::Repaired, incarnation)]),
+            )])),
+            bucket_incarnation_id: Mutex::new(Some(incarnation)),
+            ..Default::default()
+        });
+        let task = bucket_task(storage);
+
+        task.execute()
+            .await
+            .expect("mixed grace and repaired receipt should complete");
+
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+        assert_eq!(outcome.counters.processed, 2);
+        assert_eq!(outcome.counters.healed, 1);
+        assert_eq!(outcome.counters.skipped, 1);
+        let deferred = outcome
+            .objects
+            .iter()
+            .find(|item| item.identity.object == "object-a")
+            .expect("grace object should remain recorded");
+        assert!(matches!(
+            deferred.disposition,
+            HealObjectDisposition::Deferred {
+                reason: HealDeferredReason::DanglingDeleteGrace,
+                ..
+            }
+        ));
+        assert_ne!(deferred.disposition, HealObjectDisposition::Repaired);
+        let repaired = outcome
+            .objects
+            .iter()
+            .find(|item| item.identity.object == "object-b")
+            .expect("receipt-backed object should be recorded");
+        assert_eq!(repaired.identity.bucket_incarnation_id, Some(incarnation));
+        assert_eq!(repaired.disposition, HealObjectDisposition::Repaired);
+    }
+
+    #[tokio::test]
+    async fn bucket_heal_records_matching_positive_storage_receipt() {
+        let incarnation = Uuid::new_v4();
+        let storage = Arc::new(MockStorage {
+            heal_object_receipts: Mutex::new(HashMap::from([(
+                "object-a".to_string(),
+                VecDeque::from([object_receipt("object-a", None, HealObjectDisposition::Repaired, incarnation)]),
+            )])),
+            bucket_incarnation_id: Mutex::new(Some(incarnation)),
+            ..Default::default()
+        });
+        let task = bucket_task(storage);
+
+        task.execute().await.expect("bucket heal should complete");
+
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.counters.processed, 2);
+        assert_eq!(outcome.counters.healed, 1);
+        assert_eq!(outcome.counters.unknown, 1);
+        assert_eq!(
+            outcome
+                .objects
+                .iter()
+                .filter(|item| item.identity.object == "object-a")
+                .count(),
+            1
+        );
+        let repaired = outcome
+            .objects
+            .iter()
+            .find(|item| item.identity.object == "object-a")
+            .expect("receipt-backed bucket object should be recorded");
+        assert_eq!(repaired.identity.bucket_incarnation_id, Some(incarnation));
+        assert_eq!(repaired.disposition, HealObjectDisposition::Repaired);
+        let legacy = outcome
+            .objects
+            .iter()
+            .find(|item| item.identity.object == "object-b")
+            .expect("legacy bucket object should still be recorded");
+        assert_eq!(legacy.disposition, HealObjectDisposition::Unknown);
+    }
+
+    #[tokio::test]
+    async fn retired_marker_is_deferred_for_bucket_and_single_object_tasks() {
+        let storage = Arc::new(MockStorage::default());
+        storage
+            .heal_object_outcomes
+            .lock()
+            .unwrap()
+            .insert("object-a".into(), VecDeque::from([MockHealObjectOutcome::RetiredMarkerDeferred]));
+        let bucket = bucket_task(storage);
+        let object = HealTask::from_request(
+            HealRequest::object("bucket-a".into(), "marker.bin".into(), Some(Uuid::new_v4().to_string())),
+            Arc::new(MockStorage {
+                heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::RetiredMarkerDeferred)),
+                ..Default::default()
+            }),
+        );
+        for task in [&bucket, &object] {
+            task.execute().await.expect("unproven marker permits traversal completion");
+            let outcome = task.get_outcome().await;
+            assert_eq!(outcome.counters.failed, 0);
+            assert_eq!(outcome.counters.healed, 0);
+            let deferred = outcome
+                .objects
+                .iter()
+                .find(|item| {
+                    matches!(
+                        item.disposition,
+                        HealObjectDisposition::Deferred {
+                            reason: HealDeferredReason::RetiredMarkerProof,
+                            ..
+                        }
+                    )
+                })
+                .expect("typed deferral");
+            assert!(
+                deferred
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.contains("no committed retirement record"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grace_single_object_is_completed_but_deferred() {
+        let storage = Arc::new(MockStorage {
+            heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::DanglingGraceDeferred)),
+            ..Default::default()
+        });
+        let task = HealTask::from_request(HealRequest::object("bucket-a".to_string(), "recent.txt".to_string(), None), storage);
+        task.execute().await.expect("grace is deferred");
+        let outcome = task.get_outcome().await;
+        assert_eq!(task.get_status().await, HealTaskStatus::Completed);
+        assert_eq!(outcome.counters.processed, 1);
+        assert!(matches!(
+            outcome.objects[0].disposition,
+            HealObjectDisposition::Deferred {
+                reason: HealDeferredReason::DanglingDeleteGrace,
+                ..
+            }
+        ));
+        assert_eq!(outcome.counters.attempt_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn dry_run_and_transient_existence_do_not_prove_repair() {
+        for transient in [false, true] {
+            let storage = Arc::new(MockStorage::default());
+            if transient {
+                storage
+                    .object_exists_by_name
+                    .lock()
+                    .expect("existence fixture")
+                    .insert("object".to_string(), MockObjectExists::TransientSkip("retry later"));
+            } else {
+                let incarnation = Uuid::new_v4();
+                *storage.bucket_incarnation_id.lock().expect("bucket incarnation") = Some(incarnation);
+                storage.heal_object_receipts.lock().expect("receipt fixture").insert(
+                    "object".to_string(),
+                    VecDeque::from([object_receipt(
+                        "object",
+                        None,
+                        HealObjectDisposition::VerifiedHealthy,
+                        incarnation,
+                    )]),
+                );
+            }
+            let mut request = HealRequest::object("bucket-a".to_string(), "object".to_string(), None);
+            request.options.dry_run = !transient;
+            let task = HealTask::from_request(request, storage);
+            task.execute().await.expect("observation may complete");
+            let outcome = task.get_outcome().await;
+            assert_eq!(outcome.counters.healed, 0);
+            if transient {
+                assert!(matches!(
+                    outcome.objects[0].disposition,
+                    HealObjectDisposition::Deferred {
+                        reason: HealDeferredReason::TransientExistenceCheck,
+                        ..
+                    }
+                ));
+            } else {
+                assert_eq!(outcome.objects[0].disposition, HealObjectDisposition::DryRunObserved);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn untraversable_bucket_does_not_claim_complete_cluster_coverage() {
+        let storage = Arc::new(MockStorage {
+            listed_buckets: Mutex::new(Some(vec!["bucket-a".to_string(), "bucket-b".to_string()])),
+            bucket_heal_errors: Mutex::new(HashMap::from([("bucket-a".to_string(), VecDeque::from(["metadata unavailable"]))])),
+            ..Default::default()
+        });
+        let task = HealTask::from_request(
+            HealRequest::new(
+                HealType::Cluster,
+                HealOptions {
+                    recursive: true,
+                    timeout: None,
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            ),
+            storage.clone(),
+        );
+        task.execute().await.expect_err("structural bucket error");
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.execution, HealExecutionOutcome::Aborted(HealAbortReason::Untraversable));
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Partial);
+        assert_eq!(
+            storage.bucket_heal_calls.lock().expect("bucket calls").as_slice(),
+            ["bucket-a", "bucket-b"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_and_deadline_leave_partial_coverage() {
+        for cancel in [false, true] {
+            let storage = Arc::new(MockStorage {
+                block_heal_object: Mutex::new(true),
+                ..Default::default()
+            });
+            let mut request = HealRequest::object("bucket-a".to_string(), "object".to_string(), None);
+            request.options.timeout = Some(Duration::from_secs(1));
+            let task = HealTask::from_request(request, storage);
+            if cancel {
+                task.cancel().await.expect("cancel request");
+            }
+            task.execute().await.expect_err("control interruption");
+            let outcome = task.get_outcome().await;
+            assert_eq!(outcome.coverage, HealTraversalCoverage::Partial);
+            assert_eq!(
+                outcome.execution,
+                HealExecutionOutcome::Aborted(if cancel {
+                    HealAbortReason::Cancelled
+                } else {
+                    HealAbortReason::Deadline
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_keeps_the_requested_pool_and_set() {
+        let storage = Arc::new(MockStorage::default());
+        let mut request = HealRequest::ec_decode("bucket-a".to_string(), "object".to_string(), Some("version-a".to_string()));
+        request.options.pool_index = Some(2);
+        request.options.set_index = Some(3);
+        let task = HealTask::from_request(request, storage.clone());
+        task.execute().await.expect("decode fixture");
+        let pool_and_set = {
+            let options = storage.object_heal_opts.lock().expect("storage options");
+            (options[0].pool, options[0].set)
+        };
+        assert_eq!(pool_and_set, (Some(2), Some(3)));
+        let outcome = task.get_outcome().await;
+        let identity = &outcome.objects[0].identity;
+        assert_eq!((identity.pool_index, identity.set_index), (Some(2), Some(3)));
+        assert_eq!(identity.version_id.as_deref(), Some("version-a"));
+        assert_eq!(outcome.objects[0].disposition, HealObjectDisposition::Unknown);
+    }
+}
 use crate::heal::storage::{HealListItem, HealObjectInfo};
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, TraceSubscription, TraceVal, subscribe_trace_events};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem, Infos};
@@ -84,8 +785,8 @@ async fn automatic_replacement_uses_target_scoped_format() {
     let temp = TempDir::new().expect("temporary resume disk directory should be created");
     let disk = make_resume_disk(&temp).await;
     let storage = Arc::new(MockStorage {
-        replacement_targets_ready: Mutex::new(true),
-        resume_disk: Mutex::new(Some(disk)),
+        replacement_target_identities_ready: Mutex::new(true),
+        resume_disk: Mutex::new(Some(disk.clone())),
         ..Default::default()
     });
     let mut request = HealRequest::new(
@@ -118,12 +819,111 @@ async fn automatic_replacement_uses_target_scoped_format() {
         &[(0, 0, vec!["replacement-a".to_string()])],
         "automatic replacement must pass the exact pool, set, and target"
     );
+    let state = ResumeManager::load_replacement_intent(disk, &task.id)
+        .await
+        .expect("failed replacement must retain its durable responsibility")
+        .get_state()
+        .await;
+    assert!(
+        state.error_message.as_deref().is_some_and(|error| error.contains("marker")),
+        "marker admission failure must persist the error rather than leave a running replacement"
+    );
+    assert_ne!(state.replacement_phase, crate::heal::resume::ReplacementPhase::Rebuilding);
+}
+
+fn directory_backed_replacement_request() -> HealRequest {
+    let mut request = HealRequest::new(
+        HealType::ErasureSet {
+            buckets: Vec::new(),
+            set_disk_id: "pool_0_set_0".to_string(),
+        },
+        HealOptions {
+            pool_index: Some(0),
+            set_index: Some(0),
+            ..Default::default()
+        },
+        HealPriority::Low,
+    );
+    request.source = HealRequestSource::AutoHeal;
+    request.heal_endpoints = vec!["/data/disk0".to_string()];
+    request
+}
+
+#[tokio::test]
+async fn directory_backed_replacement_falls_back_to_set_format_when_disk_checks_are_bypassed() {
+    temp_env::async_with_vars(
+        [
+            (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, Some("true")),
+            (rustfs_config::ENV_MINIO_CI, None::<&str>),
+        ],
+        async {
+            let storage = Arc::new(MockStorage {
+                replacement_target_identities_ready: Mutex::new(false),
+                global_format_ok_endpoints: Mutex::new(vec!["/data/disk0".to_string()]),
+                ..Default::default()
+            });
+            let task = HealTask::from_request(directory_backed_replacement_request(), storage.clone());
+
+            // The mock has no local disk behind "/data/disk0", so the run stops at
+            // the healing-marker step that follows the format stage, exactly like
+            // `automatic_replacement_uses_target_scoped_format`. The assertions
+            // below pin which format path ran before that point.
+            let err = task.execute().await.expect_err("the mock has no local healing marker target");
+            assert!(
+                err.to_string().contains("healing marker target is unavailable"),
+                "the fallback must reach the post-format marker step, got: {err}"
+            );
+
+            assert_eq!(
+                *storage.global_format_calls.lock().unwrap(),
+                1,
+                "the fallback must run exactly one set-wide format heal"
+            );
+            assert!(
+                storage.replacement_format_calls.lock().unwrap().is_empty(),
+                "the fallback must not run the target-scoped replacement format"
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn directory_backed_replacement_stays_fail_closed_without_disk_check_bypass() {
+    temp_env::async_with_vars(
+        [
+            (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, None::<&str>),
+            (rustfs_config::ENV_MINIO_CI, None::<&str>),
+        ],
+        async {
+            let storage = Arc::new(MockStorage {
+                replacement_target_identities_ready: Mutex::new(false),
+                ..Default::default()
+            });
+            let task = HealTask::from_request(directory_backed_replacement_request(), storage.clone());
+
+            task.execute()
+                .await
+                .expect_err("an inadmissible replacement target must keep failing closed");
+
+            assert_eq!(
+                *storage.global_format_calls.lock().unwrap(),
+                0,
+                "fail-closed admission must not format the set"
+            );
+            assert!(
+                storage.replacement_format_calls.lock().unwrap().is_empty(),
+                "fail-closed admission must not format the target"
+            );
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn automatic_replacement_persists_intent_before_format() {
     let storage = Arc::new(MockStorage {
-        replacement_targets_ready: Mutex::new(true),
+        replacement_target_identities_ready: Mutex::new(true),
         ..Default::default()
     });
     let mut request = HealRequest::new(
@@ -155,7 +955,7 @@ async fn automatic_replacement_persists_intent_before_format() {
 #[tokio::test]
 async fn recovered_replacement_never_uses_a_fresh_resume_disk() {
     let storage = Arc::new(MockStorage {
-        replacement_targets_ready: Mutex::new(true),
+        replacement_target_identities_ready: Mutex::new(true),
         ..Default::default()
     });
     let mut request = HealRequest::new(
@@ -193,7 +993,7 @@ async fn automatic_replacement_rejects_a_new_identity_after_format() {
     let first_identity = replacement_identity("replacement-a", "device-a", "filesystem-a");
     let second_identity = replacement_identity("replacement-a", "device-b", "filesystem-b");
     let storage = Arc::new(MockStorage {
-        replacement_targets_ready: Mutex::new(true),
+        replacement_target_identities_ready: Mutex::new(true),
         replacement_target_identity_sequences: Mutex::new(VecDeque::from([
             vec![first_identity.clone()],
             vec![first_identity.clone()],
@@ -259,7 +1059,7 @@ async fn automatic_replacement_reuses_an_existing_non_target_resume_anchor() {
     .await
     .expect("existing intent should be stored on the non-target anchor");
     let storage = Arc::new(MockStorage {
-        replacement_targets_ready: Mutex::new(true),
+        replacement_target_identities_ready: Mutex::new(true),
         replacement_resume_disk: Mutex::new(Some(anchor.clone())),
         ..Default::default()
     });
@@ -298,7 +1098,11 @@ async fn automatic_replacement_reuses_an_existing_non_target_resume_anchor() {
         .expect("the existing non-target anchor should retain the generation")
         .get_state()
         .await;
-    assert_eq!(state.replacement_phase, ReplacementPhase::Rebuilding);
+    assert_eq!(state.replacement_phase, ReplacementPhase::Intent);
+    assert!(
+        state.error_message.as_deref().is_some_and(|error| error.contains("marker")),
+        "a reused anchor must persist marker admission failure before rebuilding starts"
+    );
 }
 
 #[tokio::test]
@@ -470,6 +1274,50 @@ async fn cleanup_pending_recovery_removes_checkpoint_without_rebuild_work() {
 }
 
 #[tokio::test]
+async fn replacement_cleanup_reloads_verified_state_from_survivor_anchor() {
+    let temp = TempDir::new().expect("temporary resume disk directory should be created");
+    let anchor = make_resume_disk(&temp).await;
+    let task_id = crate::heal::resume::ResumeUtils::generate_task_id();
+    let stale_resume = ResumeManager::new_replacement_intent(
+        anchor.clone(),
+        task_id.clone(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket-a".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![replacement_identity("replacement-a", "device-a", "filesystem-a")],
+    )
+    .await
+    .expect("replacement intent should persist on the survivor anchor");
+    let rebuilding_resume = ResumeManager::load_replacement_intent(anchor.clone(), &task_id)
+        .await
+        .expect("the inner healer should load the persisted replacement intent");
+    rebuilding_resume
+        .mark_replacement_completed_and_verified()
+        .await
+        .expect("the inner healer should persist verified completion");
+
+    assert!(
+        stale_resume.mark_replacement_cleanup_pending().await.is_err(),
+        "the original in-memory manager must remain stale after another manager persists verification"
+    );
+    let verified_resume = super::heal_erasure_set::load_verified_replacement_resume(&anchor, &task_id)
+        .await
+        .expect("cleanup should reload and verify durable replacement completion");
+    verified_resume
+        .mark_replacement_cleanup_pending()
+        .await
+        .expect("the freshly loaded verified state should enter cleanup");
+
+    let state = ResumeManager::load_replacement_intent(anchor, &task_id)
+        .await
+        .expect("cleanup-pending state should remain durable")
+        .get_state()
+        .await;
+    assert!(state.completed);
+    assert_eq!(state.replacement_phase, ReplacementPhase::CleanupPending);
+}
+
+#[tokio::test]
 async fn verified_recovery_keeps_state_when_marker_clear_fails() {
     let temp = TempDir::new().expect("temporary resume disk directory should be created");
     let anchor = make_resume_disk(&temp).await;
@@ -493,7 +1341,7 @@ async fn verified_recovery_keeps_state_when_marker_clear_fails() {
 
     let storage = Arc::new(MockStorage {
         replacement_resume_disk: Mutex::new(Some(anchor.clone())),
-        replacement_targets_ready: Mutex::new(true),
+        replacement_target_identities_ready: Mutex::new(true),
         ..Default::default()
     });
     let mut request = HealRequest::new(
@@ -537,7 +1385,15 @@ async fn verified_recovery_keeps_state_when_marker_clear_fails() {
 
 #[derive(Default)]
 struct MockStorage {
+    retry_test_pages: Option<Vec<Vec<HealListItem>>>,
+    retry_test_delays: HashMap<String, Duration>,
+    retry_test_listing_delays: Mutex<VecDeque<Duration>>,
+    retry_test_events: Mutex<Vec<String>>,
     listed: Mutex<bool>,
+    list_each_bucket: bool,
+    fail_second_listing_page: bool,
+    recoverable_second_page_failures: Mutex<Option<usize>>,
+    listing_tokens: Mutex<Vec<Option<String>>>,
     healed_objects: Mutex<Vec<String>>,
     heal_object_calls: Mutex<Vec<String>>,
     heal_object_version_ids: Mutex<Vec<Option<String>>>,
@@ -547,12 +1403,21 @@ struct MockStorage {
     object_exists_by_name: Mutex<HashMap<String, MockObjectExists>>,
     heal_object_outcome: Mutex<Option<MockHealObjectOutcome>>,
     heal_object_outcomes: Mutex<HashMap<String, VecDeque<MockHealObjectOutcome>>>,
+    heal_object_receipts: Mutex<HashMap<String, VecDeque<HealObjectReceipt>>>,
+    bucket_incarnation_id: Mutex<Option<Uuid>>,
+    bucket_incarnation_after_object_heal: Mutex<Option<Uuid>>,
+    bucket_incarnation_after_listing: Mutex<Option<Uuid>>,
+    bucket_incarnation_unavailable: Mutex<bool>,
     format_no_heal_required: Mutex<bool>,
     format_error: Mutex<Option<Error>>,
     global_format_calls: Mutex<u32>,
+    /// Endpoints the set-wide format mock reports as freshly formatted (`state == "ok"`).
+    global_format_ok_endpoints: Mutex<Vec<String>>,
     replacement_format_calls: Mutex<Vec<(usize, usize, Vec<String>)>>,
-    replacement_targets_ready: Mutex<bool>,
+    replacement_target_identities_ready: Mutex<bool>,
     replacement_target_identity_sequences: Mutex<VecDeque<Vec<crate::heal::resume::ReplacementTargetIdentity>>>,
+    replacement_execution_fixture: Mutex<Option<Arc<crate::heal::storage::ReplacementExecution>>>,
+    replacement_format_barrier: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     listed_prefixes: Mutex<Vec<String>>,
     truncate_without_token: Mutex<bool>,
     include_object_dir_candidate: Mutex<bool>,
@@ -564,6 +1429,8 @@ struct MockStorage {
     replacement_resume_disk: Mutex<Option<DiskStore>>,
     usage_baseline: Mutex<Option<HealBucketUsageBaseline>>,
     usage_baseline_error: Mutex<bool>,
+    erasure_set_scopes: Mutex<Vec<(usize, usize)>>,
+    disk_walk_calls: Mutex<Vec<String>>,
 }
 
 #[test]
@@ -646,6 +1513,280 @@ async fn execute_emits_heal_trace_task_state() {
     assert_eq!(trace_attr_string(&completed, "state").as_deref(), Some("completed"));
 }
 
+fn object_receipt(
+    object: &str,
+    version_id: Option<&str>,
+    disposition: HealObjectDisposition,
+    bucket_incarnation_id: Uuid,
+) -> HealObjectReceipt {
+    HealObjectReceipt {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Object,
+            bucket: "bucket-a".to_string(),
+            object: object.to_string(),
+            version_id: version_id.map(ToOwned::to_owned),
+            bucket_incarnation_id: Some(bucket_incarnation_id),
+            pool_index: None,
+            set_index: None,
+        },
+        disposition,
+    }
+}
+
+#[tokio::test]
+async fn object_heal_records_matching_positive_storage_receipt() {
+    let incarnation = Uuid::new_v4();
+    let storage = Arc::new(MockStorage {
+        heal_object_receipts: Mutex::new(HashMap::from([(
+            "object-a".to_string(),
+            VecDeque::from([object_receipt(
+                "object-a",
+                Some("version-a"),
+                HealObjectDisposition::Repaired,
+                incarnation,
+            )]),
+        )])),
+        bucket_incarnation_id: Mutex::new(Some(incarnation)),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-a".to_string(), Some("version-a".to_string())),
+        storage,
+    );
+
+    task.execute().await.expect("mock object heal should complete");
+
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.counters.healed, 1);
+    assert_eq!(outcome.counters.unknown, 0);
+    let object = outcome.objects.front().expect("positive receipt should be recorded");
+    assert_eq!(object.identity.object, "object-a");
+    assert_eq!(object.identity.version_id.as_deref(), Some("version-a"));
+    assert!(object.identity.bucket_incarnation_id.is_some());
+    assert_eq!(object.disposition, HealObjectDisposition::Repaired);
+}
+
+#[tokio::test]
+async fn object_heal_binds_omitted_selector_to_storage_resolved_version() {
+    let incarnation = Uuid::new_v4();
+    let resolved_version = Uuid::new_v4();
+    let resolved_version_id = resolved_version.to_string();
+    let storage = Arc::new(MockStorage {
+        heal_object_receipts: Mutex::new(HashMap::from([(
+            "object-a".to_string(),
+            VecDeque::from([object_receipt(
+                "object-a",
+                Some(&resolved_version_id),
+                HealObjectDisposition::Repaired,
+                incarnation,
+            )]),
+        )])),
+        bucket_incarnation_id: Mutex::new(Some(incarnation)),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(HealRequest::object("bucket-a".to_string(), "object-a".to_string(), None), storage);
+
+    task.execute().await.expect("latest object heal should complete");
+
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.counters.healed, 1);
+    assert_eq!(outcome.counters.unknown, 0);
+    let object = outcome.objects.front().expect("resolved latest receipt should be recorded");
+    assert_eq!(object.identity.version_id.as_deref(), Some(resolved_version_id.as_str()));
+}
+
+#[tokio::test]
+async fn cancelled_object_heal_rejects_matching_positive_storage_receipt() {
+    let incarnation = Uuid::new_v4();
+    let storage = Arc::new(MockStorage::default());
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-a".to_string(), Some("version-a".to_string())),
+        storage,
+    );
+    task.cancel().await.expect("task cancellation should succeed");
+
+    let expected = HealObjectIdentity {
+        kind: HealObjectKind::Object,
+        bucket: "bucket-a".to_string(),
+        object: "object-a".to_string(),
+        version_id: Some("version-a".to_string()),
+        bucket_incarnation_id: Some(incarnation),
+        pool_index: None,
+        set_index: None,
+    };
+    let accepted = task
+        .record_verified_storage_receipt(
+            expected,
+            Some(object_receipt(
+                "object-a",
+                Some("version-a"),
+                HealObjectDisposition::Repaired,
+                incarnation,
+            )),
+        )
+        .await;
+
+    let outcome = task.get_outcome().await;
+    assert!(!accepted);
+    assert_eq!(outcome.counters.healed, 0);
+    assert!(outcome.objects.is_empty());
+}
+
+#[tokio::test]
+async fn failed_object_heal_rejects_matching_positive_storage_receipt() {
+    let incarnation = Uuid::new_v4();
+    let storage = Arc::new(MockStorage {
+        heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::OkWithOtherError("commit failed"))),
+        heal_object_receipts: Mutex::new(HashMap::from([(
+            "object-a".to_string(),
+            VecDeque::from([object_receipt(
+                "object-a",
+                Some("version-a"),
+                HealObjectDisposition::Repaired,
+                incarnation,
+            )]),
+        )])),
+        bucket_incarnation_id: Mutex::new(Some(incarnation)),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-a".to_string(), Some("version-a".to_string())),
+        storage,
+    );
+
+    let result = task.execute().await;
+
+    let outcome = task.get_outcome().await;
+    assert!(result.is_err());
+    assert_eq!(outcome.counters.healed, 0);
+    assert_eq!(outcome.counters.unchanged, 0);
+    assert!(outcome.objects.iter().all(|object| {
+        !matches!(
+            object.disposition,
+            HealObjectDisposition::Repaired
+                | HealObjectDisposition::VerifiedHealthy
+                | HealObjectDisposition::AuthoritativelyAbsent
+        )
+    }));
+}
+
+#[tokio::test]
+async fn transient_quorum_object_heal_rejects_matching_positive_storage_receipt() {
+    let incarnation = Uuid::new_v4();
+    let storage = Arc::new(MockStorage {
+        heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::OkWithReadQuorum)),
+        heal_object_receipts: Mutex::new(HashMap::from([(
+            "object-a".to_string(),
+            VecDeque::from([object_receipt(
+                "object-a",
+                Some("version-a"),
+                HealObjectDisposition::Repaired,
+                incarnation,
+            )]),
+        )])),
+        bucket_incarnation_id: Mutex::new(Some(incarnation)),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-a".to_string(), Some("version-a".to_string())),
+        storage,
+    );
+
+    let result = task.execute().await;
+
+    let outcome = task.get_outcome().await;
+    assert!(result.is_err());
+    assert_eq!(outcome.counters.healed, 0);
+    assert_eq!(outcome.counters.unchanged, 0);
+    assert!(outcome.objects.iter().all(|object| {
+        !matches!(
+            object.disposition,
+            HealObjectDisposition::Repaired
+                | HealObjectDisposition::VerifiedHealthy
+                | HealObjectDisposition::AuthoritativelyAbsent
+        )
+    }));
+}
+
+#[tokio::test]
+async fn object_heal_latches_expected_incarnation_before_repair() {
+    let original_incarnation = Uuid::new_v4();
+    let successor_incarnation = Uuid::new_v4();
+    let storage = Arc::new(MockStorage {
+        heal_object_receipts: Mutex::new(HashMap::from([(
+            "object-a".to_string(),
+            VecDeque::from([object_receipt(
+                "object-a",
+                Some("version-a"),
+                HealObjectDisposition::VerifiedHealthy,
+                original_incarnation,
+            )]),
+        )])),
+        bucket_incarnation_id: Mutex::new(Some(original_incarnation)),
+        bucket_incarnation_after_object_heal: Mutex::new(Some(successor_incarnation)),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-a".to_string(), Some("version-a".to_string())),
+        storage,
+    );
+
+    task.execute().await.expect("mock object heal should complete");
+
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.counters.unchanged, 1);
+    assert_eq!(outcome.counters.unknown, 0);
+    let object = outcome.objects.front().expect("latched receipt should be recorded");
+    assert_eq!(object.identity.bucket_incarnation_id, Some(original_incarnation));
+    assert_eq!(object.disposition, HealObjectDisposition::VerifiedHealthy);
+}
+
+#[tokio::test]
+async fn object_heal_rejects_mismatched_or_legacy_storage_receipts() {
+    let expected_incarnation = Uuid::new_v4();
+    let storage = Arc::new(MockStorage {
+        heal_object_receipts: Mutex::new(HashMap::from([(
+            "object-a".to_string(),
+            VecDeque::from([object_receipt(
+                "object-a",
+                Some("version-a"),
+                HealObjectDisposition::Repaired,
+                Uuid::new_v4(),
+            )]),
+        )])),
+        bucket_incarnation_id: Mutex::new(Some(expected_incarnation)),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-a".to_string(), Some("version-a".to_string())),
+        storage,
+    );
+
+    task.execute()
+        .await
+        .expect("a mismatched receipt must not fail the legacy heal result");
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.counters.healed, 0);
+    assert_eq!(outcome.counters.unknown, 1);
+    assert_eq!(
+        outcome
+            .objects
+            .front()
+            .expect("legacy fallback should be recorded")
+            .disposition,
+        HealObjectDisposition::Unknown
+    );
+
+    let legacy = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-b".to_string(), None),
+        Arc::new(MockStorage::default()),
+    );
+    legacy.execute().await.expect("legacy mock object heal should complete");
+    let legacy_outcome = legacy.get_outcome().await;
+    assert_eq!(legacy_outcome.counters.healed, 0);
+    assert_eq!(legacy_outcome.counters.unknown, 1);
+}
+
 async fn recv_trace_task_state(trace: &mut TraceSubscription, task_id: &str, state: &str) -> TraceEvent {
     for _ in 0..32 {
         let event = tokio::time::timeout(Duration::from_secs(1), trace.recv())
@@ -700,12 +1841,38 @@ fn replacement_identity(
     }
 }
 
+#[derive(Clone)]
 enum MockHealObjectOutcome {
+    MissingVersion,
+    PermissionDenied,
+    RetryableLock,
+    RetryableLockTimeout,
     OkWithOtherError(&'static str),
+    OkWithReadQuorum,
     ErrOther(&'static str),
+    DanglingGraceDeferred,
+    RetiredMarkerDeferred,
+    UnavailableDrive(DriveState),
     RetryableReadQuorum,
+    InternodeHttp(http::StatusCode),
     RetryableSlowDown,
     PermanentOther(&'static str),
+}
+
+fn unavailable_drive_heal_result(state: DriveState) -> (HealResultItem, Option<Error>) {
+    (
+        HealResultItem {
+            after: Infos {
+                drives: vec![HealDriveInfo {
+                    endpoint: "remote-target".to_string(),
+                    state: state.to_string(),
+                    ..Default::default()
+                }],
+            },
+            ..Default::default()
+        },
+        None,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -779,6 +1946,30 @@ impl HealStorageAPI for MockStorage {
         Ok(self.object_exists.lock().unwrap().unwrap_or(true))
     }
 
+    async fn bucket_incarnation_id(&self, _bucket: &str) -> Result<Option<Uuid>> {
+        if *self.bucket_incarnation_unavailable.lock().unwrap() {
+            return Err(Error::Other("bucket incarnation unavailable".to_string()));
+        }
+        Ok(*self.bucket_incarnation_id.lock().unwrap())
+    }
+
+    async fn heal_bucket_at_incarnation(&self, bucket: &str, expected: Uuid, opts: &HealOpts) -> Result<HealResultItem> {
+        self.validate_bucket_incarnation(bucket, Some(expected)).await?;
+        self.heal_bucket(bucket, opts).await
+    }
+
+    async fn heal_object_at_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        expected: Uuid,
+        opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        self.validate_bucket_incarnation(bucket, Some(expected)).await?;
+        self.heal_object_with_receipt(bucket, object, version_id, opts).await
+    }
+
     async fn heal_object(
         &self,
         bucket: &str,
@@ -787,6 +1978,10 @@ impl HealStorageAPI for MockStorage {
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
         self.heal_object_calls.lock().unwrap().push(object.to_string());
+        self.retry_test_events.lock().expect("events").push(format!("heal:{object}"));
+        if let Some(delay) = self.retry_test_delays.get(object) {
+            tokio::time::sleep(*delay).await;
+        }
         self.heal_object_version_ids
             .lock()
             .unwrap()
@@ -804,13 +1999,54 @@ impl HealStorageAPI for MockStorage {
             .and_then(VecDeque::pop_front)
         {
             return match outcome {
+                MockHealObjectOutcome::MissingVersion => {
+                    Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
+                }
+                MockHealObjectOutcome::PermissionDenied => {
+                    Ok((HealResultItem::default(), Some(Error::Disk(DiskError::FileAccessDenied))))
+                }
+                MockHealObjectOutcome::RetiredMarkerDeferred => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Storage(EcstoreError::retired_marker_deferred("no committed retirement record"))),
+                )),
+                MockHealObjectOutcome::DanglingGraceDeferred => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Disk(DiskError::other(
+                        "dangling object deletion deferred by heal grace window; retry_after_secs=3599; grace_secs=3600",
+                    ))),
+                )),
+                MockHealObjectOutcome::UnavailableDrive(state) => Ok(unavailable_drive_heal_result(state)),
+                MockHealObjectOutcome::InternodeHttp(status) => Err(Error::Storage(EcstoreError::from(DiskError::from(
+                    rustfs_rio::new_test_internode_http_io_error(rustfs_rio::InternodeHttpErrorKind::HttpStatus(status)),
+                )))),
                 MockHealObjectOutcome::RetryableReadQuorum => Err(Error::Storage(EcstoreError::InsufficientReadQuorum(
                     bucket.to_string(),
                     object.to_string(),
                 ))),
+                MockHealObjectOutcome::RetryableLock => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Storage(EcstoreError::Lock(rustfs_lock::LockError::AlreadyLocked {
+                        resource: object.to_string(),
+                        owner: "competing-writer".to_string(),
+                    }))),
+                )),
+                MockHealObjectOutcome::RetryableLockTimeout => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Storage(EcstoreError::Lock(rustfs_lock::LockError::Timeout {
+                        resource: object.to_string(),
+                        timeout: Duration::from_secs(5),
+                    }))),
+                )),
                 MockHealObjectOutcome::RetryableSlowDown => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::SlowDown))))
                 }
+                MockHealObjectOutcome::OkWithReadQuorum => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Storage(EcstoreError::InsufficientReadQuorum(
+                        bucket.to_string(),
+                        object.to_string(),
+                    ))),
+                )),
                 MockHealObjectOutcome::PermanentOther(message) => Err(Error::other(message)),
                 MockHealObjectOutcome::OkWithOtherError(message) => Ok((HealResultItem::default(), Some(Error::other(message)))),
                 MockHealObjectOutcome::ErrOther(message) => Err(Error::other(message)),
@@ -818,17 +2054,58 @@ impl HealStorageAPI for MockStorage {
         }
         if let Some(outcome) = self.heal_object_outcome.lock().unwrap().take() {
             return match outcome {
+                MockHealObjectOutcome::MissingVersion => {
+                    Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
+                }
+                MockHealObjectOutcome::PermissionDenied => {
+                    Ok((HealResultItem::default(), Some(Error::Disk(DiskError::FileAccessDenied))))
+                }
+                MockHealObjectOutcome::RetiredMarkerDeferred => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Storage(EcstoreError::retired_marker_deferred("no committed retirement record"))),
+                )),
+                MockHealObjectOutcome::DanglingGraceDeferred => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Disk(DiskError::other(
+                        "dangling object deletion deferred by heal grace window; retry_after_secs=3599; grace_secs=3600",
+                    ))),
+                )),
+                MockHealObjectOutcome::UnavailableDrive(state) => Ok(unavailable_drive_heal_result(state)),
                 MockHealObjectOutcome::OkWithOtherError(message) => Ok((HealResultItem::default(), Some(Error::other(message)))),
                 MockHealObjectOutcome::ErrOther(message) | MockHealObjectOutcome::PermanentOther(message) => {
                     Err(Error::other(message))
                 }
+                MockHealObjectOutcome::InternodeHttp(status) => Err(Error::Storage(EcstoreError::from(DiskError::from(
+                    rustfs_rio::new_test_internode_http_io_error(rustfs_rio::InternodeHttpErrorKind::HttpStatus(status)),
+                )))),
                 MockHealObjectOutcome::RetryableReadQuorum => Err(Error::Storage(EcstoreError::InsufficientReadQuorum(
                     bucket.to_string(),
                     object.to_string(),
                 ))),
+                MockHealObjectOutcome::RetryableLock => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Storage(EcstoreError::Lock(rustfs_lock::LockError::AlreadyLocked {
+                        resource: object.to_string(),
+                        owner: "competing-writer".to_string(),
+                    }))),
+                )),
+                MockHealObjectOutcome::RetryableLockTimeout => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Storage(EcstoreError::Lock(rustfs_lock::LockError::Timeout {
+                        resource: object.to_string(),
+                        timeout: Duration::from_secs(5),
+                    }))),
+                )),
                 MockHealObjectOutcome::RetryableSlowDown => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::SlowDown))))
                 }
+                MockHealObjectOutcome::OkWithReadQuorum => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Storage(EcstoreError::InsufficientReadQuorum(
+                        bucket.to_string(),
+                        object.to_string(),
+                    ))),
+                )),
             };
         }
         if bucket == RUSTFS_META_BUCKET && object == format!("{BUCKET_META_PREFIX}/{DATA_USAGE_CACHE_NAME}") {
@@ -843,6 +2120,9 @@ impl HealStorageAPI for MockStorage {
             return Ok((HealResultItem::default(), Some(Error::Disk(DiskError::FileNotFound))));
         }
         self.healed_objects.lock().unwrap().push(object.to_string());
+        if let Some(bucket_incarnation_id) = self.bucket_incarnation_after_object_heal.lock().unwrap().take() {
+            *self.bucket_incarnation_id.lock().unwrap() = Some(bucket_incarnation_id);
+        }
         Ok((
             HealResultItem {
                 object_size: 1,
@@ -850,6 +2130,31 @@ impl HealStorageAPI for MockStorage {
             },
             None,
         ))
+    }
+
+    async fn heal_object_with_receipt(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        let (mut item, error) = self.heal_object(bucket, object, version_id, opts).await?;
+        let receipt = self
+            .heal_object_receipts
+            .lock()
+            .unwrap()
+            .get_mut(object)
+            .and_then(VecDeque::pop_front);
+        if let Some(resolved_version_id) = receipt
+            .as_ref()
+            .and_then(|receipt| receipt.identity.version_id.as_deref())
+            .and_then(|version| Uuid::parse_str(version).ok())
+            .map(|version| *version.as_bytes())
+        {
+            item.resolved_version_id = Some(resolved_version_id);
+        }
+        Ok(HealStorageObjectResult { item, error, receipt })
     }
 
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
@@ -873,10 +2178,26 @@ impl HealStorageAPI for MockStorage {
             return Err(error);
         }
         let no_heal_required = *self.format_no_heal_required.lock().unwrap();
+        let result = HealResultItem {
+            after: Infos {
+                drives: self
+                    .global_format_ok_endpoints
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|endpoint| HealDriveInfo {
+                        endpoint: endpoint.clone(),
+                        state: "ok".to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            },
+            ..Default::default()
+        };
         if no_heal_required {
-            Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::NoHealRequired))))
+            Ok((result, Some(Error::Storage(EcstoreError::NoHealRequired))))
         } else {
-            Ok((HealResultItem::default(), None))
+            Ok((result, None))
         }
     }
 
@@ -891,6 +2212,13 @@ impl HealStorageAPI for MockStorage {
             .lock()
             .unwrap()
             .push((pool_index, set_index, targets.to_vec()));
+        if let Some((entered, release)) = &self.replacement_format_barrier {
+            entered.notify_one();
+            release.notified().await;
+        }
+        if let Some(error) = self.format_error.lock().unwrap().take() {
+            return Err(error);
+        }
         Ok((
             HealResultItem {
                 after: Infos {
@@ -909,10 +2237,6 @@ impl HealStorageAPI for MockStorage {
         ))
     }
 
-    async fn replacement_targets_ready(&self, _targets: &[String]) -> Result<bool> {
-        Ok(*self.replacement_targets_ready.lock().unwrap())
-    }
-
     async fn list_objects_for_heal_page(
         &self,
         bucket: &str,
@@ -920,13 +2244,63 @@ impl HealStorageAPI for MockStorage {
         continuation_token: Option<&str>,
         _include_lifecycle_object_info: bool,
     ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
+        if let Some(incarnation) = self
+            .bucket_incarnation_after_listing
+            .lock()
+            .expect("listing incarnation")
+            .take()
+        {
+            *self.bucket_incarnation_id.lock().expect("bucket incarnation") = Some(incarnation);
+        }
         self.listed_prefixes.lock().unwrap().push(prefix.to_string());
+        self.listing_tokens
+            .lock()
+            .expect("listing tokens")
+            .push(continuation_token.map(ToOwned::to_owned));
+        self.retry_test_events
+            .lock()
+            .expect("events")
+            .push(format!("list:{}", continuation_token.unwrap_or("first")));
+        let delay = self.retry_test_listing_delays.lock().expect("listing delays").pop_front();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        if let Some(pages) = &self.retry_test_pages {
+            let page = continuation_token.map_or(0, |token| token.parse::<usize>().expect("test page token"));
+            let next = (page + 1 < pages.len()).then(|| (page + 1).to_string());
+            return Ok((pages[page].clone(), next.clone(), next.is_some()));
+        }
+        if let Some(remaining) = self
+            .recoverable_second_page_failures
+            .lock()
+            .expect("listing failures")
+            .as_mut()
+        {
+            if continuation_token.is_none() {
+                return Ok((vec![heal_item("object-a")], Some("second".to_string()), true));
+            }
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(Error::Storage(EcstoreError::InsufficientReadQuorum(
+                    bucket.to_string(),
+                    "page".to_string(),
+                )));
+            }
+            return Ok((vec![heal_item("object-b")], None, false));
+        }
+        if self.fail_second_listing_page {
+            return if continuation_token.is_none() {
+                Ok((vec![heal_item("object-a")], Some("next-page".to_string()), true))
+            } else {
+                Err(Error::other("listing unavailable"))
+            };
+        }
         if *self.truncate_without_token.lock().unwrap() {
             return Ok((vec![heal_item("object-a")], None, true));
         }
 
         let mut listed = self.listed.lock().unwrap();
-        if continuation_token.is_none() && !*listed {
+        if continuation_token.is_none() && (!*listed || self.list_each_bucket) {
             *listed = true;
             let objects = if bucket == RUSTFS_META_BUCKET {
                 vec![
@@ -944,6 +2318,26 @@ impl HealStorageAPI for MockStorage {
         } else {
             Ok((Vec::new(), None, false))
         }
+    }
+
+    async fn heal_erasure_set_scopes(&self, _opts: &HealOpts) -> Result<Option<Vec<(usize, usize)>>> {
+        let scopes = self.erasure_set_scopes.lock().unwrap().clone();
+        Ok((!scopes.is_empty()).then_some(scopes))
+    }
+
+    async fn list_versions_for_heal_page_disk_walk(
+        &self,
+        set_disk_id: &str,
+        _bucket: &str,
+        _prefix: &str,
+        continuation_token: Option<&str>,
+        _include_lifecycle_object_info: bool,
+    ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
+        self.disk_walk_calls.lock().unwrap().push(set_disk_id.to_string());
+        if continuation_token.is_some() {
+            return Ok((Vec::new(), None, false));
+        }
+        Ok((vec![heal_item(&format!("{set_disk_id}-object"))], None, false))
     }
 
     async fn get_disk_for_resume(&self, _set_disk_id: &str) -> Result<DiskStore> {
@@ -974,7 +2368,7 @@ impl HealStorageAPI for MockStorage {
         &self,
         targets: &[String],
     ) -> Result<Vec<crate::heal::resume::ReplacementTargetIdentity>> {
-        if !*self.replacement_targets_ready.lock().unwrap() {
+        if !*self.replacement_target_identities_ready.lock().unwrap() {
             return Err(Error::other("replacement target is not ready"));
         }
         if let Some(identities) = self.replacement_target_identity_sequences.lock().unwrap().pop_front() {
@@ -989,6 +2383,177 @@ impl HealStorageAPI for MockStorage {
                 filesystem_identity: format!("identity-{endpoint}"),
             })
             .collect())
+    }
+
+    async fn replacement_execution(&self, targets: &[String]) -> Result<Arc<crate::heal::storage::ReplacementExecution>> {
+        if let Some(execution) = self.replacement_execution_fixture.lock().unwrap().take() {
+            return Ok(execution);
+        }
+        if !*self.replacement_target_identities_ready.lock().unwrap() {
+            return Err(Error::other("replacement target is not ready"));
+        }
+        let identities = self.replacement_target_identity_sequences.lock().unwrap().front().cloned();
+        let identities = match identities {
+            Some(identities) => identities,
+            None => self.replacement_target_identities(targets).await?,
+        };
+        Ok(crate::heal::storage::ReplacementExecution::for_test(Vec::new(), identities))
+    }
+}
+
+#[tokio::test]
+async fn replacement_dropped_waiter_keeps_executor_until_format_and_failure_persistence_finish() {
+    let directory = TempDir::new().expect("survivor root");
+    let disk = make_resume_disk(&directory).await;
+    let identity = replacement_identity("replacement-a", "device-a", "mount-a");
+    let execution = crate::heal::storage::ReplacementExecution::for_test(Vec::new(), vec![identity.clone()]);
+    let ownership = Arc::downgrade(&execution);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let storage = Arc::new(MockStorage {
+        replacement_target_identities_ready: Mutex::new(true),
+        replacement_target_identity_sequences: Mutex::new(VecDeque::from([vec![identity.clone()], vec![identity]])),
+        replacement_execution_fixture: Mutex::new(Some(execution)),
+        replacement_format_barrier: Some((entered.clone(), release.clone())),
+        resume_disk: Mutex::new(Some(disk.clone())),
+        ..Default::default()
+    });
+    let mut request = directory_backed_replacement_request();
+    request.heal_endpoints = vec!["replacement-a".to_string()];
+    let task = Arc::new(HealTask::from_request(request, storage.clone()));
+    let waiter = tokio::spawn({
+        let task = task.clone();
+        async move { task.execute().await }
+    });
+    entered.notified().await;
+    waiter.abort();
+    assert!(waiter.await.expect_err("waiter aborted").is_cancelled());
+    task.cancel_token.cancel();
+    assert!(ownership.upgrade().is_some(), "issued format I/O still owns execution");
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ownership.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("executor drains after storage completes");
+    let state = ResumeManager::load_replacement_intent(disk, &task.id)
+        .await
+        .expect("failure state")
+        .get_state()
+        .await;
+    assert!(
+        state.error_message.as_deref().is_some_and(|error| error.contains("cancel")),
+        "{:?}",
+        state.error_message
+    );
+    assert!(!task.replacement_is_running());
+    assert!(storage.bucket_heal_calls.lock().unwrap().is_empty());
+    assert!(storage.heal_object_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn replacement_startup_and_scanner_decision_reuses_the_same_successor() {
+    let anchor_dir = TempDir::new().expect("anchor");
+    let anchor = make_resume_disk(&anchor_dir).await;
+    let target_dir = TempDir::new().expect("target");
+    let target = make_resume_disk(&target_dir).await;
+    let id = Uuid::new_v4().to_string();
+    let old = replacement_identity("replacement-a", "same-device", "old-mount");
+    let current = replacement_identity("replacement-a", "same-device", "new-mount");
+    let parent = ResumeManager::new_replacement_intent(
+        anchor.clone(),
+        id.clone(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket-a".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![old],
+    )
+    .await
+    .expect("pre-reboot generation");
+    target
+        .write_all(
+            crate::heal::RUSTFS_META_BUCKET,
+            crate::heal::HEALING_MARKER_PATH,
+            format!("pool_0_set_0:{id}").into(),
+        )
+        .await
+        .expect("old marker");
+    let make_storage = || MockStorage {
+        replacement_target_identities_ready: Mutex::new(true),
+        replacement_target_identity_sequences: Mutex::new(VecDeque::from([vec![current.clone()]])),
+        replacement_execution_fixture: Mutex::new(Some(crate::heal::storage::ReplacementExecution::for_test(
+            vec![target.clone()],
+            vec![current.clone()],
+        ))),
+        ..Default::default()
+    };
+    let first = parent
+        .resolve_replacement_recovery(&make_storage())
+        .await
+        .expect("startup decision");
+    let reloaded = ResumeManager::load_replacement_intent(anchor.clone(), &id)
+        .await
+        .expect("scanner reads durable authority");
+    let second = reloaded
+        .resolve_replacement_recovery(&make_storage())
+        .await
+        .expect("scanner decision");
+    assert_eq!(first.task_id, second.task_id);
+    assert_ne!(first.task_id, id);
+    assert_eq!(first.replacement_phase, ReplacementPhase::OwnershipPending);
+    assert!(first.resume_cursor.is_none());
+    assert_eq!(first.replacement_target_identities, vec![current]);
+}
+
+#[tokio::test]
+async fn replacement_failure_persistence_retains_both_errors() {
+    let directory = TempDir::new().expect("unavailable intent anchor");
+    let disk = make_resume_disk(&directory).await;
+    let task = HealTask::from_request(directory_backed_replacement_request(), Arc::new(MockStorage::default()));
+    *task.replacement_resume_disk.write().await = Some(disk);
+    let error = task
+        .persist_replacement_result(Err(Error::other("original marker conflict")))
+        .await
+        .expect_err("persistence failed");
+    let Error::ReplacementFailurePersistence { failure, persistence } = error else {
+        panic!("failure persistence must expose both errors");
+    };
+    assert!(failure.to_string().contains("original marker conflict"));
+    assert!(!persistence.to_string().is_empty());
+}
+
+#[tokio::test]
+async fn replacement_format_failures_consume_the_durable_budget_across_new_executors() {
+    let directory = TempDir::new().expect("survivor root");
+    let disk = make_resume_disk(&directory).await;
+    let mut request = directory_backed_replacement_request();
+    request.heal_endpoints = vec!["replacement-a".to_string()];
+    for attempt in 1..=3 {
+        let storage = Arc::new(MockStorage {
+            replacement_target_identities_ready: Mutex::new(true),
+            resume_disk: Mutex::new(Some(disk.clone())),
+            format_error: Mutex::new(Some(Error::other("injected format failure"))),
+            ..Default::default()
+        });
+        let task = HealTask::from_request(request.clone(), storage.clone());
+        assert!(
+            task.execute()
+                .await
+                .expect_err("format fails")
+                .to_string()
+                .contains("format failure")
+        );
+        let state = ResumeManager::load_replacement_intent(disk.clone(), &task.id)
+            .await
+            .expect("durable failure")
+            .get_state()
+            .await;
+        assert_eq!(state.retry_count, attempt, "a new executor must not reset or double-charge the attempt");
+        assert_eq!(state.replacement_phase, ReplacementPhase::Intent);
+        assert_eq!(storage.replacement_format_calls.lock().unwrap().len(), 1);
+        assert!(storage.bucket_heal_calls.lock().unwrap().is_empty());
     }
 }
 
@@ -1026,6 +2591,72 @@ async fn scoped_object_heal_slowdown_is_not_treated_as_deleted() {
         .expect("heal options lock should be available");
     assert_eq!(opts[0].pool, Some(0));
     assert_eq!(opts[0].set, Some(1));
+    assert!(!opts[0].read_repair);
+}
+
+#[tokio::test]
+async fn read_repair_object_heal_sets_read_repair_option() {
+    let storage = Arc::new(MockStorage::default());
+    let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), Some("version-a".to_string()));
+    request.source = HealRequestSource::ReadRepair;
+    let task = HealTask::from_request(request, storage.clone());
+
+    task.execute().await.expect("read-repair object heal should complete");
+
+    let opts = storage.object_heal_opts.lock().unwrap();
+    assert_eq!(opts.len(), 1);
+    assert!(opts[0].read_repair);
+    assert!(!opts[0].no_lock);
+}
+
+#[tokio::test]
+async fn read_repair_object_heal_is_not_failed_by_flat_task_timeout() {
+    let storage = Arc::new(MockStorage {
+        block_heal_object: Mutex::new(true),
+        ..Default::default()
+    });
+    let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+    request.source = HealRequestSource::ReadRepair;
+    request.options.timeout = Some(Duration::from_millis(1));
+    let task = Arc::new(HealTask::from_request(request, storage.clone()));
+    let execution = tokio::spawn({
+        let task = task.clone();
+        async move { task.execute().await }
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if !storage.object_heal_opts.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("read-repair object heal should start");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!execution.is_finished(), "read repair must not be failed by the flat task timeout");
+
+    execution.abort();
+    assert!(execution.await.is_err(), "aborted mock execution should not join successfully");
+    assert!(storage.object_heal_opts.lock().unwrap()[0].read_repair);
+}
+
+#[tokio::test]
+async fn non_read_repair_object_heal_still_uses_flat_timeout() {
+    let storage = Arc::new(MockStorage {
+        block_heal_object: Mutex::new(true),
+        ..Default::default()
+    });
+    let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+    request.options.timeout = Some(Duration::from_millis(1));
+    let task = HealTask::from_request(request, storage);
+
+    let result = tokio::time::timeout(Duration::from_secs(1), task.execute())
+        .await
+        .expect("flat timeout should finish the task");
+
+    assert!(matches!(result, Err(Error::TaskTimeout)));
 }
 
 async fn make_resume_disk(temp: &TempDir) -> DiskStore {
@@ -1079,6 +2710,47 @@ async fn test_recursive_bucket_heal_visits_objects() {
     let result_items = task.get_result_items().await;
     assert_eq!(result_items.len(), 3);
     assert_eq!(result_items.iter().filter(|item| item.object_size == 1).count(), 2);
+}
+
+#[tokio::test]
+async fn recursive_bucket_heal_uses_each_erasure_set_union_scope() {
+    let storage = Arc::new(MockStorage {
+        erasure_set_scopes: Mutex::new(vec![(0, 0), (1, 2)]),
+        ..Default::default()
+    });
+    let request = HealRequest::new(
+        HealType::Bucket {
+            bucket: "bucket-a".to_string(),
+        },
+        HealOptions {
+            recursive: true,
+            timeout: None,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    let task = HealTask::from_request(request, storage.clone());
+
+    task.heal_bucket("bucket-a")
+        .await
+        .expect("recursive bucket heal should consume every selected set union");
+
+    assert_eq!(
+        storage.disk_walk_calls.lock().unwrap().as_slice(),
+        ["pool_0_set_0".to_string(), "pool_1_set_2".to_string()]
+    );
+    assert_eq!(
+        storage.healed_objects.lock().unwrap().as_slice(),
+        ["pool_0_set_0-object".to_string(), "pool_1_set_2-object".to_string()]
+    );
+    assert!(
+        !*storage.listed.lock().unwrap(),
+        "read-quorum listing must not hide returning-disk candidates"
+    );
+    let object_opts = storage.object_heal_opts.lock().unwrap();
+    assert_eq!(object_opts.len(), 2);
+    assert_eq!((object_opts[0].pool, object_opts[0].set), (Some(0), Some(0)));
+    assert_eq!((object_opts[1].pool, object_opts[1].set), (Some(1), Some(2)));
 }
 
 #[tokio::test]
@@ -1192,6 +2864,8 @@ async fn test_recursive_bucket_heal_skips_object_dir_candidates() {
 
 #[tokio::test]
 async fn test_recursive_bucket_heal_treats_missing_continuation_token_as_end() {
+    use crate::heal::outcome::{HealExecutionOutcome, HealTraversalCoverage};
+
     // A version listing can report the final page as truncated with no
     // continuation token. That is treated as end-of-listing (not an error),
     // so the returned page is healed and the pass terminates cleanly instead
@@ -1213,9 +2887,15 @@ async fn test_recursive_bucket_heal_treats_missing_continuation_token_as_end() {
     );
     let task = HealTask::from_request(request, storage.clone());
 
-    task.heal_bucket("bucket-a")
+    task.execute()
         .await
         .expect("truncated-without-token must terminate cleanly, not loop or error");
+
+    assert_eq!(task.get_status().await, HealTaskStatus::Completed);
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+    assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+    assert_eq!(outcome.counters.processed, 1);
 
     assert_eq!(
         storage.healed_objects.lock().unwrap().as_slice(),
@@ -1242,9 +2922,118 @@ async fn test_cluster_heal_visits_bucket_objects() {
 
     assert_eq!(
         storage.healed_objects.lock().unwrap().as_slice(),
-        ["object-a".to_string(), "object-b".to_string()]
+        ["object-a".to_string(), "object-b".to_string(), POOL_META_NAME.to_string()]
     );
     assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+}
+
+#[tokio::test]
+async fn cluster_recreate_heals_pool_metadata_after_user_buckets() {
+    let storage = Arc::new(MockStorage::default());
+    let request = HealRequest::new(
+        HealType::Cluster,
+        HealOptions {
+            recursive: true,
+            recreate_missing: true,
+            timeout: None,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    let task = HealTask::from_request(request, storage.clone());
+
+    task.execute()
+        .await
+        .expect("cluster recreate heal should include pool metadata");
+
+    assert_eq!(
+        storage.heal_object_calls.lock().expect("object calls").as_slice(),
+        ["object-a".to_string(), "object-b".to_string(), POOL_META_NAME.to_string()]
+    );
+    let opts = storage.object_heal_opts.lock().expect("object opts");
+    assert!(opts.last().expect("pool metadata opts").recreate);
+}
+
+#[tokio::test]
+async fn cluster_recreate_fails_when_pool_metadata_heal_fails() {
+    let storage = Arc::new(MockStorage::default());
+    storage.heal_object_outcomes.lock().expect("object outcomes").insert(
+        POOL_META_NAME.to_string(),
+        VecDeque::from([MockHealObjectOutcome::ErrOther("pool metadata missing")]),
+    );
+    let request = HealRequest::new(
+        HealType::Cluster,
+        HealOptions {
+            recursive: true,
+            recreate_missing: true,
+            timeout: None,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    let task = HealTask::from_request(request, storage.clone());
+
+    let err = task
+        .execute()
+        .await
+        .expect_err("cluster recreate heal must not hide pool metadata failure");
+
+    assert!(matches!(err, Error::TaskExecutionFailed { .. }));
+    assert_eq!(
+        storage.heal_object_calls.lock().expect("object calls").as_slice(),
+        ["object-a".to_string(), "object-b".to_string(), POOL_META_NAME.to_string()]
+    );
+}
+
+#[tokio::test]
+async fn cluster_dry_run_does_not_heal_pool_metadata() {
+    let storage = Arc::new(MockStorage::default());
+    let request = HealRequest::new(
+        HealType::Cluster,
+        HealOptions {
+            recursive: true,
+            dry_run: true,
+            recreate_missing: true,
+            timeout: None,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    let task = HealTask::from_request(request, storage.clone());
+
+    task.execute()
+        .await
+        .expect("dry-run cluster heal should preserve existing coverage");
+
+    assert_eq!(
+        storage.heal_object_calls.lock().expect("object calls").as_slice(),
+        ["object-a".to_string(), "object-b".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn object_heal_skips_dangling_delete_grace_without_failing_task() {
+    let storage = Arc::new(MockStorage {
+        heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::DanglingGraceDeferred)),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "recent.txt".to_string(), None),
+        storage.clone(),
+    );
+
+    task.execute()
+        .await
+        .expect("grace-protected dangling cleanup should be reported as a skipped object");
+
+    assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+    assert!(storage.healed_objects.lock().unwrap().is_empty());
+    let progress = task.get_progress().await;
+    assert_eq!(progress.current_object.as_deref(), Some("skipped: bucket-a/recent.txt"));
+    assert_eq!(progress.objects_scanned, 1);
+    assert_eq!(progress.objects_healed, 0);
+    assert_eq!(progress.objects_failed, 0);
+    assert_eq!(progress.skipped_objects, 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1280,6 +3069,231 @@ async fn test_recursive_bucket_heal_retries_only_retryable_objects() {
     assert_eq!(progress.objects_scanned, 2);
     assert_eq!(progress.objects_healed, 2);
     assert_eq!(progress.objects_failed, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn recursive_bucket_heal_retries_interrupted_internode_write() {
+    let storage = Arc::new(MockStorage::default());
+    storage.heal_object_outcomes.lock().unwrap().insert(
+        "object-a".to_string(),
+        VecDeque::from([MockHealObjectOutcome::InternodeHttp(http::StatusCode::INTERNAL_SERVER_ERROR)]),
+    );
+    let task = HealTask::from_request(
+        HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-a".to_string(),
+            },
+            HealOptions {
+                recursive: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        ),
+        storage.clone(),
+    );
+    task.heal_bucket("bucket-a").await.expect("interrupted write must recover");
+    assert_eq!(storage.heal_object_calls.lock().unwrap().as_slice(), ["object-a", "object-b", "object-a"]);
+    let progress = task.get_progress().await;
+    assert_eq!((progress.objects_scanned, progress.objects_healed, progress.objects_failed), (2, 2, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn recursive_bucket_heal_bounds_internode_retries_and_keeps_auth_failures_terminal() {
+    let storage = Arc::new(MockStorage::default());
+    storage.heal_object_outcomes.lock().unwrap().insert(
+        "object-a".to_string(),
+        (0..4)
+            .map(|_| MockHealObjectOutcome::InternodeHttp(http::StatusCode::INTERNAL_SERVER_ERROR))
+            .collect(),
+    );
+    storage.heal_object_outcomes.lock().unwrap().insert(
+        "object-b".to_string(),
+        VecDeque::from([MockHealObjectOutcome::InternodeHttp(http::StatusCode::FORBIDDEN)]),
+    );
+    let task = HealTask::from_request(
+        HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-a".to_string(),
+            },
+            HealOptions {
+                recursive: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        ),
+        storage.clone(),
+    );
+    task.heal_bucket("bucket-a")
+        .await
+        .expect_err("persistent and forbidden writes must fail");
+    let failure = task.take_batch_failure().await.expect("retain failure details");
+    assert_eq!((failure.failed, failure.retryable, failure.permanent), (2, 1, 1));
+    let calls = storage.heal_object_calls.lock().unwrap();
+    assert_eq!(calls.iter().filter(|object| object.as_str() == "object-a").count(), 4);
+    assert_eq!(calls.iter().filter(|object| object.as_str() == "object-b").count(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn recursive_bucket_heal_retries_when_recreate_target_is_unavailable() {
+    for state in [DriveState::Offline, DriveState::Faulty] {
+        let state_name = state.to_string();
+        let storage = Arc::new(MockStorage::default());
+        storage
+            .heal_object_outcomes
+            .lock()
+            .unwrap()
+            .insert("object-a".to_string(), VecDeque::from([MockHealObjectOutcome::UnavailableDrive(state)]));
+        let request = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-a".to_string(),
+            },
+            HealOptions {
+                recursive: true,
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.heal_bucket("bucket-a")
+            .await
+            .expect("an unavailable recreate target should be retried after it returns");
+
+        assert_eq!(
+            storage.heal_object_calls.lock().unwrap().as_slice(),
+            ["object-a".to_string(), "object-b".to_string(), "object-a".to_string()],
+            "unexpected calls for unavailable state {state_name}"
+        );
+        let progress = task.get_progress().await;
+        assert_eq!(progress.objects_scanned, 2, "unexpected scanned count for state {state_name}");
+        assert_eq!(progress.objects_healed, 2, "unexpected healed count for state {state_name}");
+        assert_eq!(progress.objects_failed, 0, "unexpected failed count for state {state_name}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn recursive_bucket_heal_skips_dangling_delete_grace_without_batch_failure() {
+    let storage = Arc::new(MockStorage::default());
+    storage
+        .heal_object_outcomes
+        .lock()
+        .unwrap()
+        .insert("object-a".to_string(), VecDeque::from([MockHealObjectOutcome::DanglingGraceDeferred]));
+    let request = HealRequest::new(
+        HealType::Bucket {
+            bucket: "bucket-a".to_string(),
+        },
+        HealOptions {
+            recursive: true,
+            timeout: None,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    let task = HealTask::from_request(request, storage.clone());
+
+    task.heal_bucket("bucket-a")
+        .await
+        .expect("grace-protected dangling cleanup should not fail the bucket heal batch");
+
+    assert_eq!(
+        storage.heal_object_calls.lock().unwrap().as_slice(),
+        ["object-a".to_string(), "object-b".to_string()]
+    );
+    assert_eq!(storage.healed_objects.lock().unwrap().as_slice(), ["object-b".to_string()]);
+    let progress = task.get_progress().await;
+    assert_eq!(progress.objects_scanned, 2);
+    assert_eq!(progress.objects_healed, 1);
+    assert_eq!(progress.objects_failed, 0);
+    assert_eq!(progress.skipped_objects, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn recursive_bucket_heal_preserves_non_recreate_and_non_availability_results() {
+    for (dry_run, recreate_missing, state) in [
+        (true, true, DriveState::Offline),
+        (true, true, DriveState::Faulty),
+        (false, false, DriveState::Offline),
+        (false, false, DriveState::Faulty),
+        (false, true, DriveState::Ok),
+        (false, true, DriveState::Missing),
+        (false, true, DriveState::Corrupt),
+        (false, true, DriveState::PermissionDenied),
+        (false, true, DriveState::Unknown("other failure".to_string())),
+    ] {
+        let storage = Arc::new(MockStorage::default());
+        storage
+            .heal_object_outcomes
+            .lock()
+            .expect("test outcome lock")
+            .insert("object-a".to_string(), VecDeque::from([MockHealObjectOutcome::UnavailableDrive(state)]));
+        let task = HealTask::from_request(
+            HealRequest::new(
+                HealType::Bucket {
+                    bucket: "bucket-a".to_string(),
+                },
+                HealOptions {
+                    recursive: true,
+                    dry_run,
+                    recreate_missing,
+                    timeout: None,
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            ),
+            storage.clone(),
+        );
+        task.heal_bucket("bucket-a")
+            .await
+            .expect("unchanged best-effort result should not schedule an availability retry");
+        assert_eq!(
+            storage.heal_object_calls.lock().expect("test call lock").as_slice(),
+            ["object-a".to_string(), "object-b".to_string()]
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn recursive_bucket_heal_exhausts_unavailable_target_without_rescanning_healthy_objects() {
+    let storage = Arc::new(MockStorage::default());
+    storage.heal_object_outcomes.lock().expect("test outcome lock").insert(
+        "object-a".to_string(),
+        (0..4)
+            .map(|_| MockHealObjectOutcome::UnavailableDrive(DriveState::Faulty))
+            .collect(),
+    );
+    let task = HealTask::from_request(
+        HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-a".to_string(),
+            },
+            HealOptions {
+                recursive: true,
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        ),
+        storage.clone(),
+    );
+    let error = task
+        .heal_bucket("bucket-a")
+        .await
+        .expect_err("persistent unavailable target must not report success");
+    assert!(matches!(error, Error::TaskExecutionFailed { .. }));
+    let failure = task
+        .take_batch_failure()
+        .await
+        .expect("exhausted availability failure should be retained");
+    assert_eq!((failure.failed, failure.retryable, failure.permanent), (1, 1, 0));
+    let calls = storage.heal_object_calls.lock().expect("test call lock");
+    assert_eq!(calls.iter().filter(|object| object.as_str() == "object-a").count(), 4);
+    assert_eq!(calls.iter().filter(|object| object.as_str() == "object-b").count(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1455,6 +3469,40 @@ async fn test_prefix_heal_lists_and_repairs_objects_under_prefix() {
         storage.healed_objects.lock().unwrap().as_slice(),
         ["logs/object-a".to_string(), "logs/object-b".to_string()]
     );
+}
+
+#[tokio::test]
+async fn admin_object_heal_fails_when_drive_remains_unhealthy() {
+    let storage = Arc::new(MockStorage::default());
+    storage.heal_object_outcomes.lock().expect("outcomes").insert(
+        "object-a".to_string(),
+        VecDeque::from([MockHealObjectOutcome::UnavailableDrive(DriveState::Missing)]),
+    );
+    let mut request = HealRequest::new(
+        HealType::Object {
+            bucket: "bucket-a".to_string(),
+            object: "object-a".to_string(),
+            version_id: None,
+        },
+        HealOptions {
+            recreate_missing: false,
+            timeout: None,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    request.source = HealRequestSource::Admin;
+    let task = HealTask::from_request(request, storage);
+
+    let error = task
+        .execute()
+        .await
+        .expect_err("admin heal must not finish with an unhealthy drive");
+    assert!(error.to_string().contains("left one or more drives unhealthy"));
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.counters.failed, 1);
+    assert_eq!(outcome.counters.unknown, 0);
+    assert_eq!(outcome.execution, HealExecutionOutcome::CompletedWithErrors);
 }
 
 #[tokio::test]
@@ -1842,6 +3890,67 @@ async fn test_heal_recreate_scanner_non_dir_not_found_fails() {
 }
 
 #[tokio::test]
+async fn mrf_recreate_missing_object_records_exact_absence_receipt_with_scope() {
+    let incarnation = Uuid::new_v4();
+    let storage = Arc::new(MockStorage {
+        object_exists: Mutex::new(Some(false)),
+        bucket_incarnation_id: Mutex::new(Some(incarnation)),
+        heal_object_receipts: Mutex::new(HashMap::from([(
+            "deleted.bin".to_string(),
+            VecDeque::from([HealObjectReceipt {
+                identity: HealObjectIdentity {
+                    kind: HealObjectKind::Object,
+                    bucket: "bucket-a".to_string(),
+                    object: "deleted.bin".to_string(),
+                    version_id: None,
+                    bucket_incarnation_id: Some(incarnation),
+                    pool_index: Some(2),
+                    set_index: Some(3),
+                },
+                disposition: HealObjectDisposition::AuthoritativelyAbsent,
+            }]),
+        )])),
+        ..Default::default()
+    });
+    let mut request = HealRequest::new(
+        HealType::Object {
+            bucket: "bucket-a".to_string(),
+            object: "deleted.bin".to_string(),
+            version_id: None,
+        },
+        HealOptions {
+            recreate_missing: true,
+            pool_index: Some(2),
+            set_index: Some(3),
+            timeout: None,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    request.source = HealRequestSource::Mrf;
+    let task = HealTask::from_request(request, storage.clone());
+
+    task.execute()
+        .await
+        .expect("a complete MRF absence receipt must complete the task");
+
+    let opts = storage.object_heal_opts.lock().unwrap()[0];
+    assert_eq!(opts.pool, Some(2));
+    assert_eq!(opts.set, Some(3));
+    assert!(opts.recreate);
+    assert_eq!(opts.scan_mode, HealScanMode::Deep);
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.counters.unchanged, 1);
+    assert_eq!(outcome.counters.unknown, 0);
+    assert_eq!(outcome.objects.len(), 1);
+    assert_eq!(outcome.objects[0].disposition, HealObjectDisposition::AuthoritativelyAbsent);
+    assert_eq!(
+        (outcome.objects[0].identity.pool_index, outcome.objects[0].identity.set_index),
+        (Some(2), Some(3))
+    );
+}
+
+#[tokio::test]
 async fn test_heal_scanner_missing_object_without_recreate_probes_storage() {
     let storage = Arc::new(MockStorage {
         object_exists: Mutex::new(Some(false)),
@@ -2082,6 +4191,37 @@ async fn erasure_set_format_slowdown_is_propagated() {
 }
 
 #[tokio::test]
+async fn erasure_set_retry_signal_remains_typed_across_task_boundary() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let disk = make_resume_disk(&temp).await;
+    let storage = Arc::new(MockStorage {
+        heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::RetryableSlowDown)),
+        resume_disk: Mutex::new(Some(disk)),
+        ..Default::default()
+    });
+    let request = HealRequest::new(
+        HealType::ErasureSet {
+            buckets: vec!["bucket-a".to_string()],
+            set_disk_id: "pool_0_set_0".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::Normal,
+    );
+    let task = HealTask::from_request(request, storage);
+
+    let error = task
+        .execute()
+        .await
+        .expect_err("an incomplete resumable pass must remain retryable");
+
+    assert!(
+        matches!(&error, Error::TransientSkip { message } if message.contains("retry scheduled")),
+        "the resumable retry signal must keep its typed identity: {error}"
+    );
+    assert!(error.is_recoverable_heal(), "the scheduler must accept the preserved retry signal");
+}
+
+#[tokio::test]
 async fn erasure_set_bucket_prepass_failure_stops_before_object_heal() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let disk = make_resume_disk(&temp).await;
@@ -2214,6 +4354,7 @@ async fn erasure_set_disk_walk_keeps_cluster_usage_baseline_indeterminate() {
         let disk = make_resume_disk(&temp).await;
         let storage = Arc::new(MockStorage {
             resume_disk: Mutex::new(Some(disk)),
+            bucket_incarnation_id: Mutex::new(Some(Uuid::from_u128(42))),
             usage_baseline: Mutex::new(Some(HealBucketUsageBaseline {
                 objects_count: 10,
                 bytes: 8,

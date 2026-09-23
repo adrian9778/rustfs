@@ -173,7 +173,7 @@ jobs:
           path: |
             fuzz/artifacts/**
             fuzz/corpus/${{ matrix.target }}/**
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 7
 
   # ──────────────────────────────────────────────────────────────
@@ -227,7 +227,7 @@ jobs:
           path: |
             fuzz/artifacts/**
             fuzz/corpus/${{ matrix.target }}/**
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 30
 
   # ──────────────────────────────────────────────────────────────
@@ -252,4 +252,4 @@ jobs:
       - name: Open or update failure-tracking issue
         uses: ./.github/actions/schedule-failure-issue
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}

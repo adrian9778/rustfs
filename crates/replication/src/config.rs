@@ -60,15 +60,17 @@ pub const REPLICATION_READ_ONLY_HISTORICAL_FIELDS: &[&str] = &[
     "Destination.ReplicationTime",
 ];
 
-// v2: disableProxy moved from unsupported to writable (per-target read-proxy
-// opt-out is accepted by set-remote-target and the `proxy` update op).
-pub const REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION: u32 = 2;
+// v4: temporary-credential fields moved from read-only historical metadata to
+// writable fields because remote targets now use them for request signing.
+pub const REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION: u32 = 4;
 
 pub const REMOTE_TARGET_WRITABLE_FIELDS: &[&str] = &[
     "sourcebucket",
     "endpoint",
     "credentials.accessKey",
     "credentials.secretKey",
+    "credentials.sessionToken",
+    "credentials.expiration",
     "targetbucket",
     "secure",
     "path",
@@ -89,6 +91,13 @@ pub const REMOTE_TARGET_WRITABLE_FIELDS: &[&str] = &[
     // (contract v2; previously only importable via MinIO bucket-targets.json).
     "disableProxy",
 ];
+
+/// Remote target fields that are readable for persisted-data compatibility but
+/// cannot be written through the admin API.
+///
+/// The empty slice remains public for source compatibility with consumers of
+/// the v3 capability API.
+pub const REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS: &[&str] = &[];
 
 pub const REMOTE_TARGET_UNSUPPORTED_FIELDS: &[&str] = &["edge", "edgeSyncBeforeExpiry"];
 
@@ -113,6 +122,10 @@ pub trait ReplicationConfigurationExt {
     fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool;
     fn filter_target_arns(&self, obj: &ObjectOpts) -> Vec<String>;
     fn filter_force_delete_target_arns(&self, prefix: &str) -> Vec<String>;
+    /// Every target ARN the configuration still names, whatever the rule's
+    /// status, prefix or filter: the set a pending replication delete may
+    /// still be owed to. A target outside it was removed by the operator.
+    fn configured_target_arns(&self) -> HashSet<String>;
     fn filter_target_replication_decisions(&self, obj: &ObjectOpts) -> Vec<(String, bool)> {
         self.filter_target_arns(obj)
             .into_iter()
@@ -151,6 +164,24 @@ fn rule_replicates(rule: &ReplicationRule, obj: &ObjectOpts) -> bool {
             delete_marker.status == Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED))
         })
     }
+}
+
+fn replication_filter_tags_match(filter: &s3s::dto::ReplicationRuleFilter, object_tags: &HashMap<String, String>) -> bool {
+    let tag_matches = |tag: &s3s::dto::Tag| match (&tag.key, &tag.value) {
+        (None, None) => true,
+        (Some(key), _) if key.is_empty() => true,
+        (Some(key), Some(value)) => object_tags.get(key) == Some(value),
+        _ => false,
+    };
+
+    filter
+        .and
+        .as_ref()
+        .and_then(|and| and.tags.as_deref())
+        .into_iter()
+        .flatten()
+        .chain(filter.tag.iter())
+        .all(tag_matches)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -691,7 +722,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
 
             if let Some(filter) = &rule.filter {
                 let object_tags = ReplicationTagFilter::decode_tags_to_map(&obj.user_tags);
-                if filter.test_tags(&object_tags) {
+                if replication_filter_tags_match(filter, &object_tags) {
                     rules.push(rule.clone());
                 }
             } else {
@@ -699,12 +730,16 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
             }
         }
 
+        // Highest priority first, like MinIO's `FilterActionableRules`. The
+        // tie-breakers make this a total order: a comparator that only
+        // orders same-destination pairs is not transitive, and the standard
+        // library sort panics on such inputs past its insertion-sort
+        // threshold (backlog#2367 C-1).
         rules.sort_by(|a, b| {
-            if a.destination == b.destination {
-                b.priority.cmp(&a.priority)
-            } else {
-                std::cmp::Ordering::Equal
-            }
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.destination.bucket.cmp(&b.destination.bucket))
+                .then_with(|| a.id.cmp(&b.id))
         });
 
         rules
@@ -763,29 +798,37 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
     }
 
     /// Filter target ARNs and return a slice of the distinct values in the config
+    fn configured_target_arns(&self) -> HashSet<String> {
+        let role = self.role.trim();
+        if !role.is_empty() {
+            return HashSet::from([role.to_string()]);
+        }
+        self.rules
+            .iter()
+            .map(|rule| rule.destination.bucket.trim())
+            .filter(|arn| !arn.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
     fn filter_target_arns(&self, obj: &ObjectOpts) -> Vec<String> {
         let role = self.role.trim();
         if !role.is_empty() {
             return vec![role.to_string()];
         }
 
-        let mut arns = Vec::new();
-        let mut targets_map: HashSet<String> = HashSet::new();
-        let rules = self.filter_actionable_rules(obj);
-
-        for rule in rules {
+        // Rule order (priority descending) is the ARN order: callers that
+        // iterate targets see the highest-priority destination first.
+        let mut arns: Vec<String> = Vec::new();
+        for rule in self.filter_actionable_rules(obj) {
             if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED) {
                 continue;
             }
 
             let arn = rule.destination.bucket.trim();
-            if !arn.is_empty() && !targets_map.contains(arn) {
-                targets_map.insert(arn.to_string());
+            if !arn.is_empty() && !arns.iter().any(|seen| seen == arn) {
+                arns.push(arn.to_string());
             }
-        }
-
-        for arn in targets_map {
-            arns.push(arn);
         }
         arns
     }
@@ -1111,6 +1154,47 @@ mod tests {
         });
 
         assert_eq!(validate_replication_config_structure(&structure_config(vec![rule])), Ok(()));
+    }
+
+    #[test]
+    fn actionable_rules_require_every_and_tag_to_match() {
+        let mut rule = replication_rule("rule-1", "arn:target:a");
+        rule.filter = Some(s3s::dto::ReplicationRuleFilter {
+            and: Some(s3s::dto::ReplicationRuleAndOperator {
+                prefix: None,
+                tags: Some(vec![
+                    s3s::dto::Tag {
+                        key: Some("env".to_string()),
+                        value: Some("prod".to_string()),
+                    },
+                    s3s::dto::Tag {
+                        key: Some("tier".to_string()),
+                        value: Some("gold".to_string()),
+                    },
+                ]),
+            }),
+            ..Default::default()
+        });
+        let config = structure_config(vec![rule]);
+        let object = |user_tags: &str| ObjectOpts {
+            name: "object".to_string(),
+            user_tags: user_tags.to_string(),
+            ..Default::default()
+        };
+
+        assert!(config.filter_target_arns(&object("env=prod")).is_empty());
+        assert_eq!(config.filter_target_arns(&object("env=prod&tier=gold")), vec!["arn:target:a"]);
+        assert!(config.filter_target_arns(&object("")).is_empty());
+
+        let mut malformed = config;
+        malformed.rules[0].filter.as_mut().unwrap().and.as_mut().unwrap().tags = Some(vec![s3s::dto::Tag {
+            key: Some("env".to_string()),
+            value: None,
+        }]);
+        assert!(
+            malformed.filter_target_arns(&object("env=prod")).is_empty(),
+            "a malformed tag filter must fail closed"
+        );
     }
 
     #[test]
@@ -1663,6 +1747,94 @@ mod tests {
     }
 
     #[test]
+    fn replication_writable_fields_bind_to_typed_dto_fields() {
+        let mut rule = replication_rule("id-marker", "arn:bucket-marker");
+        rule.priority = Some(37);
+        rule.filter = Some(s3s::dto::ReplicationRuleFilter {
+            prefix: Some("prefix-marker/".to_string()),
+            tag: Some(s3s::dto::Tag {
+                key: Some("tag-key-marker".to_string()),
+                value: Some("tag-value-marker".to_string()),
+            }),
+            and: Some(s3s::dto::ReplicationRuleAndOperator {
+                prefix: Some("and-prefix-marker/".to_string()),
+                tags: Some(vec![s3s::dto::Tag {
+                    key: Some("and-tag-key-marker".to_string()),
+                    value: Some("and-tag-value-marker".to_string()),
+                }]),
+            }),
+            ..Default::default()
+        });
+        rule.delete_marker_replication = Some(DeleteMarkerReplication {
+            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+        });
+        rule.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
+        rule.source_selection_criteria = Some(SourceSelectionCriteria {
+            replica_modifications: Some(ReplicaModifications {
+                status: ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED),
+            }),
+            sse_kms_encrypted_objects: None,
+        });
+        let config = ReplicationConfiguration {
+            role: "role-marker".to_string(),
+            rules: vec![rule],
+        };
+
+        let rule = config.rules.first().expect("fixture should contain one rule");
+        let filter = rule.filter.as_ref().expect("fixture should contain a rule filter");
+        let field_hits = [
+            ("Role", config.role == "role-marker"),
+            ("Rule.ID", rule.id.as_deref() == Some("id-marker")),
+            ("Rule.Status", rule.status.as_str() == ReplicationRuleStatus::ENABLED),
+            ("Rule.Priority", rule.priority == Some(37)),
+            ("Rule.Filter.Prefix", filter.prefix.as_deref() == Some("prefix-marker/")),
+            (
+                "Rule.Filter.Tag",
+                filter.tag.as_ref().and_then(|tag| tag.key.as_deref()) == Some("tag-key-marker"),
+            ),
+            (
+                "Rule.Filter.And",
+                filter.and.as_ref().and_then(|and| and.prefix.as_deref()) == Some("and-prefix-marker/"),
+            ),
+            ("Rule.Destination.Bucket", rule.destination.bucket == "arn:bucket-marker"),
+            (
+                "Rule.ExistingObjectReplication.Status",
+                rule.existing_object_replication
+                    .as_ref()
+                    .is_some_and(|existing| existing.status.as_str() == ExistingObjectReplicationStatus::ENABLED),
+            ),
+            (
+                "Rule.DeleteMarkerReplication.Status",
+                rule.delete_marker_replication
+                    .as_ref()
+                    .and_then(|delete_marker| delete_marker.status.as_ref())
+                    .is_some_and(|status| status.as_str() == DeleteMarkerReplicationStatus::ENABLED),
+            ),
+            (
+                "Rule.DeleteReplication.Status",
+                rule.delete_replication
+                    .as_ref()
+                    .is_some_and(|delete| delete.status.as_str() == DeleteReplicationStatus::ENABLED),
+            ),
+            (
+                "Rule.SourceSelectionCriteria.ReplicaModifications.Status",
+                rule.source_selection_criteria
+                    .as_ref()
+                    .and_then(|criteria| criteria.replica_modifications.as_ref())
+                    .is_some_and(|modifications| modifications.status.as_str() == ReplicaModificationsStatus::ENABLED),
+            ),
+        ];
+        let bound_paths = field_hits.iter().map(|(path, _)| *path).collect::<Vec<_>>();
+        assert_eq!(bound_paths, REPLICATION_WRITABLE_FIELDS);
+
+        for (path, hit) in field_hits {
+            assert!(hit, "typed field probe did not reach {path}");
+        }
+    }
+
+    #[test]
     fn invalid_replication_status_fields_are_reported_before_persistence() {
         let arn = "arn:rustfs:replication:us-east-1:target:bucket";
         let mut config = ReplicationConfiguration {
@@ -1733,6 +1905,84 @@ mod tests {
         });
 
         assert_eq!(decisions, vec![(target_a.to_string(), false), (target_b.to_string(), true)]);
+    }
+
+    // backlog#2367 C-1: the actionable-rule sort must be a total order. A
+    // comparator that answers `Equal` for different destinations but orders
+    // same-destination rules by priority is not transitive, and the standard
+    // library sort panics on such inputs once the slice is past the
+    // insertion-sort threshold (> 20 rules).
+    #[test]
+    fn actionable_rule_sort_is_a_total_order_across_destinations() {
+        let targets = ["arn:target:a", "arn:target:b", "arn:target:c"];
+        let mut seed: u64 = 0x2367;
+        for _ in 0..200 {
+            let rule_count = 21 + (seed % 200) as usize;
+            let rules = (0..rule_count)
+                .map(|index| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let target = targets[(seed >> 33) as usize % targets.len()];
+                    delete_marker_rule(&format!("r{index}"), target, "", index as i32, true)
+                })
+                .collect();
+            let config = ReplicationConfiguration {
+                role: String::new(),
+                rules,
+            };
+            let ordered = config.filter_actionable_rules(&ObjectOpts {
+                name: "logs/app.log".to_string(),
+                op_type: ReplicationType::Object,
+                ..Default::default()
+            });
+            assert_eq!(ordered.len(), rule_count);
+            assert!(
+                ordered.windows(2).all(|pair| pair[0].priority >= pair[1].priority),
+                "actionable rules must be ordered by descending priority"
+            );
+        }
+    }
+
+    // backlog#2367 C-2: a V1 rule carries its prefix at the top level (no
+    // <Filter>). Ignoring it made `<Prefix>logs/</Prefix>` match every object.
+    #[test]
+    fn top_level_rule_prefix_scopes_matching_without_a_filter() {
+        let arn = "arn:target:a";
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![delete_marker_rule("v1-prefix", arn, "logs/", 1, true)],
+        };
+        assert_eq!(config.rules[0].prefix(), "logs/");
+
+        let matching = config.filter_actionable_rules(&ObjectOpts {
+            name: "logs/app.log".to_string(),
+            op_type: ReplicationType::Object,
+            ..Default::default()
+        });
+        assert_eq!(matching.len(), 1);
+
+        let outside = config.filter_actionable_rules(&ObjectOpts {
+            name: "data/app.log".to_string(),
+            op_type: ReplicationType::Object,
+            ..Default::default()
+        });
+        assert!(outside.is_empty(), "an object outside the V1 prefix must not match: {outside:?}");
+        assert!(
+            config
+                .filter_target_arns(&ObjectOpts {
+                    name: "data/app.log".to_string(),
+                    op_type: ReplicationType::Object,
+                    ..Default::default()
+                })
+                .is_empty()
+        );
+
+        // A <Filter> still wins over the deprecated top-level element.
+        let mut filtered = delete_marker_rule("filtered", arn, "logs/", 1, true);
+        filtered.filter = Some(s3s::dto::ReplicationRuleFilter {
+            prefix: Some("photos/".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(filtered.prefix(), "photos/");
     }
 
     #[test]

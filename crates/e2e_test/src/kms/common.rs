@@ -22,13 +22,12 @@
 //! - KMS backend configuration (Local and Vault)
 //! - SSE encryption testing utilities
 
-use crate::common::{
-    RustFSTestEnvironment, awscurl_available, awscurl_get, awscurl_post, init_logging as common_init_logging, local_http_client,
-};
+use crate::common::{RustFSTestEnvironment, awscurl_get, awscurl_post, init_logging as common_init_logging, local_http_client};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ServerSideEncryption;
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use base64_simd::STANDARD as BASE64;
 use http::header::{CONTENT_TYPE, HOST};
 use md5::{Digest as Md5Digest, Md5};
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
@@ -52,6 +51,9 @@ pub const VAULT_TOKEN: &str = "dev-root-token";
 pub const VAULT_TRANSIT_PATH: &str = "transit";
 pub const VAULT_KEY_NAME: &str = "rustfs-master-key";
 pub const ENV_TEST_VAULT_BIN: &str = "RUSTFS_TEST_VAULT_BIN";
+pub const SSE_C_KEY_MISMATCH_MESSAGE: &str =
+    "The provided encryption parameters did not match the ones used originally to encrypt the object.";
+pub const SSE_C_MISSING_PARAMETERS_MESSAGE: &str = "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object.";
 
 /// Initialize tracing for KMS tests with KMS-specific log levels
 pub fn init_logging() {
@@ -59,19 +61,28 @@ pub fn init_logging() {
     // Additional KMS-specific logging configuration can be added here if needed
 }
 
-pub fn skip_if_kms_admin_tool_unavailable(test_name: &str) -> bool {
-    if awscurl_available() {
-        return false;
-    }
-
-    info!("Skipping {} because awscurl is not available in PATH", test_name);
-    true
-}
-
 pub fn sse_customer_key_md5_base64(key: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(key.as_bytes());
-    BASE64.encode(hasher.finalize())
+    BASE64.encode_to_string(hasher.finalize())
+}
+
+pub fn assert_s3_error<T, E>(result: Result<T, SdkError<E>>, status: u16, code: &str, message: &str, context: &str)
+where
+    T: std::fmt::Debug,
+    E: ProvideErrorMetadata + std::fmt::Debug,
+{
+    let error = result.expect_err(context);
+    assert_eq!(
+        error.raw_response().map(|response| response.status().as_u16()),
+        Some(status),
+        "{context}: unexpected HTTP status: {error:?}"
+    );
+    let service_error = error
+        .as_service_error()
+        .expect("request failure should retain an S3 service error");
+    assert_eq!(service_error.code(), Some(code), "{context}: unexpected error code: {error:?}");
+    assert_eq!(service_error.message(), Some(message), "{context}: unexpected error message: {error:?}");
 }
 
 pub async fn kms_admin_request(
@@ -162,6 +173,30 @@ pub async fn start_kms(
         return Err(format!("KMS start failed: {}", response["message"].as_str().unwrap_or("unknown error")).into());
     }
     info!("KMS started successfully");
+    Ok(())
+}
+
+/// Stop the running KMS service via admin API, keeping its configuration so
+/// `start_kms` can bring it back.
+pub async fn stop_kms(
+    base_url: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let response = kms_admin_request(
+        base_url,
+        http::Method::POST,
+        "/rustfs/admin/v3/kms/stop",
+        Some("{}"),
+        access_key,
+        secret_key,
+    )
+    .await?;
+    let response: serde_json::Value = serde_json::from_str(&response)?;
+    if response["success"] != true {
+        return Err(format!("KMS stop failed: {}", response["message"].as_str().unwrap_or("unknown error")).into());
+    }
+    info!("KMS stopped successfully");
     Ok(())
 }
 
@@ -314,7 +349,7 @@ pub async fn create_default_key(
     secret_key: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let create_key_body = serde_json::json!({
-        "key_usage": "ENCRYPT_DECRYPT",
+        "key_usage": "EncryptDecrypt",
         "description": "Default key for e2e testing"
     })
     .to_string();
@@ -354,7 +389,7 @@ pub async fn create_key_with_specific_id(key_dir: &str, key_id: &str) -> Result<
         "created_at": format!("{}[UTC]", chrono::Utc::now().to_rfc3339()),
         "rotated_at": serde_json::Value::Null,
         "created_by": "e2e-test",
-        "encrypted_key_material": BASE64.encode(key_data),
+        "encrypted_key_material": BASE64.encode_to_string(key_data),
         "nonce": Vec::<u8>::new()
     });
 
@@ -372,7 +407,7 @@ pub async fn test_sse_c_encryption(s3_client: &Client, bucket: &str) -> Result<(
     info!("Testing SSE-C encryption");
 
     let test_key = "01234567890123456789012345678901"; // 32-byte key
-    let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
+    let test_key_b64 = base64_simd::STANDARD.encode_to_string(test_key);
     let test_key_md5 = sse_customer_key_md5_base64(test_key);
     let test_data = b"Hello, KMS SSE-C World!";
     let object_key = "test-sse-c-object";
@@ -490,10 +525,6 @@ pub async fn test_kms_key_management(
     access_key: &str,
     secret_key: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if skip_if_kms_admin_tool_unavailable("test_kms_key_management") {
-        return Ok(());
-    }
-
     info!("Testing KMS key management APIs");
 
     // Test CreateKey
@@ -544,8 +575,8 @@ pub async fn test_error_scenarios(s3_client: &Client, bucket: &str) -> Result<()
     // Test SSE-C with wrong key for download
     let test_key = "01234567890123456789012345678901";
     let wrong_key = "98765432109876543210987654321098";
-    let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
-    let wrong_key_b64 = base64::engine::general_purpose::STANDARD.encode(wrong_key);
+    let test_key_b64 = base64_simd::STANDARD.encode_to_string(test_key);
+    let wrong_key_b64 = base64_simd::STANDARD.encode_to_string(wrong_key);
     let test_key_md5 = sse_customer_key_md5_base64(test_key);
     let wrong_key_md5 = sse_customer_key_md5_base64(wrong_key);
     let test_data = b"Test data for error scenarios";
@@ -574,7 +605,13 @@ pub async fn test_error_scenarios(s3_client: &Client, bucket: &str) -> Result<()
         .send()
         .await;
 
-    assert!(wrong_key_result.is_err(), "Download with wrong SSE-C key should fail");
+    assert_s3_error(
+        wrong_key_result,
+        400,
+        "InvalidRequest",
+        SSE_C_KEY_MISMATCH_MESSAGE,
+        "download with a wrong SSE-C key must be rejected",
+    );
     info!("✅ Correctly rejected download with wrong SSE-C key");
 
     info!("Error scenario tests completed successfully");
@@ -794,7 +831,7 @@ pub async fn test_multipart_upload_with_config(
     // Prepare encryption parameters
     let (sse_c_key_b64, sse_c_key_md5) = match &config.encryption_type {
         EncryptionType::SSEC { key, key_md5 } => {
-            let key_b64 = base64::engine::general_purpose::STANDARD.encode(key);
+            let key_b64 = base64_simd::STANDARD.encode_to_string(key);
             (Some(key_b64), Some(key_md5.clone()))
         }
         _ => (None, None),

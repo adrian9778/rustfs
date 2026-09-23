@@ -18,10 +18,11 @@ use super::kms_audit::{KmsAdminAudit, KmsAdminOperation};
 use crate::admin::auth::{validate_admin_request, validate_admin_request_with_kms_key};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{current_kms_runtime_service_manager, current_or_init_kms_runtime_service_manager};
+use crate::admin::storage_api::s3;
+use crate::admin::utils::extract_query_params;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::kms_deletion_gate::current_key_impact;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
-use base64::Engine;
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -99,22 +100,6 @@ pub struct GenerateDataKeyApiResponse {
     pub key_id: String,
     pub plaintext_key: String,   // Base64 encoded
     pub ciphertext_blob: String, // Base64 encoded
-}
-
-/// The query parameters of an admin KMS request.
-///
-/// Parsed with `form_urlencoded`, as the rest of the admin surface does, so a
-/// parameter written without a value (`?status`) arrives as an empty value
-/// rather than disappearing: a validated parameter must be able to tell "not
-/// asked for" from "asked for, unreadable".
-pub(super) fn extract_query_params(uri: &hyper::Uri) -> HashMap<String, String> {
-    let mut params = HashMap::new();
-    if let Some(query) = uri.query() {
-        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            params.insert(key.into_owned(), value.into_owned());
-        }
-    }
-    params
 }
 
 /// Status values a `status` filter may name, spelled as the response spells
@@ -211,6 +196,25 @@ fn extract_key_id(uri: &hyper::Uri) -> Option<String> {
     ["keyId", "key-id", "key"]
         .into_iter()
         .find_map(|name| query_params.get(name).filter(|value| !value.is_empty()).cloned())
+}
+
+/// Name of the key a legacy create request asks for.
+///
+/// `mc admin kms key create <name>` sends the name as the `key-id` query
+/// parameter with no body, while RustFS clients send it as the `name` tag.
+/// Both are honored. A request carrying both has to agree with itself:
+/// picking one silently would create a key under a name the caller never
+/// sees in its own request.
+fn legacy_create_key_name(uri: &hyper::Uri, tags: &HashMap<String, String>) -> S3Result<Option<String>> {
+    let query_name = extract_key_id(uri);
+    let tag_name = tags.get("name").cloned();
+    match (query_name, tag_name) {
+        (Some(query), Some(tag)) if query != tag => Err(s3::error(
+            s3::S3ErrorCode::InvalidRequest,
+            format!("key name in the query ({query}) and in tags.name ({tag}) differ"),
+        )),
+        (query, tag) => Ok(query.or(tag)),
+    }
 }
 
 /// The `key_id` of a KMS admin request body, read without committing to the
@@ -348,9 +352,8 @@ impl Operation for CreateKeyHandler {
             return Err(s3_error!(InternalError, "kms service is not initialized"));
         };
 
-        // Extract key name from tags if provided
         let tags = request.tags.unwrap_or_default();
-        let key_name = tags.get("name").cloned();
+        let key_name = legacy_create_key_name(&req.uri, &tags)?;
 
         let kms_request = CreateKeyRequest {
             key_name,
@@ -386,7 +389,7 @@ impl Operation for CreateKeyHandler {
                     error = %e,
                     "admin kms keys state"
                 );
-                Err(s3_error!(InternalError, "failed to create key: {}", e))
+                Err(key_admin_s3_error("create key", &e))
             }
         }
     }
@@ -458,7 +461,7 @@ impl Operation for DescribeKeyHandler {
                     error = %e,
                     "admin kms keys state"
                 );
-                Err(s3_error!(InternalError, "failed to describe key: {}", e))
+                Err(key_admin_s3_error("describe key", &e))
             }
         }
     }
@@ -493,10 +496,10 @@ mod tests {
         CancelKmsKeyDeletionRequest, CancelKmsKeyDeletionResponse, CreateKeyApiRequest, CreateKeyApiResponse,
         CreateKmsKeyRequest, CreateKmsKeyResponse, DeleteKmsKeyRequest, DeleteKmsKeyResponse, DescribeKeyApiResponse,
         DescribeKmsKeyResponse, GenerateDataKeyApiRequest, GenerateDataKeyApiResponse, ListKeysApiResponse, ListKmsKeysResponse,
-        delete_key_error_status, delete_request_from_query, extract_key_id, extract_query_params, key_impact_if_requested,
-        key_list_filters, kms_create_key_actions, kms_delete_key_actions, kms_describe_key_actions,
-        kms_generate_data_key_actions, kms_list_keys_actions, parse_list_limit, scoped_key_id, stable_json_value,
-        wants_key_impact,
+        delete_request_from_query, extract_key_id, extract_query_params, key_admin_error_status, key_admin_s3_error,
+        key_impact_if_requested, key_list_filters, kms_create_key_actions, kms_delete_key_actions, kms_describe_key_actions,
+        kms_generate_data_key_actions, kms_list_keys_actions, legacy_create_key_name, parse_list_limit, scoped_key_id,
+        stable_json_value, wants_key_impact,
     };
     use http::Uri;
     use hyper::StatusCode;
@@ -515,6 +518,46 @@ mod tests {
 
     fn assert_lacks_action(actions: &[Action], action: Action) {
         assert!(!actions.contains(&action), "expected action list not to contain {action:?}");
+    }
+
+    #[test]
+    fn legacy_create_key_name_honors_the_minio_key_id_query() {
+        let uri: Uri = "/rustfs/admin/v3/kms/key/create?key-id=minio-key"
+            .parse()
+            .expect("uri should parse");
+
+        let name = legacy_create_key_name(&uri, &HashMap::new()).expect("a query-only name is valid");
+        assert_eq!(name.as_deref(), Some("minio-key"));
+    }
+
+    #[test]
+    fn legacy_create_key_name_falls_back_to_the_name_tag() {
+        let uri: Uri = "/rustfs/admin/v3/kms/key/create".parse().expect("uri should parse");
+        let tags = HashMap::from([("name".to_string(), "tagged-key".to_string())]);
+
+        let name = legacy_create_key_name(&uri, &tags).expect("a tag-only name is valid");
+        assert_eq!(name.as_deref(), Some("tagged-key"));
+        assert_eq!(legacy_create_key_name(&uri, &HashMap::new()).expect("no name is valid"), None);
+    }
+
+    #[test]
+    fn legacy_create_key_name_accepts_agreeing_sources_and_refuses_conflicting_ones() {
+        let uri: Uri = "/rustfs/admin/v3/kms/key/create?key-id=minio-key"
+            .parse()
+            .expect("uri should parse");
+
+        let agreeing = HashMap::from([("name".to_string(), "minio-key".to_string())]);
+        let name = legacy_create_key_name(&uri, &agreeing).expect("agreeing sources are valid");
+        assert_eq!(name.as_deref(), Some("minio-key"));
+
+        let conflicting = HashMap::from([("name".to_string(), "other-key".to_string())]);
+        let refused = legacy_create_key_name(&uri, &conflicting).expect_err("conflicting names must be refused");
+        assert_eq!(*refused.code(), super::s3::S3ErrorCode::InvalidRequest);
+        assert!(
+            refused
+                .message()
+                .is_some_and(|message| message.contains("minio-key") && message.contains("other-key"))
+        );
     }
 
     #[test]
@@ -674,14 +717,50 @@ mod tests {
             KmsError::invalid_operation("immediate deletion of key key-a is not allowed"),
             KmsError::validation_error("bad input"),
         ] {
-            assert_eq!(delete_key_error_status(&error), StatusCode::BAD_REQUEST, "{error} must be a 400");
+            assert_eq!(key_admin_error_status(&error), StatusCode::BAD_REQUEST, "{error} must be a 400");
         }
 
-        assert_eq!(delete_key_error_status(&KmsError::key_not_found("key-a")), StatusCode::NOT_FOUND);
+        assert_eq!(key_admin_error_status(&KmsError::key_not_found("key-a")), StatusCode::NOT_FOUND);
         assert_eq!(
-            delete_key_error_status(&KmsError::backend_error("vault is down")),
+            key_admin_error_status(&KmsError::backend_error("vault is down")),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    /// One mapping serves create, delete and generate-data-key: a backend
+    /// without the capability answers 501, a taken name 409, a blank or
+    /// malformed name 400, and only damaged material stays a server fault.
+    #[test]
+    fn key_admin_error_status_contract() {
+        assert_eq!(
+            key_admin_error_status(&KmsError::unsupported_capability("static", "create_key")),
+            StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(key_admin_error_status(&KmsError::key_already_exists("key-a")), StatusCode::CONFLICT);
+        assert_eq!(
+            key_admin_error_status(&KmsError::validation_error("key name must not be empty or whitespace")),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(key_admin_error_status(&KmsError::invalid_key("bad name")), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            key_admin_error_status(&KmsError::material_corrupt("key-a", "truncated")),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        // The XML-error routes carry the same status explicitly, since s3s
+        // derives none for a custom code.
+        let missing = key_admin_s3_error("generate data key", &KmsError::key_not_found("key-a"));
+        assert_eq!(missing.status_code(), Some(StatusCode::NOT_FOUND));
+        assert_eq!(
+            *missing.code(),
+            super::s3::S3ErrorCode::Custom(crate::error::KMS_KEY_NOT_FOUND_ERROR_CODE.into())
+        );
+        let unsupported = key_admin_s3_error("create key", &KmsError::unsupported_capability("static", "create_key"));
+        assert_eq!(unsupported.status_code(), Some(StatusCode::NOT_IMPLEMENTED));
+        assert_eq!(*unsupported.code(), super::s3::S3ErrorCode::NotImplemented);
+        let blank = key_admin_s3_error("create key", &KmsError::validation_error("key name must not be empty"));
+        assert_eq!(blank.status_code(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(*blank.code(), super::s3::S3ErrorCode::InvalidRequest);
     }
 
     /// A key the deployment still points at is refused with 409, not 400: the
@@ -690,7 +769,7 @@ mod tests {
     #[test]
     fn a_still_referenced_key_reports_a_conflict() {
         let error = KmsError::key_still_referenced("key-a", vec!["bucket:sse-bucket".to_string()]);
-        assert_eq!(delete_key_error_status(&error), StatusCode::CONFLICT);
+        assert_eq!(key_admin_error_status(&error), StatusCode::CONFLICT);
     }
 
     #[test]
@@ -1535,8 +1614,8 @@ impl Operation for GenerateDataKeyHandler {
             Ok(response) => {
                 let api_response = GenerateDataKeyApiResponse {
                     key_id: response.key_id,
-                    plaintext_key: base64::prelude::BASE64_STANDARD.encode(&response.plaintext_key),
-                    ciphertext_blob: base64::prelude::BASE64_STANDARD.encode(&response.ciphertext_blob),
+                    plaintext_key: base64_simd::STANDARD.encode_to_string(&response.plaintext_key),
+                    ciphertext_blob: base64_simd::STANDARD.encode_to_string(&response.ciphertext_blob),
                 };
 
                 let data = serde_json::to_vec(&api_response)
@@ -1557,7 +1636,7 @@ impl Operation for GenerateDataKeyHandler {
                     error = %e,
                     "admin kms keys state"
                 );
-                Err(s3_error!(InternalError, "failed to generate data key: {}", e))
+                Err(key_admin_s3_error("generate data key", &e))
             }
         }
     }
@@ -1685,6 +1764,7 @@ impl Operation for CreateKmsKeyHandler {
                     error = %e,
                     "admin kms keys state"
                 );
+                let status = key_admin_error_status(&e);
                 let response = CreateKmsKeyResponse {
                     success: false,
                     message: format!("failed to create key: {e}"),
@@ -1698,7 +1778,7 @@ impl Operation for CreateKmsKeyHandler {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
-                Ok(S3Response::with_headers((StatusCode::INTERNAL_SERVER_ERROR, Body::from(data)), headers))
+                Ok(S3Response::with_headers((status, Body::from(data)), headers))
             }
         }
     }
@@ -1788,10 +1868,22 @@ fn delete_request_from_query(uri: &hyper::Uri) -> Result<DeleteKmsKeyRequest, Bo
 /// A rejected waiting window and a refused immediate deletion both arrive as
 /// [`KmsError::InvalidOperation`], and both are the caller's input to fix, so
 /// they must surface as 400 rather than as a server fault.
-fn delete_key_error_status(error: &KmsError) -> StatusCode {
+/// HTTP status for a KMS error on a key-management route, where the key id is
+/// the resource being addressed (so a missing key is `404`, unlike the S3 data
+/// path where it is a request error). Shared by create, delete and
+/// generate-data-key so the same backend error does not read as a client
+/// error on one route and a server fault on another.
+fn key_admin_error_status(error: &KmsError) -> StatusCode {
     match error {
         KmsError::KeyNotFound { .. } => StatusCode::NOT_FOUND,
-        KmsError::InvalidOperation { .. } | KmsError::ValidationError { .. } => StatusCode::BAD_REQUEST,
+        KmsError::InvalidOperation { .. } | KmsError::ValidationError { .. } | KmsError::InvalidKey { .. } => {
+            StatusCode::BAD_REQUEST
+        }
+        // The request is well formed; the name is simply taken.
+        KmsError::KeyAlreadyExists { .. } => StatusCode::CONFLICT,
+        // A permanent gap in the configured backend (for example the read-only
+        // Static backend), never a missing resource and never retryable.
+        KmsError::UnsupportedCapability { .. } => StatusCode::NOT_IMPLEMENTED,
         // Damaged or missing key material is an integrity fault of an existing
         // key: it must surface as a server error, never as NOT_FOUND (the key
         // exists) and never as a retryable backend outage.
@@ -1805,6 +1897,23 @@ fn delete_key_error_status(error: &KmsError) -> StatusCode {
         KmsError::KeyStillReferenced { .. } => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+/// The same classification for the routes that answer with an S3 error
+/// document instead of a JSON body. s3s derives no status for a custom code,
+/// so the status is set explicitly from `key_admin_error_status`.
+fn key_admin_s3_error(action: &str, error: &KmsError) -> s3::S3Error {
+    let status = key_admin_error_status(error);
+    let code = match status {
+        StatusCode::NOT_FOUND => s3::S3ErrorCode::Custom(crate::error::KMS_KEY_NOT_FOUND_ERROR_CODE.into()),
+        StatusCode::BAD_REQUEST => s3::S3ErrorCode::InvalidRequest,
+        StatusCode::CONFLICT => s3::S3ErrorCode::Custom("KMS.AlreadyExistsException".into()),
+        StatusCode::NOT_IMPLEMENTED => s3::S3ErrorCode::NotImplemented,
+        _ => s3::S3ErrorCode::InternalError,
+    };
+    let mut s3_error = s3::error(code, format!("failed to {action}: {error}"));
+    s3_error.set_status_code(status);
+    s3_error
 }
 
 /// Delete a KMS key
@@ -1941,7 +2050,7 @@ impl Operation for DeleteKmsKeyHandler {
                     error = %e,
                     "admin kms keys state"
                 );
-                let status = delete_key_error_status(&e);
+                let status = key_admin_error_status(&e);
                 let response = DeleteKmsKeyResponse {
                     success: false,
                     message: format!("Failed to delete key: {e}"),

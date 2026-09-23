@@ -1,47 +1,34 @@
 # Decommission Compatibility Scope
 
-This note records the current RustFS decommission contract for admin/API
-compatibility reviews.
+**Use this when:** you change pool decommission or rebalance behavior, its admin API shape, the persisted `PoolMeta` decommission fields, or how tier free versions move between pools.
+**Source of truth:** `crates/ecstore/src/core/pools.rs` (queue, recovery, cleanup predicates), `crates/ecstore/src/services/rebalance/worker.rs` (rebalance predicates), `rustfs/src/admin/handlers/pools.rs` plus the `pools/*` rows of `rustfs/src/admin/route_policy.rs` (admin surface), `crates/ecstore/src/data_movement/` and `crates/ecstore/src/set_disk/` (free-version movement).
 
 ## Current Contract
 
-RustFS supports queued multi-pool decommission start requests on multi-pool
-deployments.
+RustFS supports queued multi-pool decommission start requests on multi-pool deployments. The admin handler accepts the MinIO-compatible request shape, including comma-separated pool targets. An empty target list is rejected; single-pool deployments reject decommission because there is no destination pool; on multi-pool deployments one or more valid target pools are accepted as a single queued operation.
 
-The admin handler accepts the request shape used by the MinIO-compatible admin
-API, including comma-separated pool targets. An empty target list is rejected.
-Single-pool deployments reject decommission because there is no destination pool.
-On multi-pool deployments, one or more valid target pools are accepted as a
-single queued operation.
+Deterministic request rejections (unsupported single-pool operations, missing or terminal targets, an empty start request, removing the last active pool, and clearing unresolved recovery entries) retain the typed `InvalidArgument` error and its actionable reason. Active-operation conflicts retain their existing `InvalidRequest` or `OperationAborted` contract. Storage, quorum, and fleet-proof failures are not converted into argument errors.
 
 ### Request Semantics
 
-`POST /v3/pools/decommission` with comma-separated pool targets is treated as a
-queue submission:
+`POST /v3/pools/decommission` with comma-separated pool targets is a queue submission:
 
 - validate all requested pool identifiers before mutating metadata;
 - reject duplicate target pools in the same request;
 - reject active or queued target pools;
-- reject completed decommission targets because completion means the pool can be
-  removed from the deployment configuration;
-- allow failed or canceled targets to be retried;
+- reject completed decommission targets, because completion means the pool can be removed from the deployment configuration;
+- require failed or canceled targets to be cleared before restarting, except
+  when unresolved listing entries require an explicit recovery retry;
 - persist queued metadata before starting workers;
 - start only the local-leader prefix of the queue on the receiving node.
 
-The local-leader-prefix rule keeps the active worker on the leader for the pool
-being moved while still allowing a request to contain later targets whose leaders
-are different nodes. Later queued targets are recovered or promoted by the
-leader that owns that target.
+The local-leader-prefix rule keeps the active worker on the leader for the pool being moved while still allowing a request to contain later targets whose leaders are different nodes. Later queued targets are recovered or promoted by the leader that owns that target.
 
-Admin start, cancel, and clear requests may arrive on any cluster node. When the
-target pool first endpoint is remote, RustFS forwards the operation over the
-authenticated internode RPC channel to that first endpoint. The receiving node
-still enforces the local-leader rule before mutating decommission state.
+Start, cancel (`POST /v3/pools/cancel`), and clear (`POST /v3/pools/clear`) requests may arrive on any cluster node. When the target pool's first endpoint is remote, RustFS forwards the operation over the authenticated internode RPC channel to that endpoint; the receiving node still enforces the local-leader rule before mutating decommission state.
 
 ### Persisted Metadata Shape
 
-The queue is persisted in pool metadata and decoded with the rest of
-`PoolMeta`. Each pool entry can distinguish:
+The queue is persisted in pool metadata and decoded with the rest of `PoolMeta`. Each pool entry can distinguish:
 
 - `active`: at most one pool currently moving data;
 - `queued`: validated pools waiting for the active entry to finish;
@@ -49,123 +36,185 @@ The queue is persisted in pool metadata and decoded with the rest of
 - `failed`: pools whose worker reached terminal failure;
 - `canceled`: pools canceled before or during execution.
 
-Legacy metadata without queue fields decodes as a non-queued decommission entry,
-preserving restart behavior for already deployed clusters.
+Legacy metadata without queue fields decodes as a non-queued decommission entry, preserving restart behavior for already deployed clusters.
 
 ### Serial Scheduling And Recovery
 
 Only one queued entry may own a decommission worker at a time. Startup recovery:
 
 - loads pool metadata before rebalance recovery;
-- resumes the first local non-terminal active/queued entry;
-- skips a durably completed prefix and promotes the next queued entry only after
-  successful completion;
-- treats failed or canceled terminal entries as an automatic-promotion barrier,
-  leaving later queued pools visible but stopped until an operator retries,
-  clears, or otherwise resolves the terminal entry;
-- keeps queued pools out of active worker scheduling until promotion, while still
-  making their future state visible in admin status.
+- computes the resumable entries with `resumable_decommission_queue_indices` (`crates/ecstore/src/core/pools.rs`): every pool that has decommission state and is not terminal (`complete`, `failed`, or `canceled`). Terminal predecessors are skipped, not treated as barriers, so a queued pool behind a failed or canceled attempt is still resumable (`test_resumable_decommission_queue_indices_skip_terminal_predecessors`);
+- starts workers only for the local-leader prefix of those entries; later queued pools stay out of worker scheduling until promotion while their state remains visible in admin status.
 
-Promotion is persisted before worker execution. If cancellation is already
-requested immediately after promotion, RustFS persists a canceled terminal state
-instead of leaving the promoted pool active without a worker.
+Promotion is persisted before worker execution. If cancellation is already requested immediately after promotion, RustFS persists a canceled terminal state instead of leaving the promoted pool active without a worker.
 
 ### Cancel Semantics
 
 Cancel separates active and queued behavior:
 
-- canceling the active entry requests worker cancellation and persists terminal
-  metadata;
+- canceling the active entry requests worker cancellation and persists terminal metadata;
 - canceling a queued entry marks that entry canceled before it becomes active;
-- failed or canceled terminal entries can be cleared explicitly when the operator
-  chooses to abandon the decommission attempt;
-- peer reload failures during cancel must be surfaced in status and logs.
+- failed or canceled terminal entries can be cleared explicitly (`POST /v3/pools/clear`) when the operator abandons the decommission attempt;
+- peer reload failures during cancel are surfaced in status and logs.
 
-Cancel requests can be accepted on non-leader nodes as remote cancel intent; the
-leader observes the pending cancel and applies it to the active worker.
+Cancel requests can be accepted on non-leader nodes as remote cancel intent; the leader observes the pending cancel and applies it to the active worker.
+
+`queuedBuckets` retains the unfinished work inventory after cancellation. It is
+not evidence of active scheduling: `queued` is false and `startTime` is absent.
+Operators and tests must inspect the terminal flags, peer state and progress
+stability instead of requiring the historical inventory to be empty. A normal
+canceled entry remains blocked until clear; unresolved listing entries instead
+retain the explicit retry path that can re-observe or resolve those entries.
+
+### Publication On Retiring Pools
+
+Ordinary publication rechecks the selected pool against the durable pool metadata under its existing read fence. Selection may have happened before retirement, or on a node whose local pool state has not been refreshed. A staged new PUT must return `SlowDown` instead of publishing into a pool that has since become suspended. The staged input is not automatically replayed into another pool.
+
+Running, queued, failed, canceled, and completed decommission states exclude the source from new ordinary publication, including new multipart uploads. Previously created multipart uploads retain their drain path while the source remains non-terminal; terminal source states reject further multipart publication. Failed and canceled entries become writable for new ordinary publication only after an allowed clear operation removes that state. This check does not change repair admission or the separate fence for operations that only release capacity.
+
+For mixed batch deletes, only the pools selected to receive new delete markers are publication targets. Exact-version deletions on other pools remain protected by the same pool metadata read fence, without treating the retiring source or an unrelated reserved target as a destination for those markers.
+
+### Shared Capacity On Healthy Targets
+
+Ordinary publication into a healthy target is not rejected solely because that pool has an active decommission reservation. This follows the MinIO decommission write-routing contract: the retiring source stops accepting new writes, while the remaining pools share physical capacity between foreground requests and migration. A reservation remains a migration budget and recovery ledger, not an exclusive foreground-write quota. Repair retains its existing conservative reservation admission policy.
+
+The existing durable metadata fence, valid active reservation checks, owner/mutation identity, pending-intent recovery, target write quorum and source-cleanup preflight remain required. Foreground writes do not acquire the mover's target I/O lock or settle its pending intent. Capacity estimates, including filesystem free-space deltas observed during migration, may include concurrent unrelated I/O; they are not proof of exclusive space or of a committed target object. Actual write failures and identity/quorum checks remain authoritative. Space loss can stop migration with the source retained, including after a target copy has committed. Capacity exhaustion can also fail foreground writes; this policy does not guarantee foreground priority or success. RustFS retains its existing capacity-blocked state and recovery behavior rather than changing terminal-state or retry semantics here.
+
+The native regression overlaps public PUT and multipart create/part replacement/complete/abort operations with a paused target rename on another node context, checks that foreground publication leaves the pending migration ledger unchanged, and then checks both sufficient-capacity cleanup and injected capacity loss with byte-for-byte retained source and target data. Mixed batch deletion covers marker publication on both reserved and unreserved healthy targets together with exact-version removal on the retiring source. Capacity is injected deterministically; the object and metadata operations use real temporary disks, not a physical disk-exhaustion test.
 
 ### Status Response Shape
 
-`GET /v3/pools/list` and `GET /v3/pools/status?pool=...` expose per-pool
-machine-readable decommission state. The `status` field can report `active`,
-`running`, `queued`, `complete`, `failed`, or `canceled`.
+`GET /v3/pools/list` and `GET /v3/pools/status?pool=...` expose per-pool machine-readable decommission state. The `status` field can report `active`, `running`, `queued`, `complete`, `failed`, or `canceled`.
 
 When decommission metadata is present, `decommissionInfo` includes:
 
 - queue and terminal flags: `queued`, `complete`, `failed`, `canceled`;
-- progress counters: `objectsDecommissioned`,
-  `objectsDecommissionedFailed`, `bytesDecommissioned`, and
-  `bytesDecommissionedFailed`;
+- progress counters: `objectsDecommissioned`, `objectsDecommissionedFailed`, `bytesDecommissioned`, and `bytesDecommissionedFailed`;
 - current location: `bucket`, `prefix`, and `object`;
 - queue/history lists: `queuedBuckets` and `decommissionedBuckets`;
-- `waitingReason`, currently `queued` for queued entries and
-  `waiting_for_worker` when metadata exists but no worker has started.
+- `waitingReason`: `capacity` while the pool is paused on target capacity,
+  `queued` for queued entries, and `waiting_for_worker` when metadata exists but
+  no worker has started;
+- `capacityBlockedReason`: the persisted detail for the active capacity pause,
+  absent once the pause clears.
 
-This makes queued pools and stalled metadata visible without requiring operators
-to inspect pool metadata files directly.
+A capacity pause is reported ahead of the worker states so operators can tell
+"contending but progressing" from "genuinely out of target capacity". The existing `pool.bin` layout is unchanged;
+cumulative pause history requires a separately versioned persistence contract.
+
+The object-attempt metrics count entry passes and repeated version-copy attempts
+within a listing and its deferred replay. Inline gate waits use the gate-retry
+counter. A new listing after a durable pause starts a new per-object observation;
+the maximum is the highest observation in the process, not a persisted lifetime
+attempt count.
+
+This makes queued pools and stalled metadata visible without requiring operators to inspect pool metadata files directly.
+
+### Scanner Backlog Replica Conflicts
+
+Native scanner CAS publication uses the storage-owned replica write path, not a
+direct write to a set selected from node-local pool state. On multi-pool stores,
+the fixed object namespace precedes the durable pool metadata read fence and
+the actual replica-set namespace. Admission excludes running, queued and
+completed sources; failed/canceled sources retain the scanner's existing
+membership-repair behavior. Missing pool metadata does not authorize a replica.
+Healthy reserved targets remain writable under the shared-capacity contract.
+
+The replica writer retains both outer guards in an owned task and waits for the
+rename tail, including when its caller is canceled. Lock-loss signals remain
+attached to the set commit. This does not require every disk to succeed or alter
+write quorum/fsync policy. Replica writes for this one internal key serialize
+through its fixed namespace; ordinary PUT/GET do not enter this writer. The
+scanner still requires CAS success on every surviving set before acknowledging
+a ledger generation, and retains its partial-commit recovery protocol.
+Older scanner writers still use direct set CAS; this source-publication fence
+requires updating every scanner-capable node. No new on-disk or wire format is
+introduced.
+
+The exact internal object `.rustfs.sys/buckets/.scanner-pause-backlog.json` is
+published with CAS to surviving sets. Its replica-local object modification
+times are not scanner ledger generations. A cross-pool migration receiving
+`PreconditionFailed` can therefore accept an existing unversioned replica with
+an identical known ETag, payload identity and metadata even when its write time
+differs. This exception does not apply to other keys, versioned objects, delete
+markers, missing identity evidence, or a different older ledger payload.
+
+The source is still revalidated under its mutation fence before migration.
+Existing capacity-owner and mutation checks reconcile the pending intent before
+source cleanup; the replica exception does not clear an unknown intent, rewrite
+the native target, or change the scanner's committed-membership selection.
 
 ## MinIO Divergence Decisions
 
-This section records the current product decisions for behavior that is close to
-MinIO but not always byte-for-byte identical.
+Behavior that is close to MinIO but not byte-for-byte identical. Changing either decision requires an operator compatibility note and updated characterization tests.
 
 ### Empty Delete Markers
 
-MinIO decommission documentation states that empty delete markers, meaning delete
-markers with no successor object versions, are not transitioned to another pool.
+MinIO decommission documentation states that empty delete markers (delete markers with no successor object versions) are not transitioned to another pool. RustFS follows that behavior for decommission when the bucket has no replication configuration: a lone remaining delete marker is cleanup-only metadata and is skipped. When replication is configured, RustFS keeps the delete marker eligible for movement so delete-marker replication and purge state are not lost.
 
-RustFS follows that behavior for decommission when the bucket has no replication
-configuration: a lone remaining delete marker is treated as cleanup-only metadata
-and is skipped. When replication is configured, RustFS intentionally keeps the
-delete marker eligible for movement so delete-marker replication and purge state
-are not lost.
-
-RustFS rebalance uses the same predicate as decommission: skip only a lone delete
-marker without replication. This is intentional even though MinIO's public
-documentation calls out the decommission case more explicitly than the rebalance
-case.
-
-Regression guards:
-
-- `should_skip_decommission_delete_marker_characterizes_empty_marker_without_replication`
-- `should_skip_decommission_delete_marker_characterizes_replication_configured`
-- `test_should_skip_rebalance_delete_marker_characterizes_empty_marker_without_replication`
-- `test_should_skip_rebalance_delete_marker_characterizes_replication_configured`
+Rebalance uses the same predicate as decommission (`should_skip_decommission_delete_marker` in `crates/ecstore/src/core/pools.rs`, `should_skip_rebalance_delete_marker` in `crates/ecstore/src/services/rebalance/worker.rs`), even though MinIO's public documentation calls out the decommission case more explicitly than the rebalance case.
 
 ### Lifecycle-Expired Versions During Cleanup
 
-MinIO decommission ignores versions that are already expired by lifecycle rules.
-RustFS follows that decommission behavior by allowing safely expired versions to
-count toward source cleanup completion.
+MinIO decommission ignores versions already expired by lifecycle rules. RustFS applies the same rule to decommission and rebalance: a source entry is cleanup-complete when moved versions plus safely expired versions equal the total version count (`should_cleanup_decommission_source_entry` in `crates/ecstore/src/core/pools.rs`, `should_cleanup_rebalance_source_entry` in `crates/ecstore/src/services/rebalance/worker.rs`). Versions retained by object lock or pending replication are not counted as safely expired by the callers, so an entry with such versions is retained. Both predicates accept an entry whose versions are all lifecycle-expired (`test_should_cleanup_decommission_source_entry_accepts_versions_only_safely_expired_by_lifecycle`, `test_should_cleanup_rebalance_source_entry_accepts_versions_only_expired_by_lifecycle`).
 
-RustFS rebalance is intentionally stricter. Expired versions do not prove that a
-target pool received an equivalent version, so rebalance cleanup requires actual
-rebalance completion for the source entry instead of treating lifecycle-expired
-versions as moved.
+## Tier Free Versions During Decommission
 
-Regression guards:
+A durable ILM record is not an ordinary configuration object. [ilm-tiering-persistence-contracts.md](ilm-tiering-persistence-contracts.md) owns the cross-protocol state, cleanup-owner, receipt, recovery, and mixed-version invariants; this section owns only how decommission preserves those invariants while moving data between pools.
 
-- `test_should_cleanup_decommission_source_entry_accepts_migrated_and_safely_expired_versions`
-- `test_should_cleanup_decommission_source_entry_accepts_versions_only_safely_expired_by_lifecycle`
-- `test_should_cleanup_rebalance_source_entry_rejects_versions_only_expired_by_lifecycle`
+A tier free version is an internal xl.meta record (`rustfs_filemeta::FREE_VERSION`, flagged `XL_FLAG_FREE_VERSION`) shaped like a delete marker. It is created by `MetaObject::init_free_version` when a version whose remote transition completed is deleted locally: the visible version is removed and the record keeps the remote-tier identity (tier, object name, version id, state, destination id) needed for an idempotent remote delete. Free versions are not user-visible versions; `num_versions` and all listing/GET paths exclude them.
 
-No migration step is required for these decisions because this note documents the
-current RustFS behavior. Changing either decision later requires an operator
-compatibility note and updated characterization tests.
+### Lifecycle And Consumers
 
-## Regression Guard
+Creation: a local delete that removes a version whose transition status is `complete` normally appends the record via `MetaObject::delete_version` → `init_free_version` (skipped only when `skip_tier_free_version` is set, as on data-movement copies). User-facing single and batch deletes always retain that historical owner when they actually remove a transitioned source; they do not create a tier journal, probe a fleet capability, or issue a peer mutation RPC. `TransitionVersionState::Unknown` and incomplete destination identities stay on the same conservative free-version path. Delete-marker creation on an Enabled bucket is unchanged and does not schedule remote deletion.
 
-The queued multi-pool contract is guarded by:
+Recursive prefix/delete-all cannot preserve per-object markers across its physical directory purge, so it requires a v6 recoverable journal for every transitioned visible source plus a durable dispatch manifest for the whole operation. It fails closed before mutation on legacy metadata or on any existing hidden tier free-version under the prefix. Its internal streaming walk discovers logical keys, then exact-loads every key from its authoritative set in every pool, including free versions; the S3 listing merge is never treated as a complete physical-owner inventory. Tier-operation leases stay held from that preflight through journal prepare and physical deletion. Once physical deletion starts, any error is mutation-ambiguous: authorized/dispatched journals remain for recovery to commit owners only after all physical sets prove both the source and the exact free-version identity absent; uncertain owners are retained. If a retry discovers a later transitioned source after the manifest reached `DispatchAuthorized`, it replays only the manifest's immutable predecessor set, completes that operation, and leaves the newcomer for a successor dispatch. Operators may retry after the legacy free-version worker has durably completed remote and local cleanup. Journal-less internal deletes and older nodes keep their established marker behavior.
 
-- `test_contextualized_decommission_start_request_allows_multiple_target_pools`
-- `test_decommission_start_local_leader_allows_remote_queued_pool`
-- `test_local_decommission_queue_prefix_stops_at_remote_leader`
-- `test_decommission_peer_target_returns_none_for_local_first_endpoint`
-- `test_pool_meta_queued_decommission_is_not_suspended_until_promoted`
-- `test_pool_meta_promoted_queued_decommission_can_be_canceled`
-- `test_first_resumable_decommission_queue_indices_stops_at_failed_or_canceled_state`
-- `test_first_resumable_decommission_queue_indices_allows_after_completed_prefix`
-- `admin_pool_list_item_exposes_queued_decommission_state`
+Consumption while the record exists: the background recovery loop started by `init_background_expiry` (spawned by `spawn_tier_free_version_recovery_once`, enabled by default) scans disks for pending records and re-enqueues them; the usage scanner does the same; the lifecycle worker then deletes the remote tier object idempotently and only afterwards removes the local record. Heal walks include free-version records in metadata healing. Transition planning, replication, restore, GET, listings, and usage aggregation never depend on them.
 
-These tests live in `crates/ecstore/src/core/pools.rs` and
-`rustfs/src/app/admin_usecase.rs`.
+### Decommission Handling
+
+The exact decommission inventory loader (`load_file_info_versions_exact` via `get_all_file_info_versions`) keeps free-version records inline in `versions`. The migration loop handles them before lifecycle expiry and delete-marker shortcuts. It selects a target pool using the free-version-aware lookup, then writes the original free record to every target disk with the normal metadata write quorum. The free-version marker, local version id, transition identity, transition state, and destination id are preserved at the FileInfo/metadata boundary.
+
+The source record is physically removed only after the target write quorum has committed and the source cleanup preflight still matches the exact inventory. If the lifecycle worker has already completed the remote delete and removed the source record before decommission acquires the source lock, decommission records that identity as already consumed and treats the missing source record as safe. If target capacity, metadata validation, lock fencing, or quorum fails, the source record remains and the entry records `state = "free_version_retained"` with reason `tier_free_version_migration_failed`; the worker retries the operation on a later pass. A target record with the same version id is accepted only when its free-version identity matches; a conflicting ordinary version or different free record is an overwrite error. This makes retries idempotent and prevents a free record from replacing a user-visible version.
+
+`TransitionVersionState::Unknown` records are migrated unchanged rather than discarded; the lifecycle worker retains them if remote identity validation cannot make a delete request. Only an authorized recursive prefix/delete-all v6 transaction may use a per-source journal as the sole retry source; ordinary single/batch deletes never take that path, and a journal discovered alongside an older or fallback free-version never authorizes dropping the xl.meta record.
+
+### Remote-Tuple Publication Fence
+
+Cross-pool capability v3 adds a commit-late publication contract for every path that can copy an existing transition tuple to a new physical owner. This capability version is independent of the tier-mutation RPC protocol version; a mixed fleet whose minimum cross-pool capability is below v3 cannot authorize journal-v6 remote deletion.
+
+Data movement captures a non-cloneable, process-local source capability before copying, but it does not hold a namespace write lock or tier-operation lease while reading a large body or uploading multipart parts (`NewMultipartUpload` and `UploadPart` are staging only). Immediately before single-PUT rename, Multipart Complete, or a pure-remote/free-version metadata quorum write, the final consumer acquires the exact tier generation (when a remote tuple exists), then the fixed/source/target write domains in stable order. The fixed domain is used only for a real remote-tuple decommission publisher; an ordinary local object keeps the lighter source/target commit scope.
+
+While that owned scope is held, the publisher re-reads the exact source pool and compares version, data directory, modification time, ETag, checksums, transition tuple, transition-version state, and destination identity. A missing or changed source, a changed or revoked tier generation, a bucket incarnation change, or a lost lock fails before target rename. The scope stays owned through rename quorum and the rename-tail guard handoff, so recovery-first ordering cannot delete the remote object and then let a stale restored-transitioned rebalance recreate its tuple, and publisher-first ordering makes recovery wait and rescan the newly committed owner.
+
+Full cross-key S3 Copy is not an ownership-sharing operation: it materializes local data and strips transition, destination, transaction, and free-version keys. Same-key metadata/version-only updates preserve the protected state. Admin heal keeps the legacy `nolock` request field for wire compatibility but ignores it as lock authority; final heal writes enter the normal locked path. Restore likewise ignores ambient `ObjectOptions.no_lock`, acquires its own commit-late PUT/Complete lock, validates the restore operation id, and keeps an exact tier generation lease through the local commit.
+
+### Tier Mutation Protocol And Journal v6 Rollout
+
+Tier edit/remove/clear reference proof uses the internal walk with `include_free_versions = true`, in addition to persisted journal and transition-transaction checks. Protocol v3 peer Prepare blocks new reference creators and drains existing tier-operation leases before this proof; protocol v4 preserves that state machine and adds a signed failure classification. Abort carries the canonical Prepare intent, so a peer can create an identity-bound `Aborted` tombstone even when Abort overtakes Prepare; a delayed matching Prepare then converges on `Aborted` instead of reinstalling the block, and a conflicting intent with the same mutation id fails closed. The tombstone stays durable until intent expiry plus the configured clock-skew allowance, including across reload and coordinator-record cleanup. After expiry, a missing-record replay of the original signed Prepare is rejected and cannot recreate a peer-only runtime fence. Abort checks an existing same-identity terminal record before consulting mutable current-config proof, and recovery reconstructs the original Prepared revision for Abort fanout.
+
+A new server accepts both v3 and v4 requests and selects the matching canonical response proof. During a mixed rollout an older v3 server rejects a v4 request with an authenticated, byte-exact unsupported-version status before dispatch; the v4 coordinator treats only that exact rejection as definitely-not-installed, fails the admin mutation, and does not send the peer an incompatible Abort. There is deliberately no automatic v3 retry: `Unimplemented`, near-text, timeouts, missing or unknown failure classes, and other ambiguous outcomes still receive Abort and retain the coordinator retry record if Abort cannot be proven. Operators must pause and drain tier edit/remove/clear operations before starting a rolling upgrade, leave them disabled while any v3-only peer remains, and resume only after every topology member advertises the v4-capable release. Ordinary object I/O and free-version cleanup stay available; `xl.meta` is unchanged by a rejected mutation.
+
+Sole-owner transactions use journal v6: v5-and-older readers reject and retain those records, so an old recovery worker cannot bypass the all-pool proof. Older nodes may keep creating fallback free-versions until the rollout is homogeneous. Do not downgrade every v6-aware recovery worker while any v6 record remains; drain the journal first or keep at least one v6-aware worker until cleanup converges.
+
+### Disposition Events
+
+Free versions remain internal, so no S3-visible version or admin response field is added. The structured `decommission_entry` events are the operational status surface:
+
+| Outcome | `state` | `reason` |
+|---|---|---|
+| Record migrated to the target pool | `free_version_migrated` | `tier_free_version_migrated` |
+| Record consumed by the lifecycle worker before migration | `free_version_consumed` | `tier_free_version_already_consumed` |
+| Migration failed, source retained for retry | `free_version_retained` | `tier_free_version_migration_failed` |
+
+The entry also emits a disposition summary with migrated, consumed, retained, and total counts. The final decommission sweep uses the exact loader, counts free records still present, and emits one retained record/reason per unresolved free version before failing the sweep. The existing decommission item/failed counters still report the enclosing object migration result.
+
+## Regression Guards
+
+Test names drift; locate the current guards instead of copying them:
+
+```bash
+rg -n 'fn [a-z_]*decommission[a-z_]*\(' crates/ecstore/src/core/pools.rs crates/ecstore/src/set_disk/mod.rs crates/ecstore/src/data_movement/mod.rs crates/ecstore/src/store/init.rs rustfs/src/admin/handlers/pools.rs rustfs/src/app/admin_usecase.rs
+rg -n 'fn test_should_[a-z_]*rebalance[a-z_]*\(' crates/ecstore/src/services/rebalance/rebalance_unit_tests.rs
+```

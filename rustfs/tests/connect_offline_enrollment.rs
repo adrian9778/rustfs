@@ -28,10 +28,10 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::RwLock;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
+use base64_simd::STANDARD as BASE64_STANDARD;
+use base64_simd::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
 use rustfs::connect::identity::DeviceIdentity;
 use rustfs::connect::offline::{EnrollmentError, OfflineEnrollment, VerifiedChallenge};
 use serde_json::Value;
@@ -46,12 +46,25 @@ const SPKI_PREFIX_HEX: &str = "3059301306072a8648ce3d020106082a8648ce3d030107034
 /// `clockSkew.toleranceSeconds` in `trust-model.json`.
 const SKEW_TOLERANCE_SECONDS: i64 = 300;
 
+/// Fixture reads use real descriptors, while the offline invariant below
+/// snapshots the process descriptor table. A write guard around that snapshot
+/// keeps parallel test fixture I/O from masquerading as network activity.
+static FIXTURE_ACCESS: RwLock<()> = RwLock::new(());
+
 // ---------------------------------------------------------------------------
 // Fixture access
 // ---------------------------------------------------------------------------
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../protocol/agent/v1/fixtures/offline-enrollment")
+}
+
+#[cfg(feature = "offline-enrollment-e2e-root")]
+fn e2e_fixture(name: &str) -> Vec<u8> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/offline-enrollment-e2e")
+        .join(name);
+    fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -66,6 +79,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// redefining what conformance means, which is the failure mode a
 /// fixture-driven suite is otherwise blind to.
 fn read_fixture(name: &str) -> Vec<u8> {
+    let _fixture_guard = FIXTURE_ACCESS.read().expect("fixture access lock");
     let dir = fixture_dir();
     let manifest = fs::read_to_string(dir.join("MANIFEST.sha256")).expect("read MANIFEST.sha256");
 
@@ -101,6 +115,10 @@ fn trust_model() -> Value {
     fixture_json("trust-model.json")
 }
 
+fn boundary_vectors() -> Value {
+    fixture_json("boundary-vectors.json")
+}
+
 fn vector_list(fixture: &Value) -> Vec<Value> {
     fixture["vectors"].as_array().expect("fixture carries a vector list").clone()
 }
@@ -125,7 +143,7 @@ fn envelope(document: &Value) -> Vec<u8> {
 /// The raw octets the signature covers, exactly as transmitted.
 fn signed_octets(document: &Value) -> Vec<u8> {
     BASE64_STANDARD
-        .decode(field(document, "bytes"))
+        .decode_to_vec(field(document, "bytes"))
         .expect("document bytes are padded base64")
 }
 
@@ -133,6 +151,75 @@ fn signed_octets(document: &Value) -> Vec<u8> {
 /// below; the implementation under test is required to verify before it parses.
 fn signed_document(document: &Value) -> Value {
     serde_json::from_slice(&signed_octets(document)).expect("signed document parses")
+}
+
+fn encoded_document(document: &Value) -> String {
+    BASE64_STANDARD.encode_to_string(serde_json::to_vec(document).expect("document serialises"))
+}
+
+fn apply_object_mutation(target: &mut Value, mutation: &Value) {
+    let object = target.as_object_mut().expect("mutation target is an object");
+    let name = field(mutation, "field");
+
+    match mutation["operation"].as_str().expect("mutation carries an operation") {
+        "remove" => {
+            object.remove(name);
+        }
+        "replace" => {
+            object.insert(name.to_string(), mutation["value"].clone());
+        }
+        operation => panic!("unsupported object mutation {operation}"),
+    }
+}
+
+fn boundary_artifact(source: &Value, mutation: &Value) -> Vec<u8> {
+    if field(mutation, "scope") == "serializedEnvelope" {
+        return field(mutation, "value").as_bytes().to_vec();
+    }
+
+    let mut result = source["document"].clone();
+    let scope = field(mutation, "scope");
+    if scope == "envelopeBytes" {
+        result["bytes"] = mutation["value"].clone();
+        return envelope(&result);
+    }
+    if scope == "envelopeSignature" {
+        apply_object_mutation(&mut result["signature"], mutation);
+        return envelope(&result);
+    }
+
+    let mut challenge = signed_document(&result);
+    match scope {
+        "challenge" => apply_object_mutation(&mut challenge, mutation),
+        "challengeChain" => {
+            let chain = challenge["trustChain"].as_array().expect("challenge carries a chain");
+            challenge["trustChain"] = match mutation["operation"].as_str().expect("chain mutation carries an operation") {
+                "keepFirst" => Value::Array(vec![chain[0].clone()]),
+                "objectWithFirst" => {
+                    let mut object = serde_json::Map::new();
+                    object.insert("first".to_string(), chain[0].clone());
+                    Value::Object(object)
+                }
+                operation => panic!("unsupported chain mutation {operation}"),
+            };
+        }
+        "trustLink" | "trustLinkSignature" => {
+            let index = mutation["index"].as_u64().expect("trust-link mutation carries an index") as usize;
+            let chain = challenge["trustChain"].as_array_mut().expect("challenge carries a chain");
+            let link_envelope = &mut chain[index];
+            if scope == "trustLinkSignature" {
+                apply_object_mutation(&mut link_envelope["signature"], mutation);
+            } else {
+                let mut link = signed_document(link_envelope);
+                apply_object_mutation(&mut link, mutation);
+                link_envelope["bytes"] = Value::String(encoded_document(&link));
+            }
+        }
+        other => panic!("unsupported boundary scope {other}"),
+    }
+
+    result["bytes"] = Value::String(encoded_document(&challenge));
+    envelope(&result)
 }
 
 fn unix(rfc3339: &str) -> i64 {
@@ -150,7 +237,9 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
 
 /// Turn a fixture's unpadded-base64url SEC1 point into a usable verifying key.
 fn verifying_key(sec1_base64url: &str) -> p256::ecdsa::VerifyingKey {
-    let point = BASE64_URL_NO_PAD.decode(sec1_base64url).expect("public key is base64url");
+    let point = BASE64_URL_NO_PAD
+        .decode_to_vec(sec1_base64url)
+        .expect("public key is base64url");
     assert_eq!(point.len(), 65, "the protocol freezes a 65 octet uncompressed SEC1 point");
 
     let mut der = hex_to_bytes(SPKI_PREFIX_HEX);
@@ -207,7 +296,7 @@ fn answered_challenge(response_vector: &Value) -> (Value, VerifiedChallenge) {
 
 fn device_nonce_of(document: &Value) -> [u8; 32] {
     let raw = BASE64_URL_NO_PAD
-        .decode(field(&signed_document(document), "deviceNonce"))
+        .decode_to_vec(field(&signed_document(document), "deviceNonce"))
         .expect("deviceNonce is base64url");
     raw.try_into().expect("replay.nonceLengthBytes freezes a 32 octet nonce")
 }
@@ -266,6 +355,120 @@ fn every_challenge_accept_vector_verifies_and_exposes_the_signed_fields() {
         verified_count, 3,
         "accept-vectors.json publishes three challenge vectors; a fourth is a protocol change"
     );
+}
+
+#[test]
+fn malformed_top_level_signature_members_keep_the_frozen_reason() {
+    let vector = accept_vector_named("challenge signed by a chained signing key under the pinned root");
+    let now = unix(field(&vector, "evaluationTime"));
+
+    for (member, malformed) in [
+        ("algorithm", serde_json::json!(1)),
+        ("keyId", serde_json::Value::Null),
+        ("value", serde_json::json!([])),
+    ] {
+        let mut document = vector["document"].clone();
+        document["signature"][member] = malformed;
+
+        let error = OfflineEnrollment::verify_challenge(&envelope(&document), now)
+            .expect_err(&format!("a malformed top-level signature {member} must be refused"));
+        assert_eq!(
+            error.reason(),
+            "SIGNATURE_MALFORMED",
+            "a malformed top-level signature {member} keeps the frozen classifier"
+        );
+    }
+}
+
+#[test]
+fn duplicate_top_level_signature_members_are_refused() {
+    let vector = accept_vector_named("challenge signed by a chained signing key under the pinned root");
+    let document = String::from_utf8(envelope(&vector["document"])).expect("envelope is UTF-8 JSON");
+    let duplicate = document.replacen("\"algorithm\":\"ES256\"", "\"algorithm\":\"ES384\",\"algorithm\":\"ES256\"", 1);
+    assert_ne!(duplicate, document, "the accepted vector carries the expected algorithm");
+
+    let error = OfflineEnrollment::verify_challenge(duplicate.as_bytes(), unix(field(&vector, "evaluationTime")))
+        .expect_err("a duplicate top-level signature member must be refused");
+    assert_eq!(error.reason(), "DOCUMENT_MALFORMED");
+}
+
+#[cfg(feature = "offline-enrollment-e2e-root")]
+#[test]
+fn e2e_root_is_fixed_and_disjoint_from_the_hosted_root() {
+    let challenge = e2e_fixture("challenge.json");
+    let now = unix("2099-01-01T00:00:00Z");
+
+    let verified =
+        OfflineEnrollment::verify_e2e_challenge(&challenge, now).expect("the dedicated E2E root verifies its challenge");
+    assert_eq!(verified.challenge_id, "018f7e6d-9d6a-7d93-8f64-8b20b3384712");
+    assert_eq!(
+        OfflineEnrollment::verify_challenge(&challenge, now)
+            .expect_err("the production verifier must not trust the E2E root")
+            .reason(),
+        "ENROLLMENT_ROOT_UNKNOWN"
+    );
+
+    let hosted = accept_vector_named("challenge signed by a chained signing key under the pinned root");
+    let hosted_now = unix(field(&hosted, "evaluationTime"));
+    assert_eq!(
+        OfflineEnrollment::verify_e2e_challenge(&envelope(&hosted["document"]), hosted_now)
+            .expect_err("the E2E verifier must not silently retain the hosted root")
+            .reason(),
+        "ENROLLMENT_ROOT_UNKNOWN"
+    );
+}
+
+#[cfg(feature = "offline-enrollment-e2e-root")]
+#[test]
+fn e2e_public_chain_matches_the_challenge_and_every_signature_verifies() {
+    use p256::ecdsa::signature::Verifier as _;
+
+    let root: Value = serde_json::from_slice(&e2e_fixture("root.json")).expect("E2E root parses");
+    let chain_bytes = e2e_fixture("trust-chain.json");
+    let chain: Value = serde_json::from_slice(&chain_bytes).expect("E2E chain parses");
+    let challenge_envelope: Value = serde_json::from_slice(&e2e_fixture("challenge.json")).expect("E2E challenge parses");
+    let challenge_bytes = signed_octets(&challenge_envelope);
+    let challenge: Value = serde_json::from_slice(&challenge_bytes).expect("signed E2E challenge parses");
+
+    assert_eq!(challenge["trustChain"], chain, "the independent and embedded chain JSON must match");
+    let compact_chain = chain_bytes
+        .strip_suffix(b"\n")
+        .expect("the chain fixture has one final newline");
+    assert!(
+        challenge_bytes
+            .windows(compact_chain.len())
+            .any(|window| window == compact_chain),
+        "the signed challenge must embed the independent chain byte for byte"
+    );
+
+    let mut issuer = verifying_key(field(&root, "publicKey"));
+    let mut issuer_id = field(&root, "keyId").to_owned();
+    for link in chain.as_array().expect("E2E chain is a list") {
+        assert_eq!(field(&link["signature"], "keyId"), issuer_id.as_str());
+        let signature = BASE64_URL_NO_PAD
+            .decode_to_vec(field(&link["signature"], "value"))
+            .expect("trust-link signature is base64url");
+        issuer
+            .verify(
+                &signing_input("rustfs-offline-trust-link-v1", &signed_octets(link)),
+                &p256::ecdsa::Signature::from_slice(&signature).expect("trust-link signature parses"),
+            )
+            .expect("trust-link signature verifies");
+        let document = signed_document(link);
+        issuer_id = field(&document, "subjectKeyId").to_owned();
+        issuer = verifying_key(field(&document, "subjectPublicKey"));
+    }
+
+    assert_eq!(field(&challenge, "connectKeyId"), issuer_id.as_str());
+    let signature = BASE64_URL_NO_PAD
+        .decode_to_vec(field(&challenge_envelope["signature"], "value"))
+        .expect("challenge signature is base64url");
+    issuer
+        .verify(
+            &signing_input("rustfs-offline-enrollment-challenge-v1", &challenge_bytes),
+            &p256::ecdsa::Signature::from_slice(&signature).expect("challenge signature parses"),
+        )
+        .expect("challenge signature verifies");
 }
 
 /// Connect's own producer wrote the response accept vectors. Rebuilding them
@@ -384,6 +587,124 @@ fn every_challenge_reject_vector_fails_with_its_frozen_reason() {
     );
 }
 
+#[test]
+fn every_challenge_boundary_mutation_fails_with_its_frozen_reason() {
+    let boundaries = boundary_vectors();
+    let source = accept_vector_named(field(&boundaries, "sourceVector"));
+    let now = unix(field(&source, "evaluationTime"));
+    let mut covered = 0usize;
+
+    for group in ["preparseMutations", "verificationMutations"] {
+        for mutation in boundaries[group].as_array().expect("boundary group is a list") {
+            let name = field(mutation, "name");
+            let expected = field(mutation, "expectedReason");
+            let error = match OfflineEnrollment::verify_challenge(&boundary_artifact(&source, mutation), now) {
+                Err(error) => error,
+                Ok(_) => panic!("boundary mutation '{name}' must fail"),
+            };
+            assert_eq!(error.reason(), expected, "boundary mutation '{name}'");
+            covered += 1;
+        }
+    }
+
+    assert_eq!(covered, 16, "boundary-vectors.json publishes sixteen executable challenge mutations");
+}
+
+#[test]
+fn malformed_top_level_signature_precedes_malformed_first_link_routing() {
+    let source = accept_vector_named("challenge signed by a chained signing key under the pinned root");
+    let now = unix(field(&source, "evaluationTime"));
+    let mut challenge_envelope = source["document"].clone();
+    challenge_envelope["signature"]["algorithm"] = Value::String("ES384".to_string());
+
+    let mut challenge = signed_document(&challenge_envelope);
+    let first_envelope = &mut challenge["trustChain"].as_array_mut().expect("challenge carries a chain")[0];
+    let mut first_link = signed_document(first_envelope);
+    first_link["issuerKeyId"] = Value::String("not-a-key-id".to_string());
+    first_envelope["bytes"] = Value::String(encoded_document(&first_link));
+    challenge_envelope["bytes"] = Value::String(encoded_document(&challenge));
+
+    let error = OfflineEnrollment::verify_challenge(&envelope(&challenge_envelope), now)
+        .expect_err("a malformed top-level signature and first-link issuer must not verify");
+    assert_eq!(error.reason(), "SIGNATURE_MALFORMED");
+}
+
+#[test]
+fn malformed_top_level_signature_precedes_malformed_second_link_envelope() {
+    let source = accept_vector_named("challenge signed by a chained signing key under the pinned root");
+    let now = unix(field(&source, "evaluationTime"));
+    let mut challenge_envelope = source["document"].clone();
+    challenge_envelope["signature"]["algorithm"] = Value::String("ES384".to_string());
+
+    let mut challenge = signed_document(&challenge_envelope);
+    challenge["trustChain"].as_array_mut().expect("challenge carries a chain")[1]
+        .as_object_mut()
+        .expect("trust link envelope is an object")
+        .remove("signature");
+    challenge_envelope["bytes"] = Value::String(encoded_document(&challenge));
+
+    let error = OfflineEnrollment::verify_challenge(&envelope(&challenge_envelope), now)
+        .expect_err("a malformed top-level signature and second-link envelope must not verify");
+    assert_eq!(error.reason(), "SIGNATURE_MALFORMED");
+}
+
+#[test]
+fn unpinned_root_precedes_a_malformed_chain_shape() {
+    let source = accept_vector_named("challenge signed by a chained signing key under the pinned root");
+    let now = unix(field(&source, "evaluationTime"));
+    let mut challenge_envelope = source["document"].clone();
+    let mut challenge = signed_document(&challenge_envelope);
+    let first_envelope = &mut challenge["trustChain"].as_array_mut().expect("challenge carries a chain")[0];
+    let mut first_link = signed_document(first_envelope);
+    first_link.as_object_mut().expect("trust link is an object").remove("serial");
+    first_link["issuerKeyId"] = Value::String("5ff37910aa4d69949e2c488f98d6072f10a3c3e73d776698963872582644f731".to_string());
+    first_envelope["bytes"] = Value::String(encoded_document(&first_link));
+    challenge_envelope["bytes"] = Value::String(encoded_document(&challenge));
+
+    let error =
+        OfflineEnrollment::verify_challenge(&envelope(&challenge_envelope), now).expect_err("an unpinned root must never verify");
+    assert_eq!(
+        error.reason(),
+        "ENROLLMENT_ROOT_UNKNOWN",
+        "the pinned-root decision must precede the rest of the attacker-controlled chain shape"
+    );
+}
+
+#[test]
+fn response_production_honours_the_frozen_effective_challenge_expiry() {
+    let key = DeviceIdentity::generate();
+    let boundaries = boundary_vectors();
+    let mut covered = 0usize;
+
+    for vector in boundaries["postSignaturePolicyVectors"]
+        .as_array()
+        .expect("post-signature policy vectors are a list")
+    {
+        let name = field(vector, "name");
+        let challenge = VerifiedChallenge {
+            challenge_id: "018f7e6d-9d6a-7d93-8f64-8b20b3384712".to_string(),
+            organization_name: "organizations/01HZXQ9J2XW6R7V8T9Y0Z1A2B3".to_string(),
+            cluster_name: "organizations/01HZXQ9J2XW6R7V8T9Y0Z1A2B3/clusters/01HZXQ9J2XW6R7V8T9Y0Z1A2B4".to_string(),
+            nonce: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            issued_at: field(vector, "issuedAt").to_string(),
+            expires_at: field(vector, "declaredExpiresAt").to_string(),
+            connect_key_id: "08e7295c8f9d043e22b2b80fdb1480b0bec060dacbce7de9dd2e3d583f93d7e8".to_string(),
+            challenge_proof: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        };
+        let outcome = OfflineEnrollment::build_response(&challenge, &key, &[0x5a; 32], unix(field(vector, "evaluationTime")));
+
+        match vector["expectedReason"].as_str() {
+            Some(expected) => assert_eq!(outcome.unwrap_err().reason(), expected, "post-signature policy vector '{name}'"),
+            None => {
+                outcome.unwrap_or_else(|error| panic!("post-signature policy vector '{name}' must pass: {}", error.reason()));
+            }
+        }
+        covered += 1;
+    }
+
+    assert_eq!(covered, 2, "boundary-vectors.json publishes two effective-expiry vectors");
+}
+
 /// The response reject vectors are artifacts Connect refuses. This side never
 /// verifies a response, so the device-side statement is the stronger one: given
 /// the challenge each vector answers, `build_response` must not be capable of
@@ -484,7 +805,7 @@ fn response_reject_vectors_are_artifacts_build_response_cannot_emit() {
 
                         let presented = verifying_key(field(&refused, "devicePublicKey"));
                         let raw = BASE64_URL_NO_PAD
-                            .decode(field(&vector["document"]["signature"], "value"))
+                            .decode_to_vec(field(&vector["document"]["signature"], "value"))
                             .expect("signature is base64url");
                         let signature = p256::ecdsa::Signature::from_slice(&raw).expect("signature parses");
                         assert!(
@@ -598,8 +919,12 @@ fn malleated_high_s_signature_is_refused_although_it_verifies_mathematically() {
     let malleated_value = field(&malleated, "value").to_string();
     assert_ne!(genuine_value, malleated_value, "the malleation must be a different encoding");
 
-    let genuine = BASE64_URL_NO_PAD.decode(&genuine_value).expect("signature is base64url");
-    let raw = BASE64_URL_NO_PAD.decode(&malleated_value).expect("signature is base64url");
+    let genuine = BASE64_URL_NO_PAD
+        .decode_to_vec(&genuine_value)
+        .expect("signature is base64url");
+    let raw = BASE64_URL_NO_PAD
+        .decode_to_vec(&malleated_value)
+        .expect("signature is base64url");
     assert_eq!(raw.len(), 64, "the malleation is well formed at 64 octets");
     assert_eq!(raw[..32], genuine[..32], "the malleation shares r with the genuine signature");
     assert_ne!(raw[32..], genuine[32..], "the malleation replaces s with n - s");
@@ -607,7 +932,7 @@ fn malleated_high_s_signature_is_refused_although_it_verifies_mathematically() {
     // Step one: the malleated pair really does verify under the signing key, so
     // a verifier cannot be excused for accepting it on mathematical grounds.
     let signature = p256::ecdsa::Signature::from_slice(&raw).expect("the malleated signature parses");
-    assert!(signature.normalize_s().is_some(), "the malleated signature must be the high-S form");
+    assert_ne!(signature.normalize_s(), signature, "the malleated signature must be the high-S form");
     let key = verifying_key(field(&published_key("signing"), "publicKey"));
     let input = signing_input(&domain_tag("enrollmentChallenge"), &signed_octets(&vector["document"]));
     key.verify(&input, &signature)
@@ -710,11 +1035,12 @@ fn assert_response_proves_possession(built_envelope: &Value, label: &str) {
         "{label}: the signature must use the base64url alphabet with no padding"
     );
 
-    let bytes = BASE64_URL_NO_PAD.decode(value).expect("signature is base64url");
+    let bytes = BASE64_URL_NO_PAD.decode_to_vec(value).expect("signature is base64url");
     assert_eq!(bytes.len(), 64, "{label}: the signature is a fixed-width r || s");
     let signature = p256::ecdsa::Signature::from_slice(&bytes).expect("signature parses");
-    assert!(
-        signature.normalize_s().is_none(),
+    assert_eq!(
+        signature.normalize_s(),
+        signature,
         "{label}: this side must never emit the malleated high-S form it refuses to accept"
     );
 
@@ -727,7 +1053,7 @@ fn assert_response_proves_possession(built_envelope: &Value, label: &str) {
     // SubjectPublicKeyInfo, not of the bare point and not of the transfer
     // encoding.
     let mut spki = hex_to_bytes(SPKI_PREFIX_HEX);
-    spki.extend_from_slice(&BASE64_URL_NO_PAD.decode(presented).expect("public key is base64url"));
+    spki.extend_from_slice(&BASE64_URL_NO_PAD.decode_to_vec(presented).expect("public key is base64url"));
     let fingerprint = sha256_hex(&spki);
     assert_eq!(
         field(&built, "deviceKeyId"),
@@ -771,12 +1097,12 @@ fn built_response_binds_the_challenge_proof_and_proves_possession_of_the_device_
 
     assert_eq!(
         field(&built, "devicePublicKey"),
-        BASE64_URL_NO_PAD.encode(&key.public_key_der()[hex_to_bytes(SPKI_PREFIX_HEX).len()..]),
+        BASE64_URL_NO_PAD.encode_to_string(&key.public_key_der()[hex_to_bytes(SPKI_PREFIX_HEX).len()..]),
         "the presented key must be the key that was passed in"
     );
     assert_eq!(
         field(&built, "deviceNonce"),
-        BASE64_URL_NO_PAD.encode([0x11; 32]),
+        BASE64_URL_NO_PAD.encode_to_string([0x11; 32]),
         "the device nonce must be the one that was passed in"
     );
     assert!(field(&built, "producedAt").ends_with('Z'), "producedAt is a UTC RFC 3339 instant");
@@ -813,8 +1139,8 @@ fn built_response_carries_no_private_key_material() {
     for (description, needle) in [
         ("the PKCS#8 encoding", pkcs8.to_vec()),
         ("the raw private scalar", scalar.to_vec()),
-        ("the scalar in base64url", BASE64_URL_NO_PAD.encode(scalar).into_bytes()),
-        ("the scalar in standard base64", BASE64_STANDARD.encode(scalar).into_bytes()),
+        ("the scalar in base64url", BASE64_URL_NO_PAD.encode_to_string(scalar).into_bytes()),
+        ("the scalar in standard base64", BASE64_STANDARD.encode_to_string(scalar).into_bytes()),
         ("the scalar in hex", scalar_hex.into_bytes()),
     ] {
         assert!(
@@ -826,7 +1152,7 @@ fn built_response_carries_no_private_key_material() {
     // The public half must be there, so the absence above is a statement about
     // what was excluded rather than about a haystack that would not have found
     // the private half either.
-    let point = BASE64_URL_NO_PAD.encode(&key.public_key_der()[hex_to_bytes(SPKI_PREFIX_HEX).len()..]);
+    let point = BASE64_URL_NO_PAD.encode_to_string(&key.public_key_der()[hex_to_bytes(SPKI_PREFIX_HEX).len()..]);
     assert!(
         haystack.windows(point.len()).any(|window| window == point.as_bytes()),
         "the response must still present the public key"
@@ -856,6 +1182,7 @@ fn enrollment_opens_no_descriptor_and_is_a_pure_byte_transform() {
     let document = envelope(&vector["document"]);
     let now = unix(field(&vector, "evaluationTime"));
     let key = DeviceIdentity::generate();
+    let _fixture_guard = FIXTURE_ACCESS.write().expect("fixture access lock");
 
     // Warm anything the test harness itself lazily opens before the baseline.
     let _ = open_descriptors();

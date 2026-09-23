@@ -13,17 +13,20 @@
 // limitations under the License.
 
 use crate::common::{
-    RustFSTestEnvironment, admin_create_user, awscurl_available, awscurl_post_sts_form_urlencoded, init_logging,
-    local_http_client, replication_fast_env, rustfs_binary_path, signed_request, signed_request_with_client,
-    signed_request_with_session_token,
+    AdminTransport, RustFSTestEnvironment, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user,
+    awscurl_post_sts_form_urlencoded, init_logging, local_http_client, replication_fast_env, rustfs_binary_path, signed_request,
+    signed_request_with_client, signed_request_with_session_token,
 };
 use crate::fake_s3_target::{
     FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FaultAction as FakeTargetFault, Operation as FakeTargetOperation,
     RequestRecord,
 };
-use crate::kms::common::{create_key_with_specific_id, sse_customer_key_md5_base64};
+use crate::kms::common::{
+    SSE_C_KEY_MISMATCH_MESSAGE, SSE_C_MISSING_PARAMETERS_MESSAGE, assert_s3_error, create_key_with_specific_id,
+    sse_customer_key_md5_base64,
+};
 use crate::storage_api::replication_extension::BucketTargetSys;
-use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
 use aws_sdk_s3::primitives::ByteStream;
@@ -31,8 +34,7 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, DeleteMarkerEntry, ObjectVersion, ServerSideEncryption,
     VersioningConfiguration,
 };
-use aws_sdk_s3::{Client, Config};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64_simd::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use futures::{Stream, StreamExt};
@@ -57,7 +59,7 @@ use rustfs_madmin::{
     AddServiceAccountReq, ListServiceAccountsResp, PeerInfo, PeerSite, ReplicateAddStatus, ReplicateEditStatus,
     ReplicateRemoveStatus, SRRemoveReq, SRResyncOpStatus, SRStatusInfo, SiteReplicationInfo, SyncStatus,
 };
-use s3s::header::X_AMZ_REPLICATION_STATUS;
+use s3s::header::{X_AMZ_REPLICATION_STATUS, X_AMZ_TAGGING};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -67,7 +69,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::fs;
 use tokio::net::TcpListener;
@@ -84,7 +86,7 @@ type BacklogMetricPoints = Arc<Mutex<BTreeMap<String, BTreeMap<String, (u64, f64
 /// default. This suite opts its source servers into the loopback allowance explicitly
 /// so the shared harness (`RustFSTestEnvironment` / the cluster harness) stays
 /// fail-closed and every other e2e scenario keeps exercising the production SSRF policy.
-const LOOPBACK_REPLICATION_TARGET_ENV: &[(&str, &str)] = &[("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true")];
+pub(crate) const LOOPBACK_REPLICATION_TARGET_ENV: &[(&str, &str)] = &[("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true")];
 
 /// Short data-scanner cycle for the failure-recovery tests (backlog#1147 repl-5).
 ///
@@ -366,23 +368,23 @@ impl Drop for SlowReplicationTargetGuard {
 // Mirrors madmin-go `ResyncTargetsInfo`/`ResyncTarget` json tags — the same
 // shape `mc replicate resync status` decodes.
 #[derive(Debug, Clone, serde::Deserialize)]
-struct ReplicationResetStatusResponse {
+pub(crate) struct ReplicationResetStatusResponse {
     #[serde(rename = "target", default)]
-    targets: Vec<ReplicationResetStatusTarget>,
+    pub(crate) targets: Vec<ReplicationResetStatusTarget>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-struct ReplicationResetStatusTarget {
+pub(crate) struct ReplicationResetStatusTarget {
     #[serde(rename = "arn", default)]
-    arn: String,
+    pub(crate) arn: String,
     #[serde(rename = "resetid", default)]
-    reset_id: String,
+    pub(crate) reset_id: String,
     #[serde(rename = "resyncStatus", default)]
-    status: String,
+    pub(crate) status: String,
     #[serde(rename = "replicationCount", default)]
-    replicated_count: i64,
+    pub(crate) replicated_count: i64,
     #[serde(rename = "object", default)]
-    object: String,
+    pub(crate) object: String,
 }
 
 fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
@@ -400,14 +402,14 @@ fn parse_assume_role_credentials(xml: &str) -> Result<(String, String, String), 
     Ok((access_key, secret_key, session_token))
 }
 
-struct ReplicationTargetOptions<'a> {
-    endpoint: &'a str,
-    access_key: &'a str,
-    secret_key: &'a str,
-    target_bucket: &'a str,
-    secure: bool,
-    skip_tls_verify: bool,
-    ca_cert_pem: Option<&'a str>,
+pub(crate) struct ReplicationTargetOptions<'a> {
+    pub(crate) endpoint: &'a str,
+    pub(crate) access_key: &'a str,
+    pub(crate) secret_key: &'a str,
+    pub(crate) target_bucket: &'a str,
+    pub(crate) secure: bool,
+    pub(crate) skip_tls_verify: bool,
+    pub(crate) ca_cert_pem: Option<&'a str>,
 }
 
 async fn set_replication_target(
@@ -432,7 +434,7 @@ async fn set_replication_target(
     .await
 }
 
-async fn set_replication_target_with_options(
+pub(crate) async fn set_replication_target_with_options(
     source_env: &RustFSTestEnvironment,
     source_bucket: &str,
     options: ReplicationTargetOptions<'_>,
@@ -502,7 +504,7 @@ async fn send_set_replication_target_request(
     .await
 }
 
-async fn put_bucket_replication(
+pub(crate) async fn put_bucket_replication(
     env: &RustFSTestEnvironment,
     bucket: &str,
     target_arn: &str,
@@ -510,7 +512,7 @@ async fn put_bucket_replication(
     put_bucket_replication_with_delete_statuses(env, bucket, target_arn, "Enabled", None).await
 }
 
-async fn put_bucket_replication_with_delete_statuses(
+pub(crate) async fn put_bucket_replication_with_delete_statuses(
     env: &RustFSTestEnvironment,
     bucket: &str,
     target_arn: &str,
@@ -625,7 +627,7 @@ async fn put_bucket_replication_rules(
     Ok(())
 }
 
-async fn delete_bucket_replication(
+pub(crate) async fn delete_bucket_replication(
     env: &RustFSTestEnvironment,
     bucket: &str,
 ) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
@@ -641,7 +643,10 @@ async fn get_bucket_replication(
     signed_request(http::Method::GET, &url, &env.access_key, &env.secret_key, None, None).await
 }
 
-async fn enable_bucket_versioning(env: &RustFSTestEnvironment, bucket: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub(crate) async fn enable_bucket_versioning(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     set_bucket_versioning(env, bucket, BucketVersioningStatus::Enabled).await
 }
 
@@ -893,15 +898,7 @@ async fn wait_for_replicated_object_over_https(
 }
 
 fn create_user_s3_client(env: &RustFSTestEnvironment, access_key: &str, secret_key: &str) -> Client {
-    let credentials = Credentials::new(access_key, secret_key, None, None, "e2e-site-replication");
-    let config = Config::builder()
-        .credentials_provider(credentials)
-        .region(Region::new("us-east-1"))
-        .endpoint_url(&env.url)
-        .force_path_style(true)
-        .behavior_version_latest()
-        .build();
-    Client::from_conf(config)
+    env.create_s3_client_with_credentials(access_key, secret_key)
 }
 
 async fn admin_add_canned_policy(
@@ -909,24 +906,15 @@ async fn admin_add_canned_policy(
     policy_name: &str,
     policy: &serde_json::Value,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let url = format!("{}/rustfs/admin/v3/add-canned-policy?name={}", env.url, policy_name);
-    let response = signed_request(
-        http::Method::PUT,
-        &url,
+    admin_add_canned_policy_via(
+        AdminTransport::Signed,
+        &env.url,
         &env.access_key,
         &env.secret_key,
-        Some(policy.to_string().into_bytes()),
-        Some("application/json"),
+        policy_name,
+        &policy.to_string(),
     )
-    .await?;
-
-    if response.status() != StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("add canned policy failed: {status} {body}").into());
-    }
-
-    Ok(())
+    .await
 }
 
 async fn admin_attach_policy_to_user(
@@ -934,19 +922,7 @@ async fn admin_attach_policy_to_user(
     policy_name: &str,
     username: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let url = format!(
-        "{}/rustfs/admin/v3/set-user-or-group-policy?policyName={}&userOrGroup={}&isGroup=false",
-        env.url, policy_name, username
-    );
-    let response = signed_request(http::Method::PUT, &url, &env.access_key, &env.secret_key, Some(Vec::new()), None).await?;
-
-    if response.status() != StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("attach policy to user failed: {status} {body}").into());
-    }
-
-    Ok(())
+    admin_attach_user_policy_via(AdminTransport::Signed, &env.url, &env.access_key, &env.secret_key, policy_name, username).await
 }
 
 async fn admin_update_group_members(
@@ -1242,7 +1218,7 @@ async fn wait_for_source_replication_pending_or_failed(
 }
 
 async fn wait_for_source_replication_status(client: &Client, bucket: &str, key: &str, expected: &str, ssec: bool) -> TestResult {
-    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
     let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
     let wait = async {
         loop {
@@ -1337,7 +1313,7 @@ async fn assert_failed_replication_stays_absent_for(
     ssec: bool,
     duration: Duration,
 ) -> TestResult {
-    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
     let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
     let wait = async {
         let deadline = tokio::time::Instant::now() + duration;
@@ -1939,6 +1915,21 @@ async fn site_replication_info(env: &RustFSTestEnvironment) -> Result<SiteReplic
     Ok(serde_json::from_slice(&response.bytes().await?)?)
 }
 
+async fn site_replication_rotate_svc_acct(
+    env: &RustFSTestEnvironment,
+) -> Result<ReplicateEditStatus, Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/rustfs/admin/v3/site-replication/rotate-svc-acct", env.url);
+    let response = signed_request(http::Method::POST, &url, &env.access_key, &env.secret_key, None, None).await?;
+
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("site replication rotate-svc-acct failed: {status} {body}").into());
+    }
+
+    Ok(serde_json::from_slice(&response.bytes().await?)?)
+}
+
 async fn site_replication_resync_op(
     env: &RustFSTestEnvironment,
     operation: &str,
@@ -2017,12 +2008,95 @@ fn proxy_error_response(error: impl std::fmt::Display) -> Response<Full<bytes::B
         .expect("static proxy response must be valid")
 }
 
+#[derive(Clone)]
+struct ReplicationResponseHoldRuntime {
+    armed: Arc<AtomicBool>,
+    backend_committed: watch::Sender<bool>,
+    release: watch::Receiver<bool>,
+}
+
+impl ReplicationResponseHoldRuntime {
+    fn try_claim(&self) -> bool {
+        self.armed
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
+struct ReplicationResponseHold {
+    armed: Arc<AtomicBool>,
+    backend_committed_signal: watch::Sender<bool>,
+    backend_committed: watch::Receiver<bool>,
+    release: watch::Sender<bool>,
+}
+
+impl ReplicationResponseHold {
+    fn arm(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if self.armed.load(Ordering::Acquire) {
+            return Err("replication response hold was already armed".into());
+        }
+        self.backend_committed_signal
+            .send(false)
+            .map_err(|_| "replication response hold closed before rearming")?;
+        self.release
+            .send(false)
+            .map_err(|_| "replication response hold closed before rearming")?;
+        self.armed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "replication response hold was already armed")?;
+        Ok(())
+    }
+
+    async fn wait_for_backend_commit(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let wait = async {
+            while !*self.backend_committed.borrow() {
+                self.backend_committed
+                    .changed()
+                    .await
+                    .map_err(|_| "replication response hold closed before the backend committed")?;
+            }
+            Ok::<(), Box<dyn Error + Send + Sync>>(())
+        };
+        timeout(Duration::from_secs(60), wait)
+            .await
+            .map_err(|_| "timed out waiting for the replication backend to commit")?
+    }
+
+    fn release(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.release
+            .send(true)
+            .map_err(|_| "replication response hold closed before release")?;
+        Ok(())
+    }
+}
+
+fn replication_response_hold() -> (ReplicationResponseHoldRuntime, ReplicationResponseHold) {
+    let armed = Arc::new(AtomicBool::new(false));
+    let (backend_committed, backend_committed_rx) = watch::channel(false);
+    let (release, release_rx) = watch::channel(false);
+    (
+        ReplicationResponseHoldRuntime {
+            armed: armed.clone(),
+            backend_committed: backend_committed.clone(),
+            release: release_rx,
+        },
+        ReplicationResponseHold {
+            armed,
+            backend_committed_signal: backend_committed,
+            backend_committed: backend_committed_rx,
+            release,
+        },
+    )
+}
+
 async fn forward_replication_proxy_request(
     request: Request<Incoming>,
     backend_url: &str,
     client: &reqwest::Client,
     request_count: &AtomicU64,
     mut replication_enabled: watch::Receiver<bool>,
+    mut held_tagging: watch::Receiver<Option<String>>,
+    mut response_hold: ReplicationResponseHoldRuntime,
 ) -> Response<Full<bytes::Bytes>> {
     let (parts, body) = request.into_parts();
     let is_replication = parts
@@ -2036,7 +2110,19 @@ async fn forward_replication_proxy_request(
                 return proxy_error_response("replication gate closed");
             }
         }
+        // Content-keyed hold: park only the replication request whose
+        // `x-amz-tagging` matches the held value, letting every other delivery
+        // through, so a test can make one specific (stale) delivery the last
+        // write the backend sees.
+        if let Some(tagging) = parts.headers.get(X_AMZ_TAGGING).and_then(|value| value.to_str().ok()) {
+            while held_tagging.borrow().as_deref() == Some(tagging) {
+                if held_tagging.changed().await.is_err() {
+                    return proxy_error_response("replication tag hold closed");
+                }
+            }
+        }
     }
+    let hold_response = is_replication && parts.method == http::Method::PUT && response_hold.try_claim();
 
     let Some(path_and_query) = parts.uri.path_and_query() else {
         return proxy_error_response("request URI omitted path");
@@ -2059,6 +2145,16 @@ async fn forward_replication_proxy_request(
         Ok(body) => body,
         Err(error) => return proxy_error_response(error),
     };
+    if hold_response && status.is_success() {
+        if response_hold.backend_committed.send(true).is_err() {
+            return proxy_error_response("replication response hold closed after the backend committed");
+        }
+        while !*response_hold.release.borrow() {
+            if response_hold.release.changed().await.is_err() {
+                return proxy_error_response("replication response hold closed before release");
+            }
+        }
+    }
     let mut proxied = Response::builder().status(status);
     for (name, value) in &headers {
         proxied = proxied.header(name, value);
@@ -2070,12 +2166,36 @@ async fn start_replication_counting_proxy(
     backend_url: &str,
     tasks: &mut JoinSet<()>,
 ) -> Result<(String, Arc<AtomicU64>, watch::Sender<bool>), Box<dyn Error + Send + Sync>> {
+    let (proxy_url, request_count, replication_enabled, _held_tagging, _response_hold) =
+        start_replication_counting_proxy_with_tag_hold(backend_url, tasks).await?;
+    Ok((proxy_url, request_count, replication_enabled))
+}
+
+/// [`start_replication_counting_proxy`] plus a content-keyed hold: while the
+/// returned `watch::Sender<Option<String>>` holds `Some(tagging)`, replication
+/// requests whose `x-amz-tagging` equals `tagging` are parked (and still
+/// counted); all other traffic flows. Send `None` to release them.
+async fn start_replication_counting_proxy_with_tag_hold(
+    backend_url: &str,
+    tasks: &mut JoinSet<()>,
+) -> Result<
+    (
+        String,
+        Arc<AtomicU64>,
+        watch::Sender<bool>,
+        watch::Sender<Option<String>>,
+        ReplicationResponseHold,
+    ),
+    Box<dyn Error + Send + Sync>,
+> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_url = format!("http://{}", listener.local_addr()?);
     let backend_url = backend_url.to_string();
     let request_count = Arc::new(AtomicU64::new(0));
     let task_request_count = request_count.clone();
     let (replication_enabled, task_replication_enabled) = watch::channel(true);
+    let (held_tagging, task_held_tagging) = watch::channel(None);
+    let (response_hold_runtime, response_hold) = replication_response_hold();
     tasks.spawn(async move {
         let client = local_http_client();
         let mut connections = JoinSet::new();
@@ -2087,12 +2207,16 @@ async fn start_replication_counting_proxy(
                     let client = client.clone();
                     let request_count = task_request_count.clone();
                     let replication_enabled = task_replication_enabled.clone();
+                    let held_tagging = task_held_tagging.clone();
+                    let response_hold = response_hold_runtime.clone();
                     connections.spawn(async move {
                         let service = service_fn(move |request| {
                             let backend_url = backend_url.clone();
                             let client = client.clone();
                             let request_count = request_count.clone();
                             let replication_enabled = replication_enabled.clone();
+                            let held_tagging = held_tagging.clone();
+                            let response_hold = response_hold.clone();
                             async move {
                                 Ok::<_, Infallible>(
                                     forward_replication_proxy_request(
@@ -2101,6 +2225,8 @@ async fn start_replication_counting_proxy(
                                         &client,
                                         &request_count,
                                         replication_enabled,
+                                        held_tagging,
+                                        response_hold,
                                     )
                                     .await,
                                 )
@@ -2113,7 +2239,7 @@ async fn start_replication_counting_proxy(
             }
         }
     });
-    Ok((proxy_url, request_count, replication_enabled))
+    Ok((proxy_url, request_count, replication_enabled, held_tagging, response_hold))
 }
 
 async fn site_replication_remove(
@@ -2168,7 +2294,7 @@ async fn site_replication_state_edit(
 /// return the target `(arn, reset_id)`, asserting the response carries the
 /// madmin `ResyncTargetsInfo` shape (`target[0].arn` / `target[0].resetid`)
 /// that `mc replicate resync start` decodes.
-async fn start_bucket_replication_reset(
+pub(crate) async fn start_bucket_replication_reset(
     env: &RustFSTestEnvironment,
     bucket: &str,
 ) -> Result<(String, String), Box<dyn Error + Send + Sync>> {
@@ -2188,7 +2314,7 @@ async fn start_bucket_replication_reset(
     Ok((arn, reset_id))
 }
 
-async fn get_replication_reset_status(
+pub(crate) async fn get_replication_reset_status(
     env: &RustFSTestEnvironment,
     bucket: &str,
     arn: &str,
@@ -3711,6 +3837,243 @@ async fn test_bucket_replication_converges_delete_marker_and_version_purge() -> 
     Ok(())
 }
 
+/// Regression for rustfs/backlog#2340 (not Wasabi specific): a directory
+/// marker (`prefix/` with a body) in a versioned bucket is stored as the null
+/// version, like MinIO (`putOpts`: "for directory objects skip creating new
+/// versions"), and must still replicate to completion instead of staying
+/// `PENDING`.
+#[tokio::test]
+async fn test_bucket_replication_replicates_directory_marker_in_versioned_bucket() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_env_vars = replication_fast_env();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-dir-marker-src";
+    let target_bucket = "replication-dir-marker-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let marker_key = "dir/trailing/";
+    let body = b"directory marker body";
+    let put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(marker_key)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await?;
+    assert_eq!(
+        put.version_id(),
+        Some("null"),
+        "a directory marker must expose its null version without leaking the internal nil UUID"
+    );
+
+    wait_for_source_replication_status(&source_client, source_bucket, marker_key, "COMPLETED", false).await?;
+
+    let replica = target_client
+        .get_object()
+        .bucket(target_bucket)
+        .key(marker_key)
+        .send()
+        .await?;
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), body);
+    let listed = target_client
+        .list_object_versions()
+        .bucket(target_bucket)
+        .prefix(marker_key)
+        .send()
+        .await?;
+    let marker_versions: Vec<_> = listed.versions().iter().filter(|v| v.key() == Some(marker_key)).collect();
+    assert_eq!(marker_versions.len(), 1, "the marker must land exactly once: {marker_versions:?}");
+    assert_eq!(
+        marker_versions[0].version_id(),
+        Some("null"),
+        "the replica keeps the null version identity"
+    );
+
+    Ok(())
+}
+
+/// Regression for rustfs/backlog#2340 (not Wasabi specific): permanently
+/// deleting a version whose payload lives in a data dir must leave the source
+/// clean once the purge replicates. Managed-SSE objects are never inlined and a
+/// plain object above the inline threshold takes the same layout. The version
+/// retained with a pending purge used to lose its data dir, so the purge state
+/// could never be applied (`VersionNotFound` on every retry) and the bucket
+/// stayed `BucketNotEmpty` while `ListObjectVersions` was already empty.
+#[tokio::test]
+async fn test_bucket_replication_version_purge_of_non_inline_object_releases_source_bucket() -> TestResult {
+    init_logging();
+
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("purge-datadir", true, true).await?;
+    let target_arn = wait_for_remote_target_arn(&source_env, &source_bucket).await?;
+    put_bucket_replication_with_delete_statuses(&source_env, &source_bucket, &target_arn, "Enabled", Some("Enabled")).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    let sse_key = "sse-object.bin";
+    let large_key = "large-object.bin";
+    let sse_put = source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key(sse_key)
+        .body(ByteStream::from_static(b"encrypted source payload"))
+        .server_side_encryption(ServerSideEncryption::Aes256)
+        .send()
+        .await?;
+    let large_put = source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key(large_key)
+        .body(ByteStream::from(vec![0x5a; 2 * 1024 * 1024]))
+        .send()
+        .await?;
+    let purged = [
+        (sse_key, sse_put.version_id().ok_or("SSE PUT omitted version ID")?.to_string()),
+        (large_key, large_put.version_id().ok_or("large PUT omitted version ID")?.to_string()),
+    ];
+    assert_replication_converged(&source_client, &source_bucket, &target_client, &target_bucket).await?;
+
+    for (key, version_id) in &purged {
+        source_client
+            .delete_object()
+            .bucket(&source_bucket)
+            .key(*key)
+            .version_id(version_id)
+            .send()
+            .await?;
+    }
+    assert_replication_converged(&source_client, &source_bucket, &target_client, &target_bucket).await?;
+    let target_state = list_replication_state(&target_client, &target_bucket).await?;
+    assert!(target_state.is_empty(), "target retained an explicitly purged version: {target_state:?}");
+
+    // The purge state is applied on the source asynchronously after the target
+    // acknowledges the delete; only then does the retained version go away and
+    // the bucket become deletable. A listing that is empty while DeleteBucket
+    // keeps answering BucketNotEmpty is exactly the regression.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let listing = source_client.list_object_versions().bucket(&source_bucket).send().await?;
+        let listed = listing.versions().len() + listing.delete_markers().len();
+        match source_client.delete_bucket().bucket(&source_bucket).send().await {
+            Ok(_) => break,
+            Err(err) if err.code() == Some("BucketNotEmpty") => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "source bucket stayed BucketNotEmpty after the version purge replicated; \
+                         ListObjectVersions shows {listed} entries"
+                    )
+                    .into());
+                }
+                sleep(Duration::from_millis(500)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Ok(())
+}
+
+/// Regression for rustfs/backlog#2340 (not Wasabi specific): a single-part
+/// object uploaded with `x-amz-checksum-*` must reach the target with the same
+/// checksum. The outbound options keyed the stored record by algorithm name,
+/// which the target client sent as `x-amz-meta-*` user metadata, so a replica
+/// never carried a checksum although the source HEAD returned one.
+#[tokio::test]
+async fn test_bucket_replication_forwards_single_part_object_checksums() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_env_vars = replication_fast_env();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-checksum-src";
+    let target_bucket = "replication-checksum-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let body = b"123456789";
+    let crc32_key = "checksum-crc32.txt";
+    let sha256_key = "checksum-sha256.txt";
+    let crc32_put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(crc32_key)
+        .body(ByteStream::from_static(body))
+        .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
+        .send()
+        .await?;
+    let expected_crc32 = crc32_put.checksum_crc32().ok_or("source PUT omitted CRC32")?.to_string();
+    let sha256_put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(sha256_key)
+        .body(ByteStream::from_static(body))
+        .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
+        .send()
+        .await?;
+    let expected_sha256 = sha256_put.checksum_sha256().ok_or("source PUT omitted SHA256")?.to_string();
+
+    for key in [crc32_key, sha256_key] {
+        wait_for_source_replication_status(&source_client, source_bucket, key, "COMPLETED", false).await?;
+    }
+
+    let replica = target_client
+        .head_object()
+        .bucket(target_bucket)
+        .key(crc32_key)
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(replica.checksum_crc32(), Some(expected_crc32.as_str()), "replica lost the CRC32 checksum");
+    let replica = target_client
+        .head_object()
+        .bucket(target_bucket)
+        .key(sha256_key)
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(
+        replica.checksum_sha256(),
+        Some(expected_sha256.as_str()),
+        "replica lost the SHA256 checksum"
+    );
+    // The bare algorithm name must not leak as user metadata either.
+    assert!(
+        replica
+            .metadata()
+            .is_none_or(|meta| !meta.keys().any(|k| k.eq_ignore_ascii_case("sha256"))),
+        "replica carries the checksum as user metadata: {:?}",
+        replica.metadata()
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_bucket_replication_disabled_delete_marker_does_not_propagate() -> TestResult {
     init_logging();
@@ -3804,6 +4167,12 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
     let mut source_env = RustFSTestEnvironment::new().await?;
     let mut source_env_vars = replication_fast_env();
     source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    // This matrix verifies request-time rule/admission behavior. Keep the
+    // background existing-object scanner outside the observation window: with
+    // ExistingObjectReplication enabled it may legitimately discover an
+    // object after its tags change, which is a separate data-replication path
+    // that PR #5696 intentionally did not alter.
+    source_env_vars.push(("RUSTFS_SCANNER_START_DELAY_SECS", "300"));
     source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
 
     let mut target_env_a = RustFSTestEnvironment::new().await?;
@@ -3866,6 +4235,16 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
     <Destination><Bucket>{target_b_arn}</Bucket></Destination>
   </Rule>
   <Rule>
+    <ID>matrix-and-tags</ID>
+    <Priority>135</Priority>
+    <Status>Enabled</Status>
+    <Filter><And><Prefix>and-tags/</Prefix><Tag><Key>env</Key><Value>prod</Value></Tag><Tag><Key>tier</Key><Value>gold</Value></Tag></And></Filter>
+    <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>
+    <DeleteReplication><Status>Enabled</Status></DeleteReplication>
+    <ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>
+    <Destination><Bucket>{target_b_arn}</Bucket></Destination>
+  </Rule>
+  <Rule>
     <ID>matrix-disabled</ID>
     <Priority>140</Priority>
     <Status>Disabled</Status>
@@ -3919,6 +4298,7 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
         "matrix-prefix",
         "matrix-tag",
         "matrix-disabled",
+        "matrix-and-tags",
         "matrix-priority-high",
         "Priority>200",
         "<Status>Disabled</Status>",
@@ -4031,6 +4411,37 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
         .send()
         .await?;
     assert_replication_key_absent(&target_client_b, target_bucket_b, "tagged/no-match.txt", Duration::from_secs(3)).await?;
+
+    // A metadata edit must not retroactively admit data that failed the tag
+    // filter at PUT time. This is the PR #5696 safety boundary: the target ARN
+    // has no persisted data-admission state for this version, so adding the
+    // matching tag later remains metadata-only and fails closed.
+    put_single_tag_current(&source_client, source_bucket, "tagged/no-match.txt", "route", "tagged").await?;
+    assert_replication_key_absent(&target_client_b, target_bucket_b, "tagged/no-match.txt", Duration::from_secs(3)).await?;
+
+    // S3 and MinIO both read `And.Tags` as AND: an object carrying only one of
+    // the required tags is not admitted. Matching any single tag would push
+    // data to a destination the rule never selected (backlog#2366 P1-1), and
+    // the two-tag rule is the shape `mc replicate add --tags "k1=v1&k2=v2"`
+    // writes, so a single-tag rule passing is not evidence for this.
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("and-tags/partial.txt")
+        .tagging("env=prod")
+        .body(ByteStream::from_static(b"one of two tags"))
+        .send()
+        .await?;
+    assert_replication_key_absent(&target_client_b, target_bucket_b, "and-tags/partial.txt", Duration::from_secs(3)).await?;
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("and-tags/full.txt")
+        .tagging("env=prod&tier=gold")
+        .body(ByteStream::from_static(b"both tags"))
+        .send()
+        .await?;
+    wait_for_user_get_object(&target_client_b, target_bucket_b, "and-tags/full.txt").await?;
 
     source_client
         .put_object()
@@ -4301,7 +4712,7 @@ async fn test_bucket_replication_sse_c_contract() -> TestResult {
     let target_client = target_env.create_s3_client();
     let key = "ssec-contract.txt";
     let body = b"repl-17 SSE-C payload";
-    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
     let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
 
     source_client
@@ -4347,10 +4758,16 @@ async fn test_bucket_replication_sse_c_contract() -> TestResult {
     // Without the customer key the replica must not be readable — the direct
     // detection point for a silent-plaintext replica (backlog#1291).
     let plain_read = target_client.get_object().bucket(&target_bucket).key(key).send().await;
-    assert!(plain_read.is_err(), "SSE-C replica must not be readable without the customer key");
+    assert_s3_error(
+        plain_read,
+        400,
+        "InvalidRequest",
+        SSE_C_MISSING_PARAMETERS_MESSAGE,
+        "SSE-C replica must not be readable without the customer key",
+    );
 
     // A wrong customer key must fail too.
-    let wrong_key = BASE64_STANDARD.encode("99999999999999999999999999999999");
+    let wrong_key = BASE64_STANDARD.encode_to_string("99999999999999999999999999999999");
     let wrong_key_md5 = sse_customer_key_md5_base64("99999999999999999999999999999999");
     let wrong_read = target_client
         .get_object()
@@ -4361,7 +4778,13 @@ async fn test_bucket_replication_sse_c_contract() -> TestResult {
         .sse_customer_key_md5(&wrong_key_md5)
         .send()
         .await;
-    assert!(wrong_read.is_err(), "SSE-C replica must reject a wrong customer key");
+    assert_s3_error(
+        wrong_read,
+        400,
+        "InvalidRequest",
+        SSE_C_KEY_MISMATCH_MESSAGE,
+        "SSE-C replica must reject a wrong customer key",
+    );
 
     Ok(())
 }
@@ -4380,7 +4803,7 @@ async fn test_bucket_replication_sse_c_multipart_passthrough() -> TestResult {
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
     let key = "ssec-mp-contract.bin";
-    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
     let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
 
     let created = source_client
@@ -4458,9 +4881,12 @@ async fn test_bucket_replication_sse_c_multipart_passthrough() -> TestResult {
     assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), payload.as_slice());
 
     let plain_read = target_client.get_object().bucket(&target_bucket).key(key).send().await;
-    assert!(
-        plain_read.is_err(),
-        "SSE-C multipart replica must not be readable without the customer key"
+    assert_s3_error(
+        plain_read,
+        400,
+        "InvalidRequest",
+        SSE_C_MISSING_PARAMETERS_MESSAGE,
+        "SSE-C multipart replica must not be readable without the customer key",
     );
 
     // Stability across scanner cycles: convergence must hold for passthrough.
@@ -4522,7 +4948,7 @@ async fn test_ssec_replication_fails_closed_when_target_drops_passthrough_header
     .await?;
     put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
 
-    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
     let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
     let put_ssec = |key: &'static str| {
         source_client
@@ -4695,7 +5121,7 @@ async fn test_bucket_replication_sse_c_heals_after_target_outage() -> TestResult
     let source_client = source_env.create_s3_client();
     let key = "ssec-heal-contract.txt";
     let body = b"repl-22 ssec heal payload".to_vec();
-    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
     let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
 
     // Target outage: the SSE-C write cannot replicate.
@@ -4810,7 +5236,7 @@ async fn test_bucket_replication_sse_c_existing_object_resync() -> TestResult {
     // The SSE-C object exists before any replication wiring.
     let key = "ssec-existing-contract.txt";
     let body = b"repl-22 ssec existing-object payload".to_vec();
-    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
     let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
     source_client
         .put_object()
@@ -4864,15 +5290,12 @@ async fn test_bucket_replication_sse_c_existing_object_resync() -> TestResult {
     assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), body.as_slice());
 
     // No plaintext leak: the replica stays unreadable without the key.
-    assert!(
-        target_client
-            .get_object()
-            .bucket(target_bucket)
-            .key(key)
-            .send()
-            .await
-            .is_err(),
-        "SSE-C replica must not be readable without the customer key"
+    assert_s3_error(
+        target_client.get_object().bucket(target_bucket).key(key).send().await,
+        400,
+        "InvalidRequest",
+        SSE_C_MISSING_PARAMETERS_MESSAGE,
+        "SSE-C resynced replica must not be readable without the customer key",
     );
 
     Ok(())
@@ -5710,6 +6133,327 @@ async fn test_site_replication_allows_private_ca_https_with_ca_cert_pem_real_dua
     Ok(())
 }
 
+/// rustfs/backlog#2479: a site resync must count a replicated delete marker
+/// as converged. The peer answers `HEAD ?versionId=<marker>` with a bodiless
+/// 405, which the SDK surfaces without an error code; the resync worker used
+/// to record that as `target service error` and fail the whole bucket.
+#[tokio::test]
+async fn test_site_replication_resync_replicates_delete_marker() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+    let process_env = [
+        ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true"),
+        ("RUSTFS_REPL_RESYNC_POLL_MAX_MS", "100"),
+        ("RUST_LOG", "error"),
+    ];
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server_with_env(vec![], &process_env).await?;
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_with_env(vec![], &process_env).await?;
+
+    let bucket = "site-repl-resync-marker";
+    let live_key = "live.bin";
+    let gone_key = "gone.txt";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&source_env, bucket).await?;
+
+    let add_status = site_replication_add(
+        &source_env,
+        &[
+            PeerSite {
+                name: "source-site".to_string(),
+                endpoint: source_env.url.clone(),
+                access_key: source_env.access_key.clone(),
+                secret_key: source_env.secret_key.clone(),
+                ..Default::default()
+            },
+            PeerSite {
+                name: "target-site".to_string(),
+                endpoint: target_env.url.clone(),
+                access_key: target_env.access_key.clone(),
+                secret_key: target_env.secret_key.clone(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await?;
+    assert!(add_status.success, "unexpected site add result: {:?}", add_status);
+
+    let source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
+    wait_for_site_replication_enabled(&target_env, 2).await?;
+    let remote_peer = source_info
+        .sites
+        .into_iter()
+        .find(|peer| peer.endpoint == target_env.url)
+        .ok_or("target peer missing from source site replication info")?;
+    wait_for_bucket_on_target(&target_client, bucket).await?;
+    wait_for_remote_target_arn(&source_env, bucket).await?;
+
+    // One live object and one key whose latest version is a delete marker,
+    // both converged to the peer through live replication first so the
+    // resync re-drives objects the peer already holds.
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(live_key)
+        .body(ByteStream::from(vec![b'l'; 4096]))
+        .send()
+        .await?;
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(gone_key)
+        .body(ByteStream::from(vec![b'g'; 128]))
+        .send()
+        .await?;
+    let delete = source_client.delete_object().bucket(bucket).key(gone_key).send().await?;
+    assert_eq!(delete.delete_marker(), Some(true), "a versioned delete must create a delete marker");
+    wait_for_object_on_target(&target_client, bucket, live_key).await?;
+    wait_for_target_delete_marker(&target_client, bucket, gone_key).await?;
+
+    let started = site_replication_resync_op(&source_env, "start", &remote_peer).await?;
+    assert_eq!(started.status, "success", "unexpected start result: {:?}", started);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let finished = loop {
+        let status = site_replication_resync_op(&source_env, "status", &remote_peer).await?;
+        match status.state.as_str() {
+            "completed" | "failed" => break status,
+            _ if tokio::time::Instant::now() < deadline => sleep(Duration::from_millis(250)).await,
+            _ => return Err(format!("site resync did not reach a terminal state in time: {status:?}").into()),
+        }
+    };
+    let entry = finished
+        .buckets
+        .iter()
+        .find(|entry| entry.bucket == bucket)
+        .ok_or_else(|| format!("resync status lost the bucket: {finished:?}"))?;
+    assert_eq!(
+        (finished.state.as_str(), entry.status.as_str(), entry.failed_objects),
+        ("completed", "completed", 0),
+        "the delete marker must verify as replicated, not fail the bucket: {finished:?}"
+    );
+    assert!(
+        entry.replicated_objects >= 2,
+        "the live object and the delete marker both count as replicated: {entry:?}"
+    );
+    assert!(entry.err_detail.is_empty(), "unexpected bucket error: {entry:?}");
+
+    Ok(())
+}
+
+/// rustfs/backlog#2489: an operator's bucket-level replication to a site that
+/// later becomes a peer keeps working through the site's add, resync and
+/// removal. Site replication wires its own same-name target next to the
+/// operator's and never takes the operator's target over; a bucket-level
+/// `replication-reset` run before the join must not make the site resync
+/// report the bucket as owned by another resync.
+#[tokio::test]
+async fn test_site_replication_keeps_operator_bucket_target_to_peer() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+    let process_env = [
+        ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true"),
+        ("RUSTFS_REPL_RESYNC_POLL_MAX_MS", "100"),
+        ("RUST_LOG", "error"),
+    ];
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server_with_env(vec![], &process_env).await?;
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_with_env(vec![], &process_env).await?;
+
+    let source_bucket = "site-repl-operator-src";
+    let operator_target_bucket = "site-repl-operator-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    target_client.create_bucket().bucket(operator_target_bucket).send().await?;
+    enable_bucket_versioning(&target_env, operator_target_bucket).await?;
+
+    let operator_arn = set_replication_target(&source_env, source_bucket, &target_env, operator_target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &operator_arn).await?;
+    let put_and_wait = |key: &'static str, fill: u8, on: Vec<&'static str>| {
+        let source_client = source_client.clone();
+        let target_client = target_client.clone();
+        async move {
+            source_client
+                .put_object()
+                .bucket(source_bucket)
+                .key(key)
+                .body(ByteStream::from(vec![fill; 4096]))
+                .send()
+                .await?;
+            for bucket in on {
+                let body = wait_for_object_on_target(&target_client, bucket, key).await?;
+                if body != vec![fill; 4096] {
+                    return Err(format!("{key} arrived on {bucket} with the wrong body").into());
+                }
+            }
+            Ok::<(), Box<dyn Error + Send + Sync>>(())
+        }
+    };
+    put_and_wait("before-add.bin", b'a', vec![operator_target_bucket]).await?;
+    let (reset_arn, reset_id) = start_bucket_replication_reset(&source_env, source_bucket).await?;
+    assert_eq!(reset_arn, operator_arn, "the reset must target the operator ARN");
+    wait_for_replication_reset_target(&source_env, source_bucket, &operator_arn, |target| {
+        target.reset_id == reset_id && matches!(target.status.as_str(), "Completed" | "Failed")
+    })
+    .await?;
+
+    let add_status = site_replication_add(
+        &source_env,
+        &[
+            PeerSite {
+                name: "source-site".to_string(),
+                endpoint: source_env.url.clone(),
+                access_key: source_env.access_key.clone(),
+                secret_key: source_env.secret_key.clone(),
+                ..Default::default()
+            },
+            PeerSite {
+                name: "target-site".to_string(),
+                endpoint: target_env.url.clone(),
+                access_key: target_env.access_key.clone(),
+                secret_key: target_env.secret_key.clone(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await?;
+    assert!(add_status.success, "unexpected site add result: {:?}", add_status);
+    let source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
+    wait_for_site_replication_enabled(&target_env, 2).await?;
+    let remote_peer = source_info
+        .sites
+        .into_iter()
+        .find(|peer| peer.endpoint == target_env.url)
+        .ok_or("target peer missing from source site replication info")?;
+    wait_for_bucket_on_target(&target_client, source_bucket).await?;
+
+    // Both targets: the operator's (untouched) and the site's same-name one.
+    let list_targets = || async {
+        let response = list_replication_targets_request(&source_env, Some(source_bucket)).await?;
+        let targets: Vec<serde_json::Value> = if response.status() == StatusCode::OK {
+            response.json().await?
+        } else {
+            Vec::new()
+        };
+        Ok::<Vec<(String, String)>, Box<dyn Error + Send + Sync>>(
+            targets
+                .iter()
+                .map(|target| {
+                    (
+                        target["arn"].as_str().unwrap_or_default().to_string(),
+                        target["targetbucket"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect(),
+        )
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let site_arn = loop {
+        let targets = list_targets().await?;
+        let operator_kept = targets
+            .iter()
+            .any(|(arn, target_bucket)| arn == &operator_arn && target_bucket == operator_target_bucket);
+        let site = targets
+            .iter()
+            .find(|(arn, target_bucket)| arn.contains(&remote_peer.deployment_id) && target_bucket == source_bucket)
+            .map(|(arn, _)| arn.clone());
+        assert!(operator_kept, "site replication must not take the operator target over: {targets:?}");
+        if let Some(arn) = site {
+            break arn;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("site replication never added its own target next to the operator's: {targets:?}").into());
+        }
+        sleep(Duration::from_millis(250)).await;
+    };
+    assert_ne!(site_arn, operator_arn);
+
+    // The operator's path and the site's path both deliver.
+    put_and_wait("after-add.bin", b'b', vec![operator_target_bucket, source_bucket]).await?;
+
+    let started = site_replication_resync_op(&source_env, "start", &remote_peer).await?;
+    let entry = started
+        .buckets
+        .iter()
+        .find(|entry| entry.bucket == source_bucket)
+        .ok_or_else(|| format!("start response lost the bucket: {started:?}"))?;
+    assert_ne!(
+        entry.status, "conflict",
+        "a finished bucket-level resync must not block the site resync: {entry:?}"
+    );
+    assert_eq!(
+        entry.target_arn, site_arn,
+        "the site resync must drive the site target, not the operator's"
+    );
+    assert_eq!(started.status, "success", "unexpected start result: {:?}", started);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let finished = loop {
+        let status = site_replication_resync_op(&source_env, "status", &remote_peer).await?;
+        match status.state.as_str() {
+            "completed" | "failed" => break status,
+            _ if tokio::time::Instant::now() < deadline => sleep(Duration::from_millis(250)).await,
+            _ => return Err(format!("site resync did not reach a terminal state in time: {status:?}").into()),
+        }
+    };
+    let entry = finished
+        .buckets
+        .iter()
+        .find(|entry| entry.bucket == source_bucket)
+        .ok_or_else(|| format!("resync status lost the bucket: {finished:?}"))?;
+    assert_eq!(
+        (finished.state.as_str(), entry.status.as_str(), entry.failed_objects),
+        ("completed", "completed", 0),
+        "{finished:?}"
+    );
+
+    // Leaving site replication removes only the site's own target and rule.
+    let removed = site_replication_remove(
+        &source_env,
+        &SRRemoveReq {
+            remove_all: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(removed.err_detail.is_empty(), "unexpected remove result: {removed:?}");
+    let targets = list_targets().await?;
+    assert!(
+        targets
+            .iter()
+            .any(|(arn, target_bucket)| arn == &operator_arn && target_bucket == operator_target_bucket),
+        "peer removal must keep the operator target: {targets:?}"
+    );
+    assert!(
+        !targets.iter().any(|(arn, _)| arn == &site_arn),
+        "peer removal must drop the site target: {targets:?}"
+    );
+    let rules = source_client
+        .get_bucket_replication()
+        .bucket(source_bucket)
+        .send()
+        .await?
+        .replication_configuration
+        .map(|config| config.rules)
+        .unwrap_or_default();
+    assert!(
+        rules
+            .iter()
+            .any(|rule| rule.destination.as_ref().map(|d| d.bucket.as_str()) == Some(operator_arn.as_str())),
+        "peer removal must keep the operator rule: {rules:?}"
+    );
+    put_and_wait("after-remove.bin", b'c', vec![operator_target_bucket]).await?;
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
@@ -5959,6 +6703,18 @@ async fn test_site_replication_edit_and_status_peer_state_real_three_node() -> R
     let relayed_key = "after-edit-from-relay.txt";
     let relayed_payload = b"site replication after endpoint edit from relay".to_vec();
 
+    // The first joining receiver owns data before the third site has the
+    // shared account. Initial probes and backfill must wait for every join.
+    target_client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&target_env, bucket).await?;
+    target_client
+        .put_object()
+        .bucket(bucket)
+        .key(baseline_key)
+        .body(ByteStream::from(baseline_payload.clone()))
+        .send()
+        .await?;
+
     let add_status = site_replication_add(
         &source_env,
         &[
@@ -5986,7 +6742,10 @@ async fn test_site_replication_edit_and_status_peer_state_real_three_node() -> R
         ],
     )
     .await?;
-    assert!(add_status.success, "unexpected site add result: {:?}", add_status);
+    assert!(
+        add_status.success && add_status.err_detail.is_empty() && add_status.initial_sync_error_message.is_empty(),
+        "unexpected site add result: {add_status:?}"
+    );
 
     let source_info = wait_for_site_replication_enabled(&source_env, 3).await?;
     let _target_info = wait_for_site_replication_enabled(&target_env, 3).await?;
@@ -5997,19 +6756,11 @@ async fn test_site_replication_edit_and_status_peer_state_real_three_node() -> R
         .find(|peer| peer.endpoint == target_env.url)
         .ok_or("target peer missing from source site replication info")?;
 
-    source_client.create_bucket().bucket(bucket).send().await?;
-    enable_bucket_versioning(&source_env, bucket).await?;
-    wait_for_bucket_on_target(&target_client, bucket).await?;
-    wait_for_bucket_on_target(&relay_client, bucket).await?;
-    source_client
-        .put_object()
-        .bucket(bucket)
-        .key(baseline_key)
-        .body(ByteStream::from(baseline_payload.clone()))
-        .send()
-        .await?;
-    let replicated_baseline = wait_for_object_on_target(&target_client, bucket, baseline_key).await?;
-    assert_eq!(replicated_baseline, baseline_payload);
+    for client in [&source_client, &relay_client] {
+        wait_for_bucket_on_target(client, bucket).await?;
+        let backfilled = wait_for_object_on_target(client, bucket, baseline_key).await?;
+        assert_eq!(backfilled, baseline_payload);
+    }
 
     let old_target_address = target_env.address.clone();
     let new_target_port = RustFSTestEnvironment::find_available_port().await?;
@@ -6297,6 +7048,112 @@ async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
+async fn test_site_replication_rotate_svc_acct_completes_and_replication_survives_real_dual_node()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let bucket = "site-repl-rotate-svc-acct";
+
+    let add_status = site_replication_add(
+        &source_env,
+        &[
+            PeerSite {
+                name: "source-site".to_string(),
+                endpoint: source_env.url.clone(),
+                access_key: source_env.access_key.clone(),
+                secret_key: source_env.secret_key.clone(),
+                ..Default::default()
+            },
+            PeerSite {
+                name: "target-site".to_string(),
+                endpoint: target_env.url.clone(),
+                access_key: target_env.access_key.clone(),
+                secret_key: target_env.secret_key.clone(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await?;
+    assert!(add_status.success, "unexpected site add result: {add_status:?}");
+
+    let _source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
+    let _target_info = wait_for_site_replication_enabled(&target_env, 2).await?;
+
+    source_client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&source_env, bucket).await?;
+    wait_for_bucket_on_target(&target_client, bucket).await?;
+    let baseline_payload = b"before rotation".to_vec();
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key("before-rotate.txt")
+        .body(ByteStream::from(baseline_payload.clone()))
+        .send()
+        .await?;
+    let replicated_baseline = wait_for_object_on_target(&target_client, bucket, "before-rotate.txt").await?;
+    assert_eq!(replicated_baseline, baseline_payload);
+
+    // A single rotation call must finish the whole hand-over. Before the fix
+    // the join push could only sign with the freshly installed secret, every
+    // peer rejected it, the rotation stayed pending forever, and both
+    // replication directions were dead until an operator retried.
+    let rotate_status = site_replication_rotate_svc_acct(&source_env).await?;
+    assert!(rotate_status.success, "rotation did not complete in one call: {rotate_status:?}");
+
+    for env in [&source_env, &target_env] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let info = site_replication_info(env).await?;
+            if info.enabled && info.pending_operation.is_none() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(format!("rotation left {} with a pending operation: {:?}", env.url, info.pending_operation).into());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    // Replication must actually flow again in both directions with the
+    // rotated service-account secret.
+    let forward_payload = b"after rotation from source".to_vec();
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key("after-rotate-forward.txt")
+        .body(ByteStream::from(forward_payload.clone()))
+        .send()
+        .await?;
+    let replicated_forward = wait_for_object_on_target(&target_client, bucket, "after-rotate-forward.txt").await?;
+    assert_eq!(replicated_forward, forward_payload);
+
+    let reverse_payload = b"after rotation from target".to_vec();
+    target_client
+        .put_object()
+        .bucket(bucket)
+        .key("after-rotate-reverse.txt")
+        .body(ByteStream::from(reverse_payload.clone()))
+        .send()
+        .await?;
+    let replicated_reverse = wait_for_object_on_target(&source_client, bucket, "after-rotate-reverse.txt").await?;
+    assert_eq!(replicated_reverse, reverse_payload);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -6484,6 +7341,99 @@ async fn test_site_replication_replicates_object_with_bucket_versioning_real_dua
     assert_eq!(replicated, payload);
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_site_replication_replays_bucket_created_during_peer_outage_real_dual_node() -> TestResult {
+    init_logging();
+
+    // Keep compilation outside the scenario timeout. Recovery itself waits
+    // for the production 30-second lightweight retry tick.
+    let _rustfs_binary = rustfs_binary_path();
+
+    match timeout(Duration::from_secs(150), async {
+        let mut site_env = replication_fast_env();
+        site_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+
+        let mut site_a_env = RustFSTestEnvironment::new().await?;
+        site_a_env.start_rustfs_server_with_env(vec![], &site_env).await?;
+
+        let mut site_b_env = RustFSTestEnvironment::new().await?;
+        site_b_env.start_rustfs_server_without_cleanup_with_env(&site_env).await?;
+
+        let site_a_client = site_a_env.create_s3_client();
+        let site_b_client = site_b_env.create_s3_client();
+        let bucket = "site-repl-peer-outage";
+        let key = "after-recovery.txt";
+        let payload = b"site replication recovered the missed bucket".to_vec();
+
+        let add_status = site_replication_add(
+            &site_a_env,
+            &[
+                PeerSite {
+                    name: "outage-site-a".to_string(),
+                    endpoint: site_a_env.url.clone(),
+                    access_key: site_a_env.access_key.clone(),
+                    secret_key: site_a_env.secret_key.clone(),
+                    ..Default::default()
+                },
+                PeerSite {
+                    name: "outage-site-b".to_string(),
+                    endpoint: site_b_env.url.clone(),
+                    access_key: site_b_env.access_key.clone(),
+                    secret_key: site_b_env.secret_key.clone(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await?;
+        assert!(add_status.success, "unexpected site add result: {add_status:?}");
+        wait_for_site_replication_enabled(&site_a_env, 2).await?;
+        wait_for_site_replication_enabled(&site_b_env, 2).await?;
+
+        site_b_env.stop_server();
+        site_a_client.create_bucket().bucket(bucket).send().await?;
+        site_a_client.head_bucket().bucket(bucket).send().await?;
+
+        let queued = site_replication_info(&site_a_env)
+            .await?
+            .retry_stats
+            .ok_or("peer outage did not persist a site replication retry event")?;
+        assert!(queued.pending + queued.failed > 0, "peer outage retry queue was unexpectedly empty");
+
+        site_b_env.restart_server_preserving_data(vec![], &site_env).await?;
+        let recovery_deadline = tokio::time::Instant::now() + Duration::from_secs(75);
+        loop {
+            let bucket_recovered = site_b_client.head_bucket().bucket(bucket).send().await.is_ok();
+            let queue_empty = site_replication_info(&site_a_env).await?.retry_stats.is_none();
+            if bucket_recovered && queue_empty {
+                break;
+            }
+            if tokio::time::Instant::now() >= recovery_deadline {
+                return Err(format!(
+                    "site replication retry did not settle after peer recovery; bucket_recovered={bucket_recovered}, queue_empty={queue_empty}"
+                )
+                .into());
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+
+        site_a_client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(payload.clone()))
+            .send()
+            .await?;
+        assert_eq!(wait_for_object_on_target(&site_b_client, bucket, key).await?, payload);
+
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err("site replication peer-outage recovery timed out after 150 seconds".into()),
+    }
 }
 
 /// Re-applying a site's own replication config must not disable the peer's reverse direction.
@@ -6949,6 +7899,697 @@ async fn test_site_replication_active_active_converges_without_loops_real_dual_n
     }
 }
 
+/// Replication status a site reports for one object version via HEAD
+/// (`x-amz-replication-status`), or `None` when the header is absent.
+async fn head_replication_status(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .version_id(version_id)
+        .send()
+        .await?;
+    Ok(head.replication_status().map(|status| status.as_str().to_string()))
+}
+
+/// Poll one site until the version's replication status is one of `expected`.
+async fn wait_for_version_replication_status(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    expected: &[&str],
+    site: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let last = head_replication_status(client, bucket, key, version_id).await?;
+        if let Some(status) = last.as_deref()
+            && expected.contains(&status)
+        {
+            return Ok(status.to_string());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "{site}: {bucket}/{key}?versionId={version_id} replication status {last:?} never reached {expected:?}"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn put_single_tag(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    tag_key: &str,
+    tag_value: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    client
+        .put_object_tagging()
+        .bucket(bucket)
+        .key(key)
+        .version_id(version_id)
+        .tagging(
+            aws_sdk_s3::types::Tagging::builder()
+                .tag_set(aws_sdk_s3::types::Tag::builder().key(tag_key).value(tag_value).build()?)
+                .build()?,
+        )
+        .send()
+        .await?;
+    Ok(())
+}
+
+async fn put_single_tag_current(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    tag_key: &str,
+    tag_value: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    client
+        .put_object_tagging()
+        .bucket(bucket)
+        .key(key)
+        .tagging(
+            aws_sdk_s3::types::Tagging::builder()
+                .tag_set(aws_sdk_s3::types::Tag::builder().key(tag_key).value(tag_value).build()?)
+                .build()?,
+        )
+        .send()
+        .await?;
+    Ok(())
+}
+
+async fn get_single_tag(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    tag_key: &str,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    let tagging = client
+        .get_object_tagging()
+        .bucket(bucket)
+        .key(key)
+        .version_id(version_id)
+        .send()
+        .await?;
+    Ok(tagging
+        .tag_set()
+        .iter()
+        .find(|tag| tag.key() == tag_key)
+        .map(|tag| tag.value().to_string()))
+}
+
+/// Poll one site until the version's `tag_key` equals `expected`.
+async fn wait_for_single_tag(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    tag_key: &str,
+    expected: &str,
+    site: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let observed = get_single_tag(client, bucket, key, version_id, tag_key).await?;
+        if observed.as_deref() == Some(expected) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "{site}: {bucket}/{key}?versionId={version_id} tag {tag_key}={observed:?} never became {expected}"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Poll one site until `tag_key` is absent from the selected version.
+async fn wait_for_tag_absent(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    tag_key: &str,
+    site: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let observed = get_single_tag(client, bucket, key, version_id, tag_key).await?;
+        if observed.is_none() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("{site}: {bucket}/{key}?versionId={version_id} tag {tag_key} remained {observed:?}").into());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Tag key the dual-node LWW scenario edits on both sites.
+const LWW_TAG_KEY: &str = "owner";
+
+/// Assert the version's [`LWW_TAG_KEY`] stays `expected` on both sites for a
+/// full quiet window (no late stale delivery flips it back).
+async fn assert_tag_stable_on_both_sites(
+    site_a_client: &Client,
+    site_b_client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    expected: &str,
+    quiet: Duration,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + quiet;
+    loop {
+        let on_a = get_single_tag(site_a_client, bucket, key, version_id, LWW_TAG_KEY).await?;
+        let on_b = get_single_tag(site_b_client, bucket, key, version_id, LWW_TAG_KEY).await?;
+        assert_eq!(on_a.as_deref(), Some(expected), "site A tag {LWW_TAG_KEY} regressed from the LWW winner");
+        assert_eq!(on_b.as_deref(), Some(expected), "site B tag {LWW_TAG_KEY} regressed from the LWW winner");
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Wait until the counting proxy in front of a site has admitted `expected`
+/// replication requests in total (requests held by a closed gate still count).
+async fn wait_for_proxy_replication_requests(
+    counter: &AtomicU64,
+    expected: u64,
+    site: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let observed = counter.load(Ordering::Relaxed);
+        if observed >= expected {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("{site} proxy saw {observed} replication requests, expected at least {expected}").into());
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// rustfs/backlog#2099: metadata admission must not drop a tag edit made after
+/// the target has committed the initial object but before the source persists
+/// that replication as COMPLETED.
+#[tokio::test]
+async fn test_site_replication_tagging_during_initial_pending_window_converges() -> TestResult {
+    init_logging();
+
+    // `RustFSTestEnvironment::start_rustfs_server_with_env` resolves (and on a
+    // cold checkout builds) this binary synchronously. Keep that setup outside
+    // the scenario timeout so 180 seconds measures the runtime race rather
+    // than compilation latency.
+    let _rustfs_binary = rustfs_binary_path();
+
+    match timeout(Duration::from_secs(180), async {
+        const PAYLOAD: &str = "tagging during pending replication";
+        const TAG_KEY: &str = "window";
+        const TAG_VALUE: &str = "pending";
+        const DELETE_PAYLOAD: &str = "tag deletion during pending replication";
+        const DELETE_TAG_KEY: &str = "remove";
+        const DELETE_TAG_VALUE: &str = "while-pending";
+
+        let mut site_env = replication_fast_env();
+        site_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+
+        let mut site_a_env = RustFSTestEnvironment::new().await?;
+        site_a_env.start_rustfs_server_with_env(vec![], &site_env).await?;
+
+        let mut site_b_env = RustFSTestEnvironment::new().await?;
+        site_b_env.start_rustfs_server_with_env(vec![], &site_env).await?;
+
+        let site_a_client = site_a_env.create_s3_client();
+        let site_b_client = site_b_env.create_s3_client();
+        let mut proxy_tasks = JoinSet::new();
+        let (
+            site_b_proxy,
+            _site_b_replication_requests,
+            _site_b_replication_enabled,
+            _site_b_held_tagging,
+            mut site_b_response_hold,
+        ) = start_replication_counting_proxy_with_tag_hold(&site_b_env.url, &mut proxy_tasks).await?;
+
+        let add_status = site_replication_add(
+            &site_a_env,
+            &[
+                PeerSite {
+                    name: "pending-site-a".to_string(),
+                    endpoint: site_a_env.url.clone(),
+                    access_key: site_a_env.access_key.clone(),
+                    secret_key: site_a_env.secret_key.clone(),
+                    ..Default::default()
+                },
+                PeerSite {
+                    name: "pending-site-b".to_string(),
+                    endpoint: site_b_env.url.clone(),
+                    access_key: site_b_env.access_key.clone(),
+                    secret_key: site_b_env.secret_key.clone(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await?;
+        assert!(add_status.success, "unexpected site add result: {add_status:?}");
+
+        let site_info = wait_for_site_replication_enabled(&site_a_env, 2).await?;
+        wait_for_site_replication_enabled(&site_b_env, 2).await?;
+        let mut site_b_peer = site_info
+            .sites
+            .iter()
+            .find(|peer| peer.endpoint == site_b_env.url.as_str())
+            .ok_or("site B peer missing from replication info")?
+            .clone();
+        site_b_peer.endpoint = site_b_proxy.clone();
+        site_b_peer.sync_state = SyncStatus::Enable;
+        let edit = site_replication_edit(&site_a_env, "", &site_b_peer).await?;
+        assert!(edit.success, "unexpected site B endpoint edit: {edit:?}");
+        for env in [&site_a_env, &site_b_env] {
+            wait_for_site_replication_info(env, |info| info.sites.iter().any(|peer| peer.endpoint == site_b_proxy)).await?;
+        }
+
+        let bucket = "site-repl-tag-pending";
+        let key = "pending-window.txt";
+        site_a_client.create_bucket().bucket(bucket).send().await?;
+        wait_for_bucket_on_target(&site_b_client, bucket).await?;
+
+        site_b_response_hold.arm()?;
+        let put_task = {
+            let client = site_a_client.clone();
+            let bucket = bucket.to_string();
+            let key = key.to_string();
+            tokio::spawn(async move {
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .body(ByteStream::from_static(PAYLOAD.as_bytes()))
+                    .send()
+                    .await
+            })
+        };
+
+        // The proxy reads B's complete successful response before parking it,
+        // so B's GET proves the object is committed while A's worker is still
+        // unable to persist COMPLETED.
+        site_b_response_hold.wait_for_backend_commit().await?;
+        wait_for_replicated_object(&site_b_client, bucket, key, PAYLOAD).await?;
+        let source_head = site_a_client.head_object().bucket(bucket).key(key).send().await?;
+        let version_id = source_head
+            .version_id()
+            .ok_or("source HEAD omitted the pending version ID")?
+            .to_string();
+        assert_eq!(
+            source_head.replication_status().map(|status| status.as_str()),
+            Some("PENDING"),
+            "source must still report PENDING while the initial replication response is held"
+        );
+
+        let tag_task = {
+            let client = site_a_client.clone();
+            let bucket = bucket.to_string();
+            let key = key.to_string();
+            // The original real-machine failure used the current-version S3
+            // API (no versionId). The delete phase below deliberately keeps an
+            // explicit versionId so both request shapes stay covered.
+            tokio::spawn(async move { put_single_tag_current(&client, &bucket, &key, TAG_KEY, TAG_VALUE).await })
+        };
+        wait_for_single_tag(&site_a_client, bucket, key, &version_id, TAG_KEY, TAG_VALUE, "site A").await?;
+        assert_eq!(
+            head_replication_status(&site_a_client, bucket, key, &version_id)
+                .await?
+                .as_deref(),
+            Some("PENDING"),
+            "tag update must be authored before the initial replication reaches COMPLETED"
+        );
+
+        site_b_response_hold.release()?;
+        let put_output = timeout(Duration::from_secs(60), put_task)
+            .await
+            .map_err(|_| "source PutObject remained blocked after releasing the replication response")???;
+        timeout(Duration::from_secs(60), tag_task)
+            .await
+            .map_err(|_| "PutObjectTagging remained blocked after releasing the replication response")???;
+        assert_eq!(put_output.version_id(), Some(version_id.as_str()));
+
+        wait_for_single_tag(&site_b_client, bucket, key, &version_id, TAG_KEY, TAG_VALUE, "site B").await?;
+        wait_for_version_replication_status(&site_a_client, bucket, key, &version_id, &["COMPLETED"], "site A").await?;
+        wait_for_version_replication_status(&site_b_client, bucket, key, &version_id, &["REPLICA"], "site B").await?;
+
+        let source_state = list_replication_state(&site_a_client, bucket).await?;
+        let target_state = list_replication_state(&site_b_client, bucket).await?;
+        assert_eq!(source_state, target_state, "tag replication must not fork the object version");
+        assert_eq!(source_state.len(), 1, "tag replication must leave exactly one object version");
+        assert_eq!(source_state[0].key, key);
+        assert_eq!(source_state[0].version_id, version_id);
+
+        // Re-arm the same response barrier for an initially tagged object.
+        // Deleting its tag while A is still PENDING proves the same admission
+        // rule covers DeleteObjectTagging rather than only the original PUT
+        // symptom.
+        let delete_key = "pending-delete-window.txt";
+        site_b_response_hold.arm()?;
+        let delete_put_task = {
+            let client = site_a_client.clone();
+            let bucket = bucket.to_string();
+            let key = delete_key.to_string();
+            tokio::spawn(async move {
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .tagging(format!("{DELETE_TAG_KEY}={DELETE_TAG_VALUE}"))
+                    .body(ByteStream::from_static(DELETE_PAYLOAD.as_bytes()))
+                    .send()
+                    .await
+            })
+        };
+
+        site_b_response_hold.wait_for_backend_commit().await?;
+        wait_for_replicated_object(&site_b_client, bucket, delete_key, DELETE_PAYLOAD).await?;
+        let delete_source_head = site_a_client.head_object().bucket(bucket).key(delete_key).send().await?;
+        let delete_version_id = delete_source_head
+            .version_id()
+            .ok_or("source HEAD omitted the pending tagged version ID")?
+            .to_string();
+        assert_eq!(
+            delete_source_head.replication_status().map(|status| status.as_str()),
+            Some("PENDING"),
+            "source tagged object must remain PENDING while its initial response is held"
+        );
+        wait_for_single_tag(
+            &site_b_client,
+            bucket,
+            delete_key,
+            &delete_version_id,
+            DELETE_TAG_KEY,
+            DELETE_TAG_VALUE,
+            "site B",
+        )
+        .await?;
+
+        let delete_tag_task = {
+            let client = site_a_client.clone();
+            let bucket = bucket.to_string();
+            let key = delete_key.to_string();
+            let version_id = delete_version_id.clone();
+            tokio::spawn(async move {
+                client
+                    .delete_object_tagging()
+                    .bucket(bucket)
+                    .key(key)
+                    .version_id(version_id)
+                    .send()
+                    .await
+            })
+        };
+        wait_for_tag_absent(&site_a_client, bucket, delete_key, &delete_version_id, DELETE_TAG_KEY, "site A").await?;
+        assert_eq!(
+            head_replication_status(&site_a_client, bucket, delete_key, &delete_version_id)
+                .await?
+                .as_deref(),
+            Some("PENDING"),
+            "tag deletion must be authored before the initial replication reaches COMPLETED"
+        );
+
+        site_b_response_hold.release()?;
+        let delete_put_output = timeout(Duration::from_secs(60), delete_put_task)
+            .await
+            .map_err(|_| "source tagged PutObject remained blocked after releasing the replication response")???;
+        timeout(Duration::from_secs(60), delete_tag_task)
+            .await
+            .map_err(|_| "DeleteObjectTagging remained blocked after releasing the replication response")???;
+        assert_eq!(delete_put_output.version_id(), Some(delete_version_id.as_str()));
+
+        wait_for_tag_absent(&site_b_client, bucket, delete_key, &delete_version_id, DELETE_TAG_KEY, "site B").await?;
+        wait_for_version_replication_status(&site_a_client, bucket, delete_key, &delete_version_id, &["COMPLETED"], "site A")
+            .await?;
+        wait_for_version_replication_status(&site_b_client, bucket, delete_key, &delete_version_id, &["REPLICA"], "site B")
+            .await?;
+
+        let source_state = list_replication_state(&site_a_client, bucket).await?;
+        let target_state = list_replication_state(&site_b_client, bucket).await?;
+        assert_eq!(source_state, target_state, "tag deletion must not fork the object version");
+        assert_eq!(source_state.len(), 2, "pending-window scenarios must leave exactly two object versions");
+        assert!(
+            source_state
+                .iter()
+                .any(|entry| entry.key == delete_key && entry.version_id == delete_version_id),
+            "tag deletion must preserve the original version identity"
+        );
+
+        proxy_tasks.abort_all();
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err("pending-window site-replication tagging test timed out".into()),
+    }
+}
+
+/// rustfs/backlog#1953 (audit A4/P1-6): receiver-side LWW for replicated
+/// metadata categories, exercised end to end over the real dual-node
+/// active-active site-replication control plane — sender, worker, status
+/// bookkeeping and persisted failure recovery all participate (the single-server
+/// `replication_lww_receiver_test` only injects authorized replication PUTs).
+///
+/// Scenario on one versioned object:
+/// 1. reciprocal tag edits in real order (A then B) converge both sites on the
+///    newer tag and leave the author COMPLETED / the receiver REPLICA;
+/// 2. out-of-order delivery: A's edit is held at B's inbound proxy while B
+///    authors a newer edit that reaches A first; releasing the stale delivery
+///    must NOT roll B back — both sites settle on B's value and stay there
+///    through a quiet window, with no FAILED/PENDING status left behind;
+/// 3. persisted retry: B is stopped, A's delivery reaches FAILED, A restarts,
+///    then B returns and the scanner-replayed edit converges both sites forward.
+/// Durable metadata-MRF serialization/reconstruction is covered separately by
+/// `metadata_mrf_roundtrip_preserves_tags_and_admitted_targets`.
+#[tokio::test]
+async fn test_site_replication_tagging_lww_converges_active_active_real_dual_node() -> TestResult {
+    init_logging();
+
+    match tokio::time::timeout(Duration::from_secs(420), async {
+        // The scanner is fast for the final persisted-failure recovery phase.
+        // Step 2 finishes and proves a quiet stable winner before that phase,
+        // so a later scanner pass cannot mask its stale-delivery assertion.
+        let mut site_env = replication_fast_env();
+        site_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+        site_env.extend_from_slice(FAST_SCANNER_ENV);
+
+        let mut site_a_env = RustFSTestEnvironment::new().await?;
+        site_a_env.start_rustfs_server_with_env(vec![], &site_env).await?;
+
+        let mut site_b_env = RustFSTestEnvironment::new().await?;
+        site_b_env.start_rustfs_server_with_env(vec![], &site_env).await?;
+
+        let mut proxy_tasks = JoinSet::new();
+        let (site_a_proxy, site_a_replication_requests, _site_a_replication_enabled, site_a_held_tagging, _site_a_response_hold) =
+            start_replication_counting_proxy_with_tag_hold(&site_a_env.url, &mut proxy_tasks).await?;
+        let (site_b_proxy, site_b_replication_requests, _site_b_replication_enabled, site_b_held_tagging, _site_b_response_hold) =
+            start_replication_counting_proxy_with_tag_hold(&site_b_env.url, &mut proxy_tasks).await?;
+
+        let site_a_client = site_a_env.create_s3_client();
+        let site_b_client = site_b_env.create_s3_client();
+        let bucket = "site-repl-tag-lww";
+        let key = "lww.txt";
+
+        let add_status = site_replication_add(
+            &site_a_env,
+            &[
+                PeerSite {
+                    name: "lww-site-a".to_string(),
+                    endpoint: site_a_env.url.clone(),
+                    access_key: site_a_env.access_key.clone(),
+                    secret_key: site_a_env.secret_key.clone(),
+                    ..Default::default()
+                },
+                PeerSite {
+                    name: "lww-site-b".to_string(),
+                    endpoint: site_b_env.url.clone(),
+                    access_key: site_b_env.access_key.clone(),
+                    secret_key: site_b_env.secret_key.clone(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await?;
+        assert!(add_status.success, "unexpected site add result: {add_status:?}");
+
+        let site_info = wait_for_site_replication_enabled(&site_a_env, 2).await?;
+        wait_for_site_replication_enabled(&site_b_env, 2).await?;
+
+        // Route both directions through the counting proxies so inbound
+        // replication to B can be held (out-of-order delivery) and observed.
+        for (env_url, proxy_url, label) in [(&site_a_env.url, &site_a_proxy, "A"), (&site_b_env.url, &site_b_proxy, "B")] {
+            let mut peer = site_info
+                .sites
+                .iter()
+                .find(|peer| peer.endpoint == *env_url)
+                .ok_or_else(|| format!("site {label} peer missing from replication info"))?
+                .clone();
+            peer.endpoint = proxy_url.clone();
+            peer.sync_state = SyncStatus::Enable;
+            let edit = site_replication_edit(&site_a_env, "", &peer).await?;
+            assert!(edit.success, "unexpected site {label} endpoint edit: {edit:?}");
+        }
+        for env in [&site_a_env, &site_b_env] {
+            wait_for_site_replication_info(env, |info| {
+                info.sites.iter().any(|peer| peer.endpoint == site_a_proxy)
+                    && info.sites.iter().any(|peer| peer.endpoint == site_b_proxy)
+            })
+            .await?;
+        }
+
+        site_a_client.create_bucket().bucket(bucket).send().await?;
+        wait_for_bucket_on_target(&site_b_client, bucket).await?;
+
+        let version_id = site_a_client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"tag lww payload"))
+            .send()
+            .await?
+            .version_id()
+            .ok_or("site A PUT omitted version ID")?
+            .to_string();
+        wait_for_replicated_object(&site_b_client, bucket, key, "tag lww payload").await?;
+        wait_for_version_replication_status(&site_a_client, bucket, key, &version_id, &["COMPLETED"], "site A").await?;
+        wait_for_version_replication_status(&site_b_client, bucket, key, &version_id, &["REPLICA"], "site B").await?;
+        wait_for_proxy_replication_requests(&site_b_replication_requests, 1, "site B").await?;
+
+        // --- 1. reciprocal edits in real order: A then B ----------------------
+        put_single_tag(&site_a_client, bucket, key, &version_id, LWW_TAG_KEY, "a1").await?;
+        wait_for_single_tag(&site_b_client, bucket, key, &version_id, LWW_TAG_KEY, "a1", "site B").await?;
+        wait_for_version_replication_status(&site_a_client, bucket, key, &version_id, &["COMPLETED"], "site A").await?;
+        wait_for_version_replication_status(&site_b_client, bucket, key, &version_id, &["REPLICA"], "site B").await?;
+        wait_for_proxy_replication_requests(&site_b_replication_requests, 2, "site B").await?;
+
+        put_single_tag(&site_b_client, bucket, key, &version_id, LWW_TAG_KEY, "b1").await?;
+        wait_for_single_tag(&site_a_client, bucket, key, &version_id, LWW_TAG_KEY, "b1", "site A").await?;
+        wait_for_version_replication_status(&site_b_client, bucket, key, &version_id, &["COMPLETED"], "site B").await?;
+        wait_for_version_replication_status(&site_a_client, bucket, key, &version_id, &["REPLICA"], "site A").await?;
+        assert_tag_stable_on_both_sites(&site_a_client, &site_b_client, bucket, key, &version_id, "b1", Duration::from_secs(3))
+            .await?;
+
+        // --- 2. concurrent edits, stale delivery last ------------------------
+        // Both sites edit the same version while each other's delivery is
+        // parked at the peer's inbound proxy (content-keyed: only the
+        // `owner=a2` / `owner=b2` replication PUTs wait, everything else
+        // flows). B's edit is the newer one. Releasing A's stale `a2` first
+        // makes it the last write B sees while A itself still holds `a2`, so
+        // nothing A could re-deliver carries the winner: only receiver-side
+        // LWW on B can keep `b2`. Releasing `b2` afterwards converges A.
+        site_b_held_tagging.send(Some("owner=a2".to_string()))?;
+        site_a_held_tagging.send(Some("owner=b2".to_string()))?;
+        let a2_parked_at = site_b_replication_requests.load(Ordering::Relaxed) + 1;
+        let b2_parked_at = site_a_replication_requests.load(Ordering::Relaxed) + 1;
+        put_single_tag(&site_a_client, bucket, key, &version_id, LWW_TAG_KEY, "a2").await?;
+        wait_for_proxy_replication_requests(&site_b_replication_requests, a2_parked_at, "site B").await?;
+        sleep(Duration::from_millis(50)).await;
+        put_single_tag(&site_b_client, bucket, key, &version_id, LWW_TAG_KEY, "b2").await?;
+        wait_for_proxy_replication_requests(&site_a_replication_requests, b2_parked_at, "site A").await?;
+        assert_eq!(
+            get_single_tag(&site_a_client, bucket, key, &version_id, LWW_TAG_KEY)
+                .await?
+                .as_deref(),
+            Some("a2")
+        );
+        assert_eq!(
+            get_single_tag(&site_b_client, bucket, key, &version_id, LWW_TAG_KEY)
+                .await?
+                .as_deref(),
+            Some("b2")
+        );
+
+        // Release the stale a2 delivery onto B: the newer local b2 must
+        // survive, and the delivery itself must still succeed (A reaches
+        // COMPLETED instead of looping through MRF with the stale value).
+        site_b_held_tagging.send(None)?;
+        wait_for_version_replication_status(&site_a_client, bucket, key, &version_id, &["COMPLETED"], "site A").await?;
+        let stale_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            assert_eq!(
+                get_single_tag(&site_b_client, bucket, key, &version_id, LWW_TAG_KEY)
+                    .await?
+                    .as_deref(),
+                Some("b2"),
+                "a stale inbound delivery rolled back site B's newer tag (receiver-side LWW regression)"
+            );
+            if tokio::time::Instant::now() >= stale_deadline {
+                break;
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+
+        // Release b2 onto A: the newer edit wins there and both sites settle.
+        // B's own version may legitimately read REPLICA here: the stale inbound
+        // a2 write re-labelled it as a replica write (keeping B's tags); what
+        // must not remain is PENDING/FAILED.
+        site_a_held_tagging.send(None)?;
+        wait_for_single_tag(&site_a_client, bucket, key, &version_id, LWW_TAG_KEY, "b2", "site A").await?;
+        wait_for_version_replication_status(&site_b_client, bucket, key, &version_id, &["COMPLETED", "REPLICA"], "site B")
+            .await?;
+        assert_tag_stable_on_both_sites(&site_a_client, &site_b_client, bucket, key, &version_id, "b2", Duration::from_secs(4))
+            .await?;
+        for (client, site) in [(&site_a_client, "site A"), (&site_b_client, "site B")] {
+            let status = head_replication_status(client, bucket, key, &version_id).await?;
+            assert!(
+                matches!(status.as_deref(), Some("COMPLETED" | "REPLICA")),
+                "{site} must not be left PENDING/FAILED after the concurrent edits: {status:?}"
+            );
+        }
+
+        // --- 3. persisted FAILED state survives a source restart ------------
+        site_b_env.stop_server();
+        put_single_tag(&site_a_client, bucket, key, &version_id, LWW_TAG_KEY, "a3").await?;
+        wait_for_version_replication_status(&site_a_client, bucket, key, &version_id, &["FAILED"], "site A").await?;
+        site_a_env.restart_server_preserving_data(vec![], &site_env).await?;
+        wait_for_site_replication_enabled(&site_a_env, 2).await?;
+        site_b_env.restart_server_preserving_data(vec![], &site_env).await?;
+        wait_for_site_replication_enabled(&site_b_env, 2).await?;
+
+        wait_for_single_tag(&site_b_client, bucket, key, &version_id, LWW_TAG_KEY, "a3", "site B").await?;
+        wait_for_version_replication_status(&site_a_client, bucket, key, &version_id, &["COMPLETED"], "site A").await?;
+        wait_for_version_replication_status(&site_b_client, bucket, key, &version_id, &["REPLICA"], "site B").await?;
+        assert_tag_stable_on_both_sites(&site_a_client, &site_b_client, bucket, key, &version_id, "a3", Duration::from_secs(3))
+            .await?;
+
+        // The object itself never forked: one version on each side.
+        tokio::time::timeout(
+            Duration::from_secs(70),
+            assert_replication_converged(&site_a_client, bucket, &site_b_client, bucket),
+        )
+        .await??;
+        let state = list_replication_state(&site_a_client, bucket).await?;
+        assert_eq!(state.len(), 1, "tag edits must not create new object versions: {state:?}");
+        assert_eq!(state[0].version_id, version_id);
+
+        proxy_tasks.abort_all();
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err("site replication tagging LWW test timed out".into()),
+    }
+}
 #[tokio::test]
 async fn test_site_replication_replicates_policy_backed_user_access_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
@@ -7280,11 +8921,6 @@ async fn test_site_replication_replicates_multiple_service_accounts_real_dual_no
 #[tokio::test]
 async fn test_site_replication_replicates_service_accounts_created_from_sts_session_real_dual_node() -> TestResult {
     init_logging();
-
-    if !awscurl_available() {
-        eprintln!("Skipping STS site replication service-account test because awscurl is unavailable");
-        return Ok(());
-    }
 
     let mut source_env = RustFSTestEnvironment::new().await?;
     source_env
@@ -7781,9 +9417,11 @@ async fn test_replication_check_flags_multipart_only_version_minting_target() ->
             .is_some_and(|error| error.contains("CreateMultipartUpload")),
         "the failure must name the multipart path: {payload}"
     );
-    // The PutObject leg mirrored, so it is the multipart probe that failed.
+    // The PutObject leg mirrored, so it is the multipart probe that failed;
+    // the mutation phases address the id the PUT reported and still run.
     assert_eq!(target_report["Phases"]["Put"]["Status"], "OK", "{payload}");
-    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "SKIPPED", "{payload}");
+    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionDelete"]["Status"], "OK", "{payload}");
     assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
 
     let probe_key = target
@@ -7971,6 +9609,9 @@ async fn test_replication_check_flags_version_minting_target() -> TestResult {
     let target_bucket = "version-fidelity-dst";
     target.create_bucket(target_bucket);
     target.assign_own_version_ids(true);
+    // Wasabi shape: the probe version the VersionDelete phase removed answers
+    // NoSuchVersion to cleanup's second DELETE, which must count as clean.
+    target.reject_unknown_version_deletes(true);
 
     let mut source_env = RustFSTestEnvironment::new().await?;
     let mut env_vars = replication_fast_env();
@@ -8015,11 +9656,13 @@ async fn test_replication_check_flags_version_minting_target() -> TestResult {
         fidelity["Code"], "BucketRemoteTargetVersionMismatch",
         "the failure must carry a machine-readable code: {payload}"
     );
-    // The probe PUT itself succeeded (fidelity is judged from its response);
-    // the later mutation phases are pointless against a drifting target and
-    // must be skipped, but cleanup still runs.
+    // The probe PUT itself succeeded (fidelity is judged from its response).
+    // The mutation phases address the id the target assigned — the ledger
+    // the worker records per object (rustfs/backlog#2340) — so they run and
+    // pass on a drifting target, and cleanup uses the same id.
     assert_eq!(target_report["Phases"]["Put"]["Status"], "OK", "{payload}");
-    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "SKIPPED", "{payload}");
+    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionDelete"]["Status"], "OK", "{payload}");
     assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
 
     // The probe PUT must carry the source version as `?versionId=` — the
@@ -8725,7 +10368,7 @@ async fn test_get_and_head_proxy_unreplicated_object_to_replication_target() -> 
     // the real SSE-C decryption; the plaintext fake simply ignores them).
     target.take_requests();
     let ssec_key = "01234567890123456789012345678901";
-    let ssec_key_b64 = BASE64_STANDARD.encode(ssec_key);
+    let ssec_key_b64 = BASE64_STANDARD.encode_to_string(ssec_key);
     let ssec_key_md5 = sse_customer_key_md5_base64(ssec_key);
     let _ = source_client
         .get_object()
@@ -8862,13 +10505,14 @@ async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_targ
     let target_bucket = "proxy-tag-dst";
     let (target, source_env, source_client, target_client) = start_read_proxy_lab(source_bucket, target_bucket).await?;
 
-    target_client
+    let tagged = target_client
         .put_object()
         .bucket(target_bucket)
         .key("proxy-tagged")
         .body(ByteStream::from_static(b"tagged payload"))
         .send()
         .await?;
+    let tagged_version = tagged.version_id().ok_or("versioned target PUT omitted its identity")?;
     target_client
         .put_object_tagging()
         .bucket(target_bucket)
@@ -8892,6 +10536,11 @@ async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_targ
     assert_eq!(tags.tag_set.len(), 1, "proxied tagging read must return the target's tags");
     assert_eq!(tags.tag_set[0].key.as_str(), "team");
     assert_eq!(tags.tag_set[0].value.as_str(), "storage");
+    assert_eq!(
+        tags.version_id(),
+        Some(tagged_version),
+        "proxy must preserve the resolved remote identity"
+    );
 
     let record = target
         .requests()
@@ -8905,7 +10554,230 @@ async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_targ
     );
     assert!(record.proxy_headers.replication_check.is_none());
 
+    let empty = target_client
+        .put_object()
+        .bucket(target_bucket)
+        .key("proxy-tagged")
+        .body(ByteStream::from_static(b"new version without tags"))
+        .send()
+        .await?;
+    let empty_version = empty.version_id().ok_or("empty-tag version omitted its identity")?;
+    for selector in [None, Some(empty_version), Some(tagged_version)] {
+        let tags = source_client
+            .get_object_tagging()
+            .bucket(source_bucket)
+            .key("proxy-tagged")
+            .set_version_id(selector.map(str::to_owned))
+            .send()
+            .await?;
+        let expected_version = selector.unwrap_or(empty_version);
+        assert_eq!(tags.version_id(), Some(expected_version));
+        if expected_version == tagged_version {
+            assert_eq!(tags.tag_set().len(), 1);
+            assert_eq!(tags.tag_set()[0].key(), "team");
+            assert_eq!(tags.tag_set()[0].value(), "storage");
+        } else {
+            assert!(tags.tag_set().is_empty());
+        }
+    }
+
     drop(source_env);
     target.shutdown().await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// backlog#2363
+// ---------------------------------------------------------------------------
+
+/// Wait until the source reports a terminal replication status for `key`.
+async fn wait_terminal_replication_status(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    ssec: bool,
+    timeout: Duration,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let request = client.head_object().bucket(bucket).key(key);
+        let head = if ssec {
+            request
+                .sse_customer_algorithm("AES256")
+                .sse_customer_key(&customer_key)
+                .sse_customer_key_md5(&customer_key_md5)
+                .send()
+                .await?
+        } else {
+            request.send().await?
+        };
+        let status = head.replication_status().map(|status| status.as_str().to_string());
+        if matches!(status.as_deref(), Some("COMPLETED") | Some("FAILED")) {
+            return Ok(status.unwrap_or_default());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("{bucket}/{key}: replication never reached a terminal status; last {status:?}").into());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// backlog#2363: SSE-C ciphertext passthrough of objects the source stored
+/// compressed. The replica on a RustFS target must decrypt to the original
+/// bytes for a single PUT and for a multipart upload.
+#[tokio::test]
+async fn test_bucket_replication_sse_c_compressed_passthrough() -> TestResult {
+    init_logging();
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    let mut source_process_env = replication_fast_env();
+    source_process_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_process_env.extend_from_slice(FAST_SCANNER_ENV);
+    source_process_env.extend_from_slice(&[
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("HTTP_PROXY", ""),
+        ("HTTPS_PROXY", ""),
+        ("RUSTFS_COMPRESSION_ENABLED", "true"),
+        ("RUSTFS_COMPRESSION_MULTIPART_ENABLED", "true"),
+    ]);
+    source_env.start_rustfs_server_with_env(vec![], &source_process_env).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(&[
+            ("NO_PROXY", "127.0.0.1,localhost"),
+            ("HTTP_PROXY", ""),
+            ("HTTPS_PROXY", ""),
+        ])
+        .await?;
+
+    let source_bucket = "ssec-compressed-src";
+    let target_bucket = "ssec-compressed-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+    let text = |len: usize, seed: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + 64);
+        let mut line = 0u64;
+        while out.len() < len {
+            out.extend_from_slice(format!("ssec compressed passthrough seed={seed} line={line} lorem ipsum dolor\n").as_bytes());
+            line += 1;
+        }
+        out.truncate(len);
+        out
+    };
+
+    let single_key = "ssec-compressed-single.txt";
+    let single_body = text(1024 * 1024 + 17, 1);
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(single_key)
+        .content_type("text/plain")
+        .body(ByteStream::from(single_body.clone()))
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+
+    let multipart_key = "ssec-compressed-multipart.txt";
+    let multipart_parts = [text(PART_SIZE, 2), text(1024 * 1024 + 4096, 3)];
+    let multipart_body: Vec<u8> = multipart_parts.concat();
+    let created = source_client
+        .create_multipart_upload()
+        .bucket(source_bucket)
+        .key(multipart_key)
+        .content_type("text/plain")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    let upload_id = created.upload_id().ok_or("missing multipart upload id")?.to_string();
+    let mut completed = Vec::new();
+    for (index, part) in multipart_parts.iter().enumerate() {
+        let part_number = i32::try_from(index + 1)?;
+        let uploaded = source_client
+            .upload_part()
+            .bucket(source_bucket)
+            .key(multipart_key)
+            .upload_id(&upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(part.clone()))
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(&customer_key)
+            .sse_customer_key_md5(&customer_key_md5)
+            .send()
+            .await?;
+        completed.push(
+            CompletedPart::builder()
+                .part_number(part_number)
+                .set_e_tag(uploaded.e_tag().map(str::to_string))
+                .build(),
+        );
+    }
+    source_client
+        .complete_multipart_upload()
+        .bucket(source_bucket)
+        .key(multipart_key)
+        .upload_id(&upload_id)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed)).build())
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+
+    let mut failures = Vec::new();
+    for (key, body) in [(single_key, &single_body), (multipart_key, &multipart_body)] {
+        let status = wait_terminal_replication_status(&source_client, source_bucket, key, true, Duration::from_secs(120)).await?;
+        if status != "COMPLETED" {
+            failures.push(format!("{key}: source reports {status}"));
+            continue;
+        }
+        let replica = target_client
+            .get_object()
+            .bucket(target_bucket)
+            .key(key)
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(&customer_key)
+            .sse_customer_key_md5(&customer_key_md5)
+            .send()
+            .await;
+        match replica {
+            Ok(replica) => {
+                let content_length = replica.content_length();
+                match replica.body.collect().await {
+                    Ok(collected) => {
+                        let bytes = collected.into_bytes();
+                        if bytes.as_ref() != body.as_slice() {
+                            failures.push(format!(
+                                "{key}: replica bytes differ (content_length={content_length:?}, got {} bytes, want {})",
+                                bytes.len(),
+                                body.len()
+                            ));
+                        }
+                    }
+                    Err(err) => failures.push(format!("{key}: replica body read failed: {err}")),
+                }
+            }
+            Err(err) => failures.push(format!("{key}: replica GET failed: {err}")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "SSE-C compressed passthrough replicas must decrypt to the source bytes: {failures:?}"
+    );
     Ok(())
 }

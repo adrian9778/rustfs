@@ -14,9 +14,28 @@
 
 use std::{fs, path::Path};
 
-#[cfg(test)]
-use super::Endpoint;
-use super::{DiskStore, HealDiskExt as _, local_disk_map_read, resume::ReplacementTargetIdentity};
+use super::{
+    DiskOption, DiskStore, Endpoint, HealDiskExt as _, local_disk_map_read, new_disk, resume::ReplacementTargetIdentity,
+};
+
+/// Whether automatic replacement may fall back to the set-wide format heal when
+/// a target cannot pass the independent-mount admission.
+///
+/// Directory-backed deployments already declare, through
+/// `RUSTFS_UNSAFE_BYPASS_DISK_CHECK`, that their endpoints are plain
+/// directories sharing a device with the host root. Those endpoints can never
+/// satisfy [`auto_replacement_target_identity`], so without this fallback a
+/// runtime-wiped or replaced directory disk would stay deferred forever. The
+/// admission check itself is never bypassed; the fallback only routes the heal
+/// through the ordinary format path that formats every unformatted disk in the
+/// set, which is exactly what the pre-admission `heal_disk` path did.
+pub(crate) fn directory_backed_replacement_fallback_enabled() -> bool {
+    rustfs_utils::get_env_bool_with_aliases(
+        rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK,
+        &[rustfs_config::ENV_MINIO_CI],
+        rustfs_config::DEFAULT_UNSAFE_BYPASS_DISK_CHECK,
+    )
+}
 
 pub(crate) async fn auto_replacement_target_ready(disk: &DiskStore, local_disks: &[DiskStore]) -> bool {
     auto_replacement_target_identity(disk, local_disks).await.is_some()
@@ -72,8 +91,38 @@ pub(crate) async fn auto_replacement_target_identity(
     .flatten()
 }
 
-pub(crate) async fn auto_replacement_targets_ready(targets: &[String]) -> bool {
-    auto_replacement_target_identities(targets).await.is_some()
+fn local_replacement_endpoint(target: &str, local_grid_hosts: &[String]) -> Option<Endpoint> {
+    let mut endpoint = Endpoint::try_from(target).ok()?;
+    if endpoint.is_local {
+        return Some(endpoint);
+    }
+
+    let grid_host = endpoint.grid_host();
+    if grid_host.is_empty() || !local_grid_hosts.iter().any(|local_host| local_host == &grid_host) {
+        return None;
+    }
+
+    endpoint.is_local = true;
+    Some(endpoint)
+}
+
+pub(super) async fn replacement_target_disk(target: &str, local_disks: &[DiskStore]) -> Option<DiskStore> {
+    if let Some(disk) = local_disks.iter().find(|disk| disk.endpoint().to_string() == target) {
+        return Some(disk.clone());
+    }
+
+    let local_grid_hosts = local_disks.iter().map(|disk| disk.endpoint().grid_host()).collect::<Vec<_>>();
+    let endpoint = local_replacement_endpoint(target, &local_grid_hosts)?;
+
+    new_disk(
+        &endpoint,
+        &DiskOption {
+            cleanup: false,
+            health_check: false,
+        },
+    )
+    .await
+    .ok()
 }
 
 pub(crate) async fn auto_replacement_target_identities(targets: &[String]) -> Option<Vec<ReplacementTargetIdentity>> {
@@ -88,8 +137,8 @@ pub(crate) async fn auto_replacement_target_identities(targets: &[String]) -> Op
 
     let mut identities = Vec::with_capacity(targets.len());
     for target in targets {
-        let disk = local_disks.iter().find(|disk| disk.endpoint().to_string() == *target)?;
-        identities.push(auto_replacement_target_identity(disk, &local_disks).await?);
+        let disk = replacement_target_disk(target, &local_disks).await?;
+        identities.push(auto_replacement_target_identity(&disk, &local_disks).await?);
     }
     identities.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
     identities.dedup_by(|left, right| left.endpoint == right.endpoint);
@@ -131,12 +180,70 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn local_replacement_endpoint_accepts_a_url_on_a_registered_local_grid_host() {
+        let local_grid_hosts = vec!["http://127.0.0.1:9000".to_owned()];
+        let endpoint = local_replacement_endpoint("http://127.0.0.1:9000/replacement", &local_grid_hosts)
+            .expect("matching local grid host should be accepted");
+
+        assert!(endpoint.is_local);
+    }
+
+    #[test]
+    fn local_replacement_endpoint_rejects_a_url_on_an_unregistered_grid_host() {
+        let local_grid_hosts = vec!["http://127.0.0.1:9000".to_owned()];
+
+        assert!(local_replacement_endpoint("http://127.0.0.1:9001/replacement", &local_grid_hosts).is_none());
+    }
+
+    #[test]
+    fn local_replacement_endpoint_keeps_a_local_path_local() {
+        let endpoint = local_replacement_endpoint("/replacement", &[]).expect("local path should be accepted");
+
+        assert!(endpoint.is_local);
+    }
+
+    #[test]
+    fn directory_backed_fallback_is_off_by_default() {
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, None::<&str>),
+                (rustfs_config::ENV_MINIO_CI, None::<&str>),
+            ],
+            || assert!(!directory_backed_replacement_fallback_enabled()),
+        );
+    }
+
+    #[test]
+    fn directory_backed_fallback_follows_the_disk_check_bypass() {
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, Some("true")),
+                (rustfs_config::ENV_MINIO_CI, None::<&str>),
+            ],
+            || assert!(directory_backed_replacement_fallback_enabled()),
+        );
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, Some("false")),
+                (rustfs_config::ENV_MINIO_CI, Some("true")),
+            ],
+            || {
+                assert!(
+                    !directory_backed_replacement_fallback_enabled(),
+                    "the canonical key must win over the alias"
+                )
+            },
+        );
+    }
+
     #[tokio::test]
     async fn runtime_environment_cannot_bypass_mount_admission() {
         temp_env::async_with_vars(
             [
                 ("RUSTFS_TEST_AUTO_REPLACEMENT_READINESS_BYPASS", Some("1")),
                 ("RUSTFS_E2E_AUTO_REPLACEMENT_READINESS_BYPASS", Some("1")),
+                (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, Some("true")),
             ],
             async {
                 let temp = TempDir::new().expect("temporary replacement root should be created");

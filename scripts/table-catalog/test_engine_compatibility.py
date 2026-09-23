@@ -32,7 +32,7 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertEqual(spark["status"], "manual-live-harness")
         self.assertContainsScenario(spark, "create-namespace", "manual-live-harness")
         self.assertContainsScenario(spark, "create-table", "manual-live-harness")
-        self.assertContainsScenario(spark, "append", "manual-live-harness")
+        self.assertContainsScenario(spark, "staged-create", "manual-live-harness")
         self.assertContainsScenario(spark, "reload-table", "manual-live-harness")
         self.assertContainsScenario(spark, "drop-table", "manual-live-harness")
         self.assertContainsScenario(spark, "commit-conflict", "manual-validation-required")
@@ -40,6 +40,15 @@ class EngineCompatibilityTest(unittest.TestCase):
         trino = by_client["Trino Iceberg REST catalog"]
         self.assertEqual(trino["status"], "manual-live-read-probe")
         self.assertContainsScenario(trino, "catalog-load", "manual-live-probe")
+
+        duckdb = by_client["DuckDB Iceberg"]
+        self.assertEqual(duckdb["status"], "automated-smoke")
+        self.assertEqual(duckdb["entrypoint"], "scripts/table-catalog/duckdb_smoke.py")
+        self.assertContainsScenario(duckdb, "metadata-read", "automated")
+        self.assertContainsScenario(duckdb, "catalog-attach", "automated")
+        self.assertContainsScenario(duckdb, "write-table", "automated")
+        self.assertContainsScenario(duckdb, "unsupported-boundaries", "automated")
+        self.assertContainsScenario(duckdb, "multi-table-mode", "automated")
 
     def test_spark_config_uses_rustfs_rest_catalog_and_s3fileio(self) -> None:
         config = engine_compatibility.spark_catalog_config(
@@ -133,7 +142,7 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertEqual(config["spark.sql.catalog.rustfs.s3.secret-access-key"], "rustfsadmin")
         self.assertEqual(config["spark.sql.catalog.rustfs.rest.signing-name"], "s3tables")
 
-    def test_spark_sql_smoke_covers_lifecycle_append_reload_and_cleanup(self) -> None:
+    def test_spark_sql_smoke_covers_staged_ctas_reload_and_cleanup(self) -> None:
         sql = engine_compatibility.spark_sql_smoke(
             catalog_name="rustfs",
             namespace="sales",
@@ -143,8 +152,9 @@ class EngineCompatibilityTest(unittest.TestCase):
 
         self.assertIn("CREATE NAMESPACE IF NOT EXISTS rustfs.`sales`", sql)
         self.assertIn("DROP TABLE IF EXISTS rustfs.`sales`.`orders`", sql)
-        self.assertIn("CREATE TABLE rustfs.`sales`.`orders`", sql)
-        self.assertIn("INSERT INTO rustfs.`sales`.`orders`", sql)
+        self.assertIn("CREATE TABLE rustfs.`sales`.`orders` USING iceberg AS", sql)
+        self.assertIn("SELECT * FROM VALUES (1L, 'alpha'), (2L, 'beta')", sql)
+        self.assertNotIn("INSERT INTO rustfs.`sales`.`orders`", sql)
         self.assertIn("REFRESH TABLE rustfs.`sales`.`orders`", sql)
         self.assertIn("SELECT COUNT(*) AS row_count FROM rustfs.`sales`.`orders`", sql)
         self.assertIn("DROP TABLE IF EXISTS rustfs.`sales`.`orders`", sql)
@@ -156,6 +166,70 @@ class EngineCompatibilityTest(unittest.TestCase):
                 catalog_name="rustfs",
                 namespace="sales`prod",
                 table="orders",
+            )
+
+    def test_duckdb_rest_catalog_sql_uses_rustfs_compatibility_options(self) -> None:
+        sql = engine_compatibility.duckdb_rest_catalog_sql(
+            endpoint="http://127.0.0.1:9000",
+            warehouse="rustfs-s3table-smoke",
+            access_key="rustfsadmin",
+            secret_key="rustfsadmin",
+            region="us-east-1",
+            catalog_name="rustfs",
+            namespace="smoke",
+            table="events",
+            rest_path="/iceberg",
+            rest_signing_name="s3",
+        )
+
+        self.assertIn("CREATE OR REPLACE SECRET rustfs_s3", sql)
+        self.assertIn("ENDPOINT '127.0.0.1:9000'", sql)
+        self.assertIn("SCOPE 's3://rustfs-s3table-smoke'", sql)
+        self.assertIn("ATTACH 'rustfs-s3table-smoke' AS \"rustfs\"", sql)
+        self.assertIn("ENDPOINT 'http://127.0.0.1:9000/iceberg'", sql)
+        self.assertIn("SIGV4_SERVICE 's3'", sql)
+        self.assertIn("STAGE_CREATE_TABLES false", sql)
+        self.assertIn("SKIP_CREATE_TABLE_METADATA_UPDATES true", sql)
+        self.assertIn("DISABLE_MULTI_TABLE_COMMIT true", sql)
+        self.assertIn("REMOVE_FILES_ON_DELETE false", sql)
+        self.assertIn("PURGE_REQUESTED false", sql)
+        self.assertIn('FROM "rustfs"."smoke"."events"', sql)
+        self.assertNotIn("ENDPOINT_TYPE", sql)
+
+    def test_duckdb_rest_catalog_sql_supports_s3tables_alias(self) -> None:
+        sql = engine_compatibility.duckdb_rest_catalog_sql(
+            endpoint="https://rustfs.example",
+            warehouse="analytics",
+            access_key="access'key",
+            secret_key="secret'key",
+            region="us-east-1",
+            catalog_name="rustfs_compat",
+            namespace="smoke",
+            table="events",
+            rest_path="/_iceberg",
+            rest_signing_name="s3tables",
+        )
+
+        self.assertIn("USE_SSL true", sql)
+        self.assertIn("ENDPOINT 'rustfs.example'", sql)
+        self.assertIn("ENDPOINT 'https://rustfs.example/_iceberg'", sql)
+        self.assertIn("SIGV4_SERVICE 's3tables'", sql)
+        self.assertIn("KEY_ID 'access''key'", sql)
+        self.assertIn("SECRET 'secret''key'", sql)
+
+    def test_duckdb_rest_catalog_sql_rejects_endpoint_without_scheme(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must include http:// or https://"):
+            engine_compatibility.duckdb_rest_catalog_sql(
+                endpoint="127.0.0.1:9000",
+                warehouse="analytics",
+                access_key="rustfsadmin",
+                secret_key="rustfsadmin",
+                region="us-east-1",
+                catalog_name="rustfs",
+                namespace="smoke",
+                table="events",
+                rest_path="/iceberg",
+                rest_signing_name="s3",
             )
 
     def test_cli_prints_machine_readable_engine_matrix(self) -> None:
@@ -308,6 +382,27 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertEqual(config["spark.sql.catalog.rustfs.uri"], "http://127.0.0.1:9000/_iceberg")
         self.assertEqual(config["spark.sql.catalog.rustfs.rest.signing-name"], "s3tables")
 
+    def test_cli_prints_duckdb_rest_catalog_sql(self) -> None:
+        sql = engine_compatibility.cli_json(
+            [
+                "--print-duckdb-rest-sql",
+                "--endpoint",
+                "http://127.0.0.1:9000",
+                "--warehouse",
+                "analytics",
+                "--catalog-name",
+                "rustfs_compat",
+                "--rest-path",
+                "/_iceberg",
+                "--rest-signing-name",
+                "s3tables",
+            ]
+        )
+
+        self.assertIn("ATTACH 'analytics' AS \"rustfs_compat\"", sql)
+        self.assertIn("ENDPOINT 'http://127.0.0.1:9000/_iceberg'", sql)
+        self.assertIn("SIGV4_SERVICE 's3tables'", sql)
+
     def test_live_conformance_harness_pins_clients_and_records_commands(self) -> None:
         harness = engine_compatibility.live_conformance_harness(
             endpoint="http://127.0.0.1:9000",
@@ -359,11 +454,16 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertEqual(trino["write_compatibility"], "not-claimed")
 
         duckdb = by_client["DuckDB Iceberg"]
-        self.assertEqual(duckdb["status"], "manual-live-read-probe")
+        self.assertEqual(duckdb["status"], "automated-smoke")
+        self.assertEqual(duckdb["version"], "1.5.5")
         self.assertIn("LOAD httpfs", duckdb["sql"])
         self.assertIn("LOAD iceberg", duckdb["sql"])
         self.assertIn("iceberg_scan", duckdb["sql"])
-        self.assertEqual(duckdb["write_compatibility"], "not-claimed")
+        self.assertIn("ATTACH 'rustfs-s3table-smoke'", duckdb["rest_catalog_sql"])
+        self.assertIn("STAGE_CREATE_TABLES false", duckdb["rest_catalog_sql"])
+        self.assertIn("SKIP_CREATE_TABLE_METADATA_UPDATES true", duckdb["rest_catalog_sql"])
+        self.assertEqual(duckdb["rest_catalog_write_compatibility"], "single-table-automated-smoke")
+        self.assertEqual(duckdb["write_compatibility"], "single-table-automated-smoke")
 
         snowflake = by_client["Snowflake Open Catalog / Iceberg integrations"]
         self.assertEqual(snowflake["status"], "manual-reference-probe")
@@ -407,7 +507,8 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertEqual(table_by_client["PyIceberg"]["claim_after_pass"], "automated-smoke")
         self.assertEqual(table_by_client["Spark Iceberg REST catalog"]["claim_after_pass"], "manual-live-verified")
         self.assertEqual(table_by_client["Trino Iceberg REST catalog"]["write_claim_after_pass"], "not-claimed")
-        self.assertEqual(table_by_client["DuckDB Iceberg"]["write_claim_after_pass"], "not-claimed")
+        self.assertEqual(table_by_client["DuckDB Iceberg"]["claim_after_pass"], "automated-rest-catalog-smoke")
+        self.assertEqual(table_by_client["DuckDB Iceberg"]["write_claim_after_pass"], "single-table-automated-smoke")
         self.assertIn("manual-live", " ".join(evidence["promotion_rules"]))
         self.assertIn("not-claimed", " ".join(evidence["promotion_rules"]))
 
@@ -447,7 +548,7 @@ class EngineCompatibilityTest(unittest.TestCase):
         record = engine_compatibility.live_conformance_evidence_record(
             client_name="Spark Iceberg REST catalog",
             client_version="3.5.4/iceberg-1.7.1",
-            scenario="create-namespace-create-table-append-refresh-count-cleanup",
+            scenario="create-namespace-staged-ctas-refresh-count-cleanup",
             rustfs_build="rustfs-test",
             git_sha="abc123",
             catalog_backing="durable-strong",
@@ -496,6 +597,10 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertIn("metadata_location", schema["required_fields"])
         self.assertIn("claim", schema["required_fields"])
         self.assertEqual(schema["claim_promotion"]["Trino Iceberg REST catalog"], ["manual-live-read-verified"])
+        self.assertEqual(
+            schema["claim_promotion"]["DuckDB Iceberg"],
+            ["manual-live-read-verified", "automated-rest-catalog-smoke"],
+        )
 
     def test_production_operations_guide_covers_release_boundaries(self) -> None:
         guide = engine_compatibility.production_operations_guide(

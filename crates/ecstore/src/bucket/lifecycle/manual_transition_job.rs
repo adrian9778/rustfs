@@ -588,6 +588,9 @@ impl ManualTransitionJobRecord {
         if self.state == ManualTransitionJobState::Cancelled && !self.cancel_requested {
             return Err(ManualTransitionJobError::Corrupt("cancelled job is missing cancel request"));
         }
+        if self.cursor_revision != manual_transition_cursor_revision(&self.report) {
+            return Err(ManualTransitionJobError::Corrupt("cursor revision does not match report"));
+        }
         Ok(())
     }
 }
@@ -1167,6 +1170,7 @@ pub async fn save_manual_transition_job_record_if_current(
         data.clone(),
         &ObjectOptions {
             max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             http_preconditions: Some(HTTPPreconditions {
                 if_match: Some(current_etag.to_string()),
                 ..Default::default()
@@ -1239,6 +1243,7 @@ pub(crate) async fn save_manual_transition_worker_result_if_absent(
         data,
         &ObjectOptions {
             max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             http_preconditions: Some(HTTPPreconditions {
                 if_none_match: Some("*".to_string()),
                 ..Default::default()
@@ -1267,6 +1272,7 @@ pub(crate) async fn save_manual_transition_task_if_absent(
         data,
         &ObjectOptions {
             max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             http_preconditions: Some(HTTPPreconditions {
                 if_none_match: Some("*".to_string()),
                 ..Default::default()
@@ -1618,6 +1624,7 @@ pub async fn save_manual_transition_scope_admission_if_absent(
         data.clone(),
         &ObjectOptions {
             max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             http_preconditions: Some(HTTPPreconditions {
                 if_none_match: Some("*".to_string()),
                 ..Default::default()
@@ -1669,6 +1676,7 @@ pub async fn save_manual_transition_scope_admission_if_current(
         data.clone(),
         &ObjectOptions {
             max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             http_preconditions: Some(HTTPPreconditions {
                 if_match: Some(current_etag.to_string()),
                 ..Default::default()
@@ -1996,7 +2004,7 @@ fn manual_transition_job_store_error(err: ManualTransitionJobError) -> Error {
     Error::other(err)
 }
 
-fn manual_transition_cursor_revision(report: &ManualTransitionRunReport) -> Option<u64> {
+pub(super) fn manual_transition_cursor_revision(report: &ManualTransitionRunReport) -> Option<u64> {
     report.continuation_token.as_ref()?;
     (report.scanned > 0).then_some(report.scanned)
 }
@@ -2052,6 +2060,18 @@ mod tests {
         assert_eq!(decoded.state, ManualTransitionJobState::Cancelled);
         assert!(decoded.cancel_requested);
         assert_eq!(decoded.max_objects, Some(17));
+    }
+
+    #[test]
+    fn manual_transition_job_record_rejects_untracked_cursor_revision() {
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+        record.report.scanned = 1;
+        record.report.continuation_token = encode_manual_transition_continuation_token(Some("logs/page-a".to_string()), None);
+
+        let err = record.encode().expect_err("untracked cursor progress must fail closed");
+
+        assert!(matches!(err, ManualTransitionJobError::Corrupt("cursor revision does not match report")));
     }
 
     #[test]
@@ -2734,6 +2754,7 @@ mod tests {
             lease_id: Uuid,
             lease_expires_at_unix_nanos: i128,
             state: ManualTransitionJobState,
+            #[serde(default)]
             scan_completed: bool,
             cancel_requested: bool,
             created_at_unix_nanos: i128,

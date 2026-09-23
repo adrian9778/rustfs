@@ -17,15 +17,13 @@ use rustfs_io_metrics::{
     record_cpu_usage, record_memory_usage, record_process_memory_split,
 };
 use serde::Serialize;
+#[cfg(any(not(target_os = "windows"), test))]
 use serde_json::Value;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use sysinfo::System;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
-
-static MEMORY_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
 
 const ENV_MEMORY_OBSERVABILITY_INTERVAL_SECS: &str = "RUSTFS_MEMORY_OBSERVABILITY_INTERVAL_SECS";
 const DEFAULT_MEMORY_OBSERVABILITY_INTERVAL_SECS: u64 = 15;
@@ -153,14 +151,11 @@ struct AllocatorMemorySnapshot {
     observation: AllocatorMemoryObservation,
 }
 
-fn memory_system() -> &'static Mutex<System> {
-    MEMORY_SYSTEM.get_or_init(|| Mutex::new(System::new()))
-}
-
-fn refresh_total_memory() -> u64 {
-    let mut system = memory_system().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    system.refresh_memory();
-    system.total_memory()
+/// Get effective total memory from container resources.
+///
+/// Returns the effective memory (considering cgroup limits and overrides).
+fn refresh_effective_memory() -> u64 {
+    crate::cgroup_resources::container_resources().memory_bytes
 }
 
 fn read_optional_u64(path: &Path) -> Option<u64> {
@@ -228,6 +223,7 @@ fn read_cgroup_memory_snapshot() -> Option<CgroupMemorySnapshot> {
     read_cgroup_v2().or_else(read_cgroup_v1)
 }
 
+#[cfg(not(target_os = "windows"))]
 fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
     let json = rustfs_mimalloc::MiMalloc::stats_json();
     if json.is_empty() {
@@ -240,6 +236,12 @@ fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
     })
 }
 
+#[cfg(target_os = "windows")]
+fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
+    None
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
 fn numeric_json_value(value: &Value) -> Option<u64> {
     match value {
         Value::Number(number) => number
@@ -250,6 +252,7 @@ fn numeric_json_value(value: &Value) -> Option<u64> {
     }
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn numeric_json_field(value: &Value, field: &str) -> Option<u64> {
     match value {
         Value::Object(fields) => fields
@@ -261,6 +264,7 @@ fn numeric_json_field(value: &Value, field: &str) -> Option<u64> {
     }
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn mimalloc_stat_field(value: &Value, metric: &str, field: &str) -> Option<u64> {
     match value {
         Value::Object(fields) => {
@@ -277,10 +281,12 @@ fn mimalloc_stat_field(value: &Value, metric: &str, field: &str) -> Option<u64> 
     }
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn mimalloc_stat_current(value: &Value, metric: &str) -> Option<u64> {
     mimalloc_stat_field(value, metric, "current")
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn mimalloc_stat_sum(value: &Value, metrics: &[&str], field: &str) -> Option<u64> {
     metrics
         .iter()
@@ -289,6 +295,7 @@ fn mimalloc_stat_sum(value: &Value, metrics: &[&str], field: &str) -> Option<u64
         .filter(|value| *value > 0)
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn parse_mimalloc_stats_json(stats_json: &str) -> Option<AllocatorMemoryObservation> {
     let value = serde_json::from_str::<Value>(stats_json).ok()?;
     let malloc_metrics = ["malloc_normal", "malloc_huge"];
@@ -382,19 +389,36 @@ pub fn memory_observability_controller_snapshot(ctx: &CancellationToken) -> Memo
     )
 }
 
+/// Record the effective memory total and its basis (host or cgroup).
+fn record_effective_memory(total_bytes: u64) {
+    let basis = crate::cgroup_resources::container_resources().basis;
+    metrics::gauge!("rustfs_memory_effective_total_bytes", "basis" => basis).set(total_bytes as f64);
+}
+
+/// Record container resource detection results.
+fn record_container_resource_detection() {
+    let res = crate::cgroup_resources::container_resources();
+
+    metrics::gauge!("rustfs_container_cpu_cores").set(res.cpu_cores as f64);
+    metrics::gauge!("rustfs_container_memory_bytes").set(res.memory_bytes as f64);
+    metrics::gauge!("rustfs_container_cgroup_detected").set(if res.cgroup_detected { 1.0 } else { 0.0 });
+    metrics::gauge!("rustfs_container_overridden").set(if res.overridden { 1.0 } else { 0.0 });
+}
+
 async fn record_memory_snapshot(process_sampler: Arc<Mutex<ProcessSampler>>) {
     match tokio::task::spawn_blocking(move || {
         let mut sampler = process_sampler.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let (resource, process) = sampler.snapshot_resource_and_system();
-        let total_memory = refresh_total_memory();
+        let effective_memory = refresh_effective_memory();
         let cgroup = read_cgroup_memory_snapshot();
         let allocator = read_allocator_memory_snapshot();
-        (resource, process, total_memory, cgroup, allocator)
+        (resource, process, effective_memory, cgroup, allocator)
     })
     .await
     {
-        Ok((resource, process, total_memory, cgroup, allocator)) => {
-            record_memory_usage(process.resident_memory_bytes, total_memory);
+        Ok((resource, process, effective_memory, cgroup, allocator)) => {
+            record_memory_usage(process.resident_memory_bytes, effective_memory);
+            record_effective_memory(effective_memory);
             record_cpu_usage(resource.cpu_percent);
             record_process_memory_split(process.resident_memory_bytes, process.virtual_memory_bytes);
 
@@ -423,6 +447,9 @@ pub fn init_memory_observability(ctx: CancellationToken) {
     let interval_secs = configured_memory_observability_interval_secs();
     let interval = Duration::from_secs(interval_secs.max(1));
     let process_sampler = Arc::new(Mutex::new(ProcessSampler::new()));
+
+    // Record container resource detection results at startup
+    record_container_resource_detection();
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -547,6 +574,8 @@ mod tests {
         let snapshot = super::read_allocator_memory_snapshot();
         #[cfg(not(target_os = "windows"))]
         assert!(snapshot.is_some(), "allocator snapshot should be available on non-Windows");
+        #[cfg(target_os = "windows")]
+        assert!(snapshot.is_none(), "allocator snapshot should be absent without mimalloc");
     }
 
     #[test]

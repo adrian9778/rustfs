@@ -70,10 +70,42 @@ use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_madmin::info_commands::DiskMetrics;
 use rustfs_rio::ChunkReaderBox;
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    fmt::Debug,
+    path::PathBuf,
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
+};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
+
+/// Independent admission and physical ownership for one disk rename.
+#[derive(Default)]
+pub(crate) struct RenameDataGuards {
+    pub(crate) scanner_publication_lease_token: Option<Uuid>,
+    pub(crate) external_guard: Option<Arc<dyn Send + Sync>>,
+    pub(crate) namespace_owner: Option<Arc<dyn Send + Sync>>,
+}
+
+/// Local preflight evidence stays outside DiskAPI and the RPC response format.
+pub(crate) struct RenameDataObservation {
+    pub(crate) result: Result<RenameDataResp>,
+    preflight_rejection: Option<local::LocalRenamePreflightRejection>,
+}
+
+impl RenameDataObservation {
+    fn unknown(result: Result<RenameDataResp>) -> Self {
+        Self {
+            result,
+            preflight_rejection: None,
+        }
+    }
+
+    pub(crate) fn rejected_before_publication(&self) -> bool {
+        self.result.is_err() && self.preflight_rejection.is_some()
+    }
+}
 
 const QUOTA_MUTATION_FENCE_PREFIX: &str = "tmp/quota-mutation-fences/";
 pub(crate) const QUOTA_MUTATION_FENCE_METADATA_SUFFIX: &str = "quota-mutation-fence-token";
@@ -171,11 +203,17 @@ pub struct MmapCopyStageMetrics {
     pub(crate) path_resolve_stage: &'static str,
     pub(crate) metadata_lookup_stage: &'static str,
     pub(crate) metadata_validate_stage: &'static str,
+    #[cfg(unix)]
     pub(crate) blocking_wait_stage: &'static str,
+    #[cfg(unix)]
     pub(crate) blocking_task_stage: &'static str,
+    #[cfg(unix)]
     pub(crate) file_open_stage: &'static str,
+    #[cfg(unix)]
     pub(crate) mmap_map_stage: &'static str,
+    #[cfg(unix)]
     pub(crate) mmap_copy_stage: &'static str,
+    #[cfg(unix)]
     pub(crate) direct_read_copy_stage: &'static str,
 }
 
@@ -339,6 +377,14 @@ impl DiskAPI for Disk {
         force_del_marker: bool,
         opts: DeleteOptions,
     ) -> Result<()> {
+        if let Some(scope) = crate::store::bucket_heal_scope(volume) {
+            scope.check()?;
+            if let Disk::Local(local_disk) = self {
+                return local_disk
+                    .delete_version_with_namespace_owner(volume, path, fi, force_del_marker, opts, Some(scope))
+                    .await;
+            }
+        }
         match self {
             Disk::Local(local_disk) => local_disk.delete_version(volume, path, fi, force_del_marker, opts).await,
             Disk::Remote(remote_disk) => remote_disk.delete_version(volume, path, fi, force_del_marker, opts).await,
@@ -544,6 +590,13 @@ impl DiskAPI for Disk {
         }
     }
 
+    async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        match self {
+            Disk::Local(disk) => disk.rename_file_durable(src_volume, src_path, dst_volume, dst_path).await,
+            Disk::Remote(disk) => disk.rename_file_durable(src_volume, src_path, dst_volume, dst_path).await,
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
         match self {
@@ -587,6 +640,12 @@ impl DiskAPI for Disk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
+        if let Some(scope) = crate::store::bucket_heal_scope(volume) {
+            scope.check()?;
+            if let Self::Local(disk) = self {
+                return disk.delete_with_namespace_owner(volume, path, opt, Some(scope)).await;
+            }
+        }
         match self {
             Disk::Local(local_disk) => local_disk.delete(volume, path, opt).await,
             Disk::Remote(remote_disk) => remote_disk.delete(volume, path, opt).await,
@@ -677,6 +736,87 @@ impl DiskAPI for Disk {
 }
 
 impl Disk {
+    pub async fn delete_with_scanner_publication_lease_and_guard(
+        &self,
+        volume: &str,
+        path: &str,
+        opts: DeleteOptions,
+        scanner_publication_lease_token: Option<Uuid>,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk
+                    .delete_with_publication_guard(volume, path, opts, external_guard)
+                    .await
+            }
+            Disk::Remote(remote_disk) => {
+                remote_disk
+                    .delete_with_scanner_publication_lease(volume, path, opts, scanner_publication_lease_token)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn delete_version_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        match self {
+            Self::Local(disk) => {
+                disk.delete_version_with_namespace_owner(volume, path, fi, force_del_marker, opts, namespace_owner)
+                    .await
+            }
+            Self::Remote(disk) => {
+                let result = disk.delete_version(volume, path, fi, force_del_marker, opts).await;
+                // This is sender lifetime only, not proof of a remote physical drain.
+                drop(namespace_owner);
+                result
+            }
+        }
+    }
+
+    pub(crate) async fn delete_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        match self {
+            Self::Local(disk) => disk.delete_with_namespace_owner(volume, path, opts, namespace_owner).await,
+            Self::Remote(disk) => {
+                let result = disk.delete(volume, path, opts).await;
+                drop(namespace_owner);
+                result
+            }
+        }
+    }
+
+    /// Keep local undo publication owned independently of the wrapper deadline.
+    /// Remote undo retains its existing RPC contract; this is not a remote drain proof.
+    pub(crate) async fn undo_write_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        match self {
+            Self::Local(disk) => {
+                disk.undo_write_with_namespace_owner(volume, path, fi, opts, namespace_owner)
+                    .await
+            }
+            Self::Remote(disk) => disk.delete_version(volume, path, fi, false, opts).await,
+        }
+    }
+
     pub(crate) async fn rename_data_borrowed(
         &self,
         src_volume: &str,
@@ -685,15 +825,94 @@ impl Disk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
+        let Some(scope) = crate::store::bucket_heal_scope_for_object(dst_volume, dst_path) else {
+            return self
+                .rename_data_borrowed_with_fence(src_volume, src_path, fi, dst_volume, dst_path, None)
+                .await;
+        };
+        scope.check()?;
+        self.rename_data_borrowed_with_fence_and_guard(src_volume, src_path, fi, dst_volume, dst_path, None, Some(scope))
+            .await
+    }
+
+    pub(crate) async fn rename_data_borrowed_with_fence_observed(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        guards: RenameDataGuards,
+    ) -> RenameDataObservation {
         match self {
             Disk::Local(local_disk) => {
                 local_disk
-                    .rename_data_borrowed(src_volume, src_path, fi, dst_volume, dst_path)
+                    .rename_data_observed_with_guards(src_volume, src_path, fi, dst_volume, dst_path, guards)
+                    .await
+            }
+            Disk::Remote(remote_disk) => RenameDataObservation::unknown(
+                remote_disk
+                    .rename_data_borrowed_with_fence(
+                        src_volume,
+                        src_path,
+                        fi,
+                        dst_volume,
+                        dst_path,
+                        guards.scanner_publication_lease_token,
+                    )
+                    .await,
+            ),
+        }
+    }
+
+    pub(crate) async fn rename_data_borrowed_with_fence(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        scanner_publication_lease_token: Option<Uuid>,
+    ) -> Result<RenameDataResp> {
+        self.rename_data_borrowed_with_fence_and_guard(
+            src_volume,
+            src_path,
+            fi,
+            dst_volume,
+            dst_path,
+            scanner_publication_lease_token,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn rename_data_borrowed_with_fence_and_guard(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        scanner_publication_lease_token: Option<Uuid>,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<RenameDataResp> {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk
+                    .rename_data_borrowed_with_guard(src_volume, src_path, fi, dst_volume, dst_path, external_guard)
                     .await
             }
             Disk::Remote(remote_disk) => {
                 remote_disk
-                    .rename_data_borrowed(src_volume, src_path, fi, dst_volume, dst_path)
+                    .rename_data_borrowed_with_fence(
+                        src_volume,
+                        src_path,
+                        fi,
+                        dst_volume,
+                        dst_path,
+                        scanner_publication_lease_token,
+                    )
                     .await
             }
         }
@@ -765,6 +984,14 @@ impl Disk {
             Disk::Remote(remote_disk) => remote_disk.force_runtime_state_for_test(state),
         }
     }
+
+    #[cfg(test)]
+    pub fn force_offline_for_test(&self) {
+        match self {
+            Disk::Local(local_disk) => local_disk.force_offline_for_test(),
+            Disk::Remote(remote_disk) => remote_disk.force_offline_for_test(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -808,6 +1035,7 @@ impl Disk {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn get_object_path_for_io_if_local(
         &self,
         volume: &str,
@@ -833,6 +1061,13 @@ impl Disk {
         match self {
             Disk::Local(local_disk) => local_disk.replacement_mount_lease_root(),
             Disk::Remote(_) => None,
+        }
+    }
+
+    pub async fn acquire_replacement_execution_lease(&self) -> Result<std::sync::Arc<local::ReplacementExecutionLease>> {
+        match self {
+            Self::Local(disk) => disk.get_disk().acquire_replacement_execution_lease().await,
+            Self::Remote(_) => Err(DiskError::other("replacement execution requires a local target")),
         }
     }
 }
@@ -987,6 +1222,9 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> Result<FileWriter>;
     // ReadFileStream
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
+    async fn rename_file_durable(&self, _src_volume: &str, _src_path: &str, _dst_volume: &str, _dst_path: &str) -> Result<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()>;
     async fn prepare_part_transaction(
         &self,
@@ -1089,6 +1327,25 @@ pub struct CheckPartsResp {
 pub struct UpdateMetadataOpts {
     pub no_persistence: bool,
     pub replace_user_metadata: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_reconcile: Option<Box<TransitionStateReconcileCondition>>,
+}
+
+/// An exact-copy precondition for the single-version tier repair protocol.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransitionStateReconcileCondition {
+    pub expected_metadata_digest: String,
+    pub unchanged_metadata_digest: String,
+    pub target: rustfs_filemeta::TransitionStateReconcileTarget,
+    pub tier: String,
+    pub topology_generation: String,
+    pub verify_only: bool,
+    /// Local ownership is never accepted from the wire. A remote disk acquires
+    /// its own fleet and backend leases before entering the mutation domain.
+    #[serde(skip)]
+    pub(crate) authority:
+        Option<Arc<crate::bucket::lifecycle::legacy_transition_state_reconcile::TransitionStateReconcileAuthority>>,
 }
 
 pub struct DiskLocation {
@@ -1194,6 +1451,11 @@ pub struct WalkDirOptions {
     #[serde(default)]
     pub incl_deleted: bool,
 
+    // Skip recursive prefix visibility probes only when authoritative bucket
+    // metadata proves versioning was never enabled.
+    #[serde(default)]
+    pub skip_hidden_prefix_check: bool,
+
     // ReportNotFound will return errFileNotFound if all disks reports the BaseDir cannot be found.
     pub report_notfound: bool,
 
@@ -1222,6 +1484,12 @@ pub struct WalkDirOptions {
     // Override the remote stream stall timeout for long background walks.
     #[serde(default)]
     pub stall_timeout_ms: Option<u64>,
+
+    /// In-process completion state for bounded local walks. This is skipped
+    /// from RPC serialization; remote peers retain the legacy natural-EOF
+    /// behavior until they support an explicit capability.
+    #[serde(skip)]
+    pub producer_limit_reached: Option<Arc<AtomicBool>>,
 }
 
 impl WalkDirOptions {
@@ -1296,6 +1564,10 @@ pub struct DeleteOptions {
     #[serde(default)]
     pub undo_delete: bool,
     pub old_data_dir: Option<Uuid>,
+    /// Full marker precondition checked under the actual metadata mutation lease.
+    /// Remote calls carrying it must use DeleteRetiredMarker, never DeleteVersion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_delete_marker: Option<rustfs_filemeta::MetaDeleteMarker>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1532,6 +1804,7 @@ mod tests {
             base_dir: "/path/to/dir".to_string(),
             recursive: true,
             incl_deleted: false,
+            skip_hidden_prefix_check: false,
             report_notfound: false,
             filter_prefix: Some("prefix_".to_string()),
             forward_to: Some("object/path".to_string()),
@@ -1540,12 +1813,14 @@ mod tests {
             skip_total_timeout: false,
             timeout_ms: Some(10_000),
             stall_timeout_ms: Some(20_000),
+            producer_limit_reached: None,
         };
 
         assert_eq!(opts.bucket, "test-bucket");
         assert_eq!(opts.base_dir, "/path/to/dir");
         assert!(opts.recursive);
         assert!(!opts.incl_deleted);
+        assert!(!opts.skip_hidden_prefix_check);
         assert!(!opts.report_notfound);
         assert_eq!(opts.filter_prefix, Some("prefix_".to_string()));
         assert_eq!(opts.forward_to, Some("object/path".to_string()));
@@ -1554,6 +1829,23 @@ mod tests {
         assert!(!opts.skip_total_timeout);
         assert_eq!(opts.timeout_duration(), Some(std::time::Duration::from_secs(10)));
         assert_eq!(opts.stall_timeout_duration(), Some(std::time::Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn test_walk_dir_options_default_hidden_prefix_check_for_old_peers() {
+        let mut encoded = serde_json::to_value(WalkDirOptions {
+            skip_hidden_prefix_check: true,
+            ..Default::default()
+        })
+        .expect("walk options should serialize");
+        encoded
+            .as_object_mut()
+            .expect("walk options should serialize as an object")
+            .remove("skip_hidden_prefix_check");
+
+        let decoded: WalkDirOptions = serde_json::from_value(encoded).expect("old peer options should deserialize");
+
+        assert!(!decoded.skip_hidden_prefix_check);
     }
 
     /// Test DeleteOptions structure
@@ -1565,6 +1857,7 @@ mod tests {
             undo_write: true,
             undo_delete: false,
             old_data_dir: Some(Uuid::new_v4()),
+            expected_delete_marker: None,
         };
 
         assert!(opts.recursive);

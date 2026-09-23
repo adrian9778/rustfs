@@ -675,8 +675,7 @@ fn fixed_body(message: impl Into<Bytes>) -> WebDavBody {
 
 /// Decode base64 string
 fn base64_decode(encoded: &str) -> Result<Vec<u8>, ()> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|_| ())
+    base64_simd::STANDARD.decode_to_vec(encoded).map_err(|_| ())
 }
 
 #[cfg(test)]
@@ -688,6 +687,7 @@ mod tests {
     use futures_util::stream;
     use http_body_util::StreamBody;
     use hyper::body::Frame;
+    use rustfs_credentials::Credentials;
     use s3s::dto::*;
     use std::fmt::{Debug, Formatter};
     use std::net::{Ipv4Addr, SocketAddr};
@@ -716,8 +716,7 @@ mod tests {
             &self,
             _bucket: &str,
             _key: &str,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
             _start_pos: Option<u64>,
         ) -> Result<GetObjectOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
@@ -727,20 +726,14 @@ mod tests {
             &self,
             _bucket: &str,
             _key: &str,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
             _start_pos: u64,
             _length: u64,
         ) -> Result<GetObjectOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
         }
 
-        async fn put_object(
-            &self,
-            _input: PutObjectInput,
-            _access_key: &str,
-            _secret_key: &str,
-        ) -> Result<PutObjectOutput, Self::Error> {
+        async fn put_object(&self, _input: PutObjectInput, _credentials: &Credentials) -> Result<PutObjectOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
         }
 
@@ -748,8 +741,7 @@ mod tests {
             &self,
             _bucket: &str,
             _key: &str,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<DeleteObjectOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
         }
@@ -758,57 +750,39 @@ mod tests {
             &self,
             _bucket: &str,
             _key: &str,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<HeadObjectOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
         }
 
-        async fn head_bucket(
-            &self,
-            _bucket: &str,
-            _access_key: &str,
-            _secret_key: &str,
-        ) -> Result<HeadBucketOutput, Self::Error> {
+        async fn head_bucket(&self, _bucket: &str, _credentials: &Credentials) -> Result<HeadBucketOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
         }
 
         async fn list_objects_v2(
             &self,
             _input: ListObjectsV2Input,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<ListObjectsV2Output, Self::Error> {
             unreachable!("connection tests should not hit storage")
         }
 
-        async fn list_buckets(&self, _access_key: &str, _secret_key: &str) -> Result<ListBucketsOutput, Self::Error> {
+        async fn list_buckets(&self, _credentials: &Credentials) -> Result<ListBucketsOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
         }
 
-        async fn create_bucket(
-            &self,
-            _bucket: &str,
-            _access_key: &str,
-            _secret_key: &str,
-        ) -> Result<CreateBucketOutput, Self::Error> {
+        async fn create_bucket(&self, _bucket: &str, _credentials: &Credentials) -> Result<CreateBucketOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
         }
 
-        async fn delete_bucket(
-            &self,
-            _bucket: &str,
-            _access_key: &str,
-            _secret_key: &str,
-        ) -> Result<DeleteBucketOutput, Self::Error> {
+        async fn delete_bucket(&self, _bucket: &str, _credentials: &Credentials) -> Result<DeleteBucketOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
         }
 
         async fn copy_object(
             &self,
             _input: CopyObjectInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<CopyObjectOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
         }
@@ -816,8 +790,7 @@ mod tests {
         async fn create_multipart_upload(
             &self,
             _input: CreateMultipartUploadInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<CreateMultipartUploadOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
         }
@@ -825,8 +798,7 @@ mod tests {
         async fn upload_part(
             &self,
             _input: UploadPartInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<UploadPartOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
         }
@@ -834,8 +806,7 @@ mod tests {
         async fn complete_multipart_upload(
             &self,
             _input: CompleteMultipartUploadInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<CompleteMultipartUploadOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
         }
@@ -843,8 +814,7 @@ mod tests {
         async fn abort_multipart_upload(
             &self,
             _input: AbortMultipartUploadInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<AbortMultipartUploadOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
         }
@@ -852,8 +822,7 @@ mod tests {
         async fn upload_part_copy(
             &self,
             _input: UploadPartCopyInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<UploadPartCopyOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
         }

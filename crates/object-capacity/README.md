@@ -171,7 +171,9 @@ Refreshing only dirty disks is safe only when:
 - which means the system has already completed at least one full refresh without partial errors
 - and the per-disk cache is fully populated
 
-If the per-disk cache is incomplete, or there are no dirty disks, the system falls back to a full refresh.
+If no aggregate cache exists yet, the system performs a full refresh to establish an initial value. Once an aggregate cache exists, a scheduled refresh with no dirty disks stays idle instead of repeatedly walking unchanged disks. If disks are dirty while the per-disk cache is incomplete, the system performs a full refresh because a subset cannot be merged safely.
+
+A full refresh that reaches its time budget may publish an estimated aggregate without establishing a complete per-disk baseline. That bounded estimate acknowledges dirty marks that predate the scan, while marks recorded during the scan remain pending. This prevents one old dirty mark from causing an endless timeout loop without treating the estimate as exact.
 
 ### Merge Rules After a Subset Refresh
 
@@ -280,19 +282,22 @@ The configuration constants are defined in `crates/config/src/constants/capacity
 
 | Environment Variable | Default | Description |
 | --- | --- | --- |
-| `RUSTFS_CAPACITY_SCHEDULED_INTERVAL` | `120s` | Scheduled refresh interval |
-| `RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY` | `5s` | Debounce delay after writes |
-| `RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD` | `5` | Recent 60-second write-frequency threshold |
-| `RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD` | `30s` | Cache age required before fast refresh is considered |
+| `RUSTFS_CAPACITY_SCHEDULED_INTERVAL` | `600s` | Scheduled refresh interval |
+| `RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY` | `30s` | Debounce delay after writes |
+| `RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD` | `20` | Recent 60-second write-frequency threshold |
+| `RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD` | `120s` | Cache age required before fast refresh is considered |
 | `RUSTFS_CAPACITY_MAX_FILES_THRESHOLD` | `200000` | Exact-count file threshold |
-| `RUSTFS_CAPACITY_STAT_TIMEOUT` | `3s` | Base scan timeout |
+| `RUSTFS_CAPACITY_STAT_TIMEOUT` | `3s` (`60s` with `RUSTFS_DRIVE_TIMEOUT_PROFILE=high_latency`) | Base scan timeout |
 | `RUSTFS_CAPACITY_SAMPLE_RATE` | `200` | Overflow-file sampling interval |
 | `RUSTFS_CAPACITY_METRICS_INTERVAL` | `600s` | Runtime summary emission interval |
 | `RUSTFS_CAPACITY_FOLLOW_SYMLINKS` | `false` | Whether to follow symlinks |
 | `RUSTFS_CAPACITY_ENABLE_DYNAMIC_TIMEOUT` | `true` | Whether to enable dynamic timeout scaling |
 | `RUSTFS_CAPACITY_MIN_TIMEOUT` | `2s` | Dynamic-timeout lower bound |
-| `RUSTFS_CAPACITY_MAX_TIMEOUT` | `15s` | Dynamic-timeout upper bound |
+| `RUSTFS_CAPACITY_MAX_TIMEOUT` | `15s` (`60s` with `RUSTFS_DRIVE_TIMEOUT_PROFILE=high_latency`) | Dynamic-timeout upper bound |
 | `RUSTFS_CAPACITY_STALL_TIMEOUT` | `20s` | Stall-detection threshold |
+
+Explicit `RUSTFS_CAPACITY_STAT_TIMEOUT` and `RUSTFS_CAPACITY_MAX_TIMEOUT` values
+take precedence over the drive-timeout profile.
 
 ### Configuration-Caching Note
 

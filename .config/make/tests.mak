@@ -29,18 +29,41 @@ script-tests: ## Run shell script tests
 	./scripts/test_entrypoint_credentials.sh
 	./scripts/test_internode_grpc_ab_bench.sh
 	./scripts/test_object_batch_bench_enhanced.sh
+	./scripts/test_package_service_scripts.sh
 	./scripts/test_hotpath_warp_ab_gate.sh
 	./scripts/test_hotpath_warp_abba.sh
+	./scripts/test_scanner_validation_harness.sh
+	./scripts/test_scanner_heal_checkpoint_crash_evidence.sh
+	./scripts/test_scanner_heal_authority_evidence.sh
+	./scripts/test_scanner_heal_scoped_ack_evidence.sh
+	./scripts/test_scanner_heal_legacy_rollback_evidence.sh
+	./scripts/test_scanner_heal_g14_multiset_evidence.sh
+	./scripts/test_scanner_heal_scheduler_pressure_evidence.sh
+	./scripts/test_scanner_heal_status_outcome_evidence.sh
+	./scripts/test_scanner_heal_maintenance_evidence.sh
+	./scripts/test_scanner_heal_w13_mrf_evidence.sh
+	./scripts/test_scanner_heal_w16_recovery_evidence.sh
 	./scripts/test_exact_1mib_handoff_abba.sh
 	./scripts/test_pinned_paired_abba_bench.sh
 	./scripts/test_manual_transition_runbooks.sh
+	./scripts/test_fuzz_runner.sh
+	./scripts/test_python_bin.sh
 	./scripts/check_embedded_secrets.sh --self-test
-	python3 ./scripts/check_test_wiring.py --self-test
-	python3 ./scripts/check_scheduled_validation_freshness.py --self-test
-	python3 ./scripts/s3-tests/test_report_compat.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_e2e_binary.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/ci_gate.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_security_coverage.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_scheduled_validation_freshness.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_security_workflow.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_nightly_candidate.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_functional_chain.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_functional_chain_health.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_timing_report.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_report_compat.py
 	bash -n ./scripts/validate_object_data_cache_cold_stampede.sh
-	python3 ./scripts/check_object_data_cache_follower_samples.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_object_data_cache_follower_samples.py --self-test
 	./scripts/validate_object_data_cache_cold_stampede.sh --self-test
+	./scripts/run_scanner_heal_evidence_case.sh --self-test
 
 .PHONY: test
 test: core-deps script-tests ## Run all tests (needs cargo-nextest; RUSTFS_ALLOW_CARGO_TEST_FALLBACK=1 to override)

@@ -44,21 +44,21 @@ mod replication_versioning_boundary;
 mod runtime_boundary;
 
 pub use replication_config_boundary::{
-    ObjectOpts, OperatorRuleContract, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS,
-    REMOTE_TARGET_WRITABLE_FIELDS, REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS,
-    REPLICATION_WRITABLE_FIELDS, ReplicationConfigStructureError, ReplicationConfigurationExt, ReplicationTargetValidationError,
-    assign_site_replication_rule_priorities, invalid_replication_config_status_field, is_site_replication_role,
-    is_site_replication_rule, merge_incoming_replication_config, merge_user_replication_config,
-    replication_target_arn_deployment_id, replication_target_arns, should_remove_replication_target,
-    site_replication_rule_deployment_id, unsupported_replication_config_field, validate_replication_config_structure,
-    validate_replication_config_target_arns,
+    ObjectOpts, OperatorRuleContract, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS,
+    REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, REPLICATION_CAPABILITY_CONTRACT_VERSION,
+    REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS, ReplicationConfigStructureError,
+    ReplicationConfigurationExt, ReplicationTargetValidationError, assign_site_replication_rule_priorities,
+    invalid_replication_config_status_field, is_site_replication_role, is_site_replication_rule,
+    merge_incoming_replication_config, merge_user_replication_config, replication_target_arn_deployment_id,
+    replication_target_arns, should_remove_replication_target, site_replication_rule_deployment_id,
+    unsupported_replication_config_field, validate_replication_config_structure, validate_replication_config_target_arns,
 };
-pub(crate) use replication_filemeta_boundary::version_purge_statuses_map;
 pub use replication_filemeta_boundary::{
     MrfOpKind, MrfReplicateEntry, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicationState,
     ReplicationStatusType, ReplicationType, VersionPurgeStatusType, replication_state_to_filemeta,
     replication_status_to_filemeta, replication_statuses_map, version_purge_status_to_filemeta,
 };
+pub(crate) use replication_filemeta_boundary::{ReplicationGenerationSnapshot, version_purge_statuses_map};
 pub(crate) use replication_filemeta_boundary::{
     replication_state_from_filemeta, replication_status_from_filemeta, version_purge_status_from_filemeta,
 };
@@ -66,6 +66,7 @@ pub(crate) use replication_lifecycle_bridge::ReplicationLifecycleBridge;
 pub(crate) use replication_migration_bridge::ReplicationMigrationBridge;
 pub use replication_object_bridge::ReplicationObjectBridge;
 pub use replication_object_config::{DeleteReplicationConfigSnapshot, ReplicationConfig};
+pub(crate) use replication_object_decision_boundary::replication_etags_match;
 pub use replication_object_decision_boundary::{
     MustReplicateOptions, ReplicationDeleteScheduleInput, ReplicationDeleteStateSource, delete_replication_state_from_config,
     delete_replication_version_id, should_schedule_delete_replication, should_use_existing_delete_replication_info,
@@ -88,4 +89,9 @@ pub use replication_state::{ReplicationStats, RuntimeReplicationTargetBacklog};
 pub use replication_stats_boundary::{BucketReplicationStat, BucketReplicationStats, BucketStats, InQueueMetric, XferStats};
 pub use replication_storage_boundary::{ReplicationObjectIO, ReplicationStorage};
 pub use replication_target_boundary::SsecPassthroughCapability;
+pub use replication_target_boundary::VersionIdentityCapability;
+pub use replication_target_boundary::{ObjectLockIntegrity, object_lock_put_integrity};
 pub(crate) use replication_target_config_bridge::ReplicationTargetConfigBridge;
+pub use runtime_boundary::{
+    ScannerDirtyUsageMutationObserver, ScannerDirtyUsageMutationSource, set_scanner_dirty_usage_mutation_observer,
+};

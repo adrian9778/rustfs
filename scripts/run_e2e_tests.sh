@@ -14,7 +14,12 @@ NC='\033[0m' # No Color
 
 # Default values
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TARGET_DIR="$PROJECT_ROOT/target/debug"
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+if [[ "$CARGO_TARGET_DIR" != /* ]]; then
+    CARGO_TARGET_DIR="$PROJECT_ROOT/$CARGO_TARGET_DIR"
+fi
+export CARGO_TARGET_DIR
+TARGET_DIR="$CARGO_TARGET_DIR/debug"
 RUSTFS_BINARY="$TARGET_DIR/rustfs"
 DATA_DIR="$TARGET_DIR/rustfs_test_data"
 RUSTFS_PID=""
@@ -94,7 +99,7 @@ build_rustfs() {
     print_info "Building RustFS..."
     cd "$PROJECT_ROOT"
     
-    if ! cargo build --bin rustfs --features "$RUSTFS_BUILD_FEATURES"; then
+    if ! python3 scripts/e2e_binary.py build --features "$RUSTFS_BUILD_FEATURES"; then
         print_error "Failed to build RustFS"
         exit 1
     fi
@@ -115,6 +120,10 @@ check_dependencies() {
         missing_tools+=("curl")
     fi
     
+    if ! command -v python3 >/dev/null 2>&1; then
+        missing_tools+=("python3")
+    fi
+
     if ! command -v cargo >/dev/null 2>&1; then
         missing_tools+=("cargo")
     fi
@@ -148,7 +157,7 @@ start_rustfs() {
     
     # Wait for RustFS to be ready
     print_info "Waiting for RustFS to be ready..."
-    local max_attempts=15  # Reduced from 30 to 15 seconds
+    local max_attempts=60
     local attempt=0
     
     while [ $attempt -lt $max_attempts ]; do
@@ -160,25 +169,10 @@ start_rustfs() {
             exit 1
         fi
         
-        # Try simple HTTP connection first (most reliable)
-        if curl -s --noproxy localhost --connect-timeout 2 --max-time 3 "http://localhost:9000/" >/dev/null 2>&1; then
+        if curl --silent --show-error --fail --noproxy localhost --connect-timeout 2 --max-time 3 \
+            "http://localhost:9000/health/ready" >/dev/null 2>&1; then
             print_success "RustFS is ready!"
             return 0
-        fi
-        
-        # Try health endpoint if available
-        if curl -s --noproxy localhost --connect-timeout 2 --max-time 3 "http://localhost:9000/health" >/dev/null 2>&1; then
-            print_success "RustFS is ready!"
-            return 0
-        fi
-        
-        # Try port connectivity check (faster than HTTP)
-        if nc -z localhost 9000 2>/dev/null; then
-            print_info "Port 9000 is open, verifying HTTP response..."
-            if curl -s --noproxy localhost --connect-timeout 1 --max-time 2 "http://localhost:9000/" >/dev/null 2>&1; then
-                print_success "RustFS is ready!"
-                return 0
-            fi
         fi
         
         sleep 1
@@ -187,34 +181,10 @@ start_rustfs() {
     done
     
     echo
-    print_warning "RustFS health check failed within $max_attempts seconds"
-    print_info "Checking if RustFS process is still running..."
-    if kill -0 "$RUSTFS_PID" 2>/dev/null; then
-        print_info "RustFS process is still running (PID: $RUSTFS_PID)"
-        print_info "Trying final connection attempts..."
-        
-        # Quick final attempts with shorter timeouts
-        for i in 1 2 3; do
-            if curl -s --noproxy localhost --connect-timeout 1 --max-time 2 "http://localhost:9000/" >/dev/null 2>&1; then
-                print_success "RustFS is now ready!"
-                return 0
-            fi
-            if nc -z localhost 9000 2>/dev/null; then
-                print_info "Port 9000 is accessible, continuing with tests..."
-                return 0
-            fi
-            sleep 1
-        done
-        
-        print_warning "RustFS may be slow to respond, but process is running"
-        print_info "Continuing with tests anyway..."
-        return 0
-    else
-        print_error "RustFS process has died"
-        print_error "Log output:"
-        cat "$TARGET_DIR/rustfs.log" || true
-        return 1
-    fi
+    print_error "RustFS readiness check failed within $max_attempts seconds"
+    print_error "Log output:"
+    cat "$TARGET_DIR/rustfs.log" || true
+    return 1
 }
 
 # Function to run tests
@@ -242,7 +212,7 @@ run_tests() {
 
     print_info "Test command: ${test_cmd[*]}"
 
-    if "${test_cmd[@]}"; then
+    if python3 scripts/e2e_binary.py run --features "$RUSTFS_BUILD_FEATURES" -- "${test_cmd[@]}"; then
         print_success "All tests passed!"
         return 0
     else
@@ -295,13 +265,7 @@ main() {
     # Start RustFS
     if ! start_rustfs; then
         print_error "Failed to start RustFS properly"
-        print_info "Checking if we can still run tests..."
-        if [ ! -z "$RUSTFS_PID" ] && kill -0 "$RUSTFS_PID" 2>/dev/null; then
-            print_info "RustFS process is still running, attempting to continue..."
-        else
-            print_error "RustFS is not running, cannot proceed with tests"
-            exit 1
-        fi
+        exit 1
     fi
     
     # Run tests

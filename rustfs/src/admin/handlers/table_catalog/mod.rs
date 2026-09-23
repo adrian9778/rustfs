@@ -17,6 +17,7 @@ use crate::admin::runtime_sources::default_admin_usecase;
 use crate::admin::storage_api::access::{ReqInfo, authorize_internal_object_request};
 use crate::admin::storage_api::bucket::metadata::table_catalog_path_hash;
 use crate::admin::storage_api::runtime::ECStore;
+use crate::admin::utils::empty_response;
 use crate::admin::{
     auth::{AdminResourceScope, validate_admin_action_with_bucket_object_for_iam},
     router::{AdminOperation, Operation, S3Router},
@@ -72,6 +73,8 @@ pub use view::*;
 const JSON_CONTENT_TYPE: &str = "application/json";
 const ENV_TABLE_CATALOG_CREDENTIAL_VENDING: &str = "RUSTFS_TABLE_CATALOG_CREDENTIAL_VENDING";
 const ENV_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: &str = "RUSTFS_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS";
+const ICEBERG_ACCESS_DELEGATION_HEADER: &str = "x-iceberg-access-delegation";
+const ICEBERG_VENDED_CREDENTIALS_DELEGATION: &[u8] = b"vended-credentials";
 const DEFAULT_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 15 * 60;
 const MIN_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60;
 const MAX_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60 * 60;
@@ -122,6 +125,7 @@ const CREDENTIAL_VENDING_UNSUPPORTED: &str = "unsupported";
 const CREDENTIAL_VENDING_SUPPORTED: &str = "supported";
 const CREDENTIAL_VENDING_UNSUPPORTED_REASON: &str = "temporary-credentials-not-implemented";
 const CREDENTIAL_VENDING_DISABLED_REASON: &str = "credential-vending-disabled";
+const CREDENTIAL_VENDING_NOT_AUTHORIZED_REASON: &str = "credential-vending-not-authorized";
 const CREDENTIAL_SCOPE_WAREHOUSE_PREFIX: &str = "warehouse-prefix";
 const CREDENTIAL_SCOPE_TABLE_PREFIX: &str = "table-prefix";
 const CREDENTIAL_MODE_CLIENT_PROVIDED: &str = "client-provided-s3-credentials-required";
@@ -156,6 +160,7 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /v1/{prefix}/namespaces/{namespace}",
     "HEAD /v1/{prefix}/namespaces/{namespace}",
     "DELETE /v1/{prefix}/namespaces/{namespace}",
+    "POST /v1/{prefix}/namespaces/{namespace}/properties",
     "GET /v1/{prefix}/namespaces/{namespace}/tables",
     "POST /v1/{prefix}/namespaces/{namespace}/tables",
     "POST /v1/{prefix}/namespaces/{namespace}/register",
@@ -164,6 +169,7 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials",
     "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}",
     "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+    "POST /v1/{prefix}/tables/rename",
     "GET /v1/{prefix}/namespaces/{namespace}/views",
     "POST /v1/{prefix}/namespaces/{namespace}/views",
     "GET /v1/{prefix}/namespaces/{namespace}/views/{view}",
@@ -171,10 +177,7 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "POST /v1/{prefix}/namespaces/{namespace}/views/{view}",
     "DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}",
 ];
-const TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS: &[&str] = &[
-    "POST /v1/{prefix}/namespaces/{namespace}/properties",
-    "POST /v1/{prefix}/tables/rename",
-];
+const TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS: &[&str] = &[];
 
 static GET_CONFIG_HANDLER: GetCatalogConfigHandler = GetCatalogConfigHandler {};
 static ENABLE_TABLE_BUCKET_HANDLER: EnableTableBucketHandler = EnableTableBucketHandler {};
@@ -183,6 +186,7 @@ static GET_TABLE_CATALOG_MIGRATION_HANDLER: GetTableCatalogMigrationHandler = Ge
 static MATERIALIZE_TABLE_CATALOG_MIGRATION_HANDLER: MaterializeTableCatalogMigrationHandler =
     MaterializeTableCatalogMigrationHandler {};
 static CANCEL_TABLE_CATALOG_MIGRATION_HANDLER: CancelTableCatalogMigrationHandler = CancelTableCatalogMigrationHandler {};
+static BACKFILL_TABLE_WAREHOUSE_INDEX_HANDLER: BackfillTableWarehouseIndexHandler = BackfillTableWarehouseIndexHandler {};
 static LIST_NAMESPACES_HANDLER: RestListNamespacesHandler = RestListNamespacesHandler {};
 static CREATE_NAMESPACE_HANDLER: RestCreateNamespaceHandler = RestCreateNamespaceHandler {};
 static GET_NAMESPACE_HANDLER: RestGetNamespaceHandler = RestGetNamespaceHandler {};
@@ -716,16 +720,28 @@ struct RestLoadViewResponse {
     config: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct RestStorageCredential {
     prefix: String,
     config: BTreeMap<String, String>,
 }
 
+impl std::fmt::Debug for RestStorageCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RestStorageCredential")
+            .field("prefix", &self.prefix)
+            .field("config", &"[REDACTED]")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TableCredentialScope {
-    scope_prefix: String,
-    object_prefix: String,
+    warehouse_scope_prefix: String,
+    warehouse_object_prefix: String,
+    metadata_scope_prefix: String,
+    metadata_object: String,
 }
 
 #[derive(Debug, Clone)]
@@ -734,14 +750,27 @@ struct TableCredentialIssueRequest<'a> {
     principal: Option<&'a rustfs_credentials::Credentials>,
     scope_prefix: String,
     object_prefix: String,
+    metadata_object: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct IssuedTableCredentials {
     access_key_id: String,
     secret_access_key: String,
     session_token: String,
     expiration: OffsetDateTime,
+}
+
+impl std::fmt::Debug for IssuedTableCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IssuedTableCredentials")
+            .field("access_key_id", &"[REDACTED]")
+            .field("secret_access_key", &"[REDACTED]")
+            .field("session_token", &"[REDACTED]")
+            .field("expiration", &self.expiration)
+            .finish()
+    }
 }
 
 #[async_trait::async_trait]
@@ -821,7 +850,7 @@ impl TableCredentialIssuer for IamTableCredentialIssuer {
             ));
         }
 
-        let policy = table_credential_session_policy(request.entry, &request.object_prefix)?;
+        let policy = table_credential_session_policy(request.entry, &request.object_prefix, &request.metadata_object)?;
         let policy_buf = serde_json::to_vec(&policy)
             .map_err(|err| s3_error!(InternalError, "failed to serialize table credential session policy: {}", err))?;
         let expiration = OffsetDateTime::now_utc().saturating_add(Duration::seconds(self.ttl_seconds));
@@ -875,6 +904,16 @@ fn bind_table_credential_parent(credential: &mut rustfs_credentials::Credentials
 struct RestLoadTableResponse {
     #[serde(rename = "metadata-location")]
     metadata_location: String,
+    metadata: serde_json::Value,
+    config: BTreeMap<String, String>,
+    #[serde(rename = "storage-credentials")]
+    storage_credentials: Vec<RestStorageCredential>,
+}
+
+#[derive(Debug, Serialize)]
+struct RestCreateTableResponse {
+    #[serde(rename = "metadata-location")]
+    metadata_location: Option<String>,
     metadata: serde_json::Value,
     config: BTreeMap<String, String>,
     #[serde(rename = "storage-credentials")]
@@ -967,10 +1006,6 @@ fn build_sensitive_json_response<T: Serialize>(status: StatusCode, body: &T) -> 
         .insert(http::header::PRAGMA, HeaderValue::from_static("no-cache"));
     response.headers.insert(http::header::EXPIRES, HeaderValue::from_static("0"));
     Ok(response)
-}
-
-fn empty_response(status: StatusCode) -> S3Response<(StatusCode, Body)> {
-    S3Response::new((status, Body::default()))
 }
 
 fn duration_millis_u64(duration: StdDuration) -> u64 {
@@ -2273,6 +2308,7 @@ fn table_bucket_entry_from_metadata_marker(bucket: &str) -> crate::table_catalog
         warehouse_root: format!("s3://{bucket}/"),
         state: crate::table_catalog::TableCatalogEntryState::Active,
         properties: BTreeMap::new(),
+        active_rename_id: None,
         created_at: None,
         updated_at: None,
     }
@@ -2464,9 +2500,24 @@ fn table_credential_scope(entry: &crate::table_catalog::TableEntry) -> S3Result<
         return Err(s3_error!(InvalidRequest, "table warehouse location must be inside the table bucket"));
     }
     let object_prefix = normalize_table_credential_object_prefix(object_prefix)?;
+    validate_persisted_table_metadata_location(entry, &entry.metadata_location)?;
+    let metadata_object =
+        crate::table_catalog::table_catalog_object_key_from_location(&entry.table_bucket, &entry.metadata_location)
+            .ok_or_else(|| persisted_metadata_error("table"))?;
+    let namespace = crate::table_catalog::Namespace::parse(&entry.namespace).map_err(|_| persisted_metadata_error("table"))?;
+    let table =
+        crate::table_catalog::IdentifierSegment::parse(entry.table.clone()).map_err(|_| persisted_metadata_error("table"))?;
+    if crate::table_catalog::is_reserved_table_object_key(&metadata_object)
+        && !crate::table_catalog::is_valid_table_metadata_location(&namespace, &table, &metadata_object)
+    {
+        return Err(persisted_metadata_error("table"));
+    }
+    let metadata_scope_prefix = table_metadata_location_for_client(&entry.table_bucket, &entry.metadata_location);
     Ok(TableCredentialScope {
-        scope_prefix: format!("s3://{bucket}/{object_prefix}"),
-        object_prefix,
+        warehouse_scope_prefix: format!("s3://{bucket}/{object_prefix}"),
+        warehouse_object_prefix: object_prefix,
+        metadata_scope_prefix,
+        metadata_object,
     })
 }
 
@@ -2474,6 +2525,11 @@ fn normalize_table_credential_object_prefix(object_prefix: &str) -> S3Result<Str
     let object_prefix = object_prefix.strip_suffix('/').unwrap_or(object_prefix);
     if object_prefix.is_empty() {
         return Err(s3_error!(InvalidRequest, "table credential scope prefix is empty"));
+    }
+    if crate::table_catalog::is_reserved_table_object_key(object_prefix) {
+        return Err(S3Error::from(ApiError::invalid_request(
+            "table credential scope overlaps the reserved table catalog prefix",
+        )));
     }
     if object_prefix.contains('\\') {
         return Err(s3_error!(
@@ -2504,9 +2560,16 @@ fn table_credential_catalog_resource(entry: &crate::table_catalog::TableEntry) -
     Ok(format!("namespaces/{}/tables/{}", namespace.storage_id(), table.as_str()))
 }
 
-fn table_credential_session_policy(entry: &crate::table_catalog::TableEntry, object_prefix: &str) -> S3Result<Policy> {
+fn table_credential_session_policy(
+    entry: &crate::table_catalog::TableEntry,
+    object_prefix: &str,
+    metadata_object: &str,
+) -> S3Result<Policy> {
     let bucket = &entry.table_bucket;
     let object_prefix = normalize_table_credential_object_prefix(object_prefix)?;
+    validate_persisted_table_metadata_location(entry, metadata_object)?;
+    let metadata_object = crate::table_catalog::table_catalog_object_key_from_location(bucket, metadata_object)
+        .ok_or_else(|| persisted_metadata_error("table"))?;
     let catalog_resource = table_credential_catalog_resource(entry)?;
     let policy = serde_json::json!({
         "Version": "2012-10-17",
@@ -2522,6 +2585,15 @@ fn table_credential_session_policy(entry: &crate::table_catalog::TableEntry, obj
                 ],
                 "Resource": [
                     format!("arn:aws:s3:::{bucket}/{object_prefix}*")
+                ]
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "s3:GetObject"
+                ],
+                "Resource": [
+                    format!("arn:aws:s3:::{bucket}/{metadata_object}")
                 ]
             },
             {
@@ -2550,23 +2622,44 @@ fn table_credential_session_policy(entry: &crate::table_catalog::TableEntry, obj
     Policy::parse_config(&data).map_err(|err| s3_error!(InvalidRequest, "invalid table credential policy: {}", err))
 }
 
-fn storage_credential_from_issued(scope: TableCredentialScope, issued: IssuedTableCredentials) -> RestStorageCredential {
+fn storage_credential_config(scope_prefix: &str, issued: &IssuedTableCredentials) -> BTreeMap<String, String> {
     let mut config = BTreeMap::new();
-    config.insert(S3_ACCESS_KEY_ID_CONFIG_KEY.to_string(), issued.access_key_id);
-    config.insert(S3_SECRET_ACCESS_KEY_CONFIG_KEY.to_string(), issued.secret_access_key);
-    config.insert(S3_SESSION_TOKEN_CONFIG_KEY.to_string(), issued.session_token);
+    config.insert(S3_ACCESS_KEY_ID_CONFIG_KEY.to_string(), issued.access_key_id.clone());
+    config.insert(S3_SECRET_ACCESS_KEY_CONFIG_KEY.to_string(), issued.secret_access_key.clone());
+    config.insert(S3_SESSION_TOKEN_CONFIG_KEY.to_string(), issued.session_token.clone());
     config.insert(CREDENTIAL_VENDING_CONFIG_KEY.to_string(), CREDENTIAL_VENDING_SUPPORTED.to_string());
     config.insert(CREDENTIAL_MODE_CONFIG_KEY.to_string(), CREDENTIAL_MODE_CATALOG_VENDED.to_string());
     config.insert(CREDENTIAL_SCOPE_CONFIG_KEY.to_string(), CREDENTIAL_SCOPE_TABLE_PREFIX.to_string());
-    config.insert(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY.to_string(), scope.scope_prefix.clone());
+    config.insert(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY.to_string(), scope_prefix.to_string());
     config.insert(
         CREDENTIAL_EXPIRATION_CONFIG_KEY.to_string(),
         issued.expiration.unix_timestamp().to_string(),
     );
-    RestStorageCredential {
-        prefix: scope.scope_prefix,
-        config,
-    }
+    config
+}
+
+fn storage_credentials_from_issued(scope: TableCredentialScope, issued: IssuedTableCredentials) -> Vec<RestStorageCredential> {
+    let warehouse_config = storage_credential_config(&scope.warehouse_scope_prefix, &issued);
+    let metadata_config = storage_credential_config(&scope.metadata_scope_prefix, &issued);
+    vec![
+        RestStorageCredential {
+            prefix: scope.warehouse_scope_prefix,
+            config: warehouse_config,
+        },
+        RestStorageCredential {
+            prefix: scope.metadata_scope_prefix,
+            config: metadata_config,
+        },
+    ]
+}
+
+fn requests_vended_credentials(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(ICEBERG_ACCESS_DELEGATION_HEADER)
+        .iter()
+        .flat_map(|value| value.as_bytes().split(|byte| *byte == b','))
+        .map(|token| token.trim_ascii())
+        .any(|token| token == ICEBERG_VENDED_CREDENTIALS_DELEGATION)
 }
 
 fn table_metadata_location_for_client(table_bucket: &str, metadata_location: &str) -> String {
@@ -2623,6 +2716,25 @@ fn load_table_response_from_entry(entry: crate::table_catalog::TableEntry, metad
     }
 }
 
+fn create_table_response_from_entry(
+    entry: crate::table_catalog::TableEntry,
+    metadata: serde_json::Value,
+    staged: bool,
+) -> RestCreateTableResponse {
+    let RestLoadTableResponse {
+        metadata_location,
+        metadata,
+        config,
+        storage_credentials,
+    } = load_table_response_from_entry(entry, metadata);
+    RestCreateTableResponse {
+        metadata_location: (!staged).then_some(metadata_location),
+        metadata,
+        config,
+        storage_credentials,
+    }
+}
+
 fn load_view_response_from_entry(entry: crate::table_catalog::ViewEntry, metadata: serde_json::Value) -> RestLoadViewResponse {
     let mut config = BTreeMap::new();
     let warehouse_location = entry.warehouse_location.clone();
@@ -2650,6 +2762,13 @@ fn load_credentials_response_config(vending: &str, mode: &str, reason: Option<&s
     config
 }
 
+fn client_provided_credentials_response(reason: &str) -> RestLoadCredentialsResponse {
+    RestLoadCredentialsResponse {
+        config: load_credentials_response_config(CREDENTIAL_VENDING_UNSUPPORTED, CREDENTIAL_MODE_CLIENT_PROVIDED, Some(reason)),
+        storage_credentials: Vec::new(),
+    }
+}
+
 fn add_table_credential_scope_config(config: &mut BTreeMap<String, String>, scope_prefix: &str) {
     config.insert(CREDENTIAL_SCOPE_CONFIG_KEY.to_string(), CREDENTIAL_SCOPE_TABLE_PREFIX.to_string());
     config.insert(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY.to_string(), scope_prefix.to_string());
@@ -2661,25 +2780,19 @@ async fn load_credentials_response_from_entry(
     principal: Option<&rustfs_credentials::Credentials>,
 ) -> S3Result<RestLoadCredentialsResponse> {
     if !issuer.enabled() {
-        return Ok(RestLoadCredentialsResponse {
-            config: load_credentials_response_config(
-                CREDENTIAL_VENDING_UNSUPPORTED,
-                CREDENTIAL_MODE_CLIENT_PROVIDED,
-                Some(CREDENTIAL_VENDING_DISABLED_REASON),
-            ),
-            storage_credentials: Vec::new(),
-        });
+        return Ok(client_provided_credentials_response(CREDENTIAL_VENDING_DISABLED_REASON));
     }
     let scope = table_credential_scope(entry)?;
     let request = TableCredentialIssueRequest {
         entry,
         principal,
-        scope_prefix: scope.scope_prefix.clone(),
-        object_prefix: scope.object_prefix.clone(),
+        scope_prefix: scope.warehouse_scope_prefix.clone(),
+        object_prefix: scope.warehouse_object_prefix.clone(),
+        metadata_object: scope.metadata_object.clone(),
     };
-    let scope_prefix = scope.scope_prefix.clone();
+    let scope_prefix = scope.warehouse_scope_prefix.clone();
     let storage_credentials = match issuer.issue_table_credentials(request).await? {
-        Some(issued) => vec![storage_credential_from_issued(scope, issued)],
+        Some(issued) => storage_credentials_from_issued(scope, issued),
         None => {
             let mut config = load_credentials_response_config(
                 CREDENTIAL_VENDING_UNSUPPORTED,
@@ -2699,6 +2812,28 @@ async fn load_credentials_response_from_entry(
         config,
         storage_credentials,
     })
+}
+
+fn apply_credentials_to_load_table_response(
+    mut response: RestLoadTableResponse,
+    credential_response: RestLoadCredentialsResponse,
+) -> RestLoadTableResponse {
+    response.config.remove(CREDENTIAL_VENDING_CONFIG_KEY);
+    response.config.remove(CREDENTIAL_VENDING_REASON_CONFIG_KEY);
+    response.config.remove(CREDENTIAL_MODE_CONFIG_KEY);
+    response.config.extend(credential_response.config);
+    response.storage_credentials = credential_response.storage_credentials;
+    response
+}
+
+async fn enrich_load_table_response_with_credentials(
+    response: RestLoadTableResponse,
+    entry: &crate::table_catalog::TableEntry,
+    issuer: &dyn TableCredentialIssuer,
+    principal: Option<&rustfs_credentials::Credentials>,
+) -> S3Result<RestLoadTableResponse> {
+    let credential_response = load_credentials_response_from_entry(entry, issuer, principal).await?;
+    Ok(apply_credentials_to_load_table_response(response, credential_response))
 }
 
 fn commit_table_response_from_result(
@@ -2998,16 +3133,9 @@ fn table_entry_from_create_table_request(
         mut schema,
         mut partition_spec,
         mut write_order,
-        stage_create,
+        stage_create: _,
         mut properties,
     } = request;
-    if stage_create {
-        return Err(iceberg_rest_error(
-            ICEBERG_ERROR_UNSUPPORTED_OPERATION,
-            StatusCode::NOT_ACCEPTABLE,
-            "stage-create is not supported",
-        ));
-    }
 
     let table = crate::table_catalog::IdentifierSegment::parse(name)
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
@@ -3384,6 +3512,26 @@ fn validate_table_commit_requirements(metadata: &serde_json::Value, requirements
     Ok(())
 }
 
+fn request_has_assert_create_requirement(request: &RestCommitTableRequest) -> bool {
+    request
+        .requirements
+        .iter()
+        .any(|requirement| requirement.get("type").and_then(serde_json::Value::as_str) == Some("assert-create"))
+}
+
+fn validate_create_table_commit_requirements(requirements: &[serde_json::Value]) -> S3Result<()> {
+    if requirements.is_empty()
+        || requirements
+            .iter()
+            .any(|requirement| requirement.get("type").and_then(serde_json::Value::as_str) != Some("assert-create"))
+    {
+        return Err(S3Error::from(ApiError::invalid_request(
+            "create table commit requires only assert-create requirements",
+        )));
+    }
+    Ok(())
+}
+
 fn validate_i64_requirement(
     metadata: &serde_json::Value,
     requirement: &serde_json::Value,
@@ -3449,20 +3597,104 @@ fn apply_table_commit_updates(
 }
 
 fn apply_table_commit_updates_at(
-    mut metadata: serde_json::Value,
+    metadata: serde_json::Value,
     updates: &[serde_json::Value],
     previous_metadata_location: &str,
+    commit_timestamp_ms: i64,
+) -> S3Result<serde_json::Value> {
+    apply_table_updates_at(
+        metadata,
+        updates,
+        TableMetadataUpdateMode::Existing {
+            previous_metadata_location,
+        },
+        commit_timestamp_ms,
+    )
+}
+
+fn apply_table_create_updates_at(updates: &[serde_json::Value], commit_timestamp_ms: i64) -> S3Result<serde_json::Value> {
+    let format_version = updates
+        .iter()
+        .find(|update| update.get("action").and_then(serde_json::Value::as_str) == Some("upgrade-format-version"))
+        .and_then(|update| update.get("format-version"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(2);
+    let mut metadata = serde_json::json!({
+        "format-version": format_version,
+        "last-updated-ms": commit_timestamp_ms,
+        "last-column-id": 0,
+        "schemas": [],
+        "current-schema-id": -1,
+        "partition-specs": [],
+        "default-spec-id": -1,
+        "last-partition-id": 999,
+        "sort-orders": [],
+        "default-sort-order-id": -1,
+        "properties": {},
+        "current-snapshot-id": -1,
+        "snapshots": [],
+        "snapshot-log": [],
+        "metadata-log": [],
+        "refs": {}
+    });
+    if format_version == 2 {
+        metadata_object_mut(&mut metadata)?.insert("last-sequence-number".to_string(), serde_json::Value::from(0));
+    }
+    apply_table_updates_at(metadata, updates, TableMetadataUpdateMode::Create, commit_timestamp_ms)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TableMetadataUpdateMode<'a> {
+    Create,
+    Existing { previous_metadata_location: &'a str },
+}
+
+impl TableMetadataUpdateMode<'_> {
+    fn initial_catalog_id(self, array_key: &str) -> Option<i64> {
+        match (self, array_key) {
+            (Self::Create, "schemas" | "partition-specs") => Some(0),
+            (Self::Create, "sort-orders") => Some(1),
+            (Self::Create, _) | (Self::Existing { .. }, _) => None,
+        }
+    }
+}
+
+fn apply_table_updates_at(
+    mut metadata: serde_json::Value,
+    updates: &[serde_json::Value],
+    mode: TableMetadataUpdateMode<'_>,
     commit_timestamp_ms: i64,
 ) -> S3Result<serde_json::Value> {
     if !metadata.is_object() {
         return Err(s3_error!(InvalidRequest, "current table metadata must be a JSON object"));
     }
-    if metadata.get("format-version").is_some() {
+    if matches!(mode, TableMetadataUpdateMode::Existing { .. }) && metadata.get("format-version").is_some() {
         crate::table_catalog::synchronize_table_metadata_version_fields(&mut metadata).map_err(catalog_store_error)?;
     }
-    let mut next_schema_id = next_catalog_id_for_updates(&metadata, updates, "add-schema", "schemas", "schema-id")?;
-    let mut next_spec_id = next_catalog_id_for_updates(&metadata, updates, "add-spec", "partition-specs", "spec-id")?;
-    let mut next_sort_order_id = next_catalog_id_for_updates(&metadata, updates, "add-sort-order", "sort-orders", "order-id")?;
+    let mut next_schema_id = next_catalog_id_for_updates(
+        &metadata,
+        updates,
+        "add-schema",
+        "schemas",
+        "schema-id",
+        mode.initial_catalog_id("schemas"),
+    )?;
+    let mut next_spec_id = next_catalog_id_for_updates(
+        &metadata,
+        updates,
+        "add-spec",
+        "partition-specs",
+        "spec-id",
+        mode.initial_catalog_id("partition-specs"),
+    )?;
+    let mut next_sort_order_id = next_catalog_id_for_updates(
+        &metadata,
+        updates,
+        "add-sort-order",
+        "sort-orders",
+        "order-id",
+        mode.initial_catalog_id("sort-orders"),
+    )?;
     let mut last_added_schema_id = None;
     let mut last_added_spec_id = None;
     let mut last_added_sort_order_id = None;
@@ -3552,8 +3784,16 @@ fn apply_table_commit_updates_at(
     if metadata.get("format-version").is_some() {
         crate::table_catalog::synchronize_table_metadata_version_fields(&mut metadata).map_err(catalog_store_error)?;
     }
-    append_previous_metadata_log(&mut metadata, previous_metadata_location)?;
+    if let TableMetadataUpdateMode::Existing {
+        previous_metadata_location,
+    } = mode
+    {
+        append_previous_metadata_log(&mut metadata, previous_metadata_location)?;
+    }
     metadata_object_mut(&mut metadata)?.insert("last-updated-ms".to_string(), serde_json::Value::from(commit_timestamp_ms));
+    if matches!(mode, TableMetadataUpdateMode::Create) {
+        crate::table_catalog::validate_supported_table_metadata(&metadata).map_err(catalog_store_error)?;
+    }
     Ok(metadata)
 }
 
@@ -3620,7 +3860,7 @@ fn apply_view_commit_updates_at(
     if !metadata.is_object() {
         return Err(s3_error!(InvalidRequest, "current view metadata must be a JSON object"));
     }
-    let mut next_schema_id = next_catalog_id_for_updates(&metadata, updates, "add-schema", "schemas", "schema-id")?;
+    let mut next_schema_id = next_catalog_id_for_updates(&metadata, updates, "add-schema", "schemas", "schema-id", None)?;
     let mut last_added_schema_id = None;
     let mut last_added_view_version_id = None;
     let mut added_view_version_timestamps = BTreeMap::new();
@@ -4978,11 +5218,12 @@ fn next_catalog_id_for_updates(
     action: &str,
     array_key: &str,
     id_key: &str,
+    initial_id: Option<i64>,
 ) -> S3Result<Option<i64>> {
     updates
         .iter()
         .any(|update| update.get("action").and_then(serde_json::Value::as_str) == Some(action))
-        .then(|| next_array_object_i64(metadata, array_key, id_key))
+        .then(|| next_array_object_i64(metadata, array_key, id_key, initial_id))
         .transpose()
 }
 
@@ -4997,10 +5238,22 @@ fn take_catalog_assigned_id(next_id: &mut Option<i64>, label: &str) -> S3Result<
     Ok(assigned_id)
 }
 
-fn next_array_object_i64(metadata: &serde_json::Value, array_key: &str, id_key: &str) -> S3Result<i64> {
-    last_array_object_i64(metadata, array_key, id_key)?
-        .checked_add(1)
-        .ok_or_else(|| s3_error!(InvalidRequest, "metadata field {array_key} {id_key} exceeds the signed 64-bit range"))
+fn next_array_object_i64(metadata: &serde_json::Value, array_key: &str, id_key: &str, initial_id: Option<i64>) -> S3Result<i64> {
+    match last_array_object_i64(metadata, array_key, id_key) {
+        Ok(last_id) => last_id
+            .checked_add(1)
+            .ok_or_else(|| s3_error!(InvalidRequest, "metadata field {array_key} {id_key} exceeds the signed 64-bit range")),
+        Err(_)
+            if metadata
+                .get(array_key)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty) =>
+        {
+            initial_id
+                .ok_or_else(|| S3Error::from(ApiError::invalid_request(format!("metadata field {array_key} has no {id_key}"))))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn last_array_object_i64(metadata: &serde_json::Value, array_key: &str, id_key: &str) -> S3Result<i64> {
@@ -5098,6 +5351,11 @@ fn catalog_store_error(err: crate::table_catalog::TableCatalogStoreError) -> S3E
         crate::table_catalog::TableCatalogStoreError::Unsupported(message) => {
             iceberg_rest_error(ICEBERG_ERROR_UNSUPPORTED_OPERATION, StatusCode::NOT_ACCEPTABLE, message)
         }
+        crate::table_catalog::TableCatalogStoreError::Unavailable(_) => iceberg_rest_error(
+            ICEBERG_ERROR_REST,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "table catalog is temporarily unavailable",
+        ),
         crate::table_catalog::TableCatalogStoreError::Internal(message) => {
             iceberg_rest_error(ICEBERG_ERROR_REST, StatusCode::INTERNAL_SERVER_ERROR, message)
         }
@@ -5324,11 +5582,40 @@ async fn create_table_response<S>(
     namespace: &crate::table_catalog::Namespace,
     request: CreateTableRequest,
     table_bucket_enabled: bool,
-) -> S3Result<RestLoadTableResponse>
+) -> S3Result<RestCreateTableResponse>
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
+    let staged = request.stage_create;
     let (entry, metadata) = table_entry_from_create_table_request(bucket, namespace, request)?;
+    if staged {
+        if !table_bucket_enabled {
+            return Err(S3Error::from(ApiError::invalid_request(format!("bucket {bucket} is not table-enabled"))));
+        }
+        get_namespace_response(store, bucket, namespace).await?;
+        if store
+            .load_table(bucket, &namespace.public_name(), &entry.table)
+            .await
+            .map_err(catalog_store_error)?
+            .is_some()
+            || store
+                .load_view(bucket, &namespace.public_name(), &entry.table)
+                .await
+                .map_err(catalog_store_error)?
+                .is_some()
+        {
+            return Err(iceberg_rest_error(
+                ICEBERG_ERROR_ALREADY_EXISTS,
+                StatusCode::CONFLICT,
+                format!("catalog object already exists: {}/{}/{}", bucket, namespace.public_name(), entry.table),
+            ));
+        }
+        store
+            .ensure_table_warehouse_location_available(&entry)
+            .await
+            .map_err(catalog_store_already_exists_error)?;
+        return Ok(create_table_response_from_entry(entry, metadata, true));
+    }
     ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
     crate::table_catalog::TableCommitPublication::begin_table_bucket(metadata_backend, bucket)
         .await
@@ -5354,7 +5641,7 @@ where
         .register_table_with_publication(entry.clone(), metadata_backend)
         .await
         .map_err(catalog_store_already_exists_error)?;
-    Ok(load_table_response_from_entry(entry, metadata))
+    Ok(create_table_response_from_entry(entry, metadata, false))
 }
 
 async fn create_view_response<S>(
@@ -5511,6 +5798,37 @@ async fn load_table_response<S>(
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
+    let (entry, metadata) = load_table_entry_and_metadata(store, metadata_backend, bucket, namespace, table).await?;
+    Ok(load_table_response_from_entry(entry, metadata))
+}
+
+async fn load_table_response_with_credentials<S>(
+    store: &S,
+    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    issuer: &dyn TableCredentialIssuer,
+    principal: Option<&rustfs_credentials::Credentials>,
+) -> S3Result<RestLoadTableResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let (entry, metadata) = load_table_entry_and_metadata(store, metadata_backend, bucket, namespace, table).await?;
+    let response = load_table_response_from_entry(entry.clone(), metadata);
+    enrich_load_table_response_with_credentials(response, &entry, issuer, principal).await
+}
+
+async fn load_table_entry_and_metadata<S>(
+    store: &S,
+    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+) -> S3Result<(crate::table_catalog::TableEntry, serde_json::Value)>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
     let Some(entry) = store
         .load_table(bucket, &namespace.public_name(), table)
         .await
@@ -5519,7 +5837,7 @@ where
         return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     let metadata = read_persisted_table_metadata_for_entry(metadata_backend, &entry, &entry.metadata_location, true).await?;
-    Ok(load_table_response_from_entry(entry, metadata))
+    Ok((entry, metadata))
 }
 
 async fn list_views_response<S>(
@@ -5938,11 +6256,14 @@ async fn standard_commit_table_response<S>(
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
-    let Some(current) = store
+    let current = store
         .load_table(bucket, &namespace.public_name(), table)
         .await
-        .map_err(catalog_store_error)?
-    else {
+        .map_err(catalog_store_error)?;
+    let Some(current) = current else {
+        if request_has_assert_create_requirement(&request) {
+            return commit_staged_table_create_response(store, metadata_backend, bucket, namespace, table, request).await;
+        }
         return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     if let Some(response) =
@@ -6050,6 +6371,104 @@ where
     };
     let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, commit_request).await?;
     Ok(commit_table_response_from_result(result, next_metadata))
+}
+
+async fn commit_staged_table_create_response<S>(
+    store: &S,
+    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    request: RestCommitTableRequest,
+) -> S3Result<RestCommitTableResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    validate_create_table_commit_requirements(&request.requirements)?;
+    get_namespace_response(store, bucket, namespace).await?;
+    if store
+        .load_view(bucket, &namespace.public_name(), table)
+        .await
+        .map_err(catalog_store_error)?
+        .is_some()
+    {
+        return Err(iceberg_rest_error(
+            ICEBERG_ERROR_ALREADY_EXISTS,
+            StatusCode::CONFLICT,
+            format!("catalog object already exists: {}/{}/{}", bucket, namespace.public_name(), table),
+        ));
+    }
+    let commit_timestamp_ms = current_time_millis();
+    let metadata = apply_table_create_updates_at(&request.updates, commit_timestamp_ms)?;
+    validate_metadata_table_location_in_bucket(bucket, &metadata)?;
+
+    let table = crate::table_catalog::IdentifierSegment::parse(table.to_string())
+        .map_err(|err| S3Error::from(ApiError::invalid_request(format!("invalid table name: {err}"))))?;
+    let (commit_id, _) = standard_commit_ids(request.commit_id.or(request.idempotency_key));
+    let table_id = Uuid::new_v4().to_string();
+    let metadata_location =
+        crate::table_catalog::default_table_metadata_file_path(namespace, &table, &next_metadata_file_name(1, &table_id));
+    let properties = serde_json::from_value::<BTreeMap<String, String>>(
+        metadata
+            .get("properties")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+    )
+    .map_err(|_| S3Error::from(ApiError::invalid_request("table property values must be strings")))?;
+    let mut entry = crate::table_catalog::TableEntry {
+        version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.as_str().to_string(),
+        table_id,
+        table_uuid: Uuid::new_v4().to_string(),
+        format: "ICEBERG".to_string(),
+        format_version: 1,
+        warehouse_location: metadata_table_location(&metadata)?.to_string(),
+        metadata_location,
+        version_token: format!("token-{}", Uuid::new_v4()),
+        generation: 1,
+        state: crate::table_catalog::TableCatalogEntryState::Active,
+        properties,
+        created_at: None,
+        updated_at: None,
+    };
+    adopt_registered_metadata_identity(&mut entry, &metadata)?;
+    validate_table_metadata_snapshot_graph(metadata_backend, bucket, &entry, None, &metadata).await?;
+
+    crate::table_catalog::TableCommitPublication::begin_table_bucket(metadata_backend, bucket)
+        .await
+        .map_err(catalog_store_error)?;
+    if !crate::table_catalog::TableCommitPublication::holds_table_bucket(metadata_backend, bucket) {
+        return Err(catalog_store_error(crate::table_catalog::TableCatalogStoreError::Internal(
+            "staged table creation requires a table-bucket publication fence".to_string(),
+        )));
+    }
+    let _publication_completion = crate::table_catalog::TableCommitPublicationCompletion::new(metadata_backend);
+    let metadata_data = serde_json::to_vec(&metadata).map_err(|err| {
+        S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize initial table metadata: {err}"))
+    })?;
+    metadata_backend
+        .put_object(
+            bucket,
+            &entry.metadata_location,
+            metadata_data,
+            crate::table_catalog::TableCatalogPutPrecondition::IfAbsent,
+        )
+        .await
+        .map_err(catalog_store_already_exists_error)?;
+    store
+        .register_table_with_publication(entry.clone(), metadata_backend)
+        .await
+        .map_err(catalog_store_already_exists_error)?;
+
+    Ok(RestCommitTableResponse {
+        metadata_location: table_metadata_location_for_client(bucket, &entry.metadata_location),
+        metadata: table_metadata_for_client(bucket, metadata),
+        version_token: entry.version_token,
+        generation: entry.generation,
+        commit_id,
+    })
 }
 
 async fn table_commit_for_retry<S>(

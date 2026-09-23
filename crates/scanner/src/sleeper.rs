@@ -16,11 +16,11 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Instant;
 
-use rustfs_common::metrics::global_metrics;
 use rustfs_config::{
     DEFAULT_SCANNER_IDLE_MODE, DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS, ENV_SCANNER_IDLE_MODE, ENV_SCANNER_SPEED,
     ENV_SCANNER_YIELD_EVERY_N_OBJECTS, ScannerSpeed,
 };
+use rustfs_scanner_metrics::metrics::global_metrics;
 use tokio::time::Duration;
 
 const MIN_SLEEP: Duration = Duration::from_millis(1);
@@ -29,8 +29,8 @@ const SCANNER_SPEED_FAST: u8 = 1;
 const SCANNER_SPEED_DEFAULT: u8 = 2;
 const SCANNER_SPEED_SLOW: u8 = 3;
 const SCANNER_SPEED_SLOWEST: u8 = 4;
-const FOREGROUND_READ_BACKOFF_PER_REQUEST_MS: u64 = 10;
-const FOREGROUND_READ_BACKOFF_MAX_MS: u64 = 250;
+const FOREGROUND_WORKLOAD_BACKOFF_PER_REQUEST_MS: u64 = 10;
+const FOREGROUND_WORKLOAD_BACKOFF_MAX_MS: u64 = 250;
 
 static SCANNER_DEFAULT_SPEED_PRESET: AtomicU8 = AtomicU8::new(SCANNER_SPEED_DEFAULT);
 
@@ -78,15 +78,15 @@ pub(crate) fn scanner_yield_every_n_objects() -> u64 {
     rustfs_utils::get_env_u64(ENV_SCANNER_YIELD_EVERY_N_OBJECTS, DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS)
 }
 
-fn foreground_read_backoff_duration(active_reads: u64) -> Duration {
-    if active_reads == 0 {
+fn foreground_workload_backoff_duration(active_foreground_workloads: u64) -> Duration {
+    if active_foreground_workloads == 0 {
         return Duration::ZERO;
     }
 
     Duration::from_millis(
-        active_reads
-            .saturating_mul(FOREGROUND_READ_BACKOFF_PER_REQUEST_MS)
-            .min(FOREGROUND_READ_BACKOFF_MAX_MS),
+        active_foreground_workloads
+            .saturating_mul(FOREGROUND_WORKLOAD_BACKOFF_PER_REQUEST_MS)
+            .min(FOREGROUND_WORKLOAD_BACKOFF_MAX_MS),
     )
 }
 
@@ -147,14 +147,15 @@ impl DynamicSleeper {
         }
         let (factor, max_sleep) = self.read_params();
         if factor == 0.0 || max_sleep.is_zero() {
-            let foreground_sleep = foreground_read_backoff_duration(crate::current_foreground_read_activity());
+            let foreground_sleep =
+                foreground_workload_backoff_duration(crate::workload_admission::foreground_workload_activity());
             if !foreground_sleep.is_zero() {
                 tokio::time::sleep(foreground_sleep).await;
                 global_metrics().record_scanner_throttle_sleep(foreground_sleep);
             }
             return;
         }
-        let foreground_sleep = foreground_read_backoff_duration(crate::current_foreground_read_activity());
+        let foreground_sleep = foreground_workload_backoff_duration(crate::workload_admission::foreground_workload_activity());
         let sleep_dur = Duration::from_secs_f64(MIN_SLEEP.as_secs_f64() * factor)
             .min(max_sleep)
             .max(foreground_sleep);
@@ -235,7 +236,8 @@ impl SleepTimer {
         }
         let (factor, max_sleep) = self.sleeper.read_params();
         if factor == 0.0 || max_sleep.is_zero() {
-            let foreground_sleep = foreground_read_backoff_duration(crate::current_foreground_read_activity());
+            let foreground_sleep =
+                foreground_workload_backoff_duration(crate::workload_admission::foreground_workload_activity());
             if !foreground_sleep.is_zero() {
                 tokio::time::sleep(foreground_sleep).await;
                 global_metrics().record_scanner_throttle_sleep(foreground_sleep);
@@ -243,7 +245,7 @@ impl SleepTimer {
             return;
         }
         let elapsed = self.start.elapsed();
-        let foreground_sleep = foreground_read_backoff_duration(crate::current_foreground_read_activity());
+        let foreground_sleep = foreground_workload_backoff_duration(crate::workload_admission::foreground_workload_activity());
         let sleep_dur = Duration::from_secs_f64(elapsed.as_secs_f64() * factor)
             .max(MIN_SLEEP)
             .min(max_sleep)
@@ -258,6 +260,7 @@ impl SleepTimer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use temp_env::{with_var, with_var_unset};
 
     struct ScannerDefaultSpeedGuard;
@@ -303,10 +306,10 @@ mod tests {
     }
 
     #[test]
-    fn foreground_read_backoff_is_capped() {
-        assert_eq!(foreground_read_backoff_duration(0), Duration::ZERO);
-        assert_eq!(foreground_read_backoff_duration(1), Duration::from_millis(10));
-        assert_eq!(foreground_read_backoff_duration(80), Duration::from_millis(250));
+    fn foreground_workload_backoff_is_capped() {
+        assert_eq!(foreground_workload_backoff_duration(0), Duration::ZERO);
+        assert_eq!(foreground_workload_backoff_duration(1), Duration::from_millis(10));
+        assert_eq!(foreground_workload_backoff_duration(80), Duration::from_millis(250));
     }
 
     #[test]
@@ -325,6 +328,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_refresh_from_env_applies_speed_and_idle_mode_for_next_cycle() {
         let prev_mode = SCANNER_IDLE_MODE.load(Ordering::Relaxed);
         SCANNER_IDLE_MODE.store(true, Ordering::Relaxed);
@@ -344,6 +348,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_refresh_from_env_uses_default_speed_override_when_speed_unset() {
         let _guard = ScannerDefaultSpeedGuard::set(ScannerSpeed::Slowest);
         let s = DynamicSleeper::new(ScannerSpeed::Default);
@@ -359,6 +364,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[serial]
     async fn test_fastest_never_sleeps() {
         let prev_mode = SCANNER_IDLE_MODE.load(Ordering::Relaxed);
         SCANNER_IDLE_MODE.store(true, Ordering::Relaxed);
@@ -372,6 +378,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[serial]
     async fn test_idle_mode_off_skips_sleep() {
         let prev_mode = SCANNER_IDLE_MODE.load(Ordering::Relaxed);
         SCANNER_IDLE_MODE.store(false, Ordering::Relaxed);

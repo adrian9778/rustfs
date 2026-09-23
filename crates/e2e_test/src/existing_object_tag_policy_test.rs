@@ -17,37 +17,28 @@
 //! `Content-Type: application/x-www-form-urlencoded` on `POST /`.
 
 use crate::common::{
-    RustFSTestEnvironment, awscurl_available, awscurl_delete, awscurl_post_sts_form_urlencoded, awscurl_put, init_logging,
+    AdminTransport, RustFSTestEnvironment, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user_via,
+    awscurl_delete, awscurl_post_sts_form_urlencoded, build_test_s3_config, init_logging,
 };
-use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::Client;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier, Tag, Tagging};
-use aws_sdk_s3::{Client, Config};
 use tracing::info;
 use uuid::Uuid;
 
 fn user_client(env: &RustFSTestEnvironment, access_key: &str, secret_key: &str) -> Client {
-    let credentials = Credentials::new(access_key, secret_key, None, None, "e2e-existing-tag");
-    let config = Config::builder()
-        .credentials_provider(credentials)
-        .region(Region::new("us-east-1"))
-        .endpoint_url(&env.url)
-        .force_path_style(true)
-        .behavior_version_latest()
-        .build();
-    Client::from_conf(config)
+    env.create_s3_client_with_credentials(access_key, secret_key)
 }
 
 fn sts_session_client(env: &RustFSTestEnvironment, access_key: &str, secret_key: &str, session_token: &str) -> Client {
-    let credentials = Credentials::new(access_key, secret_key, Some(session_token.into()), None, "e2e-sts-session");
-    let config = Config::builder()
-        .credentials_provider(credentials)
-        .region(Region::new("us-east-1"))
-        .endpoint_url(&env.url)
-        .force_path_style(true)
-        .behavior_version_latest()
-        .build();
-    Client::from_conf(config)
+    Client::from_conf(build_test_s3_config(
+        &env.url,
+        access_key,
+        secret_key,
+        Some(session_token),
+        "e2e-sts-session",
+    ))
 }
 
 fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
@@ -78,15 +69,16 @@ async fn assume_role_with_session_policy(
     parse_assume_role_credentials(&xml)
 }
 
+// This suite deliberately drives the admin API through the external `awscurl`
+// binary (an independent SigV4 implementation), so the wrappers below pin
+// `AdminTransport::Awscurl`.
+
 async fn admin_create_user(
     env: &RustFSTestEnvironment,
     username: &str,
     password: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let body = serde_json::json!({ "secretKey": password, "status": "enabled" }).to_string();
-    let url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", env.url, username);
-    awscurl_put(&url, &body, &env.access_key, &env.secret_key).await?;
-    Ok(())
+    admin_create_user_via(AdminTransport::Awscurl, &env.url, &env.access_key, &env.secret_key, username, password).await
 }
 
 async fn admin_add_canned_policy(
@@ -94,9 +86,15 @@ async fn admin_add_canned_policy(
     policy_name: &str,
     policy_json: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/rustfs/admin/v3/add-canned-policy?name={}", env.url, policy_name);
-    awscurl_put(&url, policy_json, &env.access_key, &env.secret_key).await?;
-    Ok(())
+    admin_add_canned_policy_via(
+        AdminTransport::Awscurl,
+        &env.url,
+        &env.access_key,
+        &env.secret_key,
+        policy_name,
+        policy_json,
+    )
+    .await
 }
 
 async fn admin_attach_policy_to_user(
@@ -104,12 +102,7 @@ async fn admin_attach_policy_to_user(
     policy_name: &str,
     username: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!(
-        "{}/rustfs/admin/v3/set-user-or-group-policy?policyName={}&userOrGroup={}&isGroup=false",
-        env.url, policy_name, username
-    );
-    awscurl_put(&url, "", &env.access_key, &env.secret_key).await?;
-    Ok(())
+    admin_attach_user_policy_via(AdminTransport::Awscurl, &env.url, &env.access_key, &env.secret_key, policy_name, username).await
 }
 
 async fn admin_remove_user(env: &RustFSTestEnvironment, username: &str) {
@@ -175,11 +168,6 @@ async fn cleanup_bucket_and_object(admin: &Client, bucket: &str, key: &str) {
 #[tokio::test]
 async fn test_e2e_iam_policy_existing_object_tag_get_object() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if !awscurl_available() {
-        info!("Skipping test_e2e_iam_policy_existing_object_tag_get_object: awscurl not available");
-        return Ok(());
-    }
-
     let suffix = Uuid::new_v4();
     let user = format!("e2eiamtag-{suffix}");
     let user_secret = "longSecretKeyForTest123!";
@@ -215,10 +203,17 @@ async fn test_e2e_iam_policy_existing_object_tag_get_object() -> Result<(), Box<
     let _ = out.body.collect().await?;
 
     put_object_tag_kv(&admin, &bucket, key, "security", "private").await?;
-    let denied = uclient.get_object().bucket(&bucket).key(key).send().await;
-    assert!(
-        denied.is_err(),
-        "GetObject must be denied when ExistingObjectTag no longer matches IAM policy"
+    let denied = uclient
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .expect_err("GetObject must be denied when ExistingObjectTag no longer matches IAM policy");
+    assert_eq!(
+        denied.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("AccessDenied"),
+        "IAM ExistingObjectTag mismatch must return AccessDenied: {denied:?}"
     );
 
     cleanup_bucket_and_object(&admin, &bucket, key).await;
@@ -233,11 +228,6 @@ async fn test_e2e_iam_policy_existing_object_tag_get_object() -> Result<(), Box<
 #[tokio::test]
 async fn test_e2e_bucket_policy_existing_object_tag_get_object() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if !awscurl_available() {
-        info!("Skipping test_e2e_bucket_policy_existing_object_tag_get_object: awscurl not available");
-        return Ok(());
-    }
-
     let suffix = Uuid::new_v4();
     let user = format!("e2ebptag-{suffix}");
     let user_secret = "longSecretKeyForTest456!";
@@ -257,8 +247,13 @@ async fn test_e2e_bucket_policy_existing_object_tag_get_object() -> Result<(), B
         .bucket(&bucket)
         .key(key)
         .send()
-        .await;
-    assert!(deny_before.is_err(), "without bucket policy, user must be denied");
+        .await
+        .expect_err("without bucket policy, user must be denied");
+    assert_eq!(
+        deny_before.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("AccessDenied"),
+        "missing bucket policy must return AccessDenied: {deny_before:?}"
+    );
 
     let bp = serde_json::json!({
         "Version": "2012-10-17",
@@ -280,8 +275,18 @@ async fn test_e2e_bucket_policy_existing_object_tag_get_object() -> Result<(), B
     let _ = ok.body.collect().await?;
 
     put_object_tag_kv(&admin, &bucket, key, "security", "private").await?;
-    let denied = uclient.get_object().bucket(&bucket).key(key).send().await;
-    assert!(denied.is_err(), "GetObject must fail when tag no longer satisfies bucket policy");
+    let denied = uclient
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .expect_err("GetObject must fail when tag no longer satisfies bucket policy");
+    assert_eq!(
+        denied.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("AccessDenied"),
+        "bucket-policy ExistingObjectTag mismatch must return AccessDenied: {denied:?}"
+    );
 
     cleanup_bucket_and_object(&admin, &bucket, key).await;
     admin_remove_user(&env, &user).await;
@@ -294,11 +299,6 @@ async fn test_e2e_bucket_policy_existing_object_tag_get_object() -> Result<(), B
 #[tokio::test]
 async fn test_e2e_sts_assume_role_session_policy_existing_object_tag() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if !awscurl_available() {
-        info!("Skipping test_e2e_sts_assume_role_session_policy_existing_object_tag: awscurl not available");
-        return Ok(());
-    }
-
     let suffix = Uuid::new_v4();
     let parent = format!("e2e-sts-par-{suffix}");
     let parent_secret = "longSecretKeyForParentSts99!";
@@ -352,10 +352,17 @@ async fn test_e2e_sts_assume_role_session_policy_existing_object_tag() -> Result
     let _ = ok.body.collect().await?;
 
     put_object_tag_kv(&parent_client, &bucket, key, "security", "private").await?;
-    let denied = session_client.get_object().bucket(&bucket).key(key).send().await;
-    assert!(
-        denied.is_err(),
-        "session policy must deny GetObject when ExistingObjectTag no longer matches"
+    let denied = session_client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .expect_err("session policy must deny GetObject when ExistingObjectTag no longer matches");
+    assert_eq!(
+        denied.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("AccessDenied"),
+        "STS ExistingObjectTag mismatch must return AccessDenied: {denied:?}"
     );
 
     cleanup_bucket_and_object(&admin, &bucket, key).await;
@@ -370,11 +377,6 @@ async fn test_e2e_sts_assume_role_session_policy_existing_object_tag() -> Result
 #[tokio::test]
 async fn test_e2e_sts_session_policy_delete_objects_object_prefix_only() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if !awscurl_available() {
-        info!("Skipping test_e2e_sts_session_policy_delete_objects_object_prefix_only: awscurl not available");
-        return Ok(());
-    }
-
     let suffix = Uuid::new_v4();
     let parent = format!("e2e-sts-del-par-{suffix}");
     let parent_secret = "longSecretKeyForParentDelete99!";
@@ -455,8 +457,18 @@ async fn test_e2e_sts_session_policy_delete_objects_object_prefix_only() -> Resu
     assert_eq!(error.key(), Some(denied_key));
     assert_eq!(error.code(), Some("AccessDenied"));
 
-    let allowed_head = parent_client.head_object().bucket(&bucket).key(allowed_key).send().await;
-    assert!(allowed_head.is_err(), "allowed-prefix object should have been deleted");
+    let allowed_head = parent_client
+        .head_object()
+        .bucket(&bucket)
+        .key(allowed_key)
+        .send()
+        .await
+        .expect_err("allowed-prefix object should have been deleted");
+    assert_eq!(
+        allowed_head.raw_response().map(|response| response.status().as_u16()),
+        Some(404),
+        "allowed-prefix object absence probe must return HTTP 404, got {allowed_head:?}"
+    );
 
     parent_client
         .head_object()

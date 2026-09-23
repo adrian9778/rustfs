@@ -29,7 +29,7 @@ use super::storage_api::test::object_utils::to_s3s_etag;
 use super::storage_api::test::runtime::{MockWarmBackend, MockWarmOp, register_mock_tier as register_mock_tier_util};
 use super::storage_api::test::{
     ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, StorageObjectInfo as ObjectInfo,
-    StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
+    StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader, install_all_v6_fleet_capability_proof,
 };
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
@@ -78,6 +78,12 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     if let Some((paths, ecstore)) = GLOBAL_ENV.get() {
         return (paths.clone(), ecstore.clone());
     }
+
+    // Production startup installs this proof through the notification-system
+    // fleet probe. This isolated single-node harness constructs ECStore
+    // directly, so model that completed all-v6 probe before any journal permit
+    // or background expiry worker can exist.
+    install_all_v6_fleet_capability_proof();
 
     let test_base_dir = format!("/tmp/rustfs_app_lifecycle_test_{}", Uuid::new_v4());
     let temp_dir = PathBuf::from(&test_base_dir);
@@ -1694,10 +1700,27 @@ async fn compensation_driven_copy_still_completes_transition() {
     assert!(backend.contains(&info.transitioned_object.name).await);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
-async fn compensation_driven_complete_multipart_upload_still_transitions() {
+#[test]
+fn compensation_driven_complete_multipart_upload_still_transitions() {
+    std::thread::Builder::new()
+        .name("lifecycle-compensation-complete-multipart".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("compensation multipart test runtime should build");
+
+            runtime.block_on(compensation_driven_complete_multipart_upload_still_transitions_inner());
+        })
+        .expect("compensation multipart test thread should spawn")
+        .join()
+        .expect("compensation multipart test thread should finish");
+}
+
+async fn compensation_driven_complete_multipart_upload_still_transitions_inner() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultMultipartUsecase::from_global();
 
@@ -2223,10 +2246,135 @@ async fn restore_object_usecase_reports_ongoing_conflict() {
     get_barrier.release();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// rustfs/backlog#1337: cancellation after the ongoing metadata commit but
+/// before detached worker creation must not strand the object forever. The
+/// replacement POST proves the abandoned v1 generation has no live worker,
+/// atomically supersedes it, and performs exactly one remote copy-back.
+#[serial]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1337"]
+#[test]
+fn restore_object_usecase_recovers_cancelled_post_commit_generation() {
+    std::thread::Builder::new()
+        .name("lifecycle-restore-orphan-recovery".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("orphan restore recovery test runtime should build");
+            runtime.block_on(restore_object_usecase_recovers_cancelled_post_commit_generation_inner());
+        })
+        .expect("orphan restore recovery test thread should spawn")
+        .join()
+        .expect("orphan restore recovery test thread should finish");
+}
+
+async fn restore_object_usecase_recovers_cancelled_post_commit_generation_inner() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&tier_name).await;
+    let bucket = format!("test-api-restore-orphan-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/restore/orphaned-generation.bin";
+    let payload: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    let uploaded = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
+    let _ = transition_uploaded_object_directly(&ecstore, bucket.as_str(), object, &tier_name, &uploaded).await;
+    backend.clear_op_log().await;
+    let tier_gets_before_restore = backend.get_count().await;
+
+    let restore_input = || {
+        RestoreObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .restore_request(Some(RestoreRequest {
+                days: Some(1),
+                description: None,
+                glacier_job_parameters: None,
+                output_location: None,
+                select_parameters: None,
+                tier: None,
+                type_: None,
+            }))
+            .build()
+            .expect("restore request should build")
+    };
+
+    let commit_barrier = crate::app::object::RestoreStatusCommitBarrier::install(bucket.as_str(), object);
+    let first_input = restore_input();
+    let first = tokio::spawn(async move {
+        DefaultObjectUsecase::from_global()
+            .execute_restore_object(build_request(first_input, Method::POST))
+            .await
+    });
+    commit_barrier.wait_until_paused().await;
+
+    first.abort();
+    assert!(first.await.expect_err("the first request must be cancelled").is_cancelled());
+    drop(commit_barrier);
+
+    let orphaned = ecstore
+        .get_object_info(bucket.as_str(), object, &ObjectOptions::default())
+        .await
+        .expect("the committed orphan generation should remain readable");
+    assert!(orphaned.restore_ongoing, "the interrupted request must have committed ongoing=true");
+    assert_eq!(
+        rustfs_utils::http::get_consistent_str(orphaned.user_defined.as_ref(), rustfs_utils::http::SUFFIX_RESTORE_WORKER_LOCK,),
+        Some(rustfs_utils::http::RESTORE_WORKER_LOCK_PROTOCOL_V1),
+        "recoverable generations must advertise the worker-lock protocol"
+    );
+    let orphaned_operation_id =
+        rustfs_utils::http::get_consistent_str(orphaned.user_defined.as_ref(), rustfs_utils::http::SUFFIX_RESTORE_OPERATION_ID)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .expect("recoverable generations must persist a non-nil operation id");
+    assert!(!orphaned_operation_id.is_nil());
+
+    DefaultObjectUsecase::from_global()
+        .execute_restore_object(build_request(restore_input(), Method::POST))
+        .await
+        .expect("a new POST must supersede the committed generation whose worker lock was released");
+
+    let completed = wait_for_restore_completion(&ecstore, &backend, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"));
+    assert!(!completed.restore_ongoing);
+    assert!(completed.restore_expires.is_some());
+    assert!(
+        rustfs_utils::http::get_str(completed.user_defined.as_ref(), rustfs_utils::http::SUFFIX_RESTORE_OPERATION_ID,).is_none(),
+        "completed replacement restore must consume its operation id"
+    );
+    assert!(
+        rustfs_utils::http::get_str(completed.user_defined.as_ref(), rustfs_utils::http::SUFFIX_RESTORE_WORKER_LOCK,).is_none(),
+        "completed replacement restore must consume its liveness marker"
+    );
+    assert_eq!(
+        backend.get_count().await - tier_gets_before_restore,
+        1,
+        "the cancelled pre-spawn generation must not issue a tier GET"
+    );
+}
+
 #[serial]
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#4879"]
-async fn restore_object_usecase_completes_suspended_null_version_in_place() {
+#[test]
+fn restore_object_usecase_completes_suspended_null_version_in_place() {
+    std::thread::Builder::new()
+        .name("lifecycle-restore-suspended-null".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("suspended null-version restore test runtime should build");
+
+            runtime.block_on(restore_object_usecase_completes_suspended_null_version_in_place_inner());
+        })
+        .expect("suspended null-version restore test thread should spawn")
+        .join()
+        .expect("suspended null-version restore test thread should finish");
+}
+
+async fn restore_object_usecase_completes_suspended_null_version_in_place_inner() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultObjectUsecase::from_global();
     let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
@@ -3007,7 +3155,7 @@ async fn delete_object_versioning_config_failure_leaves_latest_object_intact() {
         .await
         .expect_err("versioning config failure must reject DeleteObject");
 
-    assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+    assert_eq!(err.code(), &s3s::S3ErrorCode::ServiceUnavailable);
     assert_eq!(read_object_bytes(&ecstore, &bucket, object).await, payload);
 }
 

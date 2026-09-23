@@ -21,7 +21,6 @@ use aws_sdk_s3::error::BoxError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
 use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
-use base64::Engine;
 use md5::{Digest as Md5Digest, Md5};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -107,8 +106,8 @@ fn customer_key(byte: u8) -> CustomerKey {
     hasher.update(raw);
     CustomerKey {
         raw: String::from_utf8_lossy(&raw).into_owned(),
-        encoded: base64::engine::general_purpose::STANDARD.encode(raw),
-        md5: base64::engine::general_purpose::STANDARD.encode(hasher.finalize()),
+        encoded: base64_simd::STANDARD.encode_to_string(raw),
+        md5: base64_simd::STANDARD.encode_to_string(hasher.finalize()),
     }
 }
 
@@ -276,9 +275,17 @@ async fn copy_object_rotates_ssec_key_and_drops_source_encryption_metadata() -> 
             .await
             .expect_err("invalid source SSE-C parameters must reject CopyObject");
         assert_secret_absent(&format!("{error:?}"), &[&source_key, &wrong_key]);
-        assert!(
-            client.head_object().bucket(bucket).key(&failed_target).send().await.is_err(),
-            "a rejected CopyObject must not create its target"
+        let absence = client
+            .head_object()
+            .bucket(bucket)
+            .key(&failed_target)
+            .send()
+            .await
+            .expect_err("a rejected CopyObject must not create its target");
+        assert_eq!(
+            absence.raw_response().map(|response| response.status().as_u16()),
+            Some(404),
+            "rejected CopyObject absence probe must return HTTP 404, got {absence:?}"
         );
     }
     env.stop_server();
@@ -464,9 +471,17 @@ async fn multipart_copy_requires_keys_on_every_stage_and_abort_leaves_no_object(
             abort_attempts_before + 1,
             "each failed multipart copy must issue exactly one wire-level abort attempt"
         );
-        assert!(
-            client.head_object().bucket(bucket).key(&failed_target).send().await.is_err(),
-            "an aborted failed multipart copy must leave no completed object"
+        let absence = client
+            .head_object()
+            .bucket(bucket)
+            .key(&failed_target)
+            .send()
+            .await
+            .expect_err("an aborted failed multipart copy must leave no completed object");
+        assert_eq!(
+            absence.raw_response().map(|response| response.status().as_u16()),
+            Some(404),
+            "aborted multipart copy absence probe must return HTTP 404, got {absence:?}"
         );
     }
     env.stop_server();

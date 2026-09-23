@@ -125,11 +125,22 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         route(Method::POST, "/"),
         admin_route(Method::GET, "/v3/is-admin"),
         admin_route(Method::GET, "/v3/accountinfo"),
+        admin_route(Method::GET, "/v3/account/info"),
+        admin_route(Method::POST, "/v3/account/password"),
         admin_route(Method::GET, "/v3/list-users"),
         admin_route(Method::GET, "/v3/user-info"),
         admin_route(Method::DELETE, "/v3/remove-user"),
         admin_route(Method::PUT, "/v3/add-user"),
         admin_route(Method::PUT, "/v3/set-user-status"),
+        admin_route(Method::PUT, "/v3/set-user-secret-key"),
+        admin_route(Method::GET, "/v3/account/mfa"),
+        admin_route(Method::POST, "/v3/account/mfa/enroll"),
+        admin_route(Method::POST, "/v3/account/mfa/activate"),
+        admin_route(Method::POST, "/v3/account/mfa/disable"),
+        admin_route(Method::POST, "/v3/account/mfa/recovery-codes"),
+        admin_route(Method::GET, "/v3/mfa/challenge"),
+        admin_route(Method::GET, "/v3/user/mfa"),
+        admin_route(Method::DELETE, "/v3/user/mfa"),
         admin_route(Method::GET, "/v3/groups"),
         admin_route(Method::GET, "/v3/group"),
         admin_route_sample(Method::DELETE, "/v3/group/{group}", "/v3/group/test-group"),
@@ -164,16 +175,22 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/v3/target/webhook/test-target/reset",
         ),
         admin_route(Method::GET, "/v3/target/arns"),
+        admin_route_sample(
+            Method::GET,
+            "/v3/target/{target_type}/{target_name}/subscriptions",
+            "/v3/target/webhook/test-target/subscriptions",
+        ),
         admin_route(Method::POST, "/v3/service"),
         admin_route(Method::POST, "/v3/update"),
         admin_route(Method::GET, "/v3/info"),
         admin_route(Method::GET, "/v3/inspect-data"),
         admin_route(Method::POST, "/v3/inspect-data"),
         admin_route(Method::POST, "/v4/inspect/archive"),
+        admin_route(Method::GET, "/v3/gateway-key-inventory"),
         admin_route(Method::GET, "/v3/storageinfo"),
         admin_route(Method::GET, "/v3/datausageinfo"),
         admin_route_sample(Method::GET, "/v3/usage/{bucket}", "/v3/usage/test-bucket"),
-        admin_route(Method::GET, "/v3/metrics"),
+        admin_route(Method::GET, "/v3/realtime"),
         admin_route(Method::GET, "/v3/object-data-cache/stats"),
         admin_route(Method::POST, "/v3/object-data-cache/flush"),
         admin_route(Method::GET, "/v3/pools/list"),
@@ -187,7 +204,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::POST, "/v3/rebalance/stop"),
         admin_route(Method::POST, "/v3/heal/"),
         admin_route_sample(Method::POST, "/v3/heal/{bucket}", "/v3/heal/test-bucket"),
-        admin_route_sample(Method::POST, "/v3/heal/{bucket}/{prefix}", "/v3/heal/test-bucket/prefix"),
+        admin_route_sample(Method::POST, "/v3/heal/{bucket}/{*prefix}", "/v3/heal/test-bucket/prefix"),
         admin_route(Method::POST, "/v3/background-heal/status"),
         admin_route(Method::GET, "/v4/heal/replacement-recovery"),
         admin_route(Method::GET, "/v3/tier"),
@@ -198,6 +215,22 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route_sample(Method::POST, "/v3/tier/{tiername}", "/v3/tier/HOT"),
         admin_route(Method::POST, "/v3/tier/clear"),
         admin_route(Method::GET, "/v3/ilm/expiry/status"),
+        admin_route(Method::GET, "/v3/ilm/recovery/records"),
+        admin_route_sample(
+            Method::GET,
+            "/v3/ilm/recovery/records/{control_id}",
+            "/v3/ilm/recovery/records/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/ilm/recovery/records/{control_id}",
+            "/v3/ilm/recovery/records/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        admin_route_sample(
+            Method::GET,
+            "/v3/ilm/recovery/exports/{export_id}",
+            "/v3/ilm/recovery/exports/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
         admin_route(Method::POST, "/v3/ilm/transition/run"),
         admin_route_sample(
             Method::GET,
@@ -214,6 +247,8 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/v3/ilm/transition/reconcile/{transaction_id}",
             "/v3/ilm/transition/reconcile/11111111-1111-4111-8111-111111111111",
         ),
+        admin_route(Method::GET, "/v3/ilm/transition/state/reconcile"),
+        admin_route(Method::POST, "/v3/ilm/transition/state/reconcile"),
         admin_route_sample(
             Method::DELETE,
             "/v3/ilm/transition/jobs/{job_id}",
@@ -229,6 +264,24 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route_sample(Method::PUT, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
         admin_route_sample(Method::GET, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
         admin_route_sample(Method::DELETE, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
+        admin_route_sample(Method::PUT, "/v3/on-demand-migration/{bucket}", "/v3/on-demand-migration/test-bucket"),
+        admin_route_sample(Method::GET, "/v3/on-demand-migration/{bucket}", "/v3/on-demand-migration/test-bucket"),
+        admin_route_sample(Method::DELETE, "/v3/on-demand-migration/{bucket}", "/v3/on-demand-migration/test-bucket"),
+        admin_route_sample(
+            Method::GET,
+            "/v3/on-demand-migration/{bucket}/status",
+            "/v3/on-demand-migration/test-bucket/status",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/on-demand-migration/{bucket}/backfill",
+            "/v3/on-demand-migration/test-bucket/backfill",
+        ),
+        admin_route_sample(
+            Method::GET,
+            "/v3/on-demand-migration/{bucket}/backfill",
+            "/v3/on-demand-migration/test-bucket/backfill",
+        ),
         admin_route(Method::GET, "/export-bucket-metadata"),
         admin_route(Method::GET, "/v3/export-bucket-metadata"),
         admin_route(Method::PUT, "/import-bucket-metadata"),
@@ -244,6 +297,12 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::PUT, "/v3/config"),
         admin_route(Method::GET, "/v3/scanner/status"),
         admin_route(Method::POST, "/v3/scanner/cycle-state/reset"),
+        admin_route(Method::POST, "/v3/scanner/usage-state/reset"),
+        admin_route_sample(
+            Method::GET,
+            "/v3/scanner/usage-state/recovery-intents/{intent_id}",
+            "/v3/scanner/usage-state/recovery-intents/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
         admin_route(Method::GET, "/v3/audit/target/list"),
         admin_route_sample(
             Method::PUT,
@@ -278,6 +337,19 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::DELETE, "/v3/remove-remote-target"),
         admin_route(Method::POST, "/v3/replication/diff"),
         admin_route(Method::GET, "/v3/replication/mrf"),
+        admin_route(Method::GET, "/v3/integrity/readiness"),
+        admin_route_sample(Method::GET, "/v3/integrity/{bucket}/inventory", "/v3/integrity/example/inventory"),
+        admin_route_sample(Method::POST, "/v3/integrity/{bucket}/jobs", "/v3/integrity/example/jobs"),
+        admin_route_sample(
+            Method::GET,
+            "/v3/integrity/{bucket}/jobs/{job_id}",
+            "/v3/integrity/example/jobs/11111111-1111-4111-8111-111111111111",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/integrity/{bucket}/jobs/{job_id}/control",
+            "/v3/integrity/example/jobs/11111111-1111-4111-8111-111111111111/control",
+        ),
         admin_route(Method::POST, "/v3/start-job"),
         admin_route(Method::GET, "/v3/list-jobs"),
         admin_route(Method::GET, "/v3/status-job"),
@@ -322,6 +394,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::POST, "/v3/speedtest/net"),
         admin_route(Method::POST, "/v3/speedtest/site"),
         admin_route(Method::POST, "/v3/speedtest/client/devnull"),
+        admin_route(Method::GET, "/v3/speedtest/client/devnull"),
         admin_route(Method::GET, "/debug/tls/status"),
         admin_route(Method::POST, "/v3/kms/create-key"),
         admin_route(Method::POST, "/v3/kms/key/create"),
@@ -336,6 +409,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::POST, "/v3/kms/configure"),
         admin_route(Method::POST, "/v3/kms/start"),
         admin_route(Method::POST, "/v3/kms/stop"),
+        admin_route(Method::POST, "/v3/kms/reload"),
         admin_route(Method::GET, "/v3/kms/service-status"),
         admin_route(Method::POST, "/v3/kms/reconfigure"),
         admin_route(Method::POST, "/v3/kms/keys"),
@@ -346,6 +420,9 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::POST, "/v3/kms/keys/enable"),
         admin_route(Method::POST, "/v3/kms/keys/disable"),
         admin_route(Method::POST, "/v3/kms/keys/rotate"),
+        admin_route(Method::POST, "/v3/kms/keys/rekey"),
+        admin_route(Method::GET, "/v3/kms/keys/rekey/status"),
+        admin_route(Method::POST, "/v3/kms/keys/rekey/cancel"),
         admin_route(Method::GET, "/v3/kms/backup"),
         admin_route(Method::POST, "/v3/kms/backup"),
         admin_route(Method::POST, "/v3/kms/restore/dry-run"),
@@ -382,6 +459,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         table_route_sample(Method::GET, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         table_route_sample(Method::POST, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         table_route_sample(Method::DELETE, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/catalog/warehouse-index/backfill",
+            "/analytics/catalog/warehouse-index/backfill",
+        ),
         table_route_sample(Method::GET, "/{warehouse}/namespaces", "/analytics/namespaces"),
         table_route_sample(Method::POST, "/{warehouse}/namespaces", "/analytics/namespaces"),
         table_route_sample(Method::GET, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
@@ -579,6 +661,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         compat_table_route_sample(Method::GET, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         compat_table_route_sample(Method::POST, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         compat_table_route_sample(Method::DELETE, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/catalog/warehouse-index/backfill",
+            "/analytics/catalog/warehouse-index/backfill",
+        ),
         compat_table_route_sample(Method::GET, "/{warehouse}/namespaces", "/analytics/namespaces"),
         compat_table_route_sample(Method::POST, "/{warehouse}/namespaces", "/analytics/namespaces"),
         compat_table_route_sample(Method::GET, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
@@ -777,6 +864,19 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
 // production registration helper intentionally honors that environment switch.
 #[test]
 #[serial]
+fn test_reverse_probe_targets_a_registered_devnull_route() {
+    // The reverse-reachability probe used to send PUT while only POST is
+    // routed for devnull, so every probe failed with 501 and every add/join
+    // reported a false "not reachable" warning.
+    let router = registered_admin_router();
+    let connection = crate::site_replication::transport::PeerConnection::new("http://peer.example.com:9000", false, "")
+        .expect("peer connection");
+    let request = crate::admin::handlers::site_replication::devnull_probe_request(&connection, "site-replicator-0");
+    assert_route(&router, request.method().clone(), request.path());
+}
+
+#[test]
+#[serial]
 fn test_admin_route_matrix_matches_registered_routes() {
     let router = registered_admin_router();
 
@@ -881,7 +981,29 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/config"));
     assert_route(&router, Method::GET, &admin_path("/v3/scanner/status"));
     assert_route(&router, Method::POST, &admin_path("/v3/scanner/cycle-state/reset"));
+    assert_route(&router, Method::POST, &admin_path("/v3/scanner/usage-state/reset"));
+    assert_route(
+        &router,
+        Method::GET,
+        &admin_path("/v3/scanner/usage-state/recovery-intents/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
     assert_route(&router, Method::GET, &admin_path("/v3/ilm/expiry/status"));
+    assert_route(&router, Method::GET, &admin_path("/v3/ilm/recovery/records"));
+    assert_route(
+        &router,
+        Method::GET,
+        &admin_path("/v3/ilm/recovery/records/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &admin_path("/v3/ilm/recovery/records/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &admin_path("/v3/ilm/recovery/exports/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    );
     assert_route(&router, Method::POST, &admin_path("/v3/ilm/transition/run"));
     assert_route(
         &router,
@@ -903,6 +1025,8 @@ fn test_register_routes_cover_representative_admin_paths() {
         Method::POST,
         &admin_path("/v3/ilm/transition/reconcile/11111111-1111-4111-8111-111111111111"),
     );
+    assert_route(&router, Method::GET, &admin_path("/v3/ilm/transition/state/reconcile"));
+    assert_route(&router, Method::POST, &admin_path("/v3/ilm/transition/state/reconcile"));
 
     assert_route(&router, Method::GET, &table_catalog_path("/config"));
     assert_route(&router, Method::PUT, &table_catalog_path("/buckets/analytics"));
@@ -1222,7 +1346,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/service"));
     assert_route(&router, Method::GET, &admin_path("/v3/info"));
     assert_route(&router, Method::GET, &admin_path("/v3/storageinfo"));
-    assert_route(&router, Method::GET, &admin_path("/v3/metrics"));
+    assert_route(&router, Method::GET, &admin_path("/v3/realtime"));
 
     assert_route(&router, Method::GET, &admin_path("/v3/pools/list"));
     assert_route(&router, Method::GET, &admin_path("/v3/decommission/status"));
@@ -1244,6 +1368,12 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/bucket-durability/test-bucket"));
     assert_route(&router, Method::GET, &admin_path("/v3/bucket-durability/test-bucket"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/bucket-durability/test-bucket"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/on-demand-migration/test-bucket"));
+    assert_route(&router, Method::GET, &admin_path("/v3/on-demand-migration/test-bucket"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/on-demand-migration/test-bucket"));
+    assert_route(&router, Method::GET, &admin_path("/v3/on-demand-migration/test-bucket/status"));
+    assert_route(&router, Method::POST, &admin_path("/v3/on-demand-migration/test-bucket/backfill"));
+    assert_route(&router, Method::GET, &admin_path("/v3/on-demand-migration/test-bucket/backfill"));
 
     assert_route(&router, Method::GET, &admin_path("/export-bucket-metadata"));
     assert_route(&router, Method::GET, &admin_path("/v3/export-bucket-metadata"));
@@ -1286,6 +1416,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/kms/create-key"));
     assert_route(&router, Method::POST, &admin_path("/v3/kms/key/create"));
     assert_route(&router, Method::POST, &admin_path("/v3/kms/configure"));
+    assert_route(&router, Method::POST, &admin_path("/v3/kms/reload"));
     assert_route(&router, Method::GET, &admin_path("/v3/kms/status"));
     assert_route(&router, Method::POST, &admin_path("/v3/kms/status"));
     assert_route(&router, Method::GET, &admin_path("/v3/kms/key/status"));
@@ -1370,7 +1501,20 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::PUT, compat_admin_alias_path("/v3/config")),
         (Method::GET, compat_admin_alias_path("/v3/scanner/status")),
         (Method::POST, compat_admin_alias_path("/v3/scanner/cycle-state/reset")),
+        (Method::POST, compat_admin_alias_path("/v3/scanner/usage-state/reset")),
+        (
+            Method::GET,
+            compat_admin_alias_path(
+                "/v3/scanner/usage-state/recovery-intents/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        ),
         (Method::GET, compat_admin_alias_path("/v3/ilm/expiry/status")),
+        (Method::PUT, compat_admin_alias_path("/v3/on-demand-migration/b")),
+        (Method::GET, compat_admin_alias_path("/v3/on-demand-migration/b")),
+        (Method::DELETE, compat_admin_alias_path("/v3/on-demand-migration/b")),
+        (Method::GET, compat_admin_alias_path("/v3/on-demand-migration/b/status")),
+        (Method::POST, compat_admin_alias_path("/v3/on-demand-migration/b/backfill")),
+        (Method::GET, compat_admin_alias_path("/v3/on-demand-migration/b/backfill")),
     ] {
         assert!(
             router.contains_compatible_route(method.clone(), &path),

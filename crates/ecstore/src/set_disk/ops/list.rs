@@ -22,18 +22,28 @@
 //! runtime behavior is unchanged.
 
 use super::super::ctx::SetDisksCtx;
-use super::super::*;
+use super::super::{
+    Arc, CancellationToken, DeleteOptions, DiskError, DiskStore, Error, ListObjectVersionsInfo, ListObjectsV2Info,
+    OBJECT_OP_IGNORED_ERRS, ObjectInfoOrErr, Result, Sender, SetDisks, WalkOptions, debug, join_all, reduce_write_quorum_errs,
+};
+use crate::disk::DiskAPI;
 
 impl SetDisks {
     #[tracing::instrument(skip(self))]
     pub async fn delete_all(&self, bucket: &str, prefix: &str) -> Result<()> {
-        ListOperations::new(self.ctx()).delete_all(bucket, prefix).await
+        let (result, disks) = ListOperations::new(self.ctx())
+            .delete_all_observed(bucket, prefix, None)
+            .await;
+        self.record_capacity_scope_if_needed(None, &disks);
+        result
     }
 
     pub(crate) async fn delete_all_with_quorum(&self, bucket: &str, prefix: &str, write_quorum: usize) -> Result<()> {
-        ListOperations::new(self.ctx())
-            .delete_all_with_quorum(bucket, prefix, write_quorum)
-            .await
+        let (result, disks) = ListOperations::new(self.ctx())
+            .delete_all_observed(bucket, prefix, Some(write_quorum))
+            .await;
+        self.record_capacity_scope_if_needed(None, &disks);
+        result
     }
 }
 
@@ -53,19 +63,24 @@ impl<'a> ListOperations<'a> {
         Self { ctx }
     }
 
-    pub(crate) async fn delete_all(&self, bucket: &str, prefix: &str) -> Result<()> {
-        self.delete_all_inner(bucket, prefix, None).await
+    pub(crate) async fn delete_all_observed(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        write_quorum: Option<usize>,
+    ) -> (Result<()>, Vec<Option<DiskStore>>) {
+        let disks = self.ctx.disks().read().await.clone();
+        let result = self.delete_all_inner(bucket, prefix, write_quorum, disks.clone()).await;
+        (result, disks)
     }
 
-    async fn delete_all_with_quorum(&self, bucket: &str, prefix: &str, write_quorum: usize) -> Result<()> {
-        self.delete_all_inner(bucket, prefix, Some(write_quorum)).await
-    }
-
-    async fn delete_all_inner(&self, bucket: &str, prefix: &str, write_quorum: Option<usize>) -> Result<()> {
-        let disks = self.ctx.disks().read().await;
-
-        let disks = disks.clone();
-
+    async fn delete_all_inner(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        write_quorum: Option<usize>,
+        disks: Vec<Option<DiskStore>>,
+    ) -> Result<()> {
         let mut futures = Vec::with_capacity(disks.len());
         let mut errors = Vec::with_capacity(disks.len());
 

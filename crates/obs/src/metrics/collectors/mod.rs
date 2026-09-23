@@ -17,6 +17,7 @@ pub mod bucket;
 pub mod bucket_replication;
 pub mod cluster;
 pub mod cluster_config;
+pub(crate) mod cluster_drive;
 pub mod cluster_erasure_set;
 pub mod cluster_health;
 pub mod cluster_iam;
@@ -27,6 +28,7 @@ pub mod ilm;
 pub mod node;
 pub mod notification;
 pub mod notification_target;
+pub mod on_demand_migration;
 pub mod replication;
 pub(crate) mod request;
 pub mod resource;
@@ -39,6 +41,7 @@ pub mod system_memory;
 pub mod system_network;
 pub mod system_network_host;
 pub mod system_process;
+pub mod tier;
 
 pub(crate) use audit::{AuditTargetRuntimeStats, collect_audit_runtime_metrics};
 pub use audit::{AuditTargetStats, collect_audit_metrics};
@@ -68,6 +71,10 @@ pub(crate) use notification::collect_notification_runtime_metrics;
 pub use notification::{NotificationStats, collect_notification_metrics};
 pub(crate) use notification_target::{NotificationTargetRuntimeStats, collect_notification_target_runtime_metrics};
 pub use notification_target::{NotificationTargetStats, collect_notification_target_metrics};
+pub use on_demand_migration::{
+    OdmBackfillBucketStats, OdmBackfillRuntimeStats, OnDemandMigrationBreakerState, OnDemandMigrationBucketStats,
+    collect_on_demand_migration_backfill_metrics, collect_on_demand_migration_metrics, source_latency_le_label,
+};
 pub use replication::{ReplicationMetricsSnapshot, collect_replication_metrics};
 pub(crate) use replication::{ReplicationRuntimeStats, collect_replication_runtime_metrics};
 pub(crate) use request::{ApiRequestMetricSupport, ApiRequestStats, collect_request_metrics};
@@ -89,3 +96,4 @@ pub use system_process::{
     ProcessAttributeError, ProcessAttributes, ProcessStats, ProcessStatusType, collect_process_attributes,
     collect_process_metrics,
 };
+pub use tier::{TierRequestStats, collect_tier_request_metrics};

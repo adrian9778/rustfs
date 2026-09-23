@@ -180,6 +180,12 @@ where
     #[cfg(feature = "rio-v2")]
     {
         match backend {
+            // The legacy family includes v2 fixed-frame objects, whose plans
+            // seek by frame; honor the starting index here too so a rio-v2
+            // build can range-read objects a default-build node wrote.
+            ReadEncryptionBackend::Legacy if sequence_number > 0 => {
+                Box::new(rustfs_rio::DecryptReader::new_at_block(reader, key, base_nonce, sequence_number as usize))
+            }
             ReadEncryptionBackend::Legacy => Box::new(rustfs_rio::DecryptReader::new(reader, key, base_nonce)),
             ReadEncryptionBackend::V2 => {
                 Box::new(rustfs_rio_v2::DecryptReader::new_with_sequence(reader, key, base_nonce, sequence_number))
@@ -189,8 +195,14 @@ where
 
     #[cfg(not(feature = "rio-v2"))]
     {
-        let _ = (backend, sequence_number);
-        Box::new(rustfs_rio::DecryptReader::new(reader, key, base_nonce))
+        let _ = backend;
+        if sequence_number > 0 {
+            // Single-part v2 frame seek: the plan positioned the storage read
+            // at frame `sequence_number`; nonce and AAD bind absolute indices.
+            Box::new(rustfs_rio::DecryptReader::new_at_block(reader, key, base_nonce, sequence_number as usize))
+        } else {
+            Box::new(rustfs_rio::DecryptReader::new(reader, key, base_nonce))
+        }
     }
 }
 
@@ -308,6 +320,32 @@ pub struct WriteEncryption {
     mode: WriteEncryptionMode,
 }
 
+/// Write-side switch for the authenticated, fixed-frame legacy v2 layout.
+///
+/// Off by default for rolling-upgrade safety: nodes without v2 read support
+/// cannot decrypt v2 frames, and encrypted ciphertext travels verbatim through
+/// transition, decommission and SSE-C replication passthrough. Turn on only
+/// after every node (and every RustFS warm/replication target that receives
+/// raw ciphertext) runs a release with v2 read support. Reading v2 objects
+/// needs no switch — the decrypt reader dispatches on the frame type byte.
+#[cfg(not(feature = "rio-v2"))]
+pub(crate) const ENV_RUSTFS_ENCRYPTION_FRAME_V2: &str = "RUSTFS_ENCRYPTION_FRAME_V2";
+#[cfg(not(feature = "rio-v2"))]
+pub(crate) const DEFAULT_RUSTFS_ENCRYPTION_FRAME_V2: bool = false;
+
+#[cfg(not(feature = "rio-v2"))]
+pub(crate) fn encryption_frame_v2_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(ENV_RUSTFS_ENCRYPTION_FRAME_V2, DEFAULT_RUSTFS_ENCRYPTION_FRAME_V2)
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_ENCRYPTION_FRAME_V2, DEFAULT_RUSTFS_ENCRYPTION_FRAME_V2))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum WriteEncryptionMode {
     SinglepartObjectKey,
@@ -416,25 +454,32 @@ impl WritePlan {
                     None,
                     false,
                 )?,
-                WriteEncryptionMode::Singlepart { base_nonce } => HashReader::from_reader(
-                    EncryptReader::new(reader, encryption.key_bytes, base_nonce),
-                    HashReader::SIZE_PRESERVE_LAYER,
-                    actual_size,
-                    None,
-                    None,
-                    false,
-                )?,
+                WriteEncryptionMode::Singlepart { base_nonce } => {
+                    #[cfg(not(feature = "rio-v2"))]
+                    let encrypt_reader = if encryption_frame_v2_enabled() {
+                        EncryptReader::new_v2(reader, encryption.key_bytes, base_nonce)
+                    } else {
+                        EncryptReader::new(reader, encryption.key_bytes, base_nonce)
+                    };
+                    #[cfg(feature = "rio-v2")]
+                    let encrypt_reader = EncryptReader::new(reader, encryption.key_bytes, base_nonce);
+                    HashReader::from_reader(encrypt_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)?
+                }
                 WriteEncryptionMode::MultipartLegacy {
                     base_nonce,
                     multipart_part_number,
-                } => HashReader::from_reader(
-                    EncryptReader::new_multipart(reader, encryption.key_bytes, base_nonce, multipart_part_number),
-                    HashReader::SIZE_PRESERVE_LAYER,
-                    actual_size,
-                    None,
-                    None,
-                    false,
-                )?,
+                } => {
+                    #[cfg(not(feature = "rio-v2"))]
+                    let encrypt_reader = if encryption_frame_v2_enabled() {
+                        EncryptReader::new_multipart_v2(reader, encryption.key_bytes, base_nonce, multipart_part_number)
+                    } else {
+                        EncryptReader::new_multipart(reader, encryption.key_bytes, base_nonce, multipart_part_number)
+                    };
+                    #[cfg(feature = "rio-v2")]
+                    let encrypt_reader =
+                        EncryptReader::new_multipart(reader, encryption.key_bytes, base_nonce, multipart_part_number);
+                    HashReader::from_reader(encrypt_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)?
+                }
                 WriteEncryptionMode::MultipartObjectKey { multipart_part_number } => HashReader::from_reader(
                     #[cfg(feature = "rio-v2")]
                     EncryptReader::new_multipart_with_object_key(reader, encryption.key_bytes, multipart_part_number),
@@ -515,7 +560,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-amz-trailer", HeaderValue::from_static("x-amz-checksum-crc32"));
         reader
-            .add_checksum_from_s3s(&headers, None, false)
+            .add_checksum(&headers, None, false)
             .expect("attach trailing checksum metadata");
 
         let transformed = WritePlan::new()

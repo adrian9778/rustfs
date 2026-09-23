@@ -12,10 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::*;
-use crate::disk::disk_store::DiskStoreRenameDataExt;
+use super::super::{
+    Bytes, CHECK_PART_FILE_CORRUPT, CHECK_PART_SUCCESS, DeleteOptions, DiskError, DiskStore, DriveState, EVENT_SET_DISK_HEAL,
+    Error, FileInfo, HashAlgorithm, HashMap, HealDriveInfo, HealItemType, HealOpts, HealResultItem, HealScanMode, Infos,
+    LOG_SUBSYSTEM_SET_DISK, ObjectInfo, ObjectOptions, ObjectPartInfo, Path, RUSTFS_META_TMP_BUCKET, ReadOptions, Result,
+    SLASH_SEPARATOR, SetDisks, StorageError, Uuid, coding, count_errs, count_part_not_success, create_bitrot_reader,
+    create_bitrot_writer, debug, disk, disks_with_all_parts, encode_dir_object, error, file_info_is_valid_for_metadata,
+    formats_match_reference_slots, get_format_erasure_in_quorum, get_lock_acquire_timeout, has_suffix,
+    heal_bucket_local_on_disks, is_object_dir_dangling, join_all, load_format_erasure_all, path_join_buf, save_format_file,
+    should_heal_object_on_disk, stat_all_dirs, to_object_err, warn,
+};
+use crate::bucket::retirement::MarkerRetirementContext;
+use crate::diagnostics::object_lock::ObjectLockAttempt;
+use crate::set_disk::{ObjectLockDiagGuard, is_object_lock_diag_enabled};
+
+#[derive(Clone, Copy)]
+struct ExplicitVersionHeal<'a> {
+    opts: &'a HealOpts,
+    allow_regeneration: bool,
+    retirement: Option<&'a MarkerRetirementContext<'a>>,
+}
+
+use crate::disk::DataDirDeleteStatus;
+use crate::disk::DiskAPI;
+use crate::disk::local::{DELETE_DATA_DIR_MARKER_PREFIX, metadata_less_part_file};
 use crate::io_support::bitrot::object_mmap_read_enabled;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit};
 use tracing::trace;
 
@@ -23,9 +46,145 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_HEAL_OBJECT_RENAME: &str = "heal_object_rename";
 const HEAL_RENAME_INCOMPLETE: &str = "heal rename incomplete";
+const READ_REPAIR_DATA_PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Exact set-local absence, established while the object mutation lock is held.
+#[derive(Debug)]
+pub(crate) struct HealedObjectAbsence {
+    pub pool_index: usize,
+    pub set_index: usize,
+    pub removed: bool,
+}
+
+/// Conditions under which a missing object may become a storage-owned proof.
+#[derive(Clone, Copy)]
+pub(crate) struct AbsenceProofRequest<'a> {
+    pub retirement: Option<&'a MarkerRetirementContext<'a>>,
+    pub allow_unversioned: bool,
+}
+
+fn is_unavailable_heal_rpc(error: &DiskError) -> bool {
+    let DiskError::Io(error) = error else {
+        return false;
+    };
+    let Some(status) = crate::cluster::rpc::client::embedded_tonic_status(error) else {
+        return false;
+    };
+    // Tonic can report a locally observed HTTP/2 GOAWAY as Internal. Only a
+    // typed transport source identifies that case; peer-supplied text cannot.
+    status.code() == tonic::Code::Unavailable
+        || (matches!(status.code(), tonic::Code::Internal | tonic::Code::Unknown)
+            && std::error::Error::source(status).is_some_and(|source| source.is::<tonic::transport::Error>()))
+}
+
+fn heal_drive_state_for_error(error: &DiskError) -> DriveState {
+    match error {
+        DiskError::DiskNotFound | DiskError::RemoteClientUnavailable(_) => DriveState::Offline,
+        DiskError::FaultyDisk | DiskError::FaultyRemoteDisk => DriveState::Faulty,
+        DiskError::FileNotFound
+        | DiskError::FileVersionNotFound
+        | DiskError::VolumeNotFound
+        | DiskError::PartMissingOrCorrupt
+        | DiskError::OutdatedXLMeta => DriveState::Missing,
+        DiskError::FileCorrupt => DriveState::Corrupt,
+        _ if is_unavailable_heal_rpc(error) => DriveState::Offline,
+        _ => DriveState::Unknown(error.to_string()),
+    }
+}
 
 #[cfg(test)]
 static HEAL_RENAME_FAILURES: std::sync::Mutex<Vec<(String, String, usize)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadRepairPausePhase {
+    Data,
+    Commit,
+}
+
+#[cfg(test)]
+struct ReadRepairPause {
+    bucket: String,
+    object: String,
+    phase: ReadRepairPausePhase,
+    arrived: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static READ_REPAIR_PAUSES: std::sync::Mutex<Vec<ReadRepairPause>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+struct ReadRepairPauseScope {
+    bucket: String,
+    object: String,
+    phase: ReadRepairPausePhase,
+}
+
+#[cfg(test)]
+impl ReadRepairPauseScope {
+    fn install(bucket: &str, object: &str) -> (Self, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>) {
+        Self::install_at(bucket, object, ReadRepairPausePhase::Commit)
+    }
+
+    fn install_at(
+        bucket: &str,
+        object: &str,
+        phase: ReadRepairPausePhase,
+    ) -> (Self, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>) {
+        let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        READ_REPAIR_PAUSES
+            .lock()
+            .expect("read-repair commit pause registry should not poison")
+            .push(ReadRepairPause {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                phase,
+                arrived: arrived.clone(),
+                release: release.clone(),
+            });
+        (
+            Self {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                phase,
+            },
+            arrived,
+            release,
+        )
+    }
+}
+
+#[cfg(test)]
+impl Drop for ReadRepairPauseScope {
+    fn drop(&mut self) {
+        READ_REPAIR_PAUSES
+            .lock()
+            .expect("read-repair commit pause registry should not poison")
+            .retain(|pause| {
+                let keep = pause.bucket != self.bucket || pause.object != self.object || pause.phase != self.phase;
+                if !keep {
+                    pause.release.notify_one();
+                }
+                keep
+            });
+    }
+}
+
+#[cfg(test)]
+async fn pause_read_repair(bucket: &str, object: &str, phase: ReadRepairPausePhase) {
+    let pause = READ_REPAIR_PAUSES
+        .lock()
+        .expect("read-repair commit pause registry should not poison")
+        .iter()
+        .find(|pause| pause.bucket == bucket && pause.object == object && pause.phase == phase)
+        .map(|pause| (pause.arrived.clone(), pause.release.clone()));
+    if let Some((arrived, release)) = pause {
+        arrived.notify_one();
+        release.notified().await;
+    }
+}
 
 #[cfg(test)]
 struct HealRenameFailureScope {
@@ -166,10 +325,47 @@ struct RecoverableMetaCandidate {
     local_payload: bool,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ReadRepairCommitFingerprint {
+    identity: [u8; 32],
+}
+
+impl ReadRepairCommitFingerprint {
+    fn from_file_info(fi: &FileInfo) -> Self {
+        Self {
+            identity: SetDisks::file_info_quorum_hash(fi),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HealObjectLockKind {
+    Read,
+    Write,
+}
+
+impl HealObjectLockKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DanglingDeleteSafety {
     UnsafeToDelete,
     NoRecoverableCandidate,
+}
+
+#[derive(Debug, Default)]
+struct MetadataLessDataDirCleanup {
+    matched: usize,
+    removed: usize,
+    first_error: Option<DiskError>,
+    delete_errs: Vec<Option<DiskError>>,
+    touched_disks: Vec<bool>,
 }
 
 #[cfg(test)]
@@ -222,7 +418,7 @@ fn injected_dangling_check_parts_error(bucket: &str, object: &str, disk_index: u
 }
 
 #[cfg(test)]
-struct DanglingDeleteFailure {
+pub(crate) struct DanglingDeleteFailure {
     key: DanglingDeleteFailureKey,
 }
 
@@ -240,7 +436,7 @@ fn dangling_delete_failures() -> &'static std::sync::Mutex<DanglingDeleteFailure
 
 #[cfg(test)]
 impl DanglingDeleteFailure {
-    fn install(bucket: &str, object: &str, disk_index: usize, error: DiskError) -> Self {
+    pub(crate) fn install(bucket: &str, object: &str, disk_index: usize, error: DiskError) -> Self {
         let key = (bucket.to_string(), object.to_string(), disk_index);
         let previous = dangling_delete_failures()
             .lock()
@@ -262,7 +458,7 @@ impl Drop for DanglingDeleteFailure {
 }
 
 #[cfg(test)]
-fn injected_dangling_delete_error(bucket: &str, object: &str, disk_index: usize) -> Option<DiskError> {
+pub(in crate::set_disk) fn injected_dangling_delete_error(bucket: &str, object: &str, disk_index: usize) -> Option<DiskError> {
     dangling_delete_failures()
         .lock()
         .expect("dangling delete failure registry should not poison")
@@ -333,6 +529,77 @@ fn warn_heal_writer_failures(
 }
 
 impl SetDisks {
+    pub(crate) async fn purge_delete_marker_exact(
+        &self,
+        bucket: &str,
+        object: &str,
+        version: Uuid,
+        marker: rustfs_filemeta::MetaDeleteMarker,
+    ) -> Result<bool> {
+        let disks = self.get_disks_internal().await;
+        if disks.len() != self.set_drive_count || disks.iter().any(Option::is_none) {
+            return Err(StorageError::SlowDown);
+        }
+        let _object_guard = self.acquire_write_lock_diag("delete_marker_purge", bucket, object).await?;
+        let scope = crate::store::bucket_heal_scope(bucket).ok_or(StorageError::PreconditionFailed)?;
+        scope.check()?;
+
+        let request = FileInfo {
+            volume: bucket.to_owned(),
+            name: object.to_owned(),
+            version_id: Some(version),
+            ..Default::default()
+        };
+        let results = join_all(disks.iter().enumerate().map(|(disk_index, disk)| {
+            let request = request.clone();
+            let marker = marker.clone();
+            async move {
+                if let Some(error) = injected_dangling_delete_error(bucket, object, disk_index) {
+                    return Err(error);
+                }
+                let Some(disk) = disk else { return Err(DiskError::DiskNotFound) };
+                disk.delete_version(
+                    bucket,
+                    object,
+                    request,
+                    false,
+                    DeleteOptions {
+                        expected_delete_marker: Some(marker),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }
+        }))
+        .await;
+        let mut removed = false;
+        for result in results {
+            match result {
+                Ok(()) => removed = true,
+                Err(DiskError::FileNotFound | DiskError::FileVersionNotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        scope.check()?;
+        let (_, errors) =
+            Self::read_all_fileinfo(disks.as_slice(), "", bucket, object, &version.to_string(), false, false, false).await?;
+        let selected = self.get_disks_internal().await;
+        let same_targets = selected.len() == disks.len() && selected.iter().zip(&disks).all(|(current, original)| {
+            matches!((current, original), (Some(current), Some(original)) if std::sync::Arc::ptr_eq(current, original))
+        });
+        if !same_targets
+            || !errors
+                .iter()
+                .all(|error| matches!(error, Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)))
+        {
+            return Err(StorageError::SlowDown);
+        }
+        scope.check()?;
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        Ok(removed)
+    }
+
     /// Read back one healed version from every explicitly admitted replacement
     /// target. This is intentionally separate from the normal heal result: a
     /// successful result describes the transaction attempt, while automatic
@@ -346,6 +613,7 @@ impl SetDisks {
         targets: &[String],
     ) -> disk::error::Result<bool> {
         let disks = self.get_disks_internal().await;
+
         let mut target_disks = Vec::with_capacity(targets.len());
 
         for target in targets {
@@ -380,9 +648,17 @@ impl SetDisks {
                 if !file_info_is_valid_for_metadata(&file_info) {
                     return Ok(false);
                 }
-                if !version_id.is_empty() && file_info.version_id.as_ref().map(ToString::to_string).as_deref() != Some(version_id)
-                {
-                    return Ok(false);
+                if !version_id.is_empty() {
+                    let Ok(requested_version) = Uuid::parse_str(version_id) else {
+                        return Ok(false);
+                    };
+                    // Treat absent and nil UUID metadata as the same null slot.
+                    let actual_version = file_info.version_id.filter(|version_id| !version_id.is_nil());
+                    if (requested_version.is_nil() && actual_version.is_some())
+                        || (!requested_version.is_nil() && actual_version != Some(requested_version))
+                    {
+                        return Ok(false);
+                    }
                 }
                 if file_info.is_canonical_delete_marker() || file_info.is_remote() {
                     return Ok(true);
@@ -412,6 +688,7 @@ impl SetDisks {
             .all(|committed| committed))
     }
 
+    #[cfg(test)]
     #[tracing::instrument(level = "trace", skip(self, opts), fields(bucket = %bucket, object = %object, version_id = %version_id))]
     pub(in crate::set_disk) async fn heal_object(
         &self,
@@ -420,7 +697,135 @@ impl SetDisks {
         version_id: &str,
         opts: &HealOpts,
     ) -> disk::error::Result<(HealResultItem, Option<DiskError>)> {
-        Box::pin(self.heal_object_with_explicit_version_regen(bucket, object, version_id, opts, true)).await
+        Box::pin(self.heal_object_with_explicit_version_regen(
+            bucket,
+            object,
+            version_id,
+            ExplicitVersionHeal {
+                opts,
+                allow_regeneration: true,
+                retirement: None,
+            },
+            &mut None,
+        ))
+        .await
+    }
+
+    async fn read_repair_commit_fingerprint(
+        &self,
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+    ) -> disk::error::Result<ReadRepairCommitFingerprint> {
+        let (parts_metadata, errs, _) = Self::read_all_fileinfo_observed(
+            disks,
+            "",
+            bucket,
+            object,
+            version_id,
+            true,
+            false,
+            false,
+            true,
+            self.default_parity_count,
+        )
+        .await?;
+        let (read_quorum, _) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)?;
+        let read_quorum = usize::try_from(read_quorum).map_err(|_| DiskError::ErasureReadQuorum)?;
+        let (_, quorum_mod_time, quorum_etag) = Self::list_online_disks(disks, &parts_metadata, &errs, read_quorum);
+        let mut latest_meta = Self::pick_valid_fileinfo(&parts_metadata, quorum_mod_time, quorum_etag, read_quorum)?;
+        Self::hydrate_selected_fileinfo_part_checksums(&mut latest_meta)?;
+        Ok(ReadRepairCommitFingerprint::from_file_info(&latest_meta))
+    }
+
+    async fn acquire_heal_object_lock(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        kind: HealObjectLockKind,
+        op: &'static str,
+    ) -> disk::error::Result<ObjectLockDiagGuard> {
+        let ns_lock = self
+            .new_ns_lock(bucket, object)
+            .await
+            .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
+        let timeout = get_lock_acquire_timeout();
+        let mut attempt = ObjectLockAttempt::start(op, bucket, object, Some(version_id), &ns_lock, kind.as_str(), timeout);
+        let lock_result = match kind {
+            HealObjectLockKind::Read => ns_lock.get_read_lock(timeout).await,
+            HealObjectLockKind::Write => ns_lock.get_write_lock(timeout).await,
+        };
+        attempt.observe(&lock_result);
+        let guard = lock_result.map_err(|e| {
+            self.map_namespace_lock_error(bucket, object, kind.as_str(), e)
+                .narrow_to_disk()
+                .unwrap_or_else(DiskError::other)
+        })?;
+        let enabled = is_object_lock_diag_enabled();
+        Ok(ObjectLockDiagGuard::new(
+            guard,
+            enabled,
+            op,
+            enabled.then(|| bucket.to_owned()),
+            enabled.then(|| object.to_owned()),
+            enabled.then(|| ns_lock.owner().to_owned()),
+            kind.as_str(),
+        )
+        .with_attempt(attempt))
+    }
+
+    async fn acquire_revalidated_read_repair_commit_lock(
+        &self,
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        expected_fingerprint: ReadRepairCommitFingerprint,
+    ) -> disk::error::Result<Option<ObjectLockDiagGuard>> {
+        #[cfg(test)]
+        pause_read_repair(bucket, object, ReadRepairPausePhase::Commit).await;
+
+        let write_lock_wait_start = std::time::Instant::now();
+        let guard = self
+            .acquire_heal_object_lock(bucket, object, version_id, HealObjectLockKind::Write, "read_repair_commit")
+            .await?;
+        let write_lock_wait_ms = u64::try_from(write_lock_wait_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        let revalidation_start = std::time::Instant::now();
+        let current_fingerprint = self.read_repair_commit_fingerprint(disks, bucket, object, version_id).await?;
+        let revalidation_duration_ms = u64::try_from(revalidation_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        if current_fingerprint == expected_fingerprint {
+            debug!(
+                event = EVENT_SET_DISK_HEAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                state = "read_repair_commit_revalidated",
+                bucket,
+                object,
+                version_id,
+                write_lock_wait_ms,
+                revalidation_duration_ms,
+                "Read-repair heal revalidated metadata before rename"
+            );
+            Ok(Some(guard))
+        } else {
+            warn!(
+                event = EVENT_SET_DISK_HEAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                state = "read_repair_commit_stale",
+                bucket,
+                object,
+                version_id,
+                write_lock_wait_ms,
+                revalidation_duration_ms,
+                "Read-repair heal abandoned stale metadata before rename"
+            );
+            Ok(None)
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -429,9 +834,14 @@ impl SetDisks {
         bucket: &str,
         object: &str,
         version_id: &str,
-        opts: &HealOpts,
-        allow_explicit_version_regen: bool,
+        run: ExplicitVersionHeal<'_>,
+        absence: &mut Option<HealedObjectAbsence>,
     ) -> disk::error::Result<(HealResultItem, Option<DiskError>)> {
+        let ExplicitVersionHeal {
+            opts,
+            allow_regeneration: allow_explicit_version_regen,
+            retirement,
+        } = run;
         trace!(
             event = EVENT_SET_DISK_HEAL,
             component = LOG_COMPONENT_ECSTORE,
@@ -444,6 +854,10 @@ impl SetDisks {
         );
 
         let disks = self.get_disks_internal().await;
+        let bucket_heal_scope = crate::store::bucket_heal_scope_for_object(bucket, object);
+        if let Some(scope) = &bucket_heal_scope {
+            scope.check()?;
+        }
 
         let mut result = HealResultItem {
             heal_item_type: HealItemType::Object.to_string(),
@@ -454,15 +868,40 @@ impl SetDisks {
             ..Default::default()
         };
 
+        let read_repair_uses_shared_lock = opts.read_repair && !opts.no_lock;
+        // Read-repair heals are triggered by successful reads of still-readable
+        // objects. Keep readers flowing during the long reconstruction phase;
+        // take the write lock only for the final verify-and-rename fence.
+        let mut _read_repair_read_lock_guard = if read_repair_uses_shared_lock {
+            let guard = self
+                .acquire_heal_object_lock(bucket, object, version_id, HealObjectLockKind::Read, "read_repair_data")
+                .await?;
+            debug!(
+                event = EVENT_SET_DISK_HEAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                state = "read_repair_shared_data_lock",
+                bucket,
+                object,
+                version_id,
+                "Read-repair heal using shared namespace lock for data phase"
+            );
+            Some(guard)
+        } else {
+            None
+        };
+
+        #[cfg(test)]
+        if read_repair_uses_shared_lock {
+            pause_read_repair(bucket, object, ReadRepairPausePhase::Data).await;
+        }
+
         // Bound, not `_`: this guard must live to the end of the scope. A bare
         // `_` would drop it here and release the namespace write lock.
-        let _write_lock_guard = if !opts.no_lock {
-            let ns_lock = self.new_ns_lock(bucket, object).await?;
+        let _write_lock_guard = if !opts.no_lock && !read_repair_uses_shared_lock {
             Some(
-                ns_lock
-                    .get_write_lock(get_lock_acquire_timeout())
-                    .await
-                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+                self.acquire_heal_object_lock(bucket, object, version_id, HealObjectLockKind::Write, "heal_object")
+                    .await?,
             )
         } else {
             None
@@ -504,6 +943,21 @@ impl SetDisks {
             } else {
                 DiskError::FileNotFound
             };
+            if version_id.is_empty()
+                && (opts.remove || opts.dry_run)
+                && let Some(cleanup) = self
+                    .cleanup_metadata_less_data_dirs(bucket, object, &disks, opts.dry_run)
+                    .await?
+            {
+                let mut result = self
+                    .metadata_less_data_dir_heal_result(bucket, object, &cleanup, opts.dry_run)
+                    .await;
+                result.detail = format!(
+                    "metadata-less data directories matched={}, removed={}, dry_run={}",
+                    cleanup.matched, cleanup.removed, opts.dry_run
+                );
+                return Ok((result, cleanup.first_error.or(Some(err))));
+            }
             // Nothing to do, file is already gone.
             return Ok((
                 self.default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
@@ -525,10 +979,23 @@ impl SetDisks {
                 result.parity_blocks = result.disk_count - read_quorum as usize;
                 result.data_blocks = read_quorum as usize;
 
-                let ((mut online_disks, quorum_mod_time, quorum_etag), disk_len) = {
+                let ((quorum_disks, quorum_mod_time, quorum_etag), disk_len) = {
                     let disks = self.disks.read().await;
                     let disk_len = disks.len();
                     (Self::list_online_disks(&disks, &parts_metadata, &errs, read_quorum as usize), disk_len)
+                };
+
+                // A deep heal must inspect every reachable member, not only the
+                // quorum that agreed on the canonical metadata. A returning disk
+                // can legitimately carry an older xl.meta (or an explicit-version
+                // absence) while still being the exact stale target that needs
+                // repair. Restricting the repair set to quorum members silently
+                // turns that stale member into `verified_healthy`/`unchanged`
+                // (backlog#2612, #2596). Normal scans retain the quorum fast path.
+                let mut online_disks = if opts.scan_mode == HealScanMode::Deep {
+                    self.get_disks_internal().await
+                } else {
+                    quorum_disks
                 };
 
                 trace!(
@@ -548,6 +1015,13 @@ impl SetDisks {
                 match Self::pick_valid_fileinfo(&parts_metadata, quorum_mod_time, quorum_etag.clone(), read_quorum as usize) {
                     Ok(mut latest_meta) => {
                         Self::hydrate_selected_fileinfo_part_checksums(&mut latest_meta)?;
+                        let protected =
+                            !latest_meta.parts.is_empty() && latest_meta.parts.iter().all(|part| part.integrity.is_some());
+                        result.integrity_verified = protected
+                            && !latest_meta.deleted
+                            && !latest_meta.is_remote()
+                            && opts.scan_mode == HealScanMode::Deep
+                            && !read_repair_uses_shared_lock;
                         trace!(
                             event = EVENT_SET_DISK_HEAL,
                             component = LOG_COMPONENT_ECSTORE,
@@ -599,6 +1073,7 @@ impl SetDisks {
 
                         result.object_size =
                             ObjectInfo::from_file_info(&latest_meta, bucket, object, true).get_actual_size()? as usize;
+                        result.resolved_version_id = Some(*latest_meta.version_id.unwrap_or_default().as_bytes());
                         // Loop to find number of disks with valid data, per-drive
                         // data state and a list of outdated disks on which data needs
                         // to be healed.
@@ -635,16 +1110,7 @@ impl SetDisks {
                             }
 
                             let drive_state = match reason {
-                                Some(err) => match err {
-                                    DiskError::DiskNotFound => DriveState::Offline.to_string(),
-                                    DiskError::FileNotFound
-                                    | DiskError::FileVersionNotFound
-                                    | DiskError::VolumeNotFound
-                                    | DiskError::PartMissingOrCorrupt
-                                    | DiskError::OutdatedXLMeta => DriveState::Missing.to_string(),
-                                    DiskError::FileCorrupt => DriveState::Corrupt.to_string(),
-                                    _ => DriveState::Unknown(err.to_string()).to_string(),
-                                },
+                                Some(err) => heal_drive_state_for_error(&err).to_string(),
                                 None => DriveState::Ok.to_string(),
                             };
                             result.before.drives.push(HealDriveInfo {
@@ -660,7 +1126,53 @@ impl SetDisks {
                             });
                         }
 
+                        let requested_nil =
+                            version_id.is_empty() || Uuid::parse_str(version_id).is_ok_and(|requested| requested.is_nil());
+                        let selected_nil = latest_meta.version_id.is_none_or(|selected| selected.is_nil());
+                        let selected_version_matches = if requested_nil {
+                            selected_nil
+                        } else {
+                            latest_meta
+                                .version_id
+                                .is_some_and(|selected| selected.to_string().eq_ignore_ascii_case(version_id))
+                        };
+                        result.metadata_verified = !opts.dry_run
+                            && !latest_meta.is_remote()
+                            && !read_repair_uses_shared_lock
+                            && selected_version_matches
+                            && (protected || latest_meta.deleted)
+                            && !result.after.drives.is_empty()
+                            && result
+                                .after
+                                .drives
+                                .iter()
+                                .all(|drive| drive.state == DriveState::Ok.to_string());
+
+                        if !latest_meta.deleted && !latest_meta.is_remote() && !protected {
+                            result.detail =
+                                "Legacy object uses standard repair; independent object identity remains unverified".to_owned();
+                        }
+
                         if disks_to_heal_count == 0 {
+                            if result.integrity_verified && !opts.dry_run {
+                                match crate::io_support::shard_integrity::restore_proof_replicas(
+                                    &latest_meta,
+                                    &disks,
+                                    bucket,
+                                    object,
+                                )
+                                .await
+                                {
+                                    Ok(repaired) if repaired > 0 => {
+                                        result.detail = format!("Restored {repaired} independent integrity indexes")
+                                    }
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        result.integrity_verified = false;
+                                        return Ok((result, Some(error)));
+                                    }
+                                }
+                            }
                             // The object is already healthy: no disk needs healing.
                             // This is the common case for the very objects PR #4356
                             // targets — a valid `xl.meta` plus a leaked pre-#3510
@@ -748,6 +1260,10 @@ impl SetDisks {
                                 );
                             }
 
+                            if read_repair_uses_shared_lock {
+                                return Ok((result, Some(cannot_heal_err)));
+                            }
+
                             // `disks_with_all_parts` normalizes conflicting entries
                             // in `parts_metadata` to defaults. Re-read only before
                             // destructive cleanup so the guard sees every original
@@ -765,7 +1281,7 @@ impl SetDisks {
                             // Allow for dangling deletes, on versions that have DataDir missing etc.
                             // this would end up restoring the correct readable versions.
                             return match self
-                                .delete_if_dangling(
+                                .delete_if_dangling_with_proof(
                                     bucket,
                                     object,
                                     &parts_metadata,
@@ -778,17 +1294,18 @@ impl SetDisks {
                                 )
                                 .await
                             {
-                                Ok(m) => {
-                                    let derr = if !version_id.is_empty() {
-                                        DiskError::FileVersionNotFound
-                                    } else {
-                                        DiskError::FileNotFound
-                                    };
-                                    let mut t_errs = Vec::with_capacity(errs.len());
-                                    for _ in 0..errs.len() {
-                                        t_errs.push(None);
+                                Ok((m, absent)) => {
+                                    if absent {
+                                        *absence = Some(HealedObjectAbsence {
+                                            pool_index: self.pool_index,
+                                            set_index: self.set_index,
+                                            removed: true,
+                                        });
                                     }
-                                    Ok((self.default_heal_result(m, &t_errs, bucket, object, version_id).await, Some(derr)))
+                                    Ok((
+                                        self.dangling_heal_result(m, &errs, bucket, object, version_id, absent).await,
+                                        (!absent).then_some(DiskError::ErasureWriteQuorum),
+                                    ))
                                 }
                                 Err(err) => {
                                     error!(
@@ -798,10 +1315,9 @@ impl SetDisks {
                                         object,
                                         version_id,
                                         error = %err,
-                                        returned_error = %cannot_heal_err,
                                         "Heal object dangling cleanup could not prove object deletion"
                                     );
-                                    Ok((result, Some(cannot_heal_err)))
+                                    Ok((result, Some(err)))
                                 }
                             };
                         }
@@ -915,6 +1431,9 @@ impl SetDisks {
                         // For a regular object a missing data_dir means the latest metadata is
                         // corrupt; fail this object's heal with a clear error instead of building
                         // part paths under a nil UUID directory.
+                        let read_repair_commit_fingerprint =
+                            read_repair_uses_shared_lock.then(|| ReadRepairCommitFingerprint::from_file_info(&latest_meta));
+
                         let data_dir = match latest_meta.data_dir {
                             Some(data_dir) => data_dir,
                             None => {
@@ -942,7 +1461,21 @@ impl SetDisks {
                             let mut writer_failure_warned = false;
 
                             for (part_index, part) in latest_meta.parts.iter().enumerate() {
-                                let till_offset = erasure.shard_file_offset(0, part.size, part.size);
+                                use crate::io_support::shard_integrity::{PartProofReader, PreparedIntegrity, ShardVerifier};
+                                let proof = part
+                                    .integrity
+                                    .as_ref()
+                                    .map(|part| {
+                                        PartProofReader::new(part.clone(), &parts_metadata, &latest_disks, bucket, object)
+                                    })
+                                    .transpose()
+                                    .map_err(DiskError::from)?;
+                                // This reader covers the whole encoded shard. A range
+                                // offset can exclude the final encoded byte when the
+                                // logical part ends inside a data block, allowing a
+                                // one-byte tail truncation to evade deep Heal.
+                                let till_offset = usize::try_from(erasure.shard_file_size(part.size as i64))
+                                    .map_err(|_| DiskError::FileCorrupt)?;
                                 let use_mmap_read = object_mmap_read_enabled();
 
                                 let mut readers = Vec::with_capacity(latest_disks.len());
@@ -992,7 +1525,15 @@ impl SetDisks {
                                         )
                                         .await
                                         {
-                                            Ok(Some(reader)) => {
+                                            Ok(Some(mut reader)) => {
+                                                if let Some(proof) = &proof {
+                                                    reader
+                                                        .set_integrity(
+                                                            ShardVerifier::new(std::sync::Arc::clone(proof), index, 0, None)
+                                                                .map_err(DiskError::from)?,
+                                                        )
+                                                        .map_err(DiskError::from)?;
+                                                }
                                                 readers.push(Some(reader));
                                             }
                                             Ok(None) => {
@@ -1051,6 +1592,13 @@ impl SetDisks {
                                                 continue;
                                             }
                                         };
+                                        let mut writer = writer;
+                                        if let Some(proof) = &proof {
+                                            writer.set_integrity(
+                                                ShardVerifier::new(std::sync::Arc::clone(proof), index, 0, None)
+                                                    .map_err(DiskError::from)?,
+                                            );
+                                        }
                                         writers.push(Some(writer));
                                     } else {
                                         writers.push(None);
@@ -1074,13 +1622,42 @@ impl SetDisks {
                                     );
                                     writer_failure_warned = true;
                                 }
-                                if let Err(e) = erasure.heal(&mut writers, readers, part.size, &prefer).await {
+                                let heal_part = erasure.heal(&mut writers, readers, part.size, &prefer);
+                                let heal_part_result = if read_repair_uses_shared_lock {
+                                    match tokio::time::timeout(READ_REPAIR_DATA_PHASE_TIMEOUT, heal_part).await {
+                                        Ok(result) => result,
+                                        Err(_) => Err(DiskError::Timeout),
+                                    }
+                                } else {
+                                    heal_part.await
+                                };
+                                if let Err(e) = heal_part_result {
                                     // Don't leak the partially-written healed shards in
                                     // .rustfs/tmp when heal fails midway (backlog#799 B20).
                                     let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
                                     return Err(e);
                                 }
                                 // close_bitrot_writers(&mut writers).await?;
+                                if !is_inline_buffer && let Some(proof) = &proof {
+                                    let before = out_dated_disks.iter().filter(|disk| disk.is_some()).count();
+                                    let proof_result = async {
+                                        PreparedIntegrity::copy_from(proof)
+                                            .await?
+                                            .write(
+                                                &mut out_dated_disks,
+                                                bucket,
+                                                RUSTFS_META_TMP_BUCKET,
+                                                &format!("{tmp_id}/{dst_data_dir}"),
+                                            )
+                                            .await
+                                    }
+                                    .await;
+                                    if let Err(error) = proof_result {
+                                        let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
+                                        return Err(error.into());
+                                    }
+                                    disks_to_heal_count -= before - out_dated_disks.iter().filter(|disk| disk.is_some()).count();
+                                }
 
                                 for (index, disk_op) in out_dated_disks.iter_mut().enumerate() {
                                     if disk_op.is_none() {
@@ -1103,6 +1680,13 @@ impl SetDisks {
                                         part.index.clone(),
                                         part.checksums.clone(),
                                     );
+                                    if let Some(updated) = parts_metadata[index]
+                                        .parts
+                                        .iter_mut()
+                                        .find(|updated| updated.number == part.number)
+                                    {
+                                        updated.integrity.clone_from(&part.integrity);
+                                    }
                                     if is_inline_buffer {
                                         if let Some(writer) = writers[index].take() {
                                             // if let Some(w) = writer.as_any().downcast_ref::<BitrotFileWriter>() {
@@ -1150,6 +1734,32 @@ impl SetDisks {
                                 );
                             }
                         }
+                        let _read_repair_write_lock_guard = if let Some(expected_fingerprint) = read_repair_commit_fingerprint {
+                            drop(_read_repair_read_lock_guard.take());
+                            match self
+                                .acquire_revalidated_read_repair_commit_lock(
+                                    &disks,
+                                    bucket,
+                                    object,
+                                    version_id,
+                                    expected_fingerprint,
+                                )
+                                .await
+                            {
+                                Ok(Some(guard)) => Some(guard),
+                                Ok(None) => {
+                                    let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
+                                    return Ok((result, Some(DiskError::Timeout)));
+                                }
+                                Err(err) => {
+                                    let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
+                                    return Err(err);
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
                         // Rename from tmp location to the actual location.
                         // MinIO stops on the first RenameData error. RustFS intentionally
                         // continues per target, but reports any residue after all attempts
@@ -1159,6 +1769,9 @@ impl SetDisks {
                         let mut healed_disks = vec![None; out_dated_disks.len()];
                         for (index, outdated_disk) in out_dated_disks.iter().enumerate() {
                             if let Some(disk) = outdated_disk {
+                                if let Some(scope) = &bucket_heal_scope {
+                                    scope.check()?;
+                                }
                                 rename_attempts += 1;
                                 // record the index of the updated disks
                                 parts_metadata[index].erasure.index = index + 1;
@@ -1252,6 +1865,36 @@ impl SetDisks {
                             ));
                         }
 
+                        if result.integrity_verified
+                            && let Err(error) =
+                                crate::io_support::shard_integrity::restore_proof_replicas(&latest_meta, &disks, bucket, object)
+                                    .await
+                        {
+                            result.integrity_verified = false;
+                            return Ok((result, Some(error)));
+                        }
+
+                        result.repair_verified = protected
+                            && !latest_meta.deleted
+                            && !latest_meta.is_remote()
+                            && !read_repair_uses_shared_lock
+                            && result.drives_healed().is_some_and(|healed| healed > 0)
+                            && result
+                                .after
+                                .drives
+                                .iter()
+                                .all(|drive| drive.state == DriveState::Ok.to_string());
+                        result.metadata_repair_verified = latest_meta.deleted
+                            && !opts.dry_run
+                            && !latest_meta.is_remote()
+                            && !read_repair_uses_shared_lock
+                            && result.drives_healed().is_some_and(|healed| healed > 0)
+                            && result
+                                .after
+                                .drives
+                                .iter()
+                                .all(|drive| drive.state == DriveState::Ok.to_string());
+
                         // The object is healthy here; sweep any data dirs left behind
                         // by pre-#3510 unversioned overwrites, which the dangling paths
                         // above never touch (issues #3231, #3191). Best effort — a
@@ -1264,13 +1907,70 @@ impl SetDisks {
                 }
             }
             Err(err) => {
+                if let Some(retirement) = retirement
+                    && parts_metadata
+                        .iter()
+                        .zip(&errs)
+                        .any(|(info, error)| error.is_none() && info.is_canonical_delete_marker())
+                {
+                    // A current-generation delete marker can be left behind on
+                    // an inaccessible member after an acknowledged S3 DELETE.
+                    // That case has no bucket-retirement record, so evaluate its
+                    // stricter same-incarnation proof before the retired-marker
+                    // path. The proof requires an exact marker identity, at
+                    // least one replica already absent, and every target online.
+                    let cleanup =
+                        match Self::same_incarnation_marker_candidate(&parts_metadata, &errs, retirement.current_incarnation) {
+                            Ok(marker) => {
+                                self.remove_current_marker(retirement, bucket, object, marker, opts, &disks)
+                                    .await
+                            }
+                            Err(_) => match Self::retired_marker_candidate(&parts_metadata, &errs) {
+                                Ok(marker) => {
+                                    self.remove_retired_marker(retirement, bucket, object, marker, opts, &disks)
+                                        .await
+                                }
+                                Err(error) => Err(error),
+                            },
+                        };
+                    let absent = cleanup.is_ok();
+                    let item = self
+                        .dangling_heal_result(FileInfo::default(), &errs, bucket, object, version_id, absent)
+                        .await;
+                    if absent {
+                        *absence = Some(HealedObjectAbsence {
+                            pool_index: self.pool_index,
+                            set_index: self.set_index,
+                            removed: true,
+                        });
+                    }
+                    return Ok((item, cleanup.err()));
+                }
                 if allow_explicit_version_regen
                     && !version_id.is_empty()
                     && self
                         .try_regenerate_explicit_version_meta(bucket, object, version_id, &parts_metadata, &errs, &disks)
                         .await?
                 {
-                    return Box::pin(self.heal_object_with_explicit_version_regen(bucket, object, version_id, opts, false)).await;
+                    return Box::pin(self.heal_object_with_explicit_version_regen(
+                        bucket,
+                        object,
+                        version_id,
+                        ExplicitVersionHeal {
+                            allow_regeneration: false,
+                            ..run
+                        },
+                        absence,
+                    ))
+                    .await;
+                }
+
+                if opts.dry_run {
+                    return Ok((
+                        self.default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
+                            .await,
+                        Some(err),
+                    ));
                 }
 
                 if self
@@ -1287,7 +1987,7 @@ impl SetDisks {
 
                 let data_errs_by_part = HashMap::new();
                 match self
-                    .delete_if_dangling(
+                    .delete_if_dangling_with_proof(
                         bucket,
                         object,
                         &parts_metadata,
@@ -1300,22 +2000,242 @@ impl SetDisks {
                     )
                     .await
                 {
-                    Ok(m) => {
-                        let err = if !version_id.is_empty() {
-                            DiskError::FileVersionNotFound
-                        } else {
-                            DiskError::FileNotFound
-                        };
-                        Ok((self.default_heal_result(m, &errs, bucket, object, version_id).await, Some(err)))
+                    Ok((m, absent)) => {
+                        if absent {
+                            *absence = Some(HealedObjectAbsence {
+                                pool_index: self.pool_index,
+                                set_index: self.set_index,
+                                removed: true,
+                            });
+                        }
+                        Ok((
+                            self.dangling_heal_result(m, &errs, bucket, object, version_id, absent).await,
+                            (!absent).then_some(DiskError::ErasureWriteQuorum),
+                        ))
                     }
-                    Err(_) => Ok((
+                    Err(cleanup_err) => Ok((
                         self.default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
                             .await,
-                        Some(err),
+                        Some(cleanup_err),
                     )),
                 }
             }
         }
+    }
+
+    fn retired_marker_candidate(
+        metadata: &[FileInfo],
+        errors: &[Option<DiskError>],
+    ) -> disk::error::Result<rustfs_filemeta::MetaDeleteMarker> {
+        let mut candidate = None;
+        for (info, error) in metadata.iter().zip(errors) {
+            match error {
+                Some(DiskError::FileNotFound | DiskError::FileVersionNotFound) => continue,
+                Some(_) => return Err(DiskError::retired_marker_deferred("not every replica is readable")),
+                None => {}
+            }
+            if !info.is_canonical_delete_marker() || info.delete_marker_incarnation().is_none() {
+                return Err(DiskError::retired_marker_deferred("marker has no trustworthy bucket incarnation"));
+            }
+            let marker = rustfs_filemeta::MetaDeleteMarker::from(info.clone());
+            if candidate.as_ref().is_some_and(|previous| previous != &marker) {
+                return Err(DiskError::retired_marker_deferred("surviving marker identities conflict"));
+            }
+            candidate = Some(marker);
+        }
+        candidate.ok_or_else(|| DiskError::retired_marker_deferred("no exact marker candidate"))
+    }
+
+    fn same_incarnation_marker_candidate(
+        metadata: &[FileInfo],
+        errors: &[Option<DiskError>],
+        current_incarnation: Option<Uuid>,
+    ) -> disk::error::Result<rustfs_filemeta::MetaDeleteMarker> {
+        let defer = DiskError::retired_marker_deferred;
+        let Some(current) = current_incarnation.filter(|id| !id.is_nil()) else {
+            return Err(defer("current bucket incarnation is unavailable"));
+        };
+        let mut candidate = None;
+        let mut missing_replica = false;
+        for (info, error) in metadata.iter().zip(errors) {
+            match error {
+                Some(DiskError::FileNotFound | DiskError::FileVersionNotFound) => {
+                    missing_replica = true;
+                    continue;
+                }
+                Some(_) => return Err(defer("not every replica is readable")),
+                None => {}
+            }
+            if !info.is_canonical_delete_marker() || info.delete_marker_incarnation() != Some(current) {
+                return Err(defer("marker is not a canonical current-generation marker"));
+            }
+            let marker = rustfs_filemeta::MetaDeleteMarker::from(info.clone());
+            if candidate.as_ref().is_some_and(|previous| previous != &marker) {
+                return Err(defer("surviving marker identities conflict"));
+            }
+            candidate = Some(marker);
+        }
+        if !missing_replica {
+            return Err(defer("marker is present on every replica"));
+        }
+        candidate.ok_or_else(|| defer("no exact current-generation marker candidate"))
+    }
+
+    async fn remove_retired_marker(
+        &self,
+        context: &MarkerRetirementContext<'_>,
+        bucket: &str,
+        object: &str,
+        marker: rustfs_filemeta::MetaDeleteMarker,
+        opts: &HealOpts,
+        disks: &[Option<DiskStore>],
+    ) -> disk::error::Result<()> {
+        let defer = DiskError::retired_marker_deferred;
+        if opts.dry_run || !opts.remove {
+            return Err(defer("cleanup requires remove=true and dry_run=false"));
+        }
+        if disks.len() != self.set_drive_count || disks.iter().any(Option::is_none) {
+            return Err(defer("every target disk must be online"));
+        }
+        let incarnation = marker.into_fileinfo(bucket, object, false)?.delete_marker_incarnation();
+        let Some(old) = incarnation else { return Err(defer("marker incarnation is unavailable")) };
+        let Some(current) = context.current_incarnation else {
+            return Err(defer("current bucket incarnation is unavailable"));
+        };
+        if old == current || context.lifecycle_guard.is_lock_lost() {
+            return Err(defer("current generation or lost bucket lifecycle fence"));
+        }
+        let Some(store) = context.store.as_ref() else {
+            return Err(defer("retirement owner is unavailable"));
+        };
+        match crate::bucket::retirement::is_retired(store.clone(), bucket, old).await {
+            Ok(true) => {}
+            Ok(false) => return Err(defer("no committed bucket retirement record")),
+            Err(error) => return Err(DiskError::retired_marker_deferred(format!("retirement read failed: {error}"))),
+        }
+        let Some(version) = marker.version_id.filter(|id| !id.is_nil()) else {
+            return Err(defer("cleanup requires an explicit non-null version"));
+        };
+        if context.lifecycle_guard.is_lock_lost() {
+            return Err(defer("bucket lifecycle fence was lost"));
+        }
+        let result = self
+            .remove_marker_exact_under_fence(bucket, object, marker, version, disks)
+            .await;
+        if context.lifecycle_guard.is_lock_lost() {
+            return Err(defer("bucket lifecycle fence was lost"));
+        }
+        result
+    }
+
+    async fn remove_current_marker(
+        &self,
+        context: &MarkerRetirementContext<'_>,
+        bucket: &str,
+        object: &str,
+        marker: rustfs_filemeta::MetaDeleteMarker,
+        opts: &HealOpts,
+        disks: &[Option<DiskStore>],
+    ) -> disk::error::Result<()> {
+        let defer = DiskError::retired_marker_deferred;
+        if opts.dry_run || !opts.remove {
+            return Err(defer("cleanup requires remove=true and dry_run=false"));
+        }
+        if disks.len() != self.set_drive_count || disks.iter().any(Option::is_none) {
+            return Err(defer("every target disk must be online"));
+        }
+        let Some(current) = context.current_incarnation.filter(|id| !id.is_nil()) else {
+            return Err(defer("current bucket incarnation is unavailable"));
+        };
+        if context.lifecycle_guard.is_lock_lost() {
+            return Err(defer("bucket lifecycle fence was lost"));
+        }
+        let incarnation = marker.into_fileinfo(bucket, object, false)?.delete_marker_incarnation();
+        if incarnation != Some(current) {
+            return Err(defer("marker is not from the current bucket incarnation"));
+        }
+        let Some(version) = marker.version_id.filter(|id| !id.is_nil()) else {
+            return Err(defer("cleanup requires an explicit non-null version"));
+        };
+        let marker_identity = marker.stable_identity();
+        let marker_bytes = marker.marshal_msg().map_err(DiskError::other)?;
+        let Some(purge) = MrfDeleteMarkerPurge::new(current, current, marker_identity, marker_bytes) else {
+            return Err(defer("marker purge proof payload is invalid"));
+        };
+        if !self.has_marker_purge_receipt(bucket, object, version, &purge).await {
+            return Err(defer("same-incarnation marker lacks an acknowledged delete receipt"));
+        }
+        let result = self
+            .remove_marker_exact_under_fence(bucket, object, marker, version, disks)
+            .await;
+        if context.lifecycle_guard.is_lock_lost() {
+            return Err(defer("bucket lifecycle fence was lost"));
+        }
+        if result.is_ok() {
+            self.consume_marker_purge_receipt(bucket, object, version, &purge).await;
+        }
+        result
+    }
+
+    async fn remove_marker_exact_under_fence(
+        &self,
+        bucket: &str,
+        object: &str,
+        marker: rustfs_filemeta::MetaDeleteMarker,
+        version: Uuid,
+        disks: &[Option<DiskStore>],
+    ) -> disk::error::Result<()> {
+        let request = FileInfo {
+            volume: bucket.to_owned(),
+            name: object.to_owned(),
+            version_id: Some(version),
+            ..Default::default()
+        };
+        let results = join_all(disks.iter().enumerate().map(|(disk_index, disk)| {
+            let request = request.clone();
+            let marker = marker.clone();
+            async move {
+                if let Some(error) = injected_dangling_delete_error(bucket, object, disk_index) {
+                    return Err(error);
+                }
+                let Some(disk) = disk else { return Err(DiskError::DiskNotFound) };
+                disk.delete_version(
+                    bucket,
+                    object,
+                    request,
+                    false,
+                    DeleteOptions {
+                        expected_delete_marker: Some(marker),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }
+        }))
+        .await;
+        for result in results {
+            if let Err(error) = result
+                && !matches!(error, DiskError::FileNotFound | DiskError::FileVersionNotFound)
+            {
+                return Err(DiskError::retired_marker_deferred(format!("conditional marker deletion failed: {error}")));
+            }
+        }
+        let (_, errors) = Self::read_all_fileinfo(disks, "", bucket, object, &version.to_string(), false, false, false).await?;
+        let selected = self.get_disks_internal().await;
+        let same_targets = selected.len() == disks.len() && selected.iter().zip(disks).all(|(current, original)| {
+            matches!((current, original), (Some(current), Some(original)) if std::sync::Arc::ptr_eq(current, original))
+        });
+        if !same_targets
+            || !errors
+                .iter()
+                .all(|error| matches!(error, Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)))
+        {
+            return Err(DiskError::retired_marker_deferred(
+                "complete marker absence could not be verified under the original target set",
+            ));
+        }
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        Ok(())
     }
 
     async fn try_regenerate_explicit_version_meta(
@@ -1354,6 +2274,17 @@ impl SetDisks {
         let Some(candidate) = candidates.first().copied() else {
             return Ok(false);
         };
+        let protected = rustfs_filemeta::shard_integrity::descriptor_from_metadata(&candidate.metadata)
+            .map_err(DiskError::from)?
+            .is_some()
+            || candidate.parts.iter().any(|part| part.integrity.is_some());
+        // A minority metadata copy cannot establish an independent commitment.
+        // Legacy recovery retains its existing bounds without certifying identity.
+        if protected
+            && (candidates.len() < candidate.erasure.data_blocks || candidate.parts.iter().any(|part| part.integrity.is_none()))
+        {
+            return Ok(false);
+        }
         let identity = Self::file_info_quorum_hash(candidate);
         if candidates
             .iter()
@@ -1387,6 +2318,31 @@ impl SetDisks {
             return Ok(false);
         }
 
+        let mut verified_disks = vec![true; disks.len()];
+        if protected {
+            let mut proof_files = parts_metadata.to_vec();
+            for (index, file) in proof_files.iter_mut().enumerate() {
+                if matches!(
+                    errs.get(index).and_then(Option::as_ref),
+                    Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)
+                ) {
+                    *file = candidate.clone();
+                    file.erasure.index = candidate.erasure.distribution[index];
+                }
+            }
+            let mut verified = (0..candidate.parts.len())
+                .map(|part| (part, vec![crate::disk::CHECK_PART_UNKNOWN; disks.len()]))
+                .collect();
+            crate::io_support::shard_integrity::verify_deep_parts(&proof_files, disks, candidate, bucket, object, &mut verified)
+                .await?;
+            for (index, valid) in verified_disks.iter_mut().enumerate() {
+                *valid = verified.values().all(|parts| parts.get(index) == Some(&CHECK_PART_SUCCESS));
+            }
+            if verified_disks.iter().filter(|valid| **valid).count() < candidate.erasure.data_blocks {
+                return Ok(false);
+            }
+        }
+
         let mut wrote = 0usize;
         for (index, disk) in disks.iter().enumerate() {
             let Some(disk) = disk else {
@@ -1396,7 +2352,7 @@ impl SetDisks {
                 errs.get(index).and_then(Option::as_ref),
                 Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)
             );
-            if !metadata_absent {
+            if !metadata_absent || !verified_disks[index] {
                 continue;
             }
             let Some(&shard_index) = candidate.erasure.distribution.get(index) else {
@@ -1483,6 +2439,183 @@ impl SetDisks {
                 );
             }
         }
+    }
+
+    async fn cleanup_metadata_less_data_dirs(
+        &self,
+        bucket: &str,
+        object: &str,
+        disks: &[Option<DiskStore>],
+        dry_run: bool,
+    ) -> disk::error::Result<Option<MetadataLessDataDirCleanup>> {
+        if disks.iter().any(Option::is_none) {
+            return Ok(None);
+        }
+
+        let mut per_disk_dirs = Vec::new();
+        for (disk_index, disk) in disks.iter().enumerate() {
+            let Some(disk) = disk.as_ref() else {
+                return Ok(None);
+            };
+            let entries = match disk.list_dir("", bucket, object, -1).await {
+                Ok(entries) => entries,
+                Err(
+                    DiskError::FileNotFound
+                    | DiskError::FileVersionNotFound
+                    | DiskError::PathNotFound
+                    | DiskError::VolumeNotFound,
+                ) => continue,
+                Err(err) => return Err(err),
+            };
+            for entry in entries {
+                let data_dir = entry.trim_end_matches(SLASH_SEPARATOR);
+                if !entry.ends_with(SLASH_SEPARATOR) || Uuid::parse_str(data_dir).is_err() {
+                    return Ok(None);
+                }
+                let data_dir_path = format!("{object}{SLASH_SEPARATOR}{data_dir}");
+                if !Self::metadata_less_data_dir_is_reclaimable(disk, bucket, &data_dir_path).await? {
+                    return Ok(None);
+                }
+                per_disk_dirs.push((disk_index, data_dir_path));
+            }
+        }
+
+        let matched = per_disk_dirs.len();
+        if matched == 0 {
+            return Ok(None);
+        }
+
+        let mut cleanup = MetadataLessDataDirCleanup {
+            matched,
+            delete_errs: vec![None; disks.len()],
+            touched_disks: vec![false; disks.len()],
+            ..Default::default()
+        };
+        for (disk_index, _) in &per_disk_dirs {
+            cleanup.touched_disks[*disk_index] = true;
+        }
+
+        if dry_run {
+            return Ok(Some(cleanup));
+        }
+
+        for (disk_index, data_dir_path) in per_disk_dirs {
+            let Some(disk) = disks[disk_index].as_ref() else {
+                return Ok(None);
+            };
+            match disk
+                .delete_data_dir(
+                    bucket,
+                    &data_dir_path,
+                    DeleteOptions {
+                        recursive: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(DataDirDeleteStatus::Deleted) => {
+                    cleanup.removed = cleanup.removed.saturating_add(1);
+                }
+                Ok(DataDirDeleteStatus::Deferred) => {
+                    let err = DiskError::FileAccessDenied;
+                    cleanup.first_error.get_or_insert_with(|| err.clone());
+                    cleanup.delete_errs[disk_index] = Some(err);
+                }
+                Err(DiskError::FileNotFound | DiskError::PathNotFound | DiskError::VolumeNotFound) => {
+                    cleanup.removed = cleanup.removed.saturating_add(1);
+                }
+                Err(err) => {
+                    cleanup.first_error.get_or_insert_with(|| err.clone());
+                    cleanup.delete_errs[disk_index] = Some(err);
+                }
+            }
+        }
+
+        Ok(Some(cleanup))
+    }
+
+    async fn metadata_less_data_dir_is_reclaimable(
+        disk: &DiskStore,
+        bucket: &str,
+        data_dir_path: &str,
+    ) -> disk::error::Result<bool> {
+        let entries = match disk.list_dir("", bucket, data_dir_path, -1).await {
+            Ok(entries) => entries,
+            Err(
+                DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::PathNotFound | DiskError::VolumeNotFound,
+            ) => return Ok(false),
+            Err(err) => return Err(err),
+        };
+
+        let mut has_part = false;
+        for entry in entries {
+            if entry.ends_with(SLASH_SEPARATOR) {
+                return Ok(false);
+            }
+            let entry_name = entry.trim_end_matches(SLASH_SEPARATOR);
+            if metadata_less_part_file(entry_name) {
+                has_part = true;
+                continue;
+            }
+            if entry_name
+                .strip_prefix(DELETE_DATA_DIR_MARKER_PREFIX)
+                .is_some_and(|transaction| Uuid::parse_str(transaction).is_ok())
+            {
+                continue;
+            }
+            return Ok(false);
+        }
+
+        Ok(has_part)
+    }
+
+    async fn metadata_less_data_dir_heal_result(
+        &self,
+        bucket: &str,
+        object: &str,
+        cleanup: &MetadataLessDataDirCleanup,
+        dry_run: bool,
+    ) -> HealResultItem {
+        let mut result = HealResultItem {
+            heal_item_type: HealItemType::Object.to_string(),
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            disk_count: self.set_endpoints.len(),
+            parity_blocks: self.default_parity_count,
+            data_blocks: self.set_endpoints.len().saturating_sub(self.default_parity_count),
+            ..Default::default()
+        };
+        result.before.drives = Vec::with_capacity(self.set_endpoints.len());
+        result.after.drives = Vec::with_capacity(self.set_endpoints.len());
+        for (index, drive) in self.set_endpoints.iter().enumerate() {
+            let endpoint = drive.to_string();
+            let before_state = if cleanup.touched_disks.get(index).copied().unwrap_or(false) {
+                DriveState::Corrupt.to_string()
+            } else {
+                DriveState::Missing.to_string()
+            };
+            let after_state = if dry_run {
+                before_state.clone()
+            } else {
+                match cleanup.delete_errs.get(index).and_then(Option::as_ref) {
+                    None => DriveState::Missing.to_string(),
+                    Some(DiskError::DiskNotFound) => DriveState::Offline.to_string(),
+                    Some(_) => DriveState::Corrupt.to_string(),
+                }
+            };
+            result.before.drives.push(HealDriveInfo {
+                uuid: String::new(),
+                endpoint: endpoint.clone(),
+                state: before_state,
+            });
+            result.after.drives.push(HealDriveInfo {
+                uuid: String::new(),
+                endpoint,
+                state: after_state,
+            });
+        }
+        result
     }
 
     /// Prevent dangling cleanup when surviving state cannot prove that deletion
@@ -1829,12 +2962,50 @@ impl SetDisks {
     }
 }
 
+fn finalize_object_heal_result(
+    mut result: HealResultItem,
+    mut error: Option<Error>,
+    absence: &mut Option<HealedObjectAbsence>,
+    lock_lost: bool,
+    bucket: &str,
+    object: &str,
+) -> (HealResultItem, Option<Error>) {
+    if lock_lost {
+        result.integrity_verified = false;
+        result.repair_verified = false;
+        result.metadata_verified = false;
+        result.metadata_repair_verified = false;
+        *absence = None;
+        error = Some(Error::NamespaceLockQuorumUnavailable {
+            mode: "write",
+            bucket: bucket.to_owned(),
+            object: object.to_owned(),
+            required: 1,
+            achieved: 0,
+        });
+    }
+    (result, error)
+}
+
 impl SetDisks {
+    #[cfg(test)]
     pub(crate) async fn heal_replacement_format(
         &self,
         dry_run: bool,
         targets: &[String],
     ) -> Result<(HealResultItem, Option<Error>)> {
+        self.heal_replacement_format_with_fence(dry_run, targets, || false).await
+    }
+
+    pub(crate) async fn heal_replacement_format_with_fence<F>(
+        &self,
+        dry_run: bool,
+        targets: &[String],
+        fence_lost: F,
+    ) -> Result<(HealResultItem, Option<Error>)>
+    where
+        F: FnMut() -> bool + Send,
+    {
         if targets.is_empty() {
             return Err(Error::other("replacement format requires at least one target"));
         }
@@ -1850,14 +3021,18 @@ impl SetDisks {
             target_slots.push(slot);
         }
 
-        self.heal_format_for_slots(dry_run, Some(&target_slots)).await
+        self.heal_format_for_slots(dry_run, Some(&target_slots), fence_lost).await
     }
 
-    async fn heal_format_for_slots(
+    async fn heal_format_for_slots<F>(
         &self,
         dry_run: bool,
         target_slots: Option<&[usize]>,
-    ) -> Result<(HealResultItem, Option<Error>)> {
+        mut fence_lost: F,
+    ) -> Result<(HealResultItem, Option<Error>)>
+    where
+        F: FnMut() -> bool + Send,
+    {
         let disks = self.disks.read().await.clone();
         let (formats, errs) = load_format_erasure_all(&disks, true).await;
         if errs.iter().any(|err| {
@@ -1927,8 +3102,14 @@ impl SetDisks {
 
                 let mut new_format = ref_format.clone();
                 new_format.erasure.this = ref_format.erasure.sets[self.set_index][disk_idx];
+                if fence_lost() {
+                    return Ok((result, Some(StorageError::SlowDown)));
+                }
                 match save_format_file(&disks[disk_idx], &Some(new_format.clone())).await {
                     Ok(()) => {
+                        if fence_lost() {
+                            return Ok((result, Some(StorageError::SlowDown)));
+                        }
                         result.after.drives[disk_idx].uuid = new_format.erasure.this.to_string();
                         result.after.drives[disk_idx].state = DriveState::Ok.to_string();
                     }
@@ -1954,7 +3135,7 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
-        self.heal_format_for_slots(dry_run, None).await
+        self.heal_format_for_slots(dry_run, None, || false).await
     }
 
     #[tracing::instrument(skip(self))]
@@ -1972,76 +3153,18 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
-        let _write_lock_guard = if !opts.no_lock {
-            let ns_lock = self.new_ns_lock(bucket, object).await?;
-            Some(
-                ns_lock
-                    .get_write_lock(get_lock_acquire_timeout())
-                    .await
-                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
-            )
-        } else {
-            None
-        };
-
-        if has_suffix(object, SLASH_SEPARATOR) {
-            let (result, err) = self.heal_object_dir_locked(bucket, object, opts.dry_run, opts.remove).await?;
-            return Ok((result, err.map(|e| e.into())));
-        }
-
-        let disks = self.disks.read().await;
-
-        let disks = disks.clone();
-        let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false)
-            .await
-            .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
-        if DiskError::is_all_not_found(&errs) {
-            debug!(
-                event = EVENT_SET_DISK_HEAL,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_SET_DISK,
-                bucket,
-                object,
-                version_id,
-                state = "missing_object_skipped",
-                "Set disk heal skipped missing object"
-            );
-            let err = if !version_id.is_empty() {
-                Error::FileVersionNotFound
-            } else {
-                Error::FileNotFound
-            };
-            return Ok((
-                self.default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
-                    .await,
-                Some(err),
-            ));
-        }
-
-        // Heal the object.
-        // Pass no_lock=true since we already obtained write lock (or are already called with no_lock=true)
-        let mut inner_opts = *opts;
-        inner_opts.no_lock = true;
-        let (result, err) = self
-            .heal_object(bucket, object, version_id, &inner_opts)
-            .await
-            .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
-        if let Some(err) = err.as_ref() {
-            match err {
-                &DiskError::FileCorrupt if opts.scan_mode != HealScanMode::Deep => {
-                    // Instead of returning an error when a bitrot error is detected
-                    // during a normal heal scan, heal again with bitrot flag enabled.
-                    inner_opts.scan_mode = HealScanMode::Deep;
-                    let (result, err) = self
-                        .heal_object(bucket, object, version_id, &inner_opts)
-                        .await
-                        .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
-                    return Ok((result, err.map(|e| e.into())));
-                }
-                _ => {}
-            }
-        }
-        Ok((result, err.map(|e| e.into())))
+        self.heal_object_with_absence(
+            bucket,
+            object,
+            version_id,
+            opts,
+            &mut None,
+            AbsenceProofRequest {
+                retirement: None,
+                allow_unversioned: false,
+            },
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -2062,13 +3185,15 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
     async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
         let started_at = std::time::Instant::now();
         let _write_lock_guard = if !opts.no_lock {
-            let ns_lock = self.new_ns_lock(bucket, object).await?;
-            Some(
-                ns_lock
-                    .get_write_lock(get_lock_acquire_timeout())
-                    .await
-                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
-            )
+            let ns_lock = self
+                .new_ns_lock(bucket, object)
+                .await
+                .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
+            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
+                self.map_namespace_lock_error(bucket, object, "write", e)
+                    .narrow_to_disk()
+                    .unwrap_or_else(DiskError::other)
+            })?)
         } else {
             None
         };
@@ -2116,32 +3241,353 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
     }
 }
 
+impl SetDisks {
+    pub(crate) async fn heal_object_with_absence(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+        absence: &mut Option<HealedObjectAbsence>,
+        proof: AbsenceProofRequest<'_>,
+    ) -> Result<(HealResultItem, Option<Error>)> {
+        self.heal_object_with_retirement(bucket, object, version_id, opts, absence, proof)
+            .await
+    }
+
+    pub(crate) async fn heal_object_with_retirement(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+        absence: &mut Option<HealedObjectAbsence>,
+        proof: AbsenceProofRequest<'_>,
+    ) -> Result<(HealResultItem, Option<Error>)> {
+        *absence = None;
+        let _write_lock_guard = if !opts.no_lock {
+            let ns_lock = self
+                .new_ns_lock(bucket, object)
+                .await
+                .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
+            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
+                self.map_namespace_lock_error(bucket, object, "write", e)
+                    .narrow_to_disk()
+                    .unwrap_or_else(DiskError::other)
+            })?)
+        } else {
+            None
+        };
+
+        if has_suffix(object, SLASH_SEPARATOR) {
+            let (result, err) = self.heal_object_dir_locked(bucket, object, opts.dry_run, opts.remove).await?;
+            return Ok((result, err.map(|e| e.into())));
+        }
+
+        // The inner heal and missing-object report read the registry again;
+        // release this snapshot guard before a topology writer can queue between reads.
+        let disks = self.get_disks_internal().await;
+        let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false)
+            .await
+            .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+        if DiskError::is_all_not_found(&errs) {
+            debug!(
+                event = EVENT_SET_DISK_HEAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                bucket,
+                object,
+                version_id,
+                state = "missing_object_skipped",
+                "Set disk heal skipped missing object"
+            );
+            let err = if !version_id.is_empty() {
+                Error::FileVersionNotFound
+            } else {
+                Error::FileNotFound
+            };
+            if version_id.is_empty()
+                && (opts.remove || opts.dry_run)
+                && let Some(cleanup) = self
+                    .cleanup_metadata_less_data_dirs(bucket, object, &disks, opts.dry_run)
+                    .await
+                    .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?
+            {
+                let mut result = self
+                    .metadata_less_data_dir_heal_result(bucket, object, &cleanup, opts.dry_run)
+                    .await;
+                result.detail = format!(
+                    "metadata-less data directories matched={}, removed={}, dry_run={}",
+                    cleanup.matched, cleanup.removed, opts.dry_run
+                );
+                let err = cleanup.first_error.map(Error::from).or(Some(err));
+                return Ok((result, err));
+            }
+            let result = self
+                .default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
+                .await;
+            // Check the lease after the final await before publishing the proof.
+            if !opts.dry_run
+                && (proof.allow_unversioned || !version_id.is_empty())
+                && !disks.is_empty()
+                && disks.iter().all(Option::is_some)
+                && errs
+                    .iter()
+                    .all(|err| matches!(err, Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)))
+                && !_write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            {
+                *absence = Some(HealedObjectAbsence {
+                    pool_index: self.pool_index,
+                    set_index: self.set_index,
+                    removed: false,
+                });
+            }
+            return Ok((result, Some(err)));
+        }
+
+        // Heal the object.
+        // Pass no_lock=true since we already obtained write lock (or are already called with no_lock=true)
+        let mut inner_opts = *opts;
+        inner_opts.no_lock = true;
+        let (result, err) = self
+            .heal_object_with_explicit_version_regen(
+                bucket,
+                object,
+                version_id,
+                ExplicitVersionHeal {
+                    opts: &inner_opts,
+                    allow_regeneration: true,
+                    retirement: proof.retirement,
+                },
+                absence,
+            )
+            .await
+            .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+        if let Some(err) = err.as_ref() {
+            match err {
+                &DiskError::FileCorrupt if opts.scan_mode != HealScanMode::Deep => {
+                    // Instead of returning an error when a bitrot error is detected
+                    // during a normal heal scan, heal again with bitrot flag enabled.
+                    inner_opts.scan_mode = HealScanMode::Deep;
+                    let (result, err) = self
+                        .heal_object_with_explicit_version_regen(
+                            bucket,
+                            object,
+                            version_id,
+                            ExplicitVersionHeal {
+                                opts: &inner_opts,
+                                allow_regeneration: true,
+                                retirement: proof.retirement,
+                            },
+                            absence,
+                        )
+                        .await
+                        .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+                    return Ok(finalize_object_heal_result(
+                        result,
+                        err.map(Into::into),
+                        absence,
+                        _write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()),
+                        bucket,
+                        object,
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(finalize_object_heal_result(
+            result,
+            err.map(Into::into),
+            absence,
+            _write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()),
+            bucket,
+            object,
+        ))
+    }
+}
+
+impl SetDisks {
+    async fn dangling_heal_result(
+        &self,
+        metadata: FileInfo,
+        errs: &[Option<DiskError>],
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        absent: bool,
+    ) -> HealResultItem {
+        let mut item = self.default_heal_result(metadata, errs, bucket, object, version_id).await;
+        if absent {
+            for drive in &mut item.after.drives {
+                drive.state = DriveState::Missing.to_string();
+            }
+        }
+        item
+    }
+}
+
 #[cfg(test)]
 mod heal_result_report_tests {
-    use super::{DanglingCheckPartsFailure, DanglingDeleteFailure, DanglingDeleteSafety, SetDisks, heal_writer_error_summary};
+    use super::{
+        AbsenceProofRequest, DanglingCheckPartsFailure, DanglingDeleteFailure, DanglingDeleteSafety, ReadRepairCommitFingerprint,
+        ReadRepairPauseScope, SetDisks, heal_writer_error_summary,
+    };
     use super::{HEAL_RENAME_INCOMPLETE, HealRenameFailureScope, HealWriterFailureScope};
     use crate::disk::endpoint::Endpoint;
     use crate::disk::error::DiskError;
     use crate::disk::format::FormatV3;
-    use crate::disk::{DiskAPI as _, DiskOption, DiskStore, RUSTFS_META_TMP_BUCKET, ReadOptions, new_disk};
+    use crate::disk::local::RESERVED_DELETE_DATA_DIR_MARKER_PREFIX;
+    use crate::disk::{DiskAPI as _, DiskOption, DiskStore, RUSTFS_META_TMP_BUCKET, ReadOptions, STORAGE_FORMAT_FILE, new_disk};
     use crate::error::Error;
     use crate::object_api::{ObjectOptions, PutObjReader};
-    use crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks_isolated;
-    use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::set_disk::ops::object::hermetic_set_disks_support::{
+        hermetic_set_disks_for_pool_with_default_parity_isolated, hermetic_set_disks_isolated,
+    };
+    use crate::storage_api_contracts::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::storage_api_contracts::heal::HealOperations as _;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use crate::{
         config::storageclass,
         store::init_format::{load_format_erasure, save_format_file},
     };
-    use rustfs_common::heal_channel::{DriveState, HealOpts, HealScanMode};
+    use bytes::Bytes;
     use rustfs_filemeta::{BLOCK_SIZE_V2, FileInfo, ObjectPartInfo, TRANSITION_COMPLETE};
+    use rustfs_heal_contracts::heal_channel::{DriveState, HealOpts, HealScanMode};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use time::OffsetDateTime;
     use tokio::sync::RwLock;
     use tracing_subscriber::fmt::MakeWriter;
     use uuid::Uuid;
+
+    #[test]
+    fn lost_object_lock_revokes_storage_proofs_and_returns_retryable_error() {
+        let mut absence = Some(super::HealedObjectAbsence {
+            pool_index: 2,
+            set_index: 3,
+            removed: true,
+        });
+        let result = rustfs_madmin::heal_commands::HealResultItem {
+            integrity_verified: true,
+            repair_verified: true,
+            metadata_verified: true,
+            metadata_repair_verified: true,
+            ..Default::default()
+        };
+
+        let (result, error) = super::finalize_object_heal_result(result, None, &mut absence, true, "bucket", "object");
+
+        assert!(!result.integrity_verified);
+        assert!(!result.repair_verified);
+        assert!(!result.metadata_verified);
+        assert!(!result.metadata_repair_verified);
+        assert!(absence.is_none());
+        assert!(matches!(
+            error,
+            Some(Error::NamespaceLockQuorumUnavailable {
+                mode: "write",
+                bucket,
+                object,
+                required: 1,
+                achieved: 0,
+            }) if bucket == "bucket" && object == "object"
+        ));
+    }
+
+    #[test]
+    fn absent_and_nil_selected_versions_are_the_same_null_identity() {
+        let requested_nil = Uuid::nil().to_string();
+        let requested = Uuid::parse_str(&requested_nil).expect("nil UUID string");
+        assert!(requested.is_nil());
+
+        let absent: Option<Uuid> = None;
+        let selected_nil = absent.is_none_or(|selected| selected.is_nil());
+        assert!(selected_nil, "absent metadata version selects the null identity");
+
+        let selected = Uuid::new_v4();
+        assert!(!selected.is_nil(), "a concrete UUID must not satisfy a requested null selector");
+    }
+
+    #[test]
+    fn metadata_less_part_file_accepts_positive_part_numbers_only() {
+        assert!(super::metadata_less_part_file("part.1"));
+        assert!(super::metadata_less_part_file("part.42"));
+        assert!(!super::metadata_less_part_file("part.0"));
+        assert!(!super::metadata_less_part_file("part."));
+        assert!(!super::metadata_less_part_file("part.x"));
+        assert!(!super::metadata_less_part_file("xl.meta"));
+    }
+
+    #[test]
+    fn unavailable_heal_errors_use_stable_drive_states() {
+        for error in [DiskError::FaultyDisk, DiskError::FaultyRemoteDisk] {
+            assert_eq!(super::heal_drive_state_for_error(&error).to_string(), DriveState::Faulty.to_string());
+        }
+        assert_eq!(
+            super::heal_drive_state_for_error(&DiskError::RemoteClientUnavailable("peer restarting".to_string())).to_string(),
+            DriveState::Offline.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_preserves_rpc_transport_failure_through_metadata_classification() {
+        let transport = tonic::transport::Endpoint::from_static("http://127.0.0.1:0")
+            .connect()
+            .await
+            .expect_err("port zero cannot serve an internode connection");
+        let mut interrupted = tonic::Status::internal("h2 protocol error: http2 error");
+        interrupted.set_source(Arc::new(transport));
+        for (status, offline) in [
+            (interrupted, true),
+            (tonic::Status::unavailable("peer restarting"), true),
+            (tonic::Status::internal("h2 protocol error: http2 error"), false),
+            (tonic::Status::permission_denied("connection reset"), false),
+            (tonic::Status::data_loss("broken pipe"), false),
+        ] {
+            let error = DiskError::from(status);
+            let (_, _, reason) = super::should_heal_object_on_disk(&Some(error), &[], &FileInfo::default(), &FileInfo::default());
+            let reason = reason.expect("metadata probe failure must survive classification");
+            assert_eq!(
+                matches!(super::heal_drive_state_for_error(&reason), DriveState::Offline),
+                offline,
+                "{reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_repair_commit_fingerprint_tracks_commit_identity_only() {
+        let data_dir = Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("data dir should parse");
+        let mut base = meta_regen_test_fileinfo("object.bin", data_dir, 42, 0);
+        base.volume = "bucket-a".to_string();
+        base.metadata.insert("etag".to_string(), "etag-a".to_string());
+
+        let mut observed = base.clone();
+        observed.idx = 3;
+        observed.fresh = true;
+        observed.num_versions = 7;
+        observed.erasure.index = base.erasure.index.saturating_add(1);
+        observed.successor_mod_time = Some(OffsetDateTime::from_unix_timestamp(43).expect("timestamp should parse"));
+
+        assert!(
+            ReadRepairCommitFingerprint::from_file_info(&base) == ReadRepairCommitFingerprint::from_file_info(&observed),
+            "read-observation and disk-local fields must not make an unchanged object look stale"
+        );
+
+        let mut overwritten = base.clone();
+        overwritten.data_dir = Some(Uuid::parse_str("22222222-2222-2222-2222-222222222222").expect("data dir should parse"));
+        assert!(
+            ReadRepairCommitFingerprint::from_file_info(&base) != ReadRepairCommitFingerprint::from_file_info(&overwritten),
+            "a new committed data directory must abort the stale read-repair commit"
+        );
+
+        let mut metadata_changed = base.clone();
+        metadata_changed.metadata.insert("etag".to_string(), "etag-b".to_string());
+        assert!(
+            ReadRepairCommitFingerprint::from_file_info(&base) != ReadRepairCommitFingerprint::from_file_info(&metadata_changed),
+            "metadata changes must abort the stale read-repair commit"
+        );
+    }
 
     #[derive(Clone, Default)]
     struct CapturedLogs {
@@ -2187,6 +3633,26 @@ mod heal_result_report_tests {
         }
     }
 
+    async fn remove_current_object_part(temp_dir: &TempDir, bucket: &str, object: &str) -> std::io::Result<()> {
+        let object_dir = temp_dir.path().join(bucket).join(object);
+        let mut entries = tokio::fs::read_dir(&object_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let part = entry.path().join("part.1");
+            match tokio::fs::remove_file(&part).await {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no current part.1 found under {}", object_dir.display()),
+        ))
+    }
+
     #[test]
     fn heal_writer_error_summary_redacts_io_message() {
         let error = DiskError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "/sensitive/storage/path"));
@@ -2212,28 +3678,31 @@ mod heal_result_report_tests {
             }
 
             let mut reader = PutObjReader::from_vec(vec![0x5a; 1024 * 1024]);
-            set.put_object(&bucket, object, &mut reader, &ObjectOptions::default())
-                .await
-                .expect("source object should be written");
+            // This fixture reads and removes physical shards immediately after
+            // PUT. A lock-owning PUT may quorum-ack before its rename tail
+            // drains, so keep the setup on the full-fanout commit path.
+            set.put_object(
+                &bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source object should be written");
             let source = disks[2]
                 .read_version("", &bucket, object, "", &ReadOptions::default())
                 .await
                 .expect("source metadata should be readable");
-            let data_dir = source.data_dir.expect("non-inline source should have a data directory");
             let mut target_slots = [source.erasure.distribution[0] - 1, source.erasure.distribution[1] - 1];
             target_slots.sort_unstable();
 
             for index in [0, 1] {
-                tokio::fs::remove_file(
-                    temp_dirs[index]
-                        .path()
-                        .join(&bucket)
-                        .join(object)
-                        .join(data_dir.to_string())
-                        .join("part.1"),
-                )
-                .await
-                .expect("target shard should be removed before heal");
+                remove_current_object_part(&temp_dirs[index], &bucket, object)
+                    .await
+                    .expect("target shard should be removed before heal");
             }
 
             let failed_slots = &target_slots[..failed_target_count];
@@ -2394,6 +3863,20 @@ mod heal_result_report_tests {
             .expect("test metadata should be written");
     }
 
+    async fn dangling_inline_test_fixture(
+        bucket: &str,
+        object: &str,
+        mod_time: OffsetDateTime,
+    ) -> (Vec<TempDir>, Arc<SetDisks>, Vec<Option<DiskStore>>) {
+        let (temp_dirs, set, disks) = meta_regen_test_set(bucket, object, &[]).await;
+        let mut metadata = meta_regen_test_fileinfo(object, Uuid::nil(), mod_time.unix_timestamp(), 0);
+        metadata.data_dir = None;
+        metadata.set_inline_data();
+        metadata.data = Some(Bytes::from_static(b"stale-inline-shard"));
+        seed_meta_regen_test_metadata(&disks, 0, bucket, object, &metadata).await;
+        (temp_dirs, set, disks)
+    }
+
     async fn formatted_single_disk_no_parity_set() -> (TempDir, Arc<SetDisks>) {
         let format = FormatV3::new(1, 1);
         let dir = tempfile::tempdir().expect("tempdir should be created");
@@ -2475,9 +3958,20 @@ mod heal_result_report_tests {
 
             let payload = vec![0x5a; 1024 * 1024];
             let mut reader = PutObjReader::from_vec(payload);
-            set.put_object(&bucket, object, &mut reader, &ObjectOptions::default())
-                .await
-                .expect("source object should be written");
+            // This fixture removes physical shards immediately after PUT. A
+            // lock-owning PUT may quorum-ack before its rename tail drains, so
+            // keep the isolated setup on the full-fanout commit path.
+            set.put_object(
+                &bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source object should be written");
             let source = disks[2]
                 .read_version("", &bucket, object, "", &ReadOptions::default())
                 .await
@@ -2613,9 +4107,20 @@ mod heal_result_report_tests {
         }
 
         let mut reader = PutObjReader::from_vec(vec![0x5a; 1024 * 1024]);
-        set.put_object(bucket, object, &mut reader, &ObjectOptions::default())
-            .await
-            .expect("source object should be written");
+        // The target-evidence readback below asserts per-disk state right
+        // after PUT. A lock-owning PUT may quorum-ack before its rename tail
+        // drains, so keep the setup on the full-fanout commit path.
+        set.put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("source object should be written");
         let source = disks[2]
             .read_version("", bucket, object, "", &ReadOptions::default())
             .await
@@ -2623,10 +4128,22 @@ mod heal_result_report_tests {
         let data_dir = source.data_dir.expect("non-inline source should have a data directory");
         let targets = vec![set.set_endpoints[0].to_string(), set.set_endpoints[1].to_string()];
 
-        assert!(
-            set.replacement_targets_have_version(bucket, object, "", &targets)
+        for disk in disks.iter().take(targets.len()) {
+            let mut metadata = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
                 .await
-                .expect("healthy target shards should be readable")
+                .expect("target metadata should be readable");
+            metadata.version_id = None;
+            disk.write_metadata("", bucket, object, metadata)
+                .await
+                .expect("target metadata should be rewritten as a legacy null version");
+        }
+        let null_version = Uuid::nil().to_string();
+
+        assert!(
+            set.replacement_targets_have_version(bucket, object, &null_version, &targets)
+                .await
+                .expect("nil selector should confirm healthy legacy null-version target shards")
         );
 
         tokio::fs::remove_file(
@@ -2641,10 +4158,1063 @@ mod heal_result_report_tests {
         .expect("target shard should be removed after the initial commit");
 
         assert!(
-            !set.replacement_targets_have_version(bucket, object, "", &targets)
+            !set.replacement_targets_have_version(bucket, object, &null_version, &targets)
                 .await
                 .expect("missing target shard should be observable")
         );
+    }
+
+    #[tokio::test]
+    async fn deep_heal_rebuilds_missing_part_when_metadata_remains_current() {
+        let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "deep-heal-missing-part-current-meta";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let payload = vec![0x7b; 1024 * 1024];
+        let mut reader = PutObjReader::from_vec(payload);
+        set.put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("source object should be written before shard loss");
+        let source = disks[2]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("source metadata should be readable");
+        let data_dir = source.data_dir.expect("non-inline source should have a data directory");
+        let missing_part = temp_dirs[1]
+            .path()
+            .join(bucket)
+            .join(object)
+            .join(data_dir.to_string())
+            .join("part.1");
+        tokio::fs::remove_file(&missing_part)
+            .await
+            .expect("target shard should be removed while xl.meta remains current");
+
+        let (result, error) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("deep heal should finish after a single shard is removed");
+
+        assert!(error.is_none(), "deep heal should recover the missing shard: {error:?}");
+        assert_eq!(result.after.drives[1].state, DriveState::Ok.to_string());
+        assert!(
+            missing_part.exists(),
+            "deep heal must reconstruct the missing shard on the original disk slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn deep_heal_rebuilds_a_stale_current_delete_marker_metadata_replica() {
+        let (_temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "deep-heal-stale-current-marker";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("test bucket should be created");
+        }
+
+        let versioned = ObjectOptions {
+            no_lock: true,
+            versioned: true,
+            ..Default::default()
+        };
+        let original = set
+            .put_object(bucket, object, &mut PutObjReader::from_vec(vec![0x41; 1024]), &versioned)
+            .await
+            .expect("versioned source object should be written");
+        let stale_metadata = disks[0]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("pre-marker metadata should be readable");
+
+        let marker = set
+            .delete_object(bucket, object, versioned)
+            .await
+            .expect("versioned delete should create a current marker");
+        let marker_version = marker.version_id.expect("delete marker should have a version id");
+
+        // Simulate a member that was offline while the acknowledged marker was
+        // committed on the other members: its physical root still contains the
+        // pre-delete metadata and the original data version.
+        let mut stale_metadata = stale_metadata;
+        stale_metadata.fresh = true;
+        disks[0]
+            .write_metadata("", bucket, object, stale_metadata)
+            .await
+            .expect("stale member metadata should be restored for the fixture");
+        assert_eq!(
+            disks[0]
+                .read_version("", bucket, object, &marker_version.to_string(), &ReadOptions::default())
+                .await
+                .expect_err("stale member must not contain the current marker")
+                .to_string(),
+            "file version not found"
+        );
+
+        let (result, error) = set
+            .heal_object(
+                bucket,
+                object,
+                &marker_version.to_string(),
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("deep heal should report the stale marker result");
+
+        assert!(error.is_none(), "deep heal should repair stale marker metadata: {error:?}");
+        assert_eq!(result.drives_healed(), Some(1));
+        let repaired = disks[0]
+            .read_version("", bucket, object, &marker_version.to_string(), &ReadOptions::default())
+            .await
+            .expect("rejoined member should contain the marker");
+        assert!(repaired.deleted, "repaired metadata must remain a delete marker");
+        assert_eq!(repaired.version_id, Some(marker_version));
+        assert!(original.version_id.is_some(), "source object should have a version id");
+    }
+
+    #[tokio::test]
+    async fn deep_heal_rebuilds_near_tail_truncated_part() {
+        let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "deep-heal-near-tail-truncation";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let expected_payload = vec![0x6d; 1024 * 1024];
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(expected_payload.clone()),
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("source object should be written before shard truncation");
+        let source = disks[2]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("source metadata should be readable");
+        let data_dir = source.data_dir.expect("non-inline source should have a data directory");
+        let truncated_part = temp_dirs[1]
+            .path()
+            .join(bucket)
+            .join(object)
+            .join(data_dir.to_string())
+            .join("part.1");
+        let original_len = tokio::fs::metadata(&truncated_part)
+            .await
+            .expect("target shard should exist")
+            .len();
+        assert!(original_len > 1, "test shard must be large enough to truncate");
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&truncated_part)
+            .await
+            .expect("target shard should be writable");
+        file.set_len(original_len - 1)
+            .await
+            .expect("target shard should be truncated");
+
+        let mut reader = set
+            .get_object_reader(bucket, object, None, Default::default(), &ObjectOptions::default())
+            .await
+            .expect("GET should remain readable after a one-byte shard truncation");
+        let mut read_back = Vec::new();
+        tokio::io::copy(&mut reader, &mut read_back)
+            .await
+            .expect("GET should reconstruct the truncated shard through EC");
+        assert_eq!(read_back, expected_payload, "EC GET must preserve the object bytes");
+
+        let (result, error) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("deep heal should finish after a one-byte tail truncation");
+
+        assert!(error.is_none(), "deep heal should recover the truncated shard: {error:?}");
+        assert_eq!(result.drives_healed(), Some(1));
+        assert_eq!(result.before.drives[1].state, DriveState::Corrupt.to_string());
+        assert_eq!(
+            tokio::fs::metadata(&truncated_part)
+                .await
+                .expect("repaired shard should exist")
+                .len(),
+            original_len,
+            "deep heal must restore the complete shard length"
+        );
+    }
+
+    #[derive(Debug)]
+    struct FailedIntegrityReadTransport {
+        error: DiskError,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::cluster::rpc::internode_data_transport::InternodeDataTransport for FailedIntegrityReadTransport {
+        async fn open_read(
+            &self,
+            _request: crate::cluster::rpc::internode_data_transport::ReadStreamRequest,
+        ) -> crate::disk::error::Result<crate::disk::FileReader> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let error = match &self.error {
+                DiskError::FileCorrupt => DiskError::from(rustfs_rio::new_test_remote_file_corrupt_http_io_error()),
+                DiskError::FileNotFound => DiskError::from(rustfs_rio::new_test_remote_file_not_found_http_io_error()),
+                DiskError::VolumeNotFound => DiskError::from(rustfs_rio::new_test_remote_volume_not_found_http_io_error()),
+                error => error.clone(),
+            };
+            Err(error)
+        }
+
+        async fn open_write(
+            &self,
+            _request: crate::cluster::rpc::internode_data_transport::WriteStreamRequest,
+        ) -> crate::disk::error::Result<crate::disk::FileWriter> {
+            panic!("an integrity scan must not write remote data");
+        }
+
+        async fn open_walk_dir(
+            &self,
+            _request: crate::cluster::rpc::internode_data_transport::WalkDirStreamRequest,
+        ) -> crate::disk::error::Result<crate::disk::FileReader> {
+            panic!("an object integrity scan must not walk remote directories");
+        }
+
+        fn name(&self) -> &'static str {
+            "failed-integrity-read"
+        }
+
+        fn capabilities(&self) -> crate::cluster::rpc::internode_data_transport::InternodeDataTransportCapabilities {
+            crate::cluster::rpc::internode_data_transport::InternodeDataTransportCapabilities::tcp_http()
+        }
+    }
+
+    async fn assert_remote_integrity_read_failure(expected_error: DiskError) {
+        use crate::disk::{CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN};
+        use crate::object_api::ShardIntegrityWriteMode;
+
+        let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(4, 0, 2).await;
+        let bucket = "remote-integrity-read-failure";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create fixture bucket");
+        }
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(vec![0x6d; 1024 * 1024 + 123]),
+            &ObjectOptions {
+                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write protected external fixture");
+
+        let mut files = Vec::new();
+        let mut snapshots = Vec::new();
+        for (dir, disk) in dirs.iter().zip(&disks) {
+            let file = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("read fixture metadata");
+            assert!(file.data.is_none(), "the remote test must open an external shard");
+            let object_dir = dir.path().join(bucket).join(object);
+            let part_path = object_dir
+                .join(file.data_dir.expect("external shard directory").to_string())
+                .join("part.1");
+            for path in [part_path, object_dir.join("xl.meta")] {
+                let bytes = tokio::fs::read(&path).await.expect("snapshot fixture before scan");
+                snapshots.push((path, bytes));
+            }
+            files.push(file);
+        }
+        let transport = Arc::new(FailedIntegrityReadTransport {
+            error: expected_error.clone(),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let endpoint = Endpoint {
+            url: url::Url::parse("http://remote-integrity.invalid:9000/data/disk0").expect("fixture endpoint"),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let remote = crate::cluster::rpc::RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            transport.clone(),
+        )
+        .await
+        .expect("construct remote disk with failing data transport");
+        let mut verification_disks: Vec<_> = disks.iter().cloned().map(Some).collect();
+        verification_disks[0] = Some(Arc::new(crate::disk::Disk::Remote(Box::new(remote))));
+        let mut statuses = [(0, vec![CHECK_PART_UNKNOWN; disks.len()])].into_iter().collect();
+        let result = crate::io_support::shard_integrity::verify_deep_parts(
+            &files,
+            &verification_disks,
+            &files[0],
+            bucket,
+            object,
+            &mut statuses,
+        )
+        .await;
+        assert!(transport.reads.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        if matches!(expected_error, DiskError::FileCorrupt | DiskError::FileNotFound) {
+            result.expect("typed remote payload damage must identify a repairable shard");
+            let expected_status = if expected_error == DiskError::FileCorrupt {
+                CHECK_PART_FILE_CORRUPT
+            } else {
+                CHECK_PART_FILE_NOT_FOUND
+            };
+            assert_eq!(statuses[&0][0], expected_status);
+            assert!(statuses[&0][1..].iter().all(|status| *status == CHECK_PART_SUCCESS));
+            let (heal, metadata, reason) = super::should_heal_object_on_disk(&None, &[statuses[&0][0]], &files[0], &files[0]);
+            assert!(heal, "remote payload damage must schedule repair: {expected_error:?}");
+            assert!(!metadata);
+            let expected_reason = if expected_error == DiskError::FileCorrupt {
+                DiskError::FileCorrupt
+            } else {
+                DiskError::PartMissingOrCorrupt
+            };
+            assert_eq!(reason, Some(expected_reason));
+        } else {
+            let error = result.expect_err("unavailable payload storage must abort health verification");
+            if expected_error.is_internode_http_status(500) {
+                assert!(error.is_internode_http_status(500), "preserve the original transport error: {error:?}");
+            } else {
+                assert_eq!(error, expected_error, "preserve the original storage failure");
+            }
+            assert_eq!(statuses[&0][0], CHECK_PART_UNKNOWN, "failed verification cannot certify the shard");
+        }
+        for (path, before) in snapshots {
+            assert_eq!(tokio::fs::read(path).await.expect("read fixture after scan"), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_scan_remote_payload_damage_schedules_repair() {
+        for error in [DiskError::FileCorrupt, DiskError::FileNotFound] {
+            assert_remote_integrity_read_failure(error).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_scan_remote_storage_failure_cannot_certify_healthy() {
+        for error in [
+            DiskError::from(rustfs_rio::new_test_internode_http_io_error(
+                rustfs_rio::InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+            )),
+            DiskError::DiskNotFound,
+            DiskError::VolumeNotFound,
+            DiskError::FileAccessDenied,
+        ] {
+            assert_remote_integrity_read_failure(error).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deep_heal_legacy_verification_error_cannot_certify_healthy() {
+        use crate::object_api::ShardIntegrityWriteMode;
+
+        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "legacy-deep-scan-verification-error";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create legacy fixture bucket");
+        }
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(vec![0x6d; 1024 * 1024 + 123]),
+            &ObjectOptions {
+                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write external legacy fixture");
+
+        let mut files = Vec::new();
+        let mut part_paths = Vec::new();
+        let mut preserved = Vec::new();
+        for (index, (dir, disk)) in dirs.iter().zip(&disks).enumerate() {
+            let file = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("read legacy fixture metadata");
+            assert!(file.data.is_none(), "legacy verification must open the physical shard");
+            assert!(file.parts.iter().all(|part| part.integrity.is_none()));
+            let object_dir = dir.path().join(bucket).join(object);
+            let part = object_dir
+                .join(file.data_dir.expect("external legacy shard directory").to_string())
+                .join("part.1");
+            let metadata = object_dir.join("xl.meta");
+            let bytes = tokio::fs::read(&metadata).await.expect("snapshot legacy metadata");
+            preserved.push((metadata, bytes));
+            if index != 0 {
+                let bytes = tokio::fs::read(&part).await.expect("snapshot healthy legacy shard");
+                preserved.push((part.clone(), bytes));
+            }
+            part_paths.push(part);
+            files.push(file);
+        }
+        let broken_part = &part_paths[0];
+        tokio::fs::remove_file(broken_part)
+            .await
+            .expect("remove fixture shard before symlink fault");
+        std::os::unix::fs::symlink("part.1", broken_part).expect("create self-referential shard symlink");
+        let open_error = tokio::fs::File::open(broken_part)
+            .await
+            .expect_err("self-referential symlink must fail to open");
+        assert_eq!(open_error.raw_os_error(), Some(libc::ELOOP));
+
+        let verification_error = disks[0]
+            .verify_file(bucket, object, &files[0])
+            .await
+            .expect_err("legacy disk verifier must reject the symlink path");
+        assert_eq!(verification_error, DiskError::InvalidPath);
+        let error = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("an unverified legacy part must fail the complete heal operation");
+        assert_eq!(error, DiskError::InvalidPath, "complete heal must preserve the verifier's path error");
+        assert_eq!(
+            tokio::fs::read_link(broken_part)
+                .await
+                .expect("failed heal must preserve the symlink fault"),
+            std::path::Path::new("part.1")
+        );
+        for (path, before) in preserved {
+            assert_eq!(tokio::fs::read(path).await.expect("read unchanged legacy fixture"), before);
+        }
+    }
+
+    async fn assert_h2_truncated_shards(
+        mode: crate::object_api::ShardIntegrityWriteMode,
+        coding_indexes: &[usize],
+        retained_len: fn(usize, usize) -> usize,
+    ) {
+        use crate::object_api::ShardIntegrityWriteMode;
+
+        let (temp_dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(16, 0, 4).await;
+        let bucket = "deep-heal-h2-truncation";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create bucket volume");
+        }
+        let expected_payload: Vec<_> = (0..5 * 1024 * 1024 + 123)
+            .map(|index| u8::try_from((index / 4096 + index) % 251).expect("payload byte fits"))
+            .collect();
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(expected_payload.clone()),
+            &ObjectOptions {
+                shard_integrity_write_mode: Some(mode),
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("commit all source shards");
+
+        let mut files = Vec::new();
+        let mut paths = Vec::new();
+        let mut original_shards = Vec::new();
+        let mut original_metadata = Vec::new();
+        let mut damaged = Vec::new();
+        for (slot, disk) in disks.iter().enumerate() {
+            let source = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("read source metadata");
+            assert_eq!((source.erasure.data_blocks, source.erasure.parity_blocks), (12, 4));
+            assert_eq!(source.parts[0].integrity.is_some(), mode == ShardIntegrityWriteMode::Protected);
+            let directory = temp_dirs[slot].path().join(bucket).join(object);
+            let path = directory
+                .join(source.data_dir.expect("external shard data directory").to_string())
+                .join("part.1");
+            let original = tokio::fs::read(&path).await.expect("read original shard");
+            original_metadata.push(tokio::fs::read(directory.join("xl.meta")).await.expect("read xl.meta"));
+            if coding_indexes.contains(&source.erasure.index) {
+                let erasure = crate::erasure::coding::Erasure::try_new_with_options(
+                    12,
+                    4,
+                    source.erasure.block_size,
+                    source.uses_legacy_checksum,
+                )
+                .expect("valid erasure layout");
+                let stripe_size = erasure.shard_size() + source.erasure.get_checksum_info(1).algorithm.size();
+                let keep = retained_len(original.len(), stripe_size);
+                assert!(keep < original.len(), "fixture must truncate the shard");
+                tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .await
+                    .expect("open target shard")
+                    .set_len(u64::try_from(keep).expect("shard length fits"))
+                    .await
+                    .expect("truncate target shard");
+                damaged.push((slot, keep));
+            }
+            paths.push(path);
+            original_shards.push(original);
+            files.push(source);
+        }
+        assert_eq!(damaged.len(), coding_indexes.len());
+        if mode == ShardIntegrityWriteMode::Protected {
+            let mut statuses = [(0, vec![crate::disk::CHECK_PART_UNKNOWN; disks.len()])]
+                .into_iter()
+                .collect();
+            let online_disks: Vec<_> = disks.iter().cloned().map(Some).collect();
+            crate::io_support::shard_integrity::verify_deep_parts(
+                &files,
+                &online_disks,
+                &files[0],
+                bucket,
+                object,
+                &mut statuses,
+            )
+            .await
+            .expect("verify protected shards directly");
+            for (slot, status) in statuses[&0].iter().enumerate() {
+                let expected = if damaged.iter().any(|(index, _)| *index == slot) {
+                    crate::disk::CHECK_PART_FILE_CORRUPT
+                } else {
+                    crate::disk::CHECK_PART_SUCCESS
+                };
+                assert_eq!(*status, expected, "protected shard {slot}");
+            }
+        }
+
+        let opts = HealOpts {
+            no_lock: true,
+            scan_mode: HealScanMode::Deep,
+            ..Default::default()
+        };
+        let (dry_run, error) = set
+            .heal_object(bucket, object, "", &HealOpts { dry_run: true, ..opts })
+            .await
+            .expect("dry-run should report corruption");
+        assert!(error.is_none(), "dry-run error: {error:?}");
+        assert_eq!(dry_run.drives_healed(), Some(0));
+        for (slot, keep) in &damaged {
+            assert_eq!(dry_run.after.drives[*slot].state, DriveState::Corrupt.to_string());
+            assert_eq!(
+                tokio::fs::read(&paths[*slot]).await.expect("dry-run preserved shard"),
+                original_shards[*slot][..*keep]
+            );
+        }
+
+        let recoverable = damaged.len() <= 4;
+        if recoverable {
+            let mut reader = set
+                .get_object_reader(bucket, object, None, Default::default(), &ObjectOptions::default())
+                .await
+                .expect("degraded GET should remain readable");
+            let mut read_back = Vec::new();
+            tokio::io::copy(&mut reader, &mut read_back)
+                .await
+                .expect("read complete degraded GET");
+            assert_eq!(read_back, expected_payload);
+        }
+        let (result, error) = set
+            .heal_object(bucket, object, "", &opts)
+            .await
+            .expect("heal should report outcome");
+        if recoverable {
+            assert!(error.is_none(), "heal error: {error:?}");
+            assert_eq!(result.drives_healed(), Some(damaged.len()));
+            for (slot, _) in &damaged {
+                assert_eq!(result.before.drives[*slot].state, DriveState::Corrupt.to_string());
+            }
+        } else {
+            assert_eq!(error, Some(DiskError::ErasureReadQuorum));
+            assert_eq!(result.drives_healed(), Some(0));
+        }
+        for (slot, path) in paths.iter().enumerate() {
+            let expected = if !recoverable && let Some((_, keep)) = damaged.iter().find(|(index, _)| *index == slot) {
+                &original_shards[slot][..*keep]
+            } else {
+                original_shards[slot].as_slice()
+            };
+            assert_eq!(
+                tokio::fs::read(path).await.expect("read shard after heal"),
+                expected,
+                "physical shard {slot}"
+            );
+            if !recoverable {
+                let metadata_path = temp_dirs[slot].path().join(bucket).join(object).join("xl.meta");
+                assert_eq!(tokio::fs::read(metadata_path).await.expect("preserved metadata"), original_metadata[slot]);
+            }
+        }
+        if recoverable {
+            let mut reader = set
+                .get_object_reader(bucket, object, None, Default::default(), &ObjectOptions::default())
+                .await
+                .expect("GET after repair");
+            let mut read_back = Vec::new();
+            tokio::io::copy(&mut reader, &mut read_back)
+                .await
+                .expect("read repaired object");
+            assert_eq!(read_back, expected_payload);
+            let (healthy, error) = set.heal_object(bucket, object, "", &opts).await.expect("second deep scan");
+            assert!(error.is_none());
+            assert_eq!(healthy.drives_healed(), Some(0), "repair must converge");
+            assert_eq!(healthy.integrity_verified, mode == ShardIntegrityWriteMode::Protected);
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_heal_rebuilds_h2_near_tail_truncated_part() {
+        use crate::object_api::ShardIntegrityWriteMode::{Legacy, Protected};
+        for mode in [Legacy, Protected] {
+            for coding_index in [1, 13] {
+                assert_h2_truncated_shards(mode, &[coding_index], |length, _| length - 1).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_heal_rebuilds_h2_half_truncated_part() {
+        use crate::object_api::ShardIntegrityWriteMode::{Legacy, Protected};
+        for mode in [Legacy, Protected] {
+            for coding_index in [1, 13] {
+                assert_h2_truncated_shards(mode, &[coding_index], |length, _| length / 2).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_heal_rebuilds_h2_stripe_boundary_truncated_parts_at_read_quorum() {
+        use crate::object_api::ShardIntegrityWriteMode::{Legacy, Protected};
+        for mode in [Legacy, Protected] {
+            assert_h2_truncated_shards(mode, &[1, 2, 13, 16], |_, stripe| stripe).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_heal_rejects_h2_truncated_parts_below_read_quorum() {
+        use crate::object_api::ShardIntegrityWriteMode::{Legacy, Protected};
+        for mode in [Legacy, Protected] {
+            assert_h2_truncated_shards(mode, &[1, 2, 3, 13, 16], |length, _| length / 2).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_heal_inline_bitrot_rebuilds_physical_data_and_parity_shards() {
+        use crate::storage_api_contracts::range::HTTPRangeSpec;
+        use tokio::io::AsyncReadExt;
+
+        let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "deep-heal-inline-bitrot";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("test bucket should be created");
+        }
+        let payload: Vec<u8> = (0..4113)
+            .map(|index| u8::try_from(index % 251).expect("payload byte"))
+            .collect();
+        let read_options = ReadOptions {
+            read_data: true,
+            ..Default::default()
+        };
+        let object_options = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        for parity in [false, true] {
+            for corrupt_prefix in [false, true] {
+                let object = format!("parity-{parity}-prefix-{corrupt_prefix}.bin");
+                set.put_object(bucket, &object, &mut PutObjReader::from_vec(payload.clone()), &object_options)
+                    .await
+                    .expect("full-fanout PUT should persist every inline shard");
+
+                let mut target = None;
+                for (disk_index, disk) in disks.iter().enumerate() {
+                    let metadata = disk
+                        .read_version("", bucket, &object, "", &read_options)
+                        .await
+                        .expect("inline metadata should be readable");
+                    let target_shard = if parity { metadata.erasure.data_blocks + 1 } else { 1 };
+                    if metadata.erasure.index == target_shard {
+                        target = Some((disk_index, metadata));
+                        break;
+                    }
+                }
+                let (disk_index, original_meta) = target.expect("requested data/parity shard should exist");
+                let original_inline = original_meta.data.as_ref().expect("object should be inline");
+                let metadata_path = temp_dirs[disk_index]
+                    .path()
+                    .join(bucket)
+                    .join(&object)
+                    .join(STORAGE_FORMAT_FILE);
+                let mut damaged_raw = tokio::fs::read(&metadata_path).await.expect("physical xl.meta should exist");
+                let offsets: Vec<_> = damaged_raw
+                    .windows(original_inline.len())
+                    .enumerate()
+                    .filter_map(|(offset, bytes)| (bytes == original_inline.as_ref()).then_some(offset))
+                    .collect();
+                assert_eq!(offsets.len(), 1, "inline shard must have a unique physical byte range");
+                let bitflip_offset = if corrupt_prefix { 0 } else { original_inline.len() - 1 };
+                damaged_raw[offsets[0] + bitflip_offset] ^= 1;
+                tokio::fs::write(&metadata_path, &damaged_raw)
+                    .await
+                    .expect("only the encoded inline shard should be damaged");
+                let damaged_meta = disks[disk_index]
+                    .read_version("", bucket, &object, "", &read_options)
+                    .await
+                    .expect("payload corruption must leave metadata parseable");
+                assert!(damaged_meta.equals(&original_meta));
+                assert_eq!(damaged_meta.version_id, original_meta.version_id);
+                assert_eq!(damaged_meta.data_dir, original_meta.data_dir);
+                assert_ne!(damaged_meta.data, original_meta.data);
+
+                for scan_mode in [HealScanMode::Normal, HealScanMode::Deep] {
+                    let (result, error) = set
+                        .heal_object(
+                            bucket,
+                            &object,
+                            "",
+                            &HealOpts {
+                                no_lock: true,
+                                scan_mode,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("inline heal should complete");
+                    assert!(error.is_none(), "inline heal should remain recoverable: {error:?}");
+                    let deep = scan_mode == HealScanMode::Deep;
+                    assert_eq!(result.drives_healed(), Some(usize::from(deep)), "{object}: {scan_mode:?}");
+                    assert_eq!(result.after.drives[disk_index].state, DriveState::Ok.to_string());
+                    if deep {
+                        assert_eq!(result.before.drives[disk_index].state, DriveState::Corrupt.to_string());
+                        let repaired = disks[disk_index]
+                            .read_version("", bucket, &object, "", &read_options)
+                            .await
+                            .expect("repaired physical shard should be readable");
+                        assert_eq!(repaired.data, original_meta.data, "heal must restore the exact encoded shard");
+                        assert_eq!(repaired.version_id, original_meta.version_id);
+                        assert_eq!(repaired.data_dir, original_meta.data_dir);
+                    }
+
+                    for (range, expected) in [
+                        (None, payload.as_slice()),
+                        (
+                            Some(HTTPRangeSpec {
+                                start: 113,
+                                end: 1023,
+                                is_suffix_length: false,
+                            }),
+                            &payload[113..1024],
+                        ),
+                    ] {
+                        let mut reader = set
+                            .get_object_reader(bucket, &object, range, Default::default(), &object_options)
+                            .await
+                            .expect("redundant shards should serve full and range reads");
+                        let mut body = Vec::new();
+                        reader
+                            .stream
+                            .read_to_end(&mut body)
+                            .await
+                            .expect("GET should finish without truncation");
+                        assert_eq!(body, expected);
+                    }
+                    if !deep {
+                        assert_eq!(
+                            tokio::fs::read(&metadata_path)
+                                .await
+                                .expect("damaged shard should remain on disk"),
+                            damaged_raw,
+                            "successful GET and normal heal do not prove the damaged shard was repaired"
+                        );
+                    }
+                }
+
+                let (healthy, error) = set
+                    .heal_object(
+                        bucket,
+                        &object,
+                        "",
+                        &HealOpts {
+                            no_lock: true,
+                            scan_mode: HealScanMode::Deep,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("healthy inline object should pass a second deep scan");
+                assert!(error.is_none());
+                assert_eq!(healthy.drives_healed(), Some(0));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_heal_inline_bitrot_preserves_quorum_and_dry_run_boundaries() {
+        for corrupt_shards in [2, 3] {
+            let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+            let bucket = "deep-heal-inline-quorum";
+            let object = "object.bin";
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("test bucket should be created");
+            }
+            set.put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(vec![0x71; 4113]),
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("all inline shards should be committed");
+            let read_options = ReadOptions {
+                read_data: true,
+                ..Default::default()
+            };
+            let mut originals = Vec::new();
+            let mut damaged_files = Vec::new();
+            for disk_index in 0..corrupt_shards {
+                let metadata = disks[disk_index]
+                    .read_version("", bucket, object, "", &read_options)
+                    .await
+                    .expect("source shard should be readable");
+                let inline = metadata.data.expect("source shard should be inline");
+                let path = temp_dirs[disk_index]
+                    .path()
+                    .join(bucket)
+                    .join(object)
+                    .join(STORAGE_FORMAT_FILE);
+                let mut raw = tokio::fs::read(&path).await.expect("physical metadata should exist");
+                let offsets: Vec<_> = raw
+                    .windows(inline.len())
+                    .enumerate()
+                    .filter_map(|(offset, bytes)| (bytes == inline.as_ref()).then_some(offset))
+                    .collect();
+                assert_eq!(offsets.len(), 1, "shard byte range must be unique");
+                raw[offsets[0] + inline.len() - 1] ^= 1;
+                tokio::fs::write(&path, &raw).await.expect("inline shard should be damaged");
+                originals.push(inline);
+                damaged_files.push((path, raw));
+            }
+            let opts = HealOpts {
+                no_lock: true,
+                scan_mode: HealScanMode::Deep,
+                ..Default::default()
+            };
+            let (dry_run, error) = set
+                .heal_object(bucket, object, "", &HealOpts { dry_run: true, ..opts })
+                .await
+                .expect("dry-run should report inline corruption");
+            assert!(error.is_none());
+            assert_eq!(dry_run.drives_healed(), Some(0));
+            for (disk_index, (path, raw)) in damaged_files.iter().enumerate() {
+                assert_eq!(dry_run.after.drives[disk_index].state, DriveState::Corrupt.to_string());
+                assert_eq!(tokio::fs::read(path).await.expect("dry-run should preserve metadata"), *raw);
+            }
+
+            let (result, error) = set
+                .heal_object(bucket, object, "", &opts)
+                .await
+                .expect("heal should report its outcome");
+            if corrupt_shards == 2 {
+                assert!(error.is_none(), "exact read quorum should reconstruct: {error:?}");
+                assert_eq!(result.drives_healed(), Some(2));
+                for (disk_index, original) in originals.iter().enumerate() {
+                    let repaired = disks[disk_index]
+                        .read_version("", bucket, object, "", &read_options)
+                        .await
+                        .expect("reconstructed shard should be persisted");
+                    assert_eq!(repaired.data.as_ref(), Some(original));
+                }
+            } else {
+                assert_eq!(error, Some(DiskError::ErasureReadQuorum));
+                assert_eq!(result.drives_healed(), Some(0));
+                for (path, raw) in damaged_files {
+                    assert_eq!(
+                        tokio::fs::read(path)
+                            .await
+                            .expect("unrecoverable evidence must remain on disk"),
+                        raw
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_heal_inline_bitrot_rejects_unsupported_algorithms() {
+        use crate::set_disk::disks_with_all_parts;
+        use rustfs_filemeta::ChecksumInfo;
+        use rustfs_utils::HashAlgorithm;
+
+        let (_temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "deep-heal-inline-algorithm";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("test bucket should be created");
+        }
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(vec![0x71; 4113]),
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("inline fixture should be committed");
+        let mut metadata = Vec::new();
+        for disk in &disks {
+            metadata.push(
+                disk.read_version(
+                    "",
+                    bucket,
+                    object,
+                    "",
+                    &ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("inline metadata should decode"),
+            );
+        }
+        let latest = metadata[1].clone();
+        let mut online: Vec<_> = disks.into_iter().map(Some).collect();
+        for algorithm in [
+            HashAlgorithm::SHA256,
+            HashAlgorithm::HighwayHash256,
+            HashAlgorithm::BLAKE2b512,
+        ] {
+            metadata[0].erasure.checksums = vec![ChecksumInfo {
+                part_number: 1,
+                algorithm,
+                ..Default::default()
+            }];
+            for mode in [HealScanMode::Normal, HealScanMode::Deep] {
+                let result = disks_with_all_parts(
+                    &mut online,
+                    &mut metadata,
+                    &[None, None, None, None],
+                    &latest,
+                    false,
+                    bucket,
+                    object,
+                    mode,
+                )
+                .await;
+                if mode == HealScanMode::Deep {
+                    assert_eq!(
+                        result.expect_err("unverifiable inline data must not become healthy"),
+                        DiskError::BitrotHashAlgoInvalid
+                    );
+                } else {
+                    let (by_disk, _) = result.expect("normal scan should retain presence-only behavior");
+                    assert_eq!(by_disk[&0], vec![crate::disk::CHECK_PART_SUCCESS]);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_heal_inline_bitrot_accepts_persisted_empty_objects() {
+        let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "deep-heal-inline-empty";
+        let object = "empty.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("test bucket should be created");
+        }
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(Vec::new()),
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("empty object should be committed");
+        let mut originals = Vec::new();
+        for dir in &temp_dirs {
+            let path = dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+            originals.push((path.clone(), tokio::fs::read(path).await.expect("empty object metadata should exist")));
+        }
+        let (result, error) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("empty object should pass deep heal");
+        assert!(error.is_none());
+        assert_eq!(result.drives_healed(), Some(0));
+        for (path, raw) in originals {
+            assert_eq!(tokio::fs::read(path).await.expect("healthy metadata should remain on disk"), raw);
+        }
     }
 
     #[tokio::test]
@@ -2662,6 +5232,9 @@ mod heal_result_report_tests {
         .await
         .expect("versioned bucket should be created");
 
+        // The per-version target-evidence readback below asserts per-disk
+        // state right after PUT. A lock-owning PUT may quorum-ack before its
+        // rename tail drains, so keep the setup on the full-fanout commit path.
         let mut old_reader = PutObjReader::from_vec(vec![0x5a; 1024 * 1024]);
         let old_info = set
             .put_object(
@@ -2670,6 +5243,7 @@ mod heal_result_report_tests {
                 &mut old_reader,
                 &ObjectOptions {
                     versioned: true,
+                    no_lock: true,
                     ..Default::default()
                 },
             )
@@ -2687,6 +5261,7 @@ mod heal_result_report_tests {
                 &mut latest_reader,
                 &ObjectOptions {
                     versioned: true,
+                    no_lock: true,
                     ..Default::default()
                 },
             )
@@ -2773,6 +5348,366 @@ mod heal_result_report_tests {
             .await
             .expect_err("a rejected fallback must not format the missing slot");
         assert_eq!(unformatted, DiskError::UnformattedDisk);
+    }
+
+    #[derive(Clone, Copy)]
+    enum InventoryWriterHealCase {
+        Existing,
+        Missing,
+        MissingVersion,
+    }
+
+    async fn assert_heal_object_inventory_writer(case: InventoryWriterHealCase) {
+        use crate::set_disk::core::io_primitives::disk_call_counters;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let (_temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "heal-inventory-writer-bucket";
+        let object = match case {
+            InventoryWriterHealCase::Existing => "heal-inventory-writer-existing",
+            InventoryWriterHealCase::Missing => "heal-inventory-writer-missing",
+            InventoryWriterHealCase::MissingVersion => "heal-inventory-writer-missing-version",
+        };
+        set.make_bucket(
+            bucket,
+            &MakeBucketOptions {
+                versioning_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("heal fixture bucket should be created");
+        let body = vec![0x67; 64 * 1024];
+        let stored_version = Uuid::new_v4();
+        let stored_version_string = stored_version.to_string();
+        let published = if matches!(case, InventoryWriterHealCase::Missing) {
+            None
+        } else {
+            let mut reader = PutObjReader::from_vec(body.clone());
+            let info = set
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        no_lock: true,
+                        versioned: true,
+                        version_id: Some(stored_version_string.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("full-fanout PUT should seed the heal fixture");
+            for disk in &disks {
+                let metadata = disk
+                    .read_version("", bucket, object, &stored_version_string, &ReadOptions::default())
+                    .await
+                    .expect("the seeded version must be present on every disk");
+                assert_eq!(metadata.version_id, Some(stored_version));
+                assert_eq!(metadata.size, i64::try_from(body.len()).expect("fixture size should fit i64"));
+            }
+            Some(info)
+        };
+        let requested_version = match case {
+            InventoryWriterHealCase::Existing => stored_version_string.clone(),
+            InventoryWriterHealCase::Missing => String::new(),
+            InventoryWriterHealCase::MissingVersion => Uuid::new_v4().to_string(),
+        };
+        let opts = HealOpts {
+            no_lock: true,
+            ..Default::default()
+        };
+        let calls = disk_call_counters::observe(object);
+        let read_gate = set.disks.read().await;
+        // UFCS selects the trait's outer precheck, not the same-named inherent heal.
+        let heal = <SetDisks as crate::storage_api_contracts::heal::HealOperations>::heal_object(
+            set.as_ref(),
+            bucket,
+            object,
+            &requested_version,
+            &opts,
+        );
+        tokio::pin!(heal);
+        assert!(matches!(
+            futures::poll!(tokio::task::unconstrained(heal.as_mut())),
+            std::task::Poll::Pending
+        ));
+        // These tests use the current-thread runtime: full-wait metadata tasks
+        // have been spawned, but cannot run during the single unconstrained poll.
+        assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 0);
+        let writer = set.disks.write();
+        tokio::pin!(writer);
+        assert!(matches!(
+            futures::poll!(tokio::task::unconstrained(writer.as_mut())),
+            std::task::Poll::Pending
+        ));
+        assert!(set.disks.try_read().is_err(), "the writer must already block new inventory readers");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while calls.total(disk_call_counters::KIND_READ_VERSION) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the suspended trait heal must have started the real metadata fanout");
+        for disk_index in 0..4 {
+            assert_eq!(calls.for_disk(disk_call_counters::KIND_READ_VERSION, disk_index), 1);
+        }
+        drop(read_gate);
+
+        let (_, outcome) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(async { drop(writer.await) }, heal) })
+                .await
+                .expect("trait heal must not deadlock its nested inventory read with the queued writer");
+        let (result, error) = outcome.expect("heal should report the object's outcome");
+        match case {
+            InventoryWriterHealCase::Existing => assert!(error.is_none(), "existing object heal failed: {error:?}"),
+            InventoryWriterHealCase::Missing => assert!(matches!(error, Some(Error::FileNotFound))),
+            InventoryWriterHealCase::MissingVersion => assert!(matches!(error, Some(Error::FileVersionNotFound))),
+        }
+        assert_eq!(result.bucket, bucket);
+        assert_eq!(result.object, object);
+        assert_eq!(result.version_id, requested_version);
+        assert_eq!(result.disk_count, 4);
+        assert_eq!(result.before.drives.len(), 4);
+        assert_eq!(result.after.drives.len(), 4);
+        for disk_index in 0..4 {
+            let endpoint = set.set_endpoints[disk_index].to_string();
+            assert_eq!(result.before.drives[disk_index].endpoint, endpoint);
+            assert_eq!(result.after.drives[disk_index].endpoint, endpoint);
+        }
+        if let Some(published) = published {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut reader = set
+                    .get_object_reader(
+                        bucket,
+                        object,
+                        None,
+                        Default::default(),
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(stored_version_string),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("the stored version must remain readable after heal");
+                assert_eq!(reader.object_info.etag, published.etag);
+                assert_eq!(reader.object_info.version_id, Some(stored_version));
+                let mut observed_body = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut observed_body)
+                    .await
+                    .expect("stored body should stream");
+                assert_eq!(observed_body, body);
+            })
+            .await
+            .expect("GET must finish after the inventory writer and heal");
+        }
+    }
+
+    #[tokio::test]
+    async fn heal_object_inventory_writer_existing() {
+        assert_heal_object_inventory_writer(InventoryWriterHealCase::Existing).await;
+    }
+
+    #[tokio::test]
+    async fn heal_object_inventory_writer_missing() {
+        assert_heal_object_inventory_writer(InventoryWriterHealCase::Missing).await;
+    }
+
+    #[tokio::test]
+    async fn heal_object_inventory_writer_missing_version() {
+        assert_heal_object_inventory_writer(InventoryWriterHealCase::MissingVersion).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn heal_object_with_queued_disk_renewal() {
+        use crate::layout::endpoints::SetupType;
+        use crate::runtime::instance::InstanceContext;
+        use crate::set_disk::core::io_primitives::disk_call_counters;
+        use std::collections::HashMap;
+        use std::future::Future;
+        use std::task::Poll;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        // renew_disk still registers local disks on the ambient context. Match
+        // the default serial group used by its other setup/registry fixtures,
+        // and restore only this temporary endpoint, including on a failed join.
+        struct RenewDiskTestState {
+            ctx: Arc<InstanceContext>,
+            was_dist_erasure: bool,
+            map: Arc<RwLock<HashMap<String, Option<DiskStore>>>>,
+            endpoint: String,
+            previous_disk: Option<Option<DiskStore>>,
+        }
+
+        impl Drop for RenewDiskTestState {
+            fn drop(&mut self) {
+                let ctx = self.ctx.clone();
+                let was_dist_erasure = self.was_dist_erasure;
+                let map = self.map.clone();
+                let endpoint = self.endpoint.clone();
+                let previous_disk = self.previous_disk.take();
+                let handle = tokio::runtime::Handle::current();
+                std::thread::spawn(move || {
+                    handle.block_on(async move {
+                        let mut map = map.write().await;
+                        match previous_disk {
+                            Some(disk) => {
+                                map.insert(endpoint, disk);
+                            }
+                            None => {
+                                map.remove(&endpoint);
+                            }
+                        }
+                        drop(map);
+                        if was_dist_erasure {
+                            ctx.update_erasure_type(SetupType::DistErasure).await;
+                        }
+                    });
+                })
+                .join()
+                .expect("renew fixture state restoration should finish");
+            }
+        }
+
+        let (_temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let endpoint = set.set_endpoints[0].clone();
+        let ctx = crate::runtime::global::current_ctx();
+        let map = ctx.local_disk_map();
+        let restore = RenewDiskTestState {
+            ctx: ctx.clone(),
+            was_dist_erasure: ctx.is_dist_erasure().await,
+            map: map.clone(),
+            endpoint: endpoint.to_string(),
+            previous_disk: map.read().await.get(&endpoint.to_string()).cloned(),
+        };
+        // Only distributed erasure needs an override to avoid the ambient slot array.
+        if restore.was_dist_erasure {
+            ctx.update_erasure_type(SetupType::Erasure).await;
+        }
+
+        let bucket = "heal-disk-renewal-bucket";
+        let object = "heal-disk-renewal-object";
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("renew fixture bucket should be created");
+        let body = vec![0x73; 64 * 1024];
+        let mut reader = PutObjReader::from_vec(body.clone());
+        let published = set
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("full-fanout PUT should seed the renewal fixture");
+        for disk in &disks {
+            let metadata = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("the seeded object must be present on every disk");
+            assert_eq!(metadata.size, i64::try_from(body.len()).expect("fixture size should fit i64"));
+        }
+
+        let opts = HealOpts {
+            no_lock: true,
+            ..Default::default()
+        };
+        let calls = disk_call_counters::observe(object);
+        let read_gate = set.disks.read().await;
+        let heal = <SetDisks as crate::storage_api_contracts::heal::HealOperations>::heal_object(
+            set.as_ref(),
+            bucket,
+            object,
+            "",
+            &opts,
+        );
+        tokio::pin!(heal);
+        assert!(matches!(futures::poll!(tokio::task::unconstrained(heal.as_mut())), Poll::Pending));
+        assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 0);
+
+        let renew = set.renew_disk(&endpoint);
+        tokio::pin!(renew);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            futures::future::poll_fn(|cx| {
+                assert!(
+                    std::pin::pin!(tokio::task::unconstrained(renew.as_mut()))
+                        .poll(cx)
+                        .is_pending(),
+                    "renewal must reach its inventory write before returning"
+                );
+                if set.disks.try_read().is_err() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("real renewal must queue its topology writer behind the read gate");
+        let registered = map
+            .read()
+            .await
+            .get(&endpoint.to_string())
+            .cloned()
+            .flatten()
+            .expect("renewal must register the connected disk before its inventory write");
+        assert!(!Arc::ptr_eq(&registered, &disks[0]), "renewal must construct a new disk handle");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while calls.total(disk_call_counters::KIND_READ_VERSION) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the suspended trait heal must have started the real metadata fanout");
+        for disk_index in 0..4 {
+            assert_eq!(calls.for_disk(disk_call_counters::KIND_READ_VERSION, disk_index), 1);
+        }
+        drop(read_gate);
+
+        let (_, outcome) = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(renew, heal) })
+            .await
+            .expect("trait heal and real disk renewal must finish without a nested inventory read deadlock");
+        let (report, error) = outcome.expect("heal should report the existing object");
+        assert!(error.is_none(), "existing object heal failed after renewal: {error:?}");
+        assert_eq!(report.bucket, bucket);
+        assert_eq!(report.object, object);
+        assert_eq!(report.disk_count, 4);
+        let renewed = set.get_disks_internal().await[0]
+            .clone()
+            .expect("the renewed slot must remain online");
+        assert!(Arc::ptr_eq(&renewed, &registered), "the set must publish the newly connected handle");
+        assert_eq!(renewed.endpoint(), endpoint);
+        let format = load_format_erasure(&renewed, false)
+            .await
+            .expect("renewed disk format should remain readable");
+        assert_eq!(format.erasure.this, set.format.erasure.sets[0][0]);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut reader = set
+                .get_object_reader(bucket, object, None, Default::default(), &ObjectOptions::default())
+                .await
+                .expect("the object must remain readable after renewal and heal");
+            assert_eq!(reader.object_info.etag, published.etag);
+            let mut observed_body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut observed_body)
+                .await
+                .expect("stored body should stream");
+            assert_eq!(observed_body, body);
+        })
+        .await
+        .expect("GET must finish after renewal and heal");
     }
 
     // Regression for #955: an offline disk must contribute exactly one drive
@@ -2934,6 +5869,144 @@ mod heal_result_report_tests {
         );
     }
 
+    async fn write_metadata_less_data_dir(root: &std::path::Path, bucket: &str, object: &str, data_dir: Uuid) {
+        let data_dir_path = root.join(bucket).join(object).join(data_dir.to_string());
+        tokio::fs::create_dir_all(&data_dir_path)
+            .await
+            .expect("metadata-less data dir should be created");
+        tokio::fs::write(data_dir_path.join("part.1"), b"orphaned-shard")
+            .await
+            .expect("metadata-less part should be written");
+    }
+
+    #[tokio::test]
+    async fn heal_object_remove_reclaims_metadata_less_data_dirs() {
+        let bucket = "bucket-metadata-less-remove";
+        let object = "object.bin";
+        let mut temp_dirs = Vec::new();
+        let mut endpoints = Vec::new();
+        let mut disks = Vec::new();
+        let mut data_dirs = Vec::new();
+        for _ in 0..2 {
+            let (temp_dir, endpoint, disk) = real_disk().await;
+            disk.make_volume(bucket).await.expect("test bucket should be created");
+            let data_dir = Uuid::new_v4();
+            write_metadata_less_data_dir(temp_dir.path(), bucket, object, data_dir).await;
+            data_dirs.push(data_dir);
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+        let set = set_disks_with(disks, endpoints, 1).await;
+
+        let (result, err) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    remove: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("metadata-less remove should complete");
+
+        assert_eq!(err, Some(DiskError::FileNotFound));
+        assert!(
+            result.detail.contains("matched=2, removed=2"),
+            "heal result should report reclaimed metadata-less dirs: {}",
+            result.detail
+        );
+        for (temp_dir, data_dir) in temp_dirs.iter().zip(data_dirs.iter()) {
+            assert!(
+                !temp_dir.path().join(bucket).join(object).join(data_dir.to_string()).exists(),
+                "metadata-less data dir should be removed"
+            );
+        }
+
+        set.delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("metadata-less data-dir cleanup should unblock non-force bucket deletion");
+    }
+
+    #[tokio::test]
+    async fn heal_object_remove_dry_run_reports_metadata_less_data_dirs_without_deleting() {
+        let bucket = "bucket-metadata-less-dry-run";
+        let object = "object.bin";
+        let (temp_dir, endpoint, disk) = real_disk().await;
+        disk.make_volume(bucket).await.expect("test bucket should be created");
+        let data_dir = Uuid::new_v4();
+        write_metadata_less_data_dir(temp_dir.path(), bucket, object, data_dir).await;
+        let set = set_disks_with(vec![Some(disk)], vec![endpoint], 0).await;
+
+        let (result, err) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    dry_run: true,
+                    remove: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("metadata-less dry-run should complete");
+
+        assert_eq!(err, Some(DiskError::FileNotFound));
+        assert!(
+            result.detail.contains("matched=1, removed=0, dry_run=true"),
+            "dry-run should report a match without deletion: {}",
+            result.detail
+        );
+        assert!(
+            temp_dir.path().join(bucket).join(object).join(data_dir.to_string()).exists(),
+            "dry-run must preserve metadata-less data dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_object_remove_preserves_metadata_less_data_dir_with_precommit_marker() {
+        let bucket = "bucket-metadata-less-precommit";
+        let object = "object.bin";
+        let (temp_dir, endpoint, disk) = real_disk().await;
+        disk.make_volume(bucket).await.expect("test bucket should be created");
+        let data_dir = Uuid::new_v4();
+        write_metadata_less_data_dir(temp_dir.path(), bucket, object, data_dir).await;
+        let data_dir_path = temp_dir.path().join(bucket).join(object).join(data_dir.to_string());
+        tokio::fs::write(
+            data_dir_path.join(format!("{}{}", RESERVED_DELETE_DATA_DIR_MARKER_PREFIX, Uuid::new_v4())),
+            [],
+        )
+        .await
+        .expect("pre-commit reservation marker should be written");
+        let set = set_disks_with(vec![Some(disk)], vec![endpoint], 0).await;
+
+        let (result, err) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    remove: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("metadata-less precommit state should fail closed");
+
+        assert_eq!(err, Some(DiskError::FileNotFound));
+        assert!(
+            result.detail.is_empty(),
+            "pre-commit residue must not be classified as reclaimable metadata-less data"
+        );
+        assert!(data_dir_path.exists(), "pre-commit residue must be preserved");
+    }
+
     #[tokio::test]
     async fn dangling_delete_guard_preserves_conflicting_identities_without_writing_metadata() {
         let bucket = "bucket-delete-guard-conflict";
@@ -3066,6 +6139,217 @@ mod heal_result_report_tests {
             ),
             "the delete guard must not propagate metadata"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dangling_absence_proof_rejects_failed_stale_replica_and_accepts_retry() {
+        temp_env::async_with_vars([("RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS", Some("0"))], async {
+            let bucket = "dangling-absence-partial-delete";
+            let object = "history.txt";
+            let (_temp_dirs, set, disks) =
+                dangling_inline_test_fixture(bucket, object, OffsetDateTime::now_utc() - time::Duration::hours(2)).await;
+            let version = Uuid::new_v4();
+            let disk = disks[0].as_ref().expect("stale disk must be online");
+            let mut metadata = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("load stale inline metadata");
+            metadata.version_id = Some(version);
+            disk.write_metadata("", bucket, object, metadata)
+                .await
+                .expect("seed exact stale historical version");
+            let opts = HealOpts {
+                no_lock: true,
+                scan_mode: HealScanMode::Deep,
+                ..Default::default()
+            };
+            let failure = DanglingDeleteFailure::install(bucket, object, 0, DiskError::FaultyDisk);
+            let mut proof = None;
+            let (_, error) = set
+                .heal_object_with_absence(
+                    bucket,
+                    object,
+                    &version.to_string(),
+                    &opts,
+                    &mut proof,
+                    AbsenceProofRequest {
+                        retirement: None,
+                        allow_unversioned: false,
+                    },
+                )
+                .await
+                .expect("heal should return a per-object failure");
+            assert!(
+                error.is_some(),
+                "three absent slots meeting write quorum cannot hide the failed stale slot"
+            );
+            assert!(proof.is_none(), "partial cleanup must not produce an absence proof");
+            assert!(
+                disk.read_version("", bucket, object, &version.to_string(), &ReadOptions::default())
+                    .await
+                    .is_ok(),
+                "the failed historical version must remain for retry"
+            );
+            drop(failure);
+            let (result, error) = set
+                .heal_object_with_absence(
+                    bucket,
+                    object,
+                    &version.to_string(),
+                    &opts,
+                    &mut proof,
+                    AbsenceProofRequest {
+                        retirement: None,
+                        allow_unversioned: false,
+                    },
+                )
+                .await
+                .expect("retry should execute cleanup");
+            assert!(error.is_none(), "retry should complete: {error:?}");
+            let receipt = proof.take().expect("successful exact cleanup must produce proof");
+            assert!(receipt.removed);
+            assert_eq!((receipt.pool_index, receipt.set_index), (set.pool_index, set.set_index));
+            assert!(
+                result
+                    .after
+                    .drives
+                    .iter()
+                    .all(|drive| drive.state == DriveState::Missing.to_string())
+            );
+            let (_, _) = set
+                .heal_object_with_absence(
+                    bucket,
+                    object,
+                    &version.to_string(),
+                    &opts,
+                    &mut proof,
+                    AbsenceProofRequest {
+                        retirement: None,
+                        allow_unversioned: false,
+                    },
+                )
+                .await
+                .expect("already absent replay should execute");
+            assert!(!proof.expect("exact already-absent replay must remain provable").removed);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn heal_reports_success_after_dangling_inline_cleanup() {
+        temp_env::async_with_vars([("RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS", Some("0"))], async {
+            let bucket = "bucket-dangling-inline-cleanup";
+            let object = "stale.txt";
+            let (temp_dirs, set, _disks) =
+                dangling_inline_test_fixture(bucket, object, OffsetDateTime::now_utc() - time::Duration::hours(2)).await;
+
+            let (_, error) = set
+                .heal_object(
+                    bucket,
+                    object,
+                    "",
+                    &HealOpts {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("dangling cleanup should complete");
+
+            assert!(error.is_none(), "successful dangling cleanup must not be reported as FileNotFound");
+            assert!(
+                temp_dirs.iter().all(|dir| !dir.path().join(bucket).join(object).exists()),
+                "successful dangling cleanup must remove the stale object from every disk"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn heal_preserves_recent_dangling_inline_metadata_as_retryable() {
+        temp_env::async_with_vars([("RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS", Some("3600"))], async {
+            let bucket = "bucket-dangling-inline-grace";
+            let object = "recent.txt";
+            let (temp_dirs, set, _disks) = dangling_inline_test_fixture(bucket, object, OffsetDateTime::now_utc()).await;
+
+            let (_, error) = set
+                .heal_object(
+                    bucket,
+                    object,
+                    "",
+                    &HealOpts {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("grace-protected dangling metadata should return a typed heal result");
+
+            let error = error.expect("grace-protected dangling metadata should be reported as deferred");
+            assert!(
+                error.is_dangling_delete_grace(),
+                "grace-protected dangling metadata should keep a typed deferred-cleanup marker: {error}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("dangling object deletion deferred by heal grace window"),
+                "grace-protected dangling metadata should explain that cleanup was deferred: {message}"
+            );
+            assert!(
+                message.contains("retry_after_secs="),
+                "grace-protected dangling metadata should include retry timing: {message}"
+            );
+            assert!(
+                temp_dirs[0]
+                    .path()
+                    .join(bucket)
+                    .join(object)
+                    .join(STORAGE_FORMAT_FILE)
+                    .is_file(),
+                "grace-protected metadata must remain for a later heal pass"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dry_run_never_deletes_dangling_inline_metadata() {
+        temp_env::async_with_vars([("RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS", Some("0"))], async {
+            let bucket = "bucket-dangling-inline-dry-run";
+            let object = "stale.txt";
+            let (temp_dirs, set, _disks) =
+                dangling_inline_test_fixture(bucket, object, OffsetDateTime::now_utc() - time::Duration::hours(2)).await;
+
+            let (_, error) = set
+                .heal_object(
+                    bucket,
+                    object,
+                    "",
+                    &HealOpts {
+                        dry_run: true,
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("dry-run should report the dangling candidate without mutation");
+
+            assert_eq!(error, Some(DiskError::FileNotFound));
+            assert!(
+                temp_dirs[0]
+                    .path()
+                    .join(bucket)
+                    .join(object)
+                    .join(STORAGE_FORMAT_FILE)
+                    .is_file(),
+                "dry-run must preserve dangling metadata even when grace is disabled"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -3423,7 +6707,8 @@ mod heal_result_report_tests {
             )
             .await;
         assert!(
-            matches!(&resurrected, Err(Error::FileVersionNotFound) | Err(Error::ObjectNotFound(..))),
+            matches!(&resurrected, Err(Error::VersionNotFound(b, o, v))
+                if b == bucket && o == object && v == &first_version),
             "a racing heal must not resurrect the deleted version: {resurrected:?}"
         );
 
@@ -3442,78 +6727,1101 @@ mod heal_result_report_tests {
         assert_eq!(survivor.size, 1024 * 1024, "survivor size must be intact");
     }
 
-    // HS-12 (backlog#1874): unversioned overwrite commits race a Deep heal on
-    // the same object. The overwrite's post-commit tail deletes the replaced
-    // data dir without the ns lock (object.rs commit tail), which is exactly
-    // the intersection the audit flagged: the heal must tolerate the tail race
-    // (retryable outcome) and every committed overwrite must survive — the
-    // final current version is exactly the last payload written.
     #[tokio::test]
     #[serial_test::serial]
-    async fn heal_racing_unversioned_overwrites_preserves_the_last_commit() {
+    async fn read_repair_commit_aborts_when_object_changes_before_final_rename() {
         let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
-        let bucket = "heal-race-put-overwrite";
+        let bucket = "read-repair-stale-commit";
         let object = "object.bin";
         set.make_bucket(bucket, &MakeBucketOptions::default())
             .await
             .expect("bucket should be created");
 
-        const ROUNDS: usize = 8;
-        const PAYLOAD_SIZE: usize = 256 * 1024;
-        let mut last_etag = String::new();
-        for round in 0..ROUNDS {
-            // Give the heal something to rebuild on alternating rounds: remove a
-            // shard of the current data dir right before the race.
-            if round % 2 == 1 {
-                let current = disks[2]
-                    .read_version("", bucket, object, "", &ReadOptions::default())
-                    .await
-                    .expect("current metadata should be readable");
-                if let Some(data_dir) = current.data_dir {
-                    let shard = temp_dirs[3]
-                        .path()
-                        .join(bucket)
-                        .join(object)
-                        .join(data_dir.to_string())
-                        .join("part.1");
-                    if shard.exists() {
-                        tokio::fs::remove_file(&shard)
-                            .await
-                            .expect("shard damage should be injectable mid-race");
-                    }
-                }
-            }
-
-            let payload = vec![round as u8; PAYLOAD_SIZE];
-            let mut put_reader = PutObjReader::from_vec(payload);
-            let put_opts = ObjectOptions::default();
-            let heal_opts = HealOpts {
-                scan_mode: HealScanMode::Deep,
+        const PAYLOAD_SIZE: usize = 1024 * 1024;
+        let mut initial_reader = PutObjReader::from_vec(vec![0x11; PAYLOAD_SIZE]);
+        // This fixture reads and removes physical shards immediately after
+        // PUT. A lock-owning PUT may quorum-ack before its rename tail drains,
+        // so keep the setup on the full-fanout commit path.
+        set.put_object(
+            bucket,
+            object,
+            &mut initial_reader,
+            &ObjectOptions {
+                no_lock: true,
                 ..Default::default()
-            };
-            let (put_res, heal_res) = tokio::join!(
-                set.put_object(bucket, object, &mut put_reader, &put_opts),
-                set.heal_object(bucket, object, "", &heal_opts),
-            );
-            let put_info = put_res.expect("overwrite must succeed under lock serialization");
-            last_etag = put_info.etag.clone().unwrap_or_default();
-            // Heal outcome is unconstrained (may hit the tail race and report a
-            // retryable error); the invariant is checked on the end state.
-            drop(heal_res);
-        }
+            },
+        )
+        .await
+        .expect("initial object should be written");
+
+        let current = disks[2]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("current metadata should be readable");
+        let data_dir = current.data_dir.expect("non-inline object should have a data dir");
+        let missing_part = temp_dirs
+            .iter()
+            .map(|dir| dir.path().join(bucket).join(object).join(data_dir.to_string()).join("part.1"))
+            .find(|part| part.is_file())
+            .expect("part.1 should exist on at least one erasure disk");
+        tokio::fs::remove_file(missing_part)
+            .await
+            .expect("shard damage should force read-repair data work");
+
+        let (_pause, arrived, release) = ReadRepairPauseScope::install(bucket, object);
+        let heal_set = set.clone();
+        let heal_task = tokio::spawn(async move {
+            heal_set
+                .heal_object(
+                    bucket,
+                    object,
+                    "",
+                    &HealOpts {
+                        scan_mode: HealScanMode::Deep,
+                        read_repair: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived.notified())
+            .await
+            .expect("read-repair should reach the final commit fence");
+
+        let mut overwrite_reader = PutObjReader::from_vec(vec![0x22; PAYLOAD_SIZE]);
+        let overwrite = set
+            .put_object(bucket, object, &mut overwrite_reader, &ObjectOptions::default())
+            .await
+            .expect("overwrite should commit while read-repair waits before final fence");
+        release.notify_one();
+
+        let (_result, err) = tokio::time::timeout(std::time::Duration::from_secs(5), heal_task)
+            .await
+            .expect("read-repair should finish after release")
+            .expect("read-repair task should join")
+            .expect("stale read-repair should report a typed retryable error");
+        assert_eq!(err, Some(DiskError::Timeout));
 
         let final_info = set
             .get_object_info(bucket, object, &ObjectOptions::default())
             .await
-            .expect("object must remain readable after the race loop");
-        assert_eq!(
-            final_info.size, PAYLOAD_SIZE as i64,
-            "final current version must be the last committed overwrite"
+            .expect("object must remain readable after stale read-repair abort");
+        assert_eq!(final_info.etag, overwrite.etag);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn object_lock_diagnostics_distinguish_read_repair_from_queued_put() {
+        use crate::diagnostics::object_lock::tests::CapturedLockEvents;
+        use crate::object_api::WriteCompletion;
+        use crate::set_disk::ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};
+        use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+        use tokio::io::AsyncReadExt;
+        use tracing::{Instrument, instrument::WithSubscriber};
+
+        let capture = CapturedLockEvents::default();
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_LOCK_DIAG_ENABLE, Some("true")),
+                (rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1")),
+                // Keep the writer queued while allowing slow CI runs to finish the read repair.
+                (rustfs_config::ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS, Some("30000")),
+            ],
+            async {
+                let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+                let bucket = "read-repair-lock-diagnostics";
+                let object = "object.bin";
+                set.make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("create bucket");
+                let opts = ObjectOptions {
+                    versioned: true,
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                };
+                let size = 1024 * 1024;
+                let original = set
+                    .put_object(bucket, object, &mut PutObjReader::from_vec(vec![0x11; size]), &opts)
+                    .await
+                    .expect("seed historical version")
+                    .version_id
+                    .expect("historical version id");
+                let newest = set
+                    .put_object(bucket, object, &mut PutObjReader::from_vec(vec![0x22; size]), &opts)
+                    .await
+                    .expect("seed current version")
+                    .version_id
+                    .expect("current version id");
+                let metadata = disks[3]
+                    .read_version("", bucket, object, &original.to_string(), &ReadOptions::default())
+                    .await
+                    .expect("historical shard metadata");
+                let missing = dirs[3]
+                    .path()
+                    .join(bucket)
+                    .join(object)
+                    .join(metadata.data_dir.expect("non-inline data directory").to_string())
+                    .join("part.1");
+                tokio::fs::remove_file(&missing).await.expect("damage one historical shard");
+
+                let (_pause, arrived, release) =
+                    ReadRepairPauseScope::install_at(bucket, object, super::ReadRepairPausePhase::Data);
+                let heal_set = set.clone();
+                let heal = tokio::spawn(
+                    async move {
+                        heal_set
+                            .heal_object(
+                                bucket,
+                                object,
+                                &original.to_string(),
+                                &HealOpts {
+                                    read_repair: true,
+                                    scan_mode: HealScanMode::Deep,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                    }
+                    .instrument(tracing::info_span!("heal_task", task_id = "diagnostic-read-repair"))
+                    .with_current_subscriber(),
+                );
+                tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified())
+                    .await
+                    .expect("read-repair must own its shared data-phase lock");
+
+                // A second reader can enter before there is a queued writer.
+                let namespace = set.new_ns_lock(bucket, object).await.expect("reader namespace");
+                drop(
+                    namespace
+                        .get_read_lock(std::time::Duration::from_secs(1))
+                        .await
+                        .expect("shared reconstruction alone permits readers"),
+                );
+                let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeNamespace);
+                let put_set = set.clone();
+                let put = tokio::spawn(
+                    async move {
+                        put_set
+                            .put_object(bucket, object, &mut PutObjReader::from_vec(vec![0x33; size]), &opts)
+                            .await
+                    }
+                    .with_current_subscriber(),
+                );
+                barrier.wait_until_paused().await;
+                barrier.release_and_wait_until_namespace_pending().await;
+                assert!(!barrier.namespace_acquired(), "PUT must still be waiting behind read-repair");
+
+                let result = set
+                    .get_object_reader(
+                        bucket,
+                        object,
+                        None,
+                        http::HeaderMap::new(),
+                        &ObjectOptions {
+                            version_id: Some(original.to_string()),
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                assert!(
+                    matches!(result, Err(crate::error::StorageError::Lock(rustfs_lock::LockError::Timeout { .. }))),
+                    "a queued writer must block the later historical reader"
+                );
+                assert!(!barrier.namespace_acquired(), "GET can time out before PUT owns the lock");
+                let rows = capture.rows();
+                let shared = rows
+                    .iter()
+                    .find(|row| row["fields"]["op"] == "read_repair_data" && row["fields"]["state"] == "acquired")
+                    .expect("read-repair shared holder event");
+                assert_eq!(shared["fields"]["requested_version_id"], original.to_string());
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|row| row["fields"]["lock_attempt_id"] == shared["fields"]["lock_attempt_id"]
+                            && row["fields"]["state"] == "guard_dropped")
+                );
+                assert!(
+                    rows.iter()
+                        .any(|row| row["fields"]["mode"] == "read" && row["fields"]["failure"] == "timeout"),
+                    "failed reader acquisition must be retained"
+                );
+
+                release.notify_one();
+                let added = put
+                    .await
+                    .expect("PUT task")
+                    .expect("queued PUT commits")
+                    .version_id
+                    .expect("added version id");
+                let (_, error) = heal.await.expect("read-repair task").expect("read-repair operation");
+                assert!(
+                    error.is_none(),
+                    "unchanged historical version should heal after the writer completes: {error:?}"
+                );
+                assert!(tokio::fs::try_exists(&missing).await.expect("repaired shard path"));
+                for (version, value) in [(original, 0x11), (newest, 0x22), (added, 0x33)] {
+                    let mut reader = set
+                        .get_object_reader(
+                            bucket,
+                            object,
+                            None,
+                            http::HeaderMap::new(),
+                            &ObjectOptions {
+                                version_id: Some(version.to_string()),
+                                versioned: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("read each acknowledged version");
+                    assert_eq!(reader.object_info.version_id, Some(version));
+                    let mut body = Vec::new();
+                    reader.stream.read_to_end(&mut body).await.expect("complete version body");
+                    assert_eq!(body, vec![value; size]);
+                }
+            }
+            .with_subscriber(capture.subscriber()),
+        )
+        .await;
+    }
+
+    // HS-12 (backlog#1874): unversioned overwrite commits race a Deep heal on
+    // the same object. The overwrite's post-commit tail deletes the replaced
+    // data dir without the ns lock (object.rs commit tail), which is exactly
+    // the intersection the audit flagged: the heal must tolerate the tail race
+    // (retryable outcome) and every committed overwrite must survive — the
+    // final current version is exactly the last payload written. Also cover the
+    // read-repair path, which reconstructs under a shared data-phase lock and
+    // revalidates before the final rename.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn heal_racing_unversioned_overwrites_preserves_the_last_commit() {
+        for read_repair in [false, true] {
+            let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+            let bucket = if read_repair {
+                "read-repair-race-put-overwrite"
+            } else {
+                "heal-race-put-overwrite"
+            };
+            let object = "object.bin";
+            set.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+
+            const ROUNDS: usize = 8;
+            const PAYLOAD_SIZE: usize = 256 * 1024;
+            let mut last_etag = String::new();
+            for round in 0..ROUNDS {
+                // Give the heal something to rebuild on alternating rounds: remove a
+                // shard of the current data dir right before the race.
+                if round % 2 == 1 {
+                    // The previous round's lock-owning PUT may still be
+                    // draining its rename tail on this disk; shard damage is
+                    // best-effort here, so skip injection when it lags.
+                    if let Ok(current) = disks[2].read_version("", bucket, object, "", &ReadOptions::default()).await
+                        && let Some(data_dir) = current.data_dir
+                    {
+                        let shard = temp_dirs[3]
+                            .path()
+                            .join(bucket)
+                            .join(object)
+                            .join(data_dir.to_string())
+                            .join("part.1");
+                        if shard.exists() {
+                            tokio::fs::remove_file(&shard)
+                                .await
+                                .expect("shard damage should be injectable mid-race");
+                        }
+                    }
+                }
+
+                let payload = vec![round as u8; PAYLOAD_SIZE];
+                let mut put_reader = PutObjReader::from_vec(payload);
+                let put_opts = ObjectOptions::default();
+                let heal_opts = HealOpts {
+                    scan_mode: HealScanMode::Deep,
+                    read_repair,
+                    ..Default::default()
+                };
+                let (put_res, heal_res) = tokio::join!(
+                    set.put_object(bucket, object, &mut put_reader, &put_opts),
+                    set.heal_object(bucket, object, "", &heal_opts),
+                );
+                let put_info = put_res.expect("overwrite must succeed under lock serialization");
+                last_etag = put_info.etag.clone().unwrap_or_default();
+                // Heal outcome is unconstrained (may hit the tail race and report a
+                // retryable error); the invariant is checked on the end state.
+                drop(heal_res);
+            }
+
+            let final_info = set
+                .get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("object must remain readable after the race loop");
+            assert_eq!(
+                final_info.size, PAYLOAD_SIZE as i64,
+                "final current version must be the last committed overwrite"
+            );
+            assert_eq!(
+                final_info.etag.unwrap_or_default(),
+                last_etag,
+                "the racing heal loop must never leave a stale or resurrected current version"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod shard_integrity_rollout_tests;
+
+#[cfg(test)]
+mod shard_identity_tests {
+    use crate::disk::{DiskAPI as _, ReadOptions};
+    use crate::object_api::{ObjectOptions, PutObjReader};
+    use crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity_isolated;
+    use crate::storage_api_contracts::multipart::MultipartOperations as _;
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use crate::storage_api_contracts::range::HTTPRangeSpec;
+    use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn shard_integrity_heal_rejects_complete_donor_shards_ec12_4() {
+        let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(16, 0, 4).await;
+        let bucket = "donor-shard-identity";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create fixture bucket");
+        }
+        let expected = vec![0x5a; 5 * 1024 * 1024 + 123];
+        let donor_body = vec![0xa6; expected.len()];
+        let options = ObjectOptions {
+            shard_integrity_write_mode: Some(crate::object_api::ShardIntegrityWriteMode::Protected),
+            no_lock: true,
+            versioned: true,
+            ..Default::default()
+        };
+        for (case, (coding_indexes, replace_descriptor)) in [
+            (vec![1], false),
+            (vec![6], false),
+            (vec![12], false),
+            (vec![13], false),
+            (vec![16], false),
+            (vec![1, 2, 3, 4], false),
+            (vec![1, 2, 3, 4, 5], false),
+            (vec![1], true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let target = format!("target-{case}");
+            let donor = format!("donor-{case}");
+            set.put_object(bucket, &target, &mut PutObjReader::from_vec(expected.clone()), &options)
+                .await
+                .expect("commit every target shard");
+            set.put_object(bucket, &donor, &mut PutObjReader::from_vec(donor_body.clone()), &options)
+                .await
+                .expect("commit every donor shard");
+            let mut target_meta = Vec::new();
+            let mut donor_meta = Vec::new();
+            for disk in &disks {
+                target_meta.push(
+                    disk.read_version("", bucket, &target, "", &ReadOptions::default())
+                        .await
+                        .expect("target metadata"),
+                );
+                donor_meta.push(
+                    disk.read_version("", bucket, &donor, "", &ReadOptions::default())
+                        .await
+                        .expect("donor metadata"),
+                );
+            }
+            assert_eq!((target_meta[0].erasure.data_blocks, target_meta[0].erasure.parity_blocks), (12, 4));
+            let mut before = Vec::new();
+            let mut paths = Vec::new();
+            let mut meta_before = Vec::new();
+            for (slot, meta) in target_meta.iter().enumerate() {
+                let object_path = dirs[slot].path().join(bucket).join(&target);
+                let path = object_path
+                    .join(meta.data_dir.expect("external data dir").to_string())
+                    .join("part.1");
+                before.push(tokio::fs::read(&path).await.expect("original shard"));
+                meta_before.push(tokio::fs::read(object_path.join("xl.meta")).await.expect("original xl.meta"));
+                paths.push(path);
+            }
+            for index in &coding_indexes {
+                let target_slot = target_meta
+                    .iter()
+                    .position(|m| m.erasure.index == *index)
+                    .expect("target coding index");
+                let donor_slot = donor_meta
+                    .iter()
+                    .position(|m| m.erasure.index == *index)
+                    .expect("donor coding index");
+                let path = dirs[donor_slot]
+                    .path()
+                    .join(bucket)
+                    .join(&donor)
+                    .join(donor_meta[donor_slot].data_dir.expect("donor data dir").to_string())
+                    .join("part.1");
+                let replacement = tokio::fs::read(path).await.expect("complete valid donor");
+                assert_eq!(
+                    replacement.len(),
+                    before[target_slot].len(),
+                    "the adversarial file must have the same physical length"
+                );
+                assert_ne!(replacement, before[target_slot]);
+                tokio::fs::write(&paths[target_slot], replacement)
+                    .await
+                    .expect("replace the complete shard without changing metadata");
+                if replace_descriptor {
+                    let mut altered = target_meta[target_slot].clone();
+                    let suffix = rustfs_filemeta::shard_integrity::SUFFIX_SHARD_INTEGRITY;
+                    let descriptor = rustfs_utils::http::get_consistent_str(&donor_meta[donor_slot].metadata, suffix)
+                        .expect("donor descriptor");
+                    rustfs_utils::http::insert_str(&mut altered.metadata, suffix, descriptor.to_owned());
+                    disks[target_slot]
+                        .write_metadata("", bucket, &target, altered)
+                        .await
+                        .expect("a minority descriptor must not authorize its own donor payload");
+                }
+            }
+            let version = target_meta[0].version_id.expect("versioned fixture").to_string();
+            if coding_indexes.len() <= 4 {
+                let mut reader = set
+                    .get_object_reader(bucket, &target, None, Default::default(), &options)
+                    .await
+                    .expect("recoverable GET before explicit heal");
+                let mut body = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut body)
+                    .await
+                    .expect("verify and reconstruct every GET block");
+                assert_eq!(body, expected, "GET must not expose donor data before explicit heal");
+            }
+            let heal = set
+                .heal_object(
+                    bucket,
+                    &target,
+                    &version,
+                    &HealOpts {
+                        no_lock: true,
+                        scan_mode: HealScanMode::Deep,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if coding_indexes.len() <= 4 {
+                let (result, error) = heal.expect("recoverable donor mismatch");
+                assert!(error.is_none(), "{error:?}");
+                assert_eq!(
+                    result.drives_healed(),
+                    Some(coding_indexes.len()),
+                    "every complete donor must be detected"
+                );
+                for (slot, path) in paths.iter().enumerate() {
+                    assert_eq!(
+                        tokio::fs::read(path).await.expect("post-heal shard"),
+                        before[slot],
+                        "reconstruct exact original bytes at slot {slot}"
+                    );
+                }
+                for (range, expected_range) in [
+                    (None, expected.as_slice()),
+                    (
+                        Some(HTTPRangeSpec {
+                            start: 1024 * 1024 + 17,
+                            end: 2 * 1024 * 1024 + 99,
+                            is_suffix_length: false,
+                        }),
+                        &expected[1024 * 1024 + 17..2 * 1024 * 1024 + 100],
+                    ),
+                ] {
+                    let mut reader = set
+                        .get_object_reader(
+                            bucket,
+                            &target,
+                            range,
+                            Default::default(),
+                            &ObjectOptions {
+                                version_id: Some(version.clone()),
+                                ..options.clone()
+                            },
+                        )
+                        .await
+                        .expect("read repaired version");
+                    let mut body = Vec::new();
+                    reader
+                        .stream
+                        .read_to_end(&mut body)
+                        .await
+                        .expect("complete verified GET body");
+                    assert_eq!(body, expected_range, "full and range GET must match original bytes");
+                }
+            } else {
+                assert!(
+                    heal.as_ref().map_or(true, |(_, error)| error.is_some()),
+                    "eleven authoritative sources must not produce a successful heal"
+                );
+                let read = set
+                    .get_object_reader(bucket, &target, None, Default::default(), &options)
+                    .await;
+                if let Ok(mut reader) = read {
+                    let mut body = Vec::new();
+                    assert!(reader.stream.read_to_end(&mut body).await.is_err(), "quorum-minus-one must fail the body");
+                    assert!(body.is_empty(), "unverified first-stripe bytes must not escape");
+                }
+                for (slot, meta) in target_meta.iter().enumerate() {
+                    if !coding_indexes.contains(&meta.erasure.index) {
+                        assert_eq!(tokio::fs::read(&paths[slot]).await.expect("retained correct shard"), before[slot]);
+                    }
+                    assert_eq!(
+                        tokio::fs::read(dirs[slot].path().join(bucket).join(&target).join("xl.meta"))
+                            .await
+                            .expect("retained metadata"),
+                        meta_before[slot]
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shard_integrity_inline_donor_repair_and_late_external_get() {
+        let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(4, 0, 2).await;
+        let bucket = "bound-inline-and-late";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("fixture bucket");
+        }
+        let options = ObjectOptions {
+            shard_integrity_write_mode: Some(crate::object_api::ShardIntegrityWriteMode::Protected),
+            no_lock: true,
+            ..Default::default()
+        };
+        let read_options = ReadOptions {
+            read_data: true,
+            ..Default::default()
+        };
+        for (size, late) in [(4113usize, false), (3 * 1024 * 1024 + 123, true)] {
+            let target = format!("target-{size}");
+            let donor = format!("donor-{size}");
+            let expected = vec![0x4d; size];
+            set.put_object(bucket, &target, &mut PutObjReader::from_vec(expected.clone()), &options)
+                .await
+                .expect("target PUT");
+            set.put_object(bucket, &donor, &mut PutObjReader::from_vec(vec![0x9a; size]), &options)
+                .await
+                .expect("donor PUT");
+            let mut target_parts = Vec::new();
+            let mut donor_parts = Vec::new();
+            for disk in &disks {
+                target_parts.push(
+                    disk.read_version("", bucket, &target, "", &read_options)
+                        .await
+                        .expect("target meta"),
+                );
+                donor_parts.push(
+                    disk.read_version("", bucket, &donor, "", &read_options)
+                        .await
+                        .expect("donor meta"),
+                );
+            }
+            let slot = target_parts
+                .iter()
+                .position(|fi| fi.erasure.index == 1)
+                .expect("target data slot");
+            let donor_slot = donor_parts
+                .iter()
+                .position(|fi| fi.erasure.index == 1)
+                .expect("donor data slot");
+            if !late {
+                let original = target_parts[slot].data.clone().expect("inline target");
+                let donor_bytes = donor_parts[donor_slot].data.as_ref().expect("inline donor");
+                assert_eq!(donor_bytes.len(), original.len());
+                let path = dirs[slot].path().join(bucket).join(&target).join("xl.meta");
+                let mut raw = tokio::fs::read(&path).await.expect("physical inline metadata");
+                let offsets: Vec<_> = raw
+                    .windows(original.len())
+                    .enumerate()
+                    .filter_map(|(offset, bytes)| (bytes == original.as_ref()).then_some(offset))
+                    .collect();
+                assert_eq!(offsets.len(), 1, "unique inline payload range");
+                raw[offsets[0]..offsets[0] + original.len()].copy_from_slice(donor_bytes);
+                tokio::fs::write(path, raw)
+                    .await
+                    .expect("replace inline bytes with target identity retained");
+                let (result, error) = set
+                    .heal_object(
+                        bucket,
+                        &target,
+                        "",
+                        &HealOpts {
+                            no_lock: true,
+                            scan_mode: HealScanMode::Deep,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("inline heal");
+                assert!(error.is_none(), "{error:?}");
+                assert_eq!(result.drives_healed(), Some(1));
+                let repaired = disks[slot]
+                    .read_version("", bucket, &target, "", &read_options)
+                    .await
+                    .expect("repaired inline");
+                assert_eq!(repaired.data, Some(original));
+            } else {
+                let target_path = dirs[slot]
+                    .path()
+                    .join(bucket)
+                    .join(&target)
+                    .join(target_parts[slot].data_dir.expect("target dir").to_string())
+                    .join("part.1");
+                let donor_path = dirs[donor_slot]
+                    .path()
+                    .join(bucket)
+                    .join(&donor)
+                    .join(donor_parts[donor_slot].data_dir.expect("donor dir").to_string())
+                    .join("part.1");
+                let mut bytes = tokio::fs::read(&target_path).await.expect("target bytes");
+                let donor_bytes = tokio::fs::read(donor_path).await.expect("donor bytes");
+                let frame = 32 + target_parts[slot].erasure.shard_size();
+                bytes[frame..2 * frame].copy_from_slice(&donor_bytes[frame..2 * frame]);
+                tokio::fs::write(target_path, bytes)
+                    .await
+                    .expect("replace a later complete frame");
+            }
+            let mut reader = set
+                .get_object_reader(bucket, &target, None, Default::default(), &options)
+                .await
+                .expect("GET after corruption");
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("late corruption must reconstruct without leaking donor bytes");
+            assert_eq!(body, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn shard_integrity_legacy_requires_target_digest_not_only_parity_consistency() {
+        let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(4, 0, 2).await;
+        let bucket = "legacy-shard-authority";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("fixture bucket");
+        }
+        let options = ObjectOptions {
+            shard_integrity_write_mode: Some(crate::object_api::ShardIntegrityWriteMode::Protected),
+            no_lock: true,
+            ..Default::default()
+        };
+        let expected = vec![0x4d; 1024 * 1024 + 123];
+        let mut parts = Vec::new();
+        let mut paths = Vec::new();
+        for (object, body) in [("target", expected.clone()), ("donor", vec![0x9a; expected.len()])] {
+            set.put_object(bucket, object, &mut PutObjReader::from_vec(body), &options)
+                .await
+                .expect("seed legacy fixture");
+            let mut object_parts = Vec::new();
+            let mut object_paths = Vec::new();
+            for (slot, disk) in disks.iter().enumerate() {
+                let mut fi = disk
+                    .read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .expect("source meta");
+                let path = dirs[slot]
+                    .path()
+                    .join(bucket)
+                    .join(object)
+                    .join(fi.data_dir.expect("data dir").to_string())
+                    .join("part.1");
+                let encoded = tokio::fs::read(&path).await.expect("encoded source");
+                let mut legacy = Vec::with_capacity(encoded.len());
+                for frame in encoded.chunks(32 + fi.erasure.shard_size()) {
+                    let payload = &frame[32..];
+                    legacy.extend_from_slice(rustfs_utils::HashAlgorithm::HighwayHash256S.hash_encode(payload).as_ref());
+                    legacy.extend_from_slice(payload);
+                }
+                rustfs_filemeta::shard_integrity::clear_integrity_metadata(&mut fi.metadata);
+                for part in &mut fi.parts {
+                    part.integrity = None;
+                }
+                tokio::fs::write(&path, legacy).await.expect("legacy framing");
+                disk.write_metadata("", bucket, object, fi.clone())
+                    .await
+                    .expect("legacy metadata");
+                object_parts.push(fi);
+                object_paths.push(path);
+            }
+            parts.push(object_parts);
+            paths.push(object_paths);
+        }
+        let mut reader = set
+            .get_object_reader(bucket, "target", None, Default::default(), &options)
+            .await
+            .expect("healthy legacy object remains readable");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("legacy body");
+        assert_eq!(body, expected);
+        for (slot, fi) in parts[0].iter().enumerate() {
+            let source = parts[1]
+                .iter()
+                .position(|donor| donor.erasure.index == fi.erasure.index)
+                .expect("coding index");
+            tokio::fs::copy(&paths[1][source], &paths[0][slot])
+                .await
+                .expect("install a complete parity-consistent foreign codeword");
+        }
+        // Compatibility keeps legacy GET semantics. A complete foreign codeword
+        // remains an explicit residual risk until a trusted source rewrites it.
+        let mut legacy = set
+            .get_object_reader(bucket, "target", None, Default::default(), &options)
+            .await
+            .expect("legacy GET remains available");
+        let mut foreign = Vec::new();
+        legacy
+            .stream
+            .read_to_end(&mut foreign)
+            .await
+            .expect("legacy donor is internally consistent");
+        assert_ne!(foreign, expected);
+        for scan_mode in [HealScanMode::Normal, HealScanMode::Deep] {
+            let heal = set
+                .heal_object(
+                    bucket,
+                    "target",
+                    "",
+                    &HealOpts {
+                        no_lock: true,
+                        scan_mode,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            let (result, error) = heal.expect("legacy scan");
+            assert!(error.is_none(), "legacy scan remains observable");
+            assert!(!result.integrity_verified, "a foreign codeword must not be certified");
+            assert_eq!(result.drives_healed(), Some(0), "legacy scan must not rewrite data");
+        }
+    }
+
+    #[tokio::test]
+    async fn shard_integrity_multipart_replacement_and_metadata_copy_preserve_identity() {
+        use crate::set_disk::{CompletePart, RUSTFS_META_MULTIPART_BUCKET, SetDisks};
+        use rustfs_filemeta::ObjectPartInfo;
+
+        let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(4, 0, 2).await;
+        let bucket = "bound-multipart-copy";
+        let object = "target";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("fixture bucket");
+        }
+        let options = ObjectOptions {
+            shard_integrity_write_mode: Some(crate::object_api::ShardIntegrityWriteMode::Protected),
+            no_lock: true,
+            versioned: true,
+            ..Default::default()
+        };
+        let upload = set.new_multipart_upload(bucket, object, &options).await.expect("new upload");
+        let (upload_meta, _) = set
+            .check_upload_id_exists(bucket, object, &upload.upload_id, false)
+            .await
+            .expect("upload metadata");
+        let upload_path = SetDisks::get_multipart_upload_dir(bucket, object, &upload.upload_id, false);
+        let part_path = dirs[0]
+            .path()
+            .join(RUSTFS_META_MULTIPART_BUCKET)
+            .join(upload_path)
+            .join(upload_meta.data_dir.expect("staging directory").to_string())
+            .join("part.2");
+        let first = vec![0x36; 5 * 1024 * 1024];
+        let second = vec![0x69; 1024 * 1024 + 123];
+        let p1 = set
+            .put_object_part(bucket, object, &upload.upload_id, 1, &mut PutObjReader::from_vec(first.clone()), &options)
+            .await
+            .expect("first part");
+        set.put_object_part(
+            bucket,
+            object,
+            &upload.upload_id,
+            2,
+            &mut PutObjReader::from_vec(vec![0xa5; second.len()]),
+            &options,
+        )
+        .await
+        .expect("original second part");
+        let old_frame = tokio::fs::read(&part_path).await.expect("old part shard");
+        let old_meta: ObjectPartInfo = rmp_serde::from_slice(
+            &tokio::fs::read(part_path.with_extension("2.meta"))
+                .await
+                .expect("old part descriptor"),
+        )
+        .expect("decode old part descriptor");
+        let p2 = set
+            .put_object_part(
+                bucket,
+                object,
+                &upload.upload_id,
+                2,
+                &mut PutObjReader::from_vec(second.clone()),
+                &options,
+            )
+            .await
+            .expect("replace second part");
+        let mut completed = set
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![
+                    CompletePart {
+                        part_num: p1.part_num,
+                        etag: p1.etag,
+                        ..Default::default()
+                    },
+                    CompletePart {
+                        part_num: p2.part_num,
+                        etag: p2.etag,
+                        ..Default::default()
+                    },
+                ],
+                &options,
+            )
+            .await
+            .expect("complete replacement");
+        let original = disks[0]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("completed descriptor");
+        assert_ne!(
+            original.parts[1].integrity.as_ref().map(|proof| proof.generation),
+            old_meta.integrity.as_ref().map(|proof| proof.generation)
         );
-        assert_eq!(
-            final_info.etag.unwrap_or_default(),
-            last_etag,
-            "the racing heal loop must never leave a stale or resurrected current version"
+        assert_ne!(
+            original.parts[0].integrity.as_ref().map(|proof| proof.generation),
+            original.parts[1].integrity.as_ref().map(|proof| proof.generation)
         );
+        let final_path = dirs[0]
+            .path()
+            .join(bucket)
+            .join(object)
+            .join(original.data_dir.expect("completed directory").to_string())
+            .join("part.2");
+        assert_eq!(old_frame.len(), tokio::fs::metadata(&final_path).await.unwrap().len() as usize);
+        tokio::fs::write(final_path, old_frame)
+            .await
+            .expect("replay replaced part shard");
+        let (result, error) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("heal replayed part");
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(result.drives_healed(), Some(1));
+
+        // REPLACE may omit every internal field; metadata-only COPY must keep
+        // the existing payload domain even when it creates another version.
+        completed.metadata_only = true;
+        completed.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+            "x-amz-meta-label".to_string(),
+            "replacement".to_string(),
+        )]));
+        set.copy_object(bucket, object, bucket, object, &mut completed, &options, &options)
+            .await
+            .expect("metadata replacement copy");
+        let copied = disks[0]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("copied descriptor");
+        for part in [1, 2] {
+            assert_eq!(copied.parts[part - 1].integrity, original.parts[part - 1].integrity);
+        }
+        let expected = [first, second].concat();
+        for version in [None, original.version_id.map(|id| id.to_string())] {
+            for range in [
+                None,
+                Some(HTTPRangeSpec {
+                    start: 5 * 1024 * 1024 - 17,
+                    end: 5 * 1024 * 1024 + 99,
+                    is_suffix_length: false,
+                }),
+            ] {
+                let expected_bytes = if range.is_some() {
+                    &expected[5 * 1024 * 1024 - 17..5 * 1024 * 1024 + 100]
+                } else {
+                    &expected[..]
+                };
+                let mut reader = set
+                    .get_object_reader(
+                        bucket,
+                        object,
+                        range,
+                        Default::default(),
+                        &ObjectOptions {
+                            version_id: version.clone(),
+                            ..options.clone()
+                        },
+                    )
+                    .await
+                    .expect("multipart GET");
+                let mut actual = Vec::new();
+                reader.stream.read_to_end(&mut actual).await.expect("verified multipart body");
+                assert_eq!(actual, expected_bytes);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn shard_integrity_index_repair_preserves_payload_and_metadata() {
+        let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(4, 0, 2).await;
+        let bucket = "integrity-index-repair";
+        let object = "target";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket");
+        }
+        let expected = vec![0x6a; 2 * 1024 * 1024 + 123];
+        let opts = ObjectOptions {
+            shard_integrity_write_mode: Some(crate::object_api::ShardIntegrityWriteMode::Protected),
+            no_lock: true,
+            ..Default::default()
+        };
+        set.put_object(bucket, object, &mut PutObjReader::from_vec(expected.clone()), &opts)
+            .await
+            .expect("PUT");
+        let mut snapshots = Vec::new();
+        for (dir, disk) in dirs.iter().zip(&disks) {
+            let info = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("metadata");
+            let root = dir.path().join(bucket).join(object);
+            let data = root.join(info.data_dir.expect("data dir").to_string());
+            let proof = data.join(info.parts[0].integrity.as_ref().expect("commitment").file_name());
+            snapshots.push((
+                data.join("part.1"),
+                tokio::fs::read(data.join("part.1")).await.expect("payload"),
+                root.join("xl.meta"),
+                tokio::fs::read(root.join("xl.meta")).await.expect("xl.meta"),
+                proof.clone(),
+                tokio::fs::read(proof).await.expect("index"),
+            ));
+        }
+        tokio::fs::remove_file(&snapshots[0].4).await.expect("missing index");
+        let mut bad = snapshots[1].5.clone();
+        bad[70] ^= 1;
+        tokio::fs::write(&snapshots[1].4, bad).await.expect("corrupt index");
+        let mut reader = set
+            .get_object_reader(bucket, object, None, Default::default(), &opts)
+            .await
+            .expect("GET with proof fallback");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("verified fallback body");
+        assert_eq!(body, expected);
+        let (healed, error) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("index repair");
+        assert!(error.is_none(), "{error:?}");
+        assert!(healed.integrity_verified);
+        for ((path, payload, meta_path, meta, proof_path, proof), (disk, dir)) in snapshots.iter().zip(disks.iter().zip(&dirs)) {
+            assert_eq!(tokio::fs::read(path).await.expect("payload"), *payload);
+            assert_eq!(tokio::fs::read(meta_path).await.expect("metadata"), *meta);
+            assert_eq!(tokio::fs::read(proof_path).await.expect("restored proof"), *proof);
+            let relative = proof_path.strip_prefix(dir.path().join(bucket)).expect("relative proof path");
+            disk.delete(bucket, relative.to_str().expect("proof path"), crate::disk::DeleteOptions::default())
+                .await
+                .expect("lose all independent proofs");
+        }
+        // All missing proofs cannot be recreated by trusting the surviving
+        // payload's self-contained bitrot checksum.
+        if let Ok(mut reader) = set.get_object_reader(bucket, object, None, Default::default(), &opts).await {
+            let mut body = Vec::new();
+            assert!(reader.stream.read_to_end(&mut body).await.is_err());
+        }
+        if let Ok((result, error)) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            assert!(error.is_some() || !result.integrity_verified);
+        }
+        for (path, payload, meta_path, meta, proof_path, _) in snapshots {
+            assert_eq!(tokio::fs::read(path).await.expect("retained payload"), payload);
+            assert_eq!(tokio::fs::read(meta_path).await.expect("retained metadata"), meta);
+            assert!(!proof_path.exists(), "no proof minted from unverified payload");
+        }
+    }
+    #[tokio::test]
+    async fn shard_integrity_empty_and_no_parity_objects_remain_usable() {
+        for parity in [0, 2] {
+            let (_dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(4, 0, parity).await;
+            let bucket = "integrity-empty-no-parity";
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("bucket");
+            }
+            for size in [0, 1, 1024 * 1024 + 123] {
+                let object = format!("target-{size}");
+                let expected = vec![0x51; size];
+                let opts = ObjectOptions {
+                    shard_integrity_write_mode: Some(crate::object_api::ShardIntegrityWriteMode::Protected),
+                    no_lock: true,
+                    ..Default::default()
+                };
+                set.put_object(bucket, &object, &mut PutObjReader::from_vec(expected.clone()), &opts)
+                    .await
+                    .expect("PUT");
+                let mut reader = set
+                    .get_object_reader(bucket, &object, None, Default::default(), &opts)
+                    .await
+                    .expect("GET");
+                let mut body = Vec::new();
+                reader.stream.read_to_end(&mut body).await.expect("body");
+                assert_eq!(body, expected);
+                let (result, error) = set
+                    .heal_object(
+                        bucket,
+                        &object,
+                        "",
+                        &HealOpts {
+                            no_lock: true,
+                            scan_mode: HealScanMode::Deep,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("Deep scan");
+                assert!(error.is_none(), "{parity} {size}: {error:?}");
+                assert!(result.integrity_verified);
+            }
+        }
     }
 }

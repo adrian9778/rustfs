@@ -20,10 +20,10 @@
 //! module produces, so any divergence is a protocol break rather than a
 //! local behaviour change.
 
-use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_NO_PAD};
-use p256::ecdsa::signature::Signer as _;
+use base64_simd::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_NO_PAD};
+use p256::ecdsa::signature::{Signer as _, Verifier as _};
 use p256::ecdsa::{Signature, SigningKey};
+use p256::elliptic_curve::Generate as _;
 use p256::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _, LineEnding};
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
@@ -111,7 +111,7 @@ impl RegistrationTranscript {
         }
 
         let expiry = expires_unix.to_string();
-        let csr_digest = BASE64_URL_NO_PAD.encode(Sha256::digest(certificate_request));
+        let csr_digest = BASE64_URL_NO_PAD.encode_to_string(Sha256::digest(certificate_request));
 
         let fields: [(&'static str, &str); FIELD_COUNT] = [
             ("registrationTokenUid", registration_token_uid),
@@ -188,10 +188,8 @@ impl std::fmt::Debug for DeviceIdentity {
 impl DeviceIdentity {
     /// Generate a fresh P-256 key.
     pub fn generate() -> Self {
-        // p256 is pinned to rand_core 0.6 while the workspace `rand` is 0.10, so
-        // the RNG comes from p256's own re-export rather than the workspace one.
         Self {
-            signing_key: SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng),
+            signing_key: SigningKey::generate(),
         }
     }
 
@@ -222,8 +220,10 @@ impl DeviceIdentity {
     /// Build the PKCS#10 certificate request Connect consumes.
     ///
     /// Connect reads the request for its SubjectPublicKeyInfo and its
-    /// self-signature and for nothing else: it assigns the device uid itself,
-    /// so the subject and SAN carried here name nothing Connect will honour.
+    /// self-signature. The generated profile deliberately has no subject
+    /// alternative name, so the stock CA authorization path cannot
+    /// reinterpret an untyped name as a different ASN.1 GeneralName. Connect
+    /// assigns the issued subject and device URI itself.
     pub fn certificate_request_der(&self) -> Result<Vec<u8>, IdentityError> {
         let pkcs8 = self.to_pkcs8_der()?;
         let key_pair =
@@ -239,7 +239,7 @@ impl DeviceIdentity {
 
     /// Standard padded base64 of the certificate request, as the body carries it.
     pub fn certificate_request_base64(&self) -> Result<String, IdentityError> {
-        Ok(BASE64_STANDARD.encode(self.certificate_request_der()?))
+        Ok(BASE64_STANDARD.encode_to_string(self.certificate_request_der()?))
     }
 
     /// Sign a transcript, producing the low-S fixed-width proof.
@@ -249,12 +249,30 @@ impl DeviceIdentity {
     /// half of the group order before encoding.
     pub fn sign_registration(&self, transcript: &RegistrationTranscript) -> RegistrationProof {
         let signature: Signature = self.signing_key.sign(transcript.as_bytes());
-        let canonical = signature.normalize_s().unwrap_or(signature);
+        let canonical = signature.normalize_s();
 
         RegistrationProof {
             algorithm: PROOF_ALGORITHM.to_string(),
-            value: BASE64_URL_NO_PAD.encode(canonical.to_bytes()),
+            value: BASE64_URL_NO_PAD.encode_to_string(canonical.to_bytes()),
         }
+    }
+
+    pub(crate) fn sign_pending_registration_state(&self, state: &[u8]) -> String {
+        let signature: Signature = self.signing_key.sign(state);
+        BASE64_URL_NO_PAD.encode_to_string(signature.normalize_s().to_bytes())
+    }
+
+    pub(crate) fn verifies_pending_registration_state(&self, state: &[u8], proof: &str) -> bool {
+        let Ok(octets) = BASE64_URL_NO_PAD.decode_to_vec(proof) else {
+            return false;
+        };
+        if BASE64_URL_NO_PAD.encode_to_string(&octets) != proof {
+            return false;
+        }
+        let Ok(signature) = Signature::from_slice(&octets) else {
+            return false;
+        };
+        signature.normalize_s() == signature && self.signing_key.verifying_key().verify(state, &signature).is_ok()
     }
 
     /// The device public key, DER SubjectPublicKeyInfo.

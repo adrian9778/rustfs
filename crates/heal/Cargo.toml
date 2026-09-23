@@ -31,6 +31,7 @@ workspace = true
 
 [features]
 default = []
+test-util = []
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",
@@ -74,8 +75,12 @@ hotpath.workspace = true
 rustfs-config = { workspace = true }
 rustfs-concurrency = { workspace = true }
 rustfs-ecstore = { workspace = true }
+rustfs-lock = { workspace = true }
+rustfs-io-metrics = { workspace = true }
+rustfs-rio = { workspace = true }
 rustfs-storage-api = { workspace = true }
 rustfs-common = { workspace = true }
+rustfs-heal-contracts = { workspace = true }
 rustfs-madmin = { workspace = true }
 rustfs-utils = { workspace = true }
 tokio = { workspace = true, features = ["sync", "io-util", "time", "macros", "fs", "rt-multi-thread"] }
@@ -88,12 +93,13 @@ uuid = { workspace = true, features = ["v4", "serde", "fast-rng", "macro-diagnos
 async-trait = { workspace = true }
 futures = { workspace = true }
 metrics = { workspace = true }
-base64 = { workspace = true }
+base64-simd = { workspace = true }
 bytes = { workspace = true }
 crc-fast = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+rustfs-filemeta = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 rustfs-test-utils = { workspace = true }
 serial_test = { workspace = true }
@@ -102,6 +108,7 @@ walkdir = { workspace = true }
 http = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
 tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }
+chrono = { workspace = true }
 
 [lib]
 doctest = false

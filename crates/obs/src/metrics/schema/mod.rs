@@ -28,6 +28,7 @@ pub mod ilm;
 pub mod node_bucket;
 pub mod node_disk;
 pub mod notification_target;
+pub mod on_demand_migration;
 pub mod process_resource;
 pub mod replication;
 pub(crate) mod request;
@@ -39,6 +40,7 @@ pub mod system_memory;
 pub mod system_network;
 pub mod system_network_host;
 pub mod system_process;
+pub mod tier;
 
 pub use entry::descriptor::MetricDescriptor;
 pub use entry::metric_name::MetricName;

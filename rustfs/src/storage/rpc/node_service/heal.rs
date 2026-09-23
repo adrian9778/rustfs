@@ -16,8 +16,8 @@ use crate::module_switches::{heal_enabled_from_env, scanner_enabled_from_env};
 use crate::storage::storage_api::runtime_sources_consumer::EndpointServerPools;
 use jiff::Timestamp;
 use rmp_serde::Deserializer;
-use rustfs_common::heal_channel::HealScanMode;
 use rustfs_heal::HealOperationsSnapshot;
+use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_scanner::scanner::BackgroundHealInfo;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -61,6 +61,36 @@ fn jiff_to_chrono_datetime(timestamp: Timestamp) -> chrono::DateTime<chrono::Utc
 pub(crate) struct HealControlCoordinator {
     pub grid_host: String,
     pub is_local: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum HealSelectorError {
+    #[error("heal start requires both pool and set")]
+    Incomplete,
+    #[error("heal pool index {pool} is out of range")]
+    InvalidPool { pool: usize },
+    #[error("heal set index {set} is out of range for pool {pool}")]
+    InvalidSet { pool: usize, set: usize },
+}
+
+/// Validate configured positions independently of disk health: an offline set
+/// remains a valid target for repair.
+pub(crate) fn validate_heal_selector(
+    endpoints: &EndpointServerPools,
+    pool: Option<usize>,
+    set: Option<usize>,
+) -> Result<(), HealSelectorError> {
+    match (pool, set) {
+        (None, None) => Ok(()),
+        (Some(pool), Some(set)) => {
+            let selected_pool = endpoints.as_ref().get(pool).ok_or(HealSelectorError::InvalidPool { pool })?;
+            if set >= selected_pool.set_count {
+                return Err(HealSelectorError::InvalidSet { pool, set });
+            }
+            Ok(())
+        }
+        _ => Err(HealSelectorError::Incomplete),
+    }
 }
 
 pub(crate) fn heal_control_coordinator(endpoint_pools: &EndpointServerPools) -> Result<HealControlCoordinator, String> {
@@ -469,10 +499,10 @@ pub(crate) fn decode_node_replacement_recovery_status(data: &[u8]) -> Result<Nod
 #[cfg(test)]
 mod tests {
     use super::{
-        NODE_HEAL_STATUS_MAX_SIZE, NODE_HEAL_STATUS_PREVIOUS_VERSION, NODE_HEAL_STATUS_VERSION, NodeHealProgress,
-        NodeHealStatusSnapshot, NodeReplacementRecoveryStatusSnapshot, decode_node_heal_status,
+        HealSelectorError, NODE_HEAL_STATUS_MAX_SIZE, NODE_HEAL_STATUS_PREVIOUS_VERSION, NODE_HEAL_STATUS_VERSION,
+        NodeHealProgress, NodeHealStatusSnapshot, NodeReplacementRecoveryStatusSnapshot, decode_node_heal_status,
         decode_node_replacement_recovery_status, encode_node_heal_status, encode_node_replacement_recovery_status,
-        heal_control_coordinator, heal_topology_fingerprint,
+        heal_control_coordinator, heal_topology_fingerprint, validate_heal_selector,
     };
     use crate::storage::storage_api::{
         Endpoint,
@@ -504,6 +534,41 @@ mod tests {
             cmd_line: String::new(),
             platform: String::new(),
         }])
+    }
+
+    #[test]
+    fn heal_selector_uses_selected_pool_bounds_without_disk_health() {
+        let mut endpoints = topology_endpoints("node-d");
+        let mut second_pool = endpoints.as_ref()[0].clone();
+        second_pool.set_count = 1;
+        second_pool.endpoints.as_mut().truncate(2);
+        for endpoint in second_pool.endpoints.as_mut() {
+            endpoint.set_pool_index(1);
+        }
+        endpoints.as_mut().push(second_pool);
+        // These configured positions have no attached live disks. Validation
+        // must not probe their availability before accepting a repair target.
+        for (pool, set) in [(None, None), (Some(0), Some(0)), (Some(0), Some(1)), (Some(1), Some(0))] {
+            validate_heal_selector(&endpoints, pool, set).expect("configured selector should remain valid without disks");
+        }
+        for (pool, set, expected) in [
+            (Some(0), None, HealSelectorError::Incomplete),
+            (None, Some(0), HealSelectorError::Incomplete),
+            (Some(2), Some(0), HealSelectorError::InvalidPool { pool: 2 }),
+            (Some(usize::MAX), Some(0), HealSelectorError::InvalidPool { pool: usize::MAX }),
+            (Some(0), Some(2), HealSelectorError::InvalidSet { pool: 0, set: 2 }),
+            (Some(1), Some(1), HealSelectorError::InvalidSet { pool: 1, set: 1 }),
+            (
+                Some(0),
+                Some(usize::MAX),
+                HealSelectorError::InvalidSet {
+                    pool: 0,
+                    set: usize::MAX,
+                },
+            ),
+        ] {
+            assert_eq!(validate_heal_selector(&endpoints, pool, set), Err(expected));
+        }
     }
 
     #[test]
@@ -726,6 +791,7 @@ mod tests {
         assert_eq!(decoded.info().bitrot_start_cycle, 9);
         assert_eq!(decoded.operations.queue_length, 2);
         assert_eq!(decoded.operations.queued_by_source.mrf, 0);
+        assert_eq!(decoded.operations.admission, rustfs_heal::HealAdmissionTelemetry::default());
         let progress = decoded.progress.expect("legacy progress should decode");
         assert_eq!(progress.objects_scanned, 7);
         assert!(!progress.baseline_known);
@@ -770,7 +836,7 @@ mod tests {
             BackgroundHealInfo {
                 bitrot_start_time: Some(started_at),
                 bitrot_start_cycle: 9,
-                current_scan_mode: rustfs_common::heal_channel::HealScanMode::Deep,
+                current_scan_mode: rustfs_heal_contracts::heal_channel::HealScanMode::Deep,
             },
             HealOperationsSnapshot::default(),
             None,

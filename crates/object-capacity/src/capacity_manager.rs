@@ -14,25 +14,27 @@
 
 //! Hybrid Capacity Manager for efficient capacity statistics
 
-use super::scan::refresh_capacity_with_scope;
+use super::scan::{ScheduledCapacityRefresh, refresh_capacity_with_scope, select_scheduled_capacity_refresh};
 use super::types::CapacityDiskRef;
 use crate::capacity_scope::{CapacityScope, CapacityScopeDisk, drain_global_dirty_scopes, take_capacity_scope};
 use futures::FutureExt;
 use rustfs_config::{
     DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_MAX_TIMEOUT_SECS,
-    DEFAULT_CAPACITY_METRICS_INTERVAL_SECS, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, DEFAULT_FAST_UPDATE_THRESHOLD_SECS,
-    DEFAULT_MAX_FILES_THRESHOLD, DEFAULT_SAMPLE_RATE, DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS, DEFAULT_STAT_TIMEOUT_SECS,
-    DEFAULT_WRITE_FREQUENCY_THRESHOLD, DEFAULT_WRITE_TRIGGER_DELAY_SECS, ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT,
+    DEFAULT_CAPACITY_METRICS_INTERVAL_SECS, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, DEFAULT_DRIVE_TIMEOUT_PROFILE,
+    DEFAULT_FAST_UPDATE_THRESHOLD_SECS, DEFAULT_MAX_FILES_THRESHOLD, DEFAULT_SAMPLE_RATE, DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS,
+    DEFAULT_STAT_TIMEOUT_SECS, DEFAULT_WRITE_FREQUENCY_THRESHOLD, DEFAULT_WRITE_TRIGGER_DELAY_SECS,
+    DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY, DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS, ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT,
     ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_FOLLOW_SYMLINKS, ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_MAX_TIMEOUT,
     ENV_CAPACITY_METRICS_INTERVAL, ENV_CAPACITY_MIN_TIMEOUT, ENV_CAPACITY_SAMPLE_RATE, ENV_CAPACITY_SCHEDULED_INTERVAL,
     ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
+    ENV_DRIVE_TIMEOUT_PROFILE,
 };
 use rustfs_io_metrics::capacity_metrics::{
     record_capacity_current_bytes, record_capacity_degraded_reading, record_capacity_dirty_disk_count,
     record_capacity_refresh_inflight, record_capacity_refresh_joiner, record_capacity_refresh_result,
     record_capacity_update_completed, record_capacity_update_failed, record_capacity_write_operation,
 };
-use rustfs_utils::{get_env_bool, get_env_u64, get_env_usize};
+use rustfs_utils::{get_env_bool, get_env_str, get_env_u64, get_env_usize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -112,6 +114,15 @@ fn env_u64_at_least(env: &'static str, default: u64, min: u64) -> u64 {
     }
 }
 
+fn capacity_timeout_profile_default(default: u64) -> u64 {
+    let profile = get_env_str(ENV_DRIVE_TIMEOUT_PROFILE, DEFAULT_DRIVE_TIMEOUT_PROFILE);
+    if profile.trim().eq_ignore_ascii_case(DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY) {
+        DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS
+    } else {
+        default
+    }
+}
+
 impl CachedCapacityConfig {
     /// Build configuration from environment variables
     fn from_env() -> Self {
@@ -131,7 +142,11 @@ impl CachedCapacityConfig {
             )),
             max_files_threshold: env_u64_at_least(ENV_CAPACITY_MAX_FILES_THRESHOLD, DEFAULT_MAX_FILES_THRESHOLD as u64, 1)
                 as usize,
-            stat_timeout: Duration::from_secs(env_u64_at_least(ENV_CAPACITY_STAT_TIMEOUT, DEFAULT_STAT_TIMEOUT_SECS, 1)),
+            stat_timeout: Duration::from_secs(env_u64_at_least(
+                ENV_CAPACITY_STAT_TIMEOUT,
+                capacity_timeout_profile_default(DEFAULT_STAT_TIMEOUT_SECS),
+                1,
+            )),
             sample_rate: get_env_usize(ENV_CAPACITY_SAMPLE_RATE, DEFAULT_SAMPLE_RATE),
             metrics_interval: Duration::from_secs(get_env_u64(
                 ENV_CAPACITY_METRICS_INTERVAL,
@@ -140,7 +155,11 @@ impl CachedCapacityConfig {
             follow_symlinks: get_env_bool(ENV_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_FOLLOW_SYMLINKS),
             enable_dynamic_timeout: get_env_bool(ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT),
             min_timeout: Duration::from_secs(env_u64_at_least(ENV_CAPACITY_MIN_TIMEOUT, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, 1)),
-            max_timeout: Duration::from_secs(env_u64_at_least(ENV_CAPACITY_MAX_TIMEOUT, DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, 1)),
+            max_timeout: Duration::from_secs(env_u64_at_least(
+                ENV_CAPACITY_MAX_TIMEOUT,
+                capacity_timeout_profile_default(DEFAULT_CAPACITY_MAX_TIMEOUT_SECS),
+                1,
+            )),
         }
     }
 }
@@ -1021,6 +1040,7 @@ impl HybridCapacityManager {
     /// remote or removed disks would otherwise stay marked forever and keep
     /// the dirty-disk gauge permanently non-zero (backlog#1020 S30).
     pub async fn retain_dirty_disks_within(&self, local: &HashSet<CapacityScopeDisk>) {
+        self.sync_global_dirty_scopes().await;
         let mut dirty_disks = self.dirty_disks.write().await;
         let before = dirty_disks.len();
         dirty_disks.retain(|disk, _| local.contains(disk));
@@ -1378,6 +1398,44 @@ where
     }
 }
 
+async fn run_scheduled_capacity_refresh(manager: Arc<HybridCapacityManager>, disks: Vec<CapacityDiskRef>) -> bool {
+    let start = Instant::now();
+    match select_scheduled_capacity_refresh(manager.as_ref(), &disks).await {
+        ScheduledCapacityRefresh::Idle => {
+            debug!(
+                event = EVENT_CAPACITY_REFRESH_SCHEDULED,
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "skipped",
+                source = DataSource::Scheduled.as_metric_label(),
+                reason = "no_dirty_disks",
+                disk_count = disks.len(),
+                "capacity refresh scheduled"
+            );
+            true
+        }
+        ScheduledCapacityRefresh::Scan { disks, dirty_subset } => {
+            debug!(
+                event = EVENT_CAPACITY_REFRESH_SCHEDULED,
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "started",
+                source = DataSource::Scheduled.as_metric_label(),
+                refresh_scope = if dirty_subset { "dirty_subset" } else { "full" },
+                disk_count = disks.len(),
+                enqueue_latency_ms = start.elapsed().as_millis() as u64,
+                "capacity refresh scheduled"
+            );
+            let result = manager
+                .refresh_or_join(DataSource::Scheduled, move || async move {
+                    refresh_capacity_with_scope(disks, dirty_subset).await
+                })
+                .await;
+            scheduled_refresh_was_clean(&result)
+        }
+    }
+}
+
 /// Owned capacity scheduler tasks for one server runtime.
 #[must_use = "capacity background tasks stop when their lifecycle handle is dropped"]
 pub struct CapacityBackgroundTasks {
@@ -1429,29 +1487,7 @@ pub async fn start_background_tasks(disks: Vec<CapacityDiskRef>) -> CapacityBack
 
     tasks.spawn(async move {
         run_scheduled_refresh_loop(refresh_interval, refresh_shutdown, move || {
-            let start = Instant::now();
-            let manager = manager_for_refresh.clone();
-            let disks = disks.clone();
-            let disk_count = disks.len();
-            async move {
-                debug!(
-                    event = EVENT_CAPACITY_REFRESH_SCHEDULED,
-                    component = LOG_COMPONENT_CAPACITY,
-                    subsystem = LOG_SUBSYSTEM_RUNTIME,
-                    state = "started",
-                    source = DataSource::Scheduled.as_metric_label(),
-                    disk_count,
-                    enqueue_latency_ms = start.elapsed().as_millis() as u64,
-                    "capacity refresh scheduled"
-                );
-                let result = manager
-                    .refresh_or_join(
-                        DataSource::Scheduled,
-                        move || async move { refresh_capacity_with_scope(disks, false).await },
-                    )
-                    .await;
-                scheduled_refresh_was_clean(&result)
-            }
+            run_scheduled_capacity_refresh(manager_for_refresh.clone(), disks.clone())
         })
         .await;
     });
@@ -1480,9 +1516,10 @@ mod tests {
     use super::*;
     use crate::capacity_scope::{CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope};
     use rustfs_config::{
-        ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_METRICS_INTERVAL,
-        ENV_CAPACITY_SAMPLE_RATE, ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD,
-        ENV_CAPACITY_WRITE_TRIGGER_DELAY,
+        DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY, ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_MAX_FILES_THRESHOLD,
+        ENV_CAPACITY_MAX_TIMEOUT, ENV_CAPACITY_METRICS_INTERVAL, ENV_CAPACITY_MIN_TIMEOUT, ENV_CAPACITY_SAMPLE_RATE,
+        ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
+        ENV_DRIVE_TIMEOUT_PROFILE,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1524,6 +1561,39 @@ mod tests {
         assert!(!scheduled_refresh_was_clean(&Ok(timed_out)));
         assert!(!scheduled_refresh_was_clean(&Ok(degraded)));
         assert!(!scheduled_refresh_was_clean(&Err("scan failed".to_string())));
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_capacity_refresh_skips_clean_cache_then_scans_dirty_disk() {
+        let temp_dir = tempfile::TempDir::new().expect("capacity test directory should be created");
+        std::fs::write(temp_dir.path().join("object.bin"), b"capacity-bytes").expect("capacity fixture should be written");
+        let disk = CapacityDiskRef {
+            endpoint: "node-a".to_string(),
+            drive_path: temp_dir.path().display().to_string(),
+        };
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+        manager
+            .update_capacity(CapacityUpdate::estimated(123, 1), DataSource::RealTime)
+            .await;
+
+        assert!(run_scheduled_capacity_refresh(manager.clone(), vec![disk.clone()]).await);
+        let cached = manager.get_capacity().await.expect("cached capacity should remain available");
+        assert_eq!(cached.total_used, 123);
+        assert_eq!(cached.source, DataSource::RealTime);
+
+        manager
+            .mark_dirty_scope(&CapacityScope {
+                disks: vec![CapacityScopeDisk {
+                    endpoint: disk.endpoint.clone(),
+                    drive_path: disk.drive_path.clone(),
+                }],
+            })
+            .await;
+
+        assert!(run_scheduled_capacity_refresh(manager.clone(), vec![disk]).await);
+        let cached = manager.get_capacity().await.expect("dirty refresh should update the cache");
+        assert_eq!(cached.source, DataSource::Scheduled);
+        assert!(manager.get_dirty_disks().await.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1635,22 +1705,22 @@ mod tests {
             (
                 ENV_CAPACITY_SCHEDULED_INTERVAL,
                 || get_scheduled_update_interval().as_secs(),
-                120,
+                600,
                 "600",
                 600,
             ),
-            (ENV_CAPACITY_WRITE_TRIGGER_DELAY, || get_write_trigger_delay().as_secs(), 5, "20", 20),
+            (ENV_CAPACITY_WRITE_TRIGGER_DELAY, || get_write_trigger_delay().as_secs(), 30, "20", 20),
             (
                 ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD,
                 || get_write_frequency_threshold() as u64,
-                5,
+                20,
                 "20",
                 20,
             ),
             (
                 ENV_CAPACITY_FAST_UPDATE_THRESHOLD,
                 || get_fast_update_threshold().as_secs(),
-                30,
+                120,
                 "120",
                 120,
             ),
@@ -1669,11 +1739,13 @@ mod tests {
 
     #[test]
     fn test_config_getter_defaults() {
-        for (env_var, getter, default, _, _) in config_getter_cases() {
-            temp_env::with_var(env_var, None::<&str>, || {
-                assert_eq!(getter(), default, "{env_var}: unexpected default value");
-            });
-        }
+        temp_env::with_var_unset(ENV_DRIVE_TIMEOUT_PROFILE, || {
+            for (env_var, getter, default, _, _) in config_getter_cases() {
+                temp_env::with_var(env_var, None::<&str>, || {
+                    assert_eq!(getter(), default, "{env_var}: unexpected default value");
+                });
+            }
+        });
     }
 
     #[test]
@@ -1697,11 +1769,67 @@ mod tests {
             (ENV_CAPACITY_MIN_TIMEOUT, || get_min_timeout().as_secs(), 2),
             (ENV_CAPACITY_MAX_TIMEOUT, || get_max_timeout().as_secs(), 15),
         ];
-        for (env_var, getter, default) in zero_cases {
-            temp_env::with_var(env_var, Some("0"), || {
-                assert_eq!(getter(), default, "{env_var}: zero must clamp to default");
-            });
-        }
+        temp_env::with_var_unset(ENV_DRIVE_TIMEOUT_PROFILE, || {
+            for (env_var, getter, default) in zero_cases {
+                temp_env::with_var(env_var, Some("0"), || {
+                    assert_eq!(getter(), default, "{env_var}: zero must clamp to default");
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn capacity_timeouts_use_high_latency_drive_profile_defaults() {
+        temp_env::with_vars(
+            [
+                (ENV_DRIVE_TIMEOUT_PROFILE, Some(DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY)),
+                (ENV_CAPACITY_STAT_TIMEOUT, None),
+                (ENV_CAPACITY_MIN_TIMEOUT, None),
+                (ENV_CAPACITY_MAX_TIMEOUT, None),
+            ],
+            || {
+                let config = CachedCapacityConfig::from_env();
+                assert_eq!(config.stat_timeout, Duration::from_secs(60));
+                assert_eq!(config.min_timeout, Duration::from_secs(2));
+                assert_eq!(config.max_timeout, Duration::from_secs(60));
+            },
+        );
+    }
+
+    #[test]
+    fn explicit_capacity_timeouts_override_high_latency_drive_profile() {
+        temp_env::with_vars(
+            [
+                (ENV_DRIVE_TIMEOUT_PROFILE, Some(DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY)),
+                (ENV_CAPACITY_STAT_TIMEOUT, Some("7")),
+                (ENV_CAPACITY_MIN_TIMEOUT, Some("4")),
+                (ENV_CAPACITY_MAX_TIMEOUT, Some("11")),
+            ],
+            || {
+                let config = CachedCapacityConfig::from_env();
+                assert_eq!(config.stat_timeout, Duration::from_secs(7));
+                assert_eq!(config.min_timeout, Duration::from_secs(4));
+                assert_eq!(config.max_timeout, Duration::from_secs(11));
+            },
+        );
+    }
+
+    #[test]
+    fn invalid_drive_profile_preserves_capacity_defaults() {
+        temp_env::with_vars(
+            [
+                (ENV_DRIVE_TIMEOUT_PROFILE, Some("invalid")),
+                (ENV_CAPACITY_STAT_TIMEOUT, None),
+                (ENV_CAPACITY_MIN_TIMEOUT, None),
+                (ENV_CAPACITY_MAX_TIMEOUT, None),
+            ],
+            || {
+                let config = CachedCapacityConfig::from_env();
+                assert_eq!(config.stat_timeout, Duration::from_secs(DEFAULT_STAT_TIMEOUT_SECS));
+                assert_eq!(config.min_timeout, Duration::from_secs(DEFAULT_CAPACITY_MIN_TIMEOUT_SECS));
+                assert_eq!(config.max_timeout, Duration::from_secs(DEFAULT_CAPACITY_MAX_TIMEOUT_SECS));
+            },
+        );
     }
 
     #[tokio::test]
@@ -2645,10 +2773,10 @@ mod tests {
         let config = HybridStrategyConfig::from_env();
 
         // Check default values
-        assert_eq!(config.scheduled_update_interval, Duration::from_secs(120));
-        assert_eq!(config.write_trigger_delay, Duration::from_secs(5));
-        assert_eq!(config.write_frequency_threshold, 5);
-        assert_eq!(config.fast_update_threshold, Duration::from_secs(30));
+        assert_eq!(config.scheduled_update_interval, Duration::from_secs(600));
+        assert_eq!(config.write_trigger_delay, Duration::from_secs(30));
+        assert_eq!(config.write_frequency_threshold, 20);
+        assert_eq!(config.fast_update_threshold, Duration::from_secs(120));
         assert!(config.enable_smart_update);
         assert!(config.enable_write_trigger);
     }

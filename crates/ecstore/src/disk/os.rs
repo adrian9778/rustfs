@@ -91,6 +91,10 @@ pub(crate) mod fsync_dir_recorder {
     static RECORDED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static LIMITED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static GROUPED: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+    #[cfg(unix)]
+    static FAILURES: std::sync::LazyLock<Mutex<HashMap<PathBuf, io::ErrorKind>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    #[cfg(unix)]
     static BEFORE_LIMITED: std::sync::LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
         std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
     static BEFORE_GROUP_BATCH: std::sync::LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
@@ -150,6 +154,20 @@ pub(crate) mod fsync_dir_recorder {
         contains_path(&RECORDED.lock().expect("fsync dir recorder poisoned"), dir)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn set_failure(dir: &Path, kind: io::ErrorKind) {
+        FAILURES
+            .lock()
+            .expect("fsync dir failure hook poisoned")
+            .insert(dir.to_path_buf(), kind);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn take_failure(dir: &Path) -> Option<io::ErrorKind> {
+        remove_path_keyed(&FAILURES, dir, "fsync dir failure hook poisoned")
+    }
+
+    #[cfg(unix)]
     pub(crate) fn record_limited(dir: &Path) {
         record_path(&LIMITED, dir, "limited fsync dir recorder");
         let hook = remove_hook(&BEFORE_LIMITED, dir, "limited fsync hook poisoned");
@@ -162,6 +180,7 @@ pub(crate) mod fsync_dir_recorder {
         contains_path(&LIMITED.lock().expect("limited fsync dir recorder poisoned"), dir)
     }
 
+    #[cfg(unix)]
     pub(crate) fn set_before_limited(dir: &Path, hook: impl FnOnce() + Send + 'static) {
         BEFORE_LIMITED
             .lock()
@@ -237,8 +256,141 @@ pub(crate) mod fsync_dir_recorder {
             .insert(dir.to_path_buf(), kind);
     }
 
+    #[cfg(unix)]
     pub(crate) fn take_grouped_failure(dir: &Path) -> Option<io::ErrorKind> {
         remove_path_keyed(&GROUPED_FAILURES, dir, "grouped fsync failure hook poisoned")
+    }
+}
+
+/// Pause a real namespace mutation inside its physical executor.
+#[cfg(all(any(test, feature = "test-util"), not(windows)))]
+pub(crate) mod prepared_publication_test_hooks {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub(crate) enum Stage {
+        PreparedRename,
+        Rename,
+        Remove,
+        #[cfg(test)]
+        Rollback,
+        #[cfg(test)]
+        DirFsync,
+    }
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    type Key = (Stage, PathBuf);
+    static BEFORE_PUBLICATION: LazyLock<Mutex<HashMap<Key, Hook>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(crate) struct Guard(Key);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            BEFORE_PUBLICATION.lock().remove(&self.0);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install(path: &Path, hook: impl FnOnce() + Send + 'static) -> Guard {
+        install_at(Stage::PreparedRename, path, hook)
+    }
+
+    pub(crate) fn install_at(stage: Stage, path: &Path, hook: impl FnOnce() + Send + 'static) -> Guard {
+        let key = (stage, path.to_path_buf());
+        assert!(BEFORE_PUBLICATION.lock().insert(key.clone(), Box::new(hook)).is_none());
+        Guard(key)
+    }
+
+    pub(crate) fn run(stage: Stage, path: &Path) {
+        let hook = BEFORE_PUBLICATION.lock().remove(&(stage, path.to_path_buf()));
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    type RenameDestinationHook = Box<dyn FnOnce(&Path) + Send>;
+    #[cfg(test)]
+    static RENAME_DESTINATIONS: LazyLock<Mutex<HashMap<PathBuf, RenameDestinationHook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    #[cfg(test)]
+    pub(crate) struct RenameDestinationGuard(PathBuf);
+
+    #[cfg(test)]
+    impl Drop for RenameDestinationGuard {
+        fn drop(&mut self) {
+            RENAME_DESTINATIONS.lock().remove(&self.0);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_rename_destination(source: &Path, hook: impl FnOnce(&Path) + Send + 'static) -> RenameDestinationGuard {
+        assert!(
+            RENAME_DESTINATIONS
+                .lock()
+                .insert(source.to_path_buf(), Box::new(hook))
+                .is_none()
+        );
+        RenameDestinationGuard(source.to_path_buf())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn drain_namespace_key(path: &Path) {
+        drop(super::acquire_namespace_mutation_lease(path).await);
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_rename_destination(source: &Path, destination: &Path) {
+        let hook = RENAME_DESTINATIONS.lock().remove(source);
+        if let Some(hook) = hook {
+            hook(destination);
+        }
+    }
+}
+
+/// Controlled application-test pause at an existing physical executor boundary.
+#[cfg(all(feature = "test-util", not(windows)))]
+pub struct LocalPublicationPause {
+    _hook: prepared_publication_test_hooks::Guard,
+    entered: oneshot::Receiver<()>,
+    _release: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(all(feature = "test-util", not(windows)))]
+#[derive(Clone, Copy)]
+pub enum LocalPublicationStage {
+    PreparedRename,
+    Rename,
+    Remove,
+}
+
+#[cfg(all(feature = "test-util", not(windows)))]
+impl LocalPublicationPause {
+    pub fn install(disk: &crate::disk::Disk, volume: &str, path: &str, stage: LocalPublicationStage) -> Result<Self> {
+        let path = disk
+            .get_object_path_for_io_if_local(volume, path)
+            .ok_or(DiskError::DiskNotFound)??;
+        let stage = match stage {
+            LocalPublicationStage::PreparedRename => prepared_publication_test_hooks::Stage::PreparedRename,
+            LocalPublicationStage::Rename => prepared_publication_test_hooks::Stage::Rename,
+            LocalPublicationStage::Remove => prepared_publication_test_hooks::Stage::Remove,
+        };
+        let (entered_tx, entered) = oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let hook = prepared_publication_test_hooks::install_at(stage, &path, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        Ok(Self {
+            _hook: hook,
+            entered,
+            _release: release,
+        })
+    }
+
+    pub async fn entered(&mut self) -> std::result::Result<(), oneshot::error::RecvError> {
+        (&mut self.entered).await
     }
 }
 
@@ -298,6 +450,39 @@ pub(crate) mod windows_rename_test_hooks {
     }
 }
 
+/// Test-only hooks into the destination-parent walk of rename preparation.
+///
+/// Pruning and Windows sharing races live between syscalls inside
+/// [`mkdir_all_below_existing_base_std`], so only an injection at that exact
+/// point reproduces it deterministically. Hooks are keyed by the absolute path
+/// of the component just opened and queued per path: a retrying preparation
+/// visits the same component again, so a test models a pruner that keeps
+/// walking upward by queueing one hook per visit.
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) mod prepare_rename_test_hooks {
+    use super::*;
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    static AFTER_COMPONENT_OPENED: LazyLock<Mutex<HashMap<PathBuf, VecDeque<Hook>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(crate) fn queue_after_component_opened(path: &Path, hook: impl FnOnce() + Send + 'static) {
+        AFTER_COMPONENT_OPENED
+            .lock()
+            .entry(path.to_path_buf())
+            .or_default()
+            .push_back(Box::new(hook));
+    }
+
+    pub(crate) fn run_after_component_opened(path: &Path) {
+        let hook = AFTER_COMPONENT_OPENED.lock().get_mut(path).and_then(VecDeque::pop_front);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 /// Fsync a directory so recently created or renamed entries survive power loss.
 /// No-op on non-Unix platforms where directories cannot be opened for syncing.
 pub fn fsync_dir_std(dir: impl AsRef<Path>) -> io::Result<()> {
@@ -305,6 +490,10 @@ pub fn fsync_dir_std(dir: impl AsRef<Path>) -> io::Result<()> {
     fsync_dir_recorder::record(dir.as_ref());
     #[cfg(unix)]
     {
+        #[cfg(test)]
+        if let Some(kind) = fsync_dir_recorder::take_failure(dir.as_ref()) {
+            return Err(io::Error::from(kind));
+        }
         std::fs::File::open(dir.as_ref())?.sync_all()?;
     }
     #[cfg(not(unix))]
@@ -543,6 +732,7 @@ impl OpenedDstDirFsyncGroup {
 }
 
 struct DstDirFsyncWaiter {
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
     result_tx: oneshot::Sender<SharedDstDirFsyncResult>,
 }
 
@@ -601,6 +791,7 @@ impl DstDirFsyncGroupCommit {
     fn enqueue_opened(
         &self,
         opened: OpenedDstDirFsyncGroup,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> io::Result<(oneshot::Receiver<SharedDstDirFsyncResult>, Option<Arc<DstDirFsyncGroup>>)> {
         let (result_tx, result_rx) = oneshot::channel();
         let mut registry = self.inner.lock();
@@ -631,7 +822,10 @@ impl DstDirFsyncGroupCommit {
             group
         };
         let mut group_state = group.inner.lock();
-        group_state.pending.push_back(DstDirFsyncWaiter { result_tx });
+        group_state.pending.push_back(DstDirFsyncWaiter {
+            result_tx,
+            namespace_owner,
+        });
         let start_worker = !group_state.worker_running;
         if start_worker {
             group_state.worker_running = true;
@@ -653,7 +847,13 @@ impl DstDirFsyncGroupCommit {
     fn remove_idle_group(&self, group: &Arc<DstDirFsyncGroup>) {
         let mut registry = self.inner.lock();
         let group_state = group.inner.lock();
-        if !group_state.worker_running && group_state.pending.is_empty() {
+        if !group_state.worker_running
+            && group_state.pending.is_empty()
+            && registry
+                .groups
+                .get(&group.key)
+                .is_some_and(|registered| Arc::ptr_eq(registered, group))
+        {
             registry.groups.remove(&group.key);
         }
     }
@@ -676,16 +876,20 @@ impl DstDirFsyncGroupCommit {
         &self,
         dir: &Path,
     ) -> io::Result<(oneshot::Receiver<SharedDstDirFsyncResult>, Option<Arc<DstDirFsyncGroup>>)> {
-        self.enqueue_opened(OpenedDstDirFsyncGroup::open(dir)?)
+        self.enqueue_opened(OpenedDstDirFsyncGroup::open(dir)?, None)
     }
 }
 
 #[cfg(unix)]
-async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup) -> io::Result<()> {
+async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup, namespace_owners: Vec<Arc<dyn Send + Sync>>) -> io::Result<()> {
     #[cfg(test)]
     let dir = group.dir.clone();
     let dir_file = group.dir_file.clone();
     fsync_spawn_blocking(move || {
+        // The batch worker may be cancelled while this syscall is still running.
+        let _namespace_owners = namespace_owners;
+        #[cfg(all(test, not(windows)))]
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::DirFsync, &dir);
         #[cfg(test)]
         {
             if let Some(kind) = fsync_dir_recorder::take_grouped_failure(&dir) {
@@ -700,66 +904,118 @@ async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup) -> io::Result<()> {
+async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup, namespace_owners: Vec<Arc<dyn Send + Sync>>) -> io::Result<()> {
+    let _namespace_owners = namespace_owners;
     fsync_dir(&group.dir).await
 }
 
-async fn run_dst_dir_fsync_group_worker(group: Arc<DstDirFsyncGroup>) {
-    loop {
-        #[cfg(test)]
-        fsync_dir_recorder::run_before_group_batch(&group.dir);
-        tokio::task::yield_now().await;
-        let batch: Vec<DstDirFsyncWaiter> = {
-            let mut group_state = group.inner.lock();
-            group_state.pending.drain(..).collect()
-        };
-        if batch.is_empty() {
-            let mut group_state = group.inner.lock();
+struct DstDirFsyncWorkerGuard {
+    group: Arc<DstDirFsyncGroup>,
+    in_flight: usize,
+    armed: bool,
+}
+
+impl Drop for DstDirFsyncWorkerGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Cancellation must release queued owners, but the physical batch keeps
+        // its own owners until its blocking syscall returns.
+        let pending = {
+            let mut registry = DST_DIR_FSYNC_GROUP_COMMIT.inner.lock();
+            let mut group_state = self.group.inner.lock();
+            let pending = std::mem::take(&mut group_state.pending);
             group_state.worker_running = false;
-            drop(group_state);
-            DST_DIR_FSYNC_GROUP_COMMIT.remove_idle_group(&group);
-            return;
-        }
-
-        #[cfg(test)]
-        fsync_dir_recorder::record_grouped(&group.dir, batch.len());
-        let result = fsync_open_dst_dir_group(&group)
-            .await
-            .map_err(SharedDstDirFsyncError::from_error);
-        let batch_len = batch.len();
-        DST_DIR_FSYNC_GROUP_COMMIT.complete_batch(batch_len);
-
-        let should_stop = {
-            let mut group_state = group.inner.lock();
-            if group_state.pending.is_empty() {
-                group_state.worker_running = false;
-                true
-            } else {
-                false
+            if registry
+                .groups
+                .get(&self.group.key)
+                .is_some_and(|group| Arc::ptr_eq(group, &self.group))
+            {
+                registry.total_waiters = registry.total_waiters.saturating_sub(pending.len() + self.in_flight);
+                registry.groups.remove(&self.group.key);
             }
+            pending
         };
-        if should_stop {
-            DST_DIR_FSYNC_GROUP_COMMIT.remove_idle_group(&group);
-        }
-        for waiter in batch {
-            let _ = waiter.result_tx.send(result.clone());
-        }
-        if should_stop {
-            return;
+        // Lease and channel destructors must run outside the registry locks.
+        drop(pending);
+    }
+}
+
+fn run_dst_dir_fsync_group_worker(group: Arc<DstDirFsyncGroup>) -> impl std::future::Future<Output = ()> {
+    // Capture before spawning: shutdown may drop the future without polling it.
+    let worker_guard = DstDirFsyncWorkerGuard {
+        group: group.clone(),
+        in_flight: 0,
+        armed: true,
+    };
+    async move {
+        let mut worker_guard = worker_guard;
+        loop {
+            #[cfg(test)]
+            fsync_dir_recorder::run_before_group_batch(&group.dir);
+            tokio::task::yield_now().await;
+            let mut batch: Vec<DstDirFsyncWaiter> = {
+                let mut group_state = group.inner.lock();
+                group_state.pending.drain(..).collect()
+            };
+            if batch.is_empty() {
+                let mut group_state = group.inner.lock();
+                worker_guard.armed = false;
+                group_state.worker_running = false;
+                drop(group_state);
+                DST_DIR_FSYNC_GROUP_COMMIT.remove_idle_group(&group);
+                return;
+            }
+            worker_guard.in_flight = batch.len();
+
+            #[cfg(test)]
+            fsync_dir_recorder::record_grouped(&group.dir, batch.len());
+            let namespace_owners = batch.iter_mut().filter_map(|waiter| waiter.namespace_owner.take()).collect();
+            let result = fsync_open_dst_dir_group(&group, namespace_owners)
+                .await
+                .map_err(SharedDstDirFsyncError::from_error);
+            let batch_len = batch.len();
+            DST_DIR_FSYNC_GROUP_COMMIT.complete_batch(batch_len);
+            worker_guard.in_flight = 0;
+
+            let should_stop = {
+                let mut group_state = group.inner.lock();
+                if group_state.pending.is_empty() {
+                    worker_guard.armed = false;
+                    group_state.worker_running = false;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_stop {
+                DST_DIR_FSYNC_GROUP_COMMIT.remove_idle_group(&group);
+            }
+            for waiter in batch {
+                let _ = waiter.result_tx.send(result.clone());
+            }
+            if should_stop {
+                return;
+            }
         }
     }
 }
 
-async fn fsync_dst_dir_group_commit_with_enabled(dir: impl AsRef<Path>, enabled: bool) -> io::Result<()> {
+async fn fsync_dst_dir_group_commit_with_enabled(
+    dir: impl AsRef<Path>,
+    enabled: bool,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> io::Result<()> {
     if !enabled {
-        return fsync_dir(dir).await;
+        return fsync_dir_with_owner(dir.as_ref(), namespace_owner).await;
     }
 
     let dir = dir.as_ref().to_path_buf();
     let opened = tokio::task::spawn_blocking(move || OpenedDstDirFsyncGroup::open(&dir))
         .await
         .map_err(|err| io::Error::other(format!("blocking dst dir group open failed: {err}")))??;
-    let (result_rx, worker) = DST_DIR_FSYNC_GROUP_COMMIT.enqueue_opened(opened)?;
+    let (result_rx, worker) = DST_DIR_FSYNC_GROUP_COMMIT.enqueue_opened(opened, namespace_owner)?;
     if let Some(group) = worker {
         tokio::spawn(run_dst_dir_fsync_group_worker(group));
     }
@@ -771,8 +1027,11 @@ async fn fsync_dst_dir_group_commit_with_enabled(dir: impl AsRef<Path>, enabled:
     }
 }
 
-pub(crate) async fn fsync_dst_dir_group_commit(dir: impl AsRef<Path>) -> io::Result<()> {
-    fsync_dst_dir_group_commit_with_enabled(dir, dst_dir_fsync_group_commit_enabled()).await
+pub(crate) async fn fsync_dst_dir_group_commit(
+    dir: impl AsRef<Path>,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> io::Result<()> {
+    fsync_dst_dir_group_commit_with_enabled(dir, dst_dir_fsync_group_commit_enabled(), namespace_owner).await
 }
 
 pub(crate) async fn fsync_dst_dir_group_commit_or_namespace_file_sync_limit(
@@ -781,7 +1040,7 @@ pub(crate) async fn fsync_dst_dir_group_commit_or_namespace_file_sync_limit(
     admission: &FileSyncAdmission,
 ) -> io::Result<()> {
     if dst_dir_fsync_group_commit_enabled() {
-        fsync_dst_dir_group_commit_with_enabled(dir, true).await
+        fsync_dst_dir_group_commit_with_enabled(dir, true, Some(lease)).await
     } else {
         fsync_dir_with_namespace_file_sync_limit(dir, lease, admission).await
     }
@@ -789,7 +1048,7 @@ pub(crate) async fn fsync_dst_dir_group_commit_or_namespace_file_sync_limit(
 
 #[cfg(test)]
 pub(crate) async fn fsync_dst_dir_group_commit_for_test(dir: impl AsRef<Path>, enabled: bool) -> io::Result<()> {
-    fsync_dst_dir_group_commit_with_enabled(dir, enabled).await
+    fsync_dst_dir_group_commit_with_enabled(dir, enabled, None).await
 }
 
 #[cfg(test)]
@@ -1190,12 +1449,46 @@ fn disk_namespace_mutation_lock(path: &Path) -> Arc<NamespaceMutationLock> {
     lock
 }
 
+static DISK_METADATA_MUTATION_LOCKS: LazyLock<Mutex<NamespaceMutationLockRegistry>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Serializes the complete xl.meta read/modify/commit transaction. This domain
+/// precedes namespace/volume publication locks, whose narrower syscall leases
+/// may retain it after cancellation of the async caller.
+pub(crate) struct MetadataMutationLease {
+    _guard: OwnedMutexGuard<()>,
+    _owner: Option<Arc<dyn Send + Sync>>,
+}
+
+pub(crate) async fn acquire_metadata_mutation_lease(
+    object: &Path,
+    owner: Option<Arc<dyn Send + Sync>>,
+) -> Arc<MetadataMutationLease> {
+    let lock = {
+        let mut locks = DISK_METADATA_MUTATION_LOCKS.lock();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(object).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(AsyncMutex::new(()));
+            locks.insert(object.to_path_buf(), Arc::downgrade(&lock));
+            lock
+        }
+    };
+    Arc::new(MetadataMutationLease {
+        _guard: lock.lock_owned().await,
+        _owner: owner,
+    })
+}
+
 /// Keeps a namespace transaction serialized even when its async waiter is
 /// cancelled while a blocking filesystem call is still running.
 pub(crate) struct NamespaceMutationLease {
     _namespace_guard: OwnedMutexGuard<()>,
     _volume_guard: Option<OwnedRwLockReadGuard<()>>,
     external_guard: Mutex<Option<Arc<dyn Send + Sync>>>,
+    // Independent of the quota claim; both survive cancellation of the waiter.
+    _namespace_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 impl NamespaceMutationLease {
@@ -1205,10 +1498,18 @@ impl NamespaceMutationLease {
 }
 
 async fn acquire_namespace_mutation_lease(path: &Path) -> Arc<NamespaceMutationLease> {
+    acquire_namespace_mutation_lease_with_owner(path, None).await
+}
+
+pub(in crate::disk) async fn acquire_namespace_mutation_lease_with_owner(
+    path: &Path,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> Arc<NamespaceMutationLease> {
     Arc::new(NamespaceMutationLease {
         _namespace_guard: disk_namespace_mutation_lock(path).lock_owned().await,
         _volume_guard: None,
         external_guard: Mutex::new(None),
+        _namespace_owner: namespace_owner,
     })
 }
 
@@ -1219,12 +1520,22 @@ pub(crate) async fn acquire_rename_data_mutation_lease(
     volume: &str,
     destination_object: &Path,
 ) -> Arc<NamespaceMutationLease> {
+    acquire_rename_data_mutation_lease_with_owner(root, volume, destination_object, None).await
+}
+
+pub(crate) async fn acquire_rename_data_mutation_lease_with_owner(
+    root: &Path,
+    volume: &str,
+    destination_object: &Path,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> Arc<NamespaceMutationLease> {
     let namespace_guard = disk_namespace_mutation_lock(destination_object).lock_owned().await;
     let volume_guard = disk_volume_mutation_lock(root, volume).read_owned().await;
     Arc::new(NamespaceMutationLease {
         _namespace_guard: namespace_guard,
         _volume_guard: Some(volume_guard),
         external_guard: Mutex::new(None),
+        _namespace_owner: namespace_owner,
     })
 }
 
@@ -1714,6 +2025,105 @@ pub async fn rename_all(
     Ok(())
 }
 
+pub(crate) async fn fsync_dir_with_owner(path: &Path, namespace_owner: Option<Arc<dyn Send + Sync>>) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if namespace_owner.is_none() {
+            return fsync_dir(path).await;
+        }
+        let path = path.to_path_buf();
+        fsync_spawn_blocking(move || {
+            let _namespace_owner = namespace_owner;
+            fsync_dir_std(path)
+        })
+        .await?
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = namespace_owner;
+        fsync_dir(path).await
+    }
+}
+
+/// Retain namespace ownership in the actual filesystem executor after timeout.
+pub(crate) async fn remove_file_with_owner(
+    path: impl AsRef<Path>,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> io::Result<()> {
+    if namespace_owner.is_none() {
+        return tokio::fs::remove_file(path).await;
+    }
+    let path = path.as_ref().to_path_buf();
+    let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
+    run_blocking_namespace_operation(lease, move || {
+        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Remove, &path);
+        std::fs::remove_file(path)
+    })
+    .await
+}
+
+/// Retain namespace ownership in the actual filesystem executor after timeout.
+pub(crate) async fn remove_dir_with_owner(
+    path: impl AsRef<Path>,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> io::Result<()> {
+    if namespace_owner.is_none() {
+        return tokio::fs::remove_dir(path).await;
+    }
+    let path = path.as_ref().to_path_buf();
+    let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
+    run_blocking_namespace_operation(lease, move || std::fs::remove_dir(path)).await
+}
+
+/// Preserve raw rename semantics while retaining a counted owner in the syscall.
+/// Unlike reliable rename, this never creates parents or retries a missing source.
+pub(in crate::disk) async fn rename_with_namespace_owner(
+    src: &Path,
+    dst: &Path,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> io::Result<()> {
+    if namespace_owner.is_none() {
+        return tokio::fs::rename(src, dst).await;
+    }
+    let src = src.to_path_buf();
+    let dst = dst.to_path_buf();
+    let lease = acquire_namespace_mutation_lease_with_owner(&dst, namespace_owner).await;
+    run_blocking_namespace_operation(lease, move || {
+        #[cfg(all(test, not(windows)))]
+        {
+            prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &src);
+            prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &dst);
+        }
+        std::fs::rename(src, dst)
+    })
+    .await
+}
+
+pub(in crate::disk) async fn create_dir_all_with_namespace_owner(
+    path: &Path,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> io::Result<()> {
+    if namespace_owner.is_none() {
+        return tokio::fs::create_dir_all(path).await;
+    }
+    let path = path.to_path_buf();
+    let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
+    run_blocking_namespace_operation(lease, move || std::fs::create_dir_all(path)).await
+}
+
+#[tracing::instrument(name = "rename_all", level = "debug", skip_all)]
+pub(crate) async fn rename_all_with_owner(
+    src_file_path: impl AsRef<Path>,
+    dst_file_path: impl AsRef<Path>,
+    base_dir: impl AsRef<Path>,
+    publication_root: &PublicationRoot,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> Result<()> {
+    let lease = acquire_namespace_mutation_lease_with_owner(dst_file_path.as_ref(), namespace_owner).await;
+    rename_all_with_lease(src_file_path, dst_file_path, base_dir, publication_root, lease).await
+}
+
 pub(crate) async fn rename_all_with_lease(
     src_file_path: impl AsRef<Path>,
     dst_file_path: impl AsRef<Path>,
@@ -1732,6 +2142,41 @@ pub(crate) async fn rename_all_with_lease(
     .await
     .map_err(to_file_error)?;
     Ok(())
+}
+
+/// Publish a conditional repair and sync its directory in one owned executor.
+/// Cancellation cannot release its metadata/fleet/tier leases between rename
+/// and fsync. The last authority check runs after destination preparation.
+pub(crate) async fn rename_reconciled_metadata(
+    source: PathBuf,
+    destination: PathBuf,
+    base_dir: PathBuf,
+    publication_root: PublicationRoot,
+    owner: Option<Arc<dyn Send + Sync>>,
+    authority: Arc<crate::bucket::lifecycle::legacy_transition_state_reconcile::TransitionStateReconcileAuthority>,
+) -> Result<()> {
+    let lease = acquire_namespace_mutation_lease_with_owner(&destination, owner).await;
+    run_blocking_namespace_operation(lease, move || {
+        let preparation = prepare_rename_with_retry(&source, &destination, &base_dir, &publication_root)?;
+        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &destination);
+        if !authority.is_current() {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "transition reconciliation authority expired"));
+        }
+        rename_prepared(&source, &destination, &preparation)?;
+        if let Some(parent) = destination.parent() {
+            fsync_dir_std(parent)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|err| {
+        if err.kind() == io::ErrorKind::WouldBlock {
+            DiskError::OutdatedXLMeta
+        } else {
+            to_file_error(err).into()
+        }
+    })
 }
 
 #[cfg(windows)]
@@ -1905,8 +2350,10 @@ pub(crate) async fn rename_all_with_prepared_source(
         let base_dir = base_dir.clone();
         move || {
             validate_prepared_rename_source(&prepared_source, &src_file_path)?;
-            let (preparation, attempt) = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
-            rename_prepared(&src_file_path, &dst_file_path, &preparation, attempt)
+            let preparation = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
+            #[cfg(any(test, feature = "test-util"))]
+            prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::PreparedRename, &dst_file_path);
+            rename_prepared(&src_file_path, &dst_file_path, &preparation)
         }
     };
     let result = run_blocking_namespace_operation(lease, operation).await;
@@ -1938,6 +2385,32 @@ pub async fn rename_all_ignore_missing_source(
 ) -> Result<()> {
     let src_file_path = src_file_path.as_ref();
     match reliable_rename_inner(src_file_path, dst_file_path.as_ref(), base_dir, publication_root, false).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound && rename_source_is_missing(src_file_path, publication_root) => Ok(()),
+        Err(err) => Err(to_file_error(err).into()),
+    }
+}
+
+#[tracing::instrument(name = "rename_all_ignore_missing_source", level = "debug", skip_all)]
+pub(crate) async fn rename_all_ignore_missing_source_with_owner(
+    src_file_path: impl AsRef<Path>,
+    dst_file_path: impl AsRef<Path>,
+    base_dir: impl AsRef<Path>,
+    publication_root: &PublicationRoot,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> Result<()> {
+    let src_file_path = src_file_path.as_ref();
+    let lease = acquire_namespace_mutation_lease_with_owner(dst_file_path.as_ref(), namespace_owner).await;
+    match reliable_rename_inner_with_lease(
+        src_file_path.to_path_buf(),
+        dst_file_path.as_ref().to_path_buf(),
+        base_dir.as_ref().to_path_buf(),
+        publication_root.clone(),
+        false,
+        lease,
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound && rename_source_is_missing(src_file_path, publication_root) => Ok(()),
         Err(err) => Err(to_file_error(err).into()),
@@ -2008,8 +2481,15 @@ async fn reliable_rename_inner_with_lease(
         let dst_file_path = dst_file_path.clone();
         let base_dir = base_dir.clone();
         move || {
-            let (preparation, attempt) = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
-            rename_prepared(&src_file_path, &dst_file_path, &preparation, attempt)
+            let preparation = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
+            #[cfg(all(test, not(windows)))]
+            prepared_publication_test_hooks::run_rename_destination(&src_file_path, &dst_file_path);
+            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+            {
+                prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &src_file_path);
+                prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &dst_file_path);
+            }
+            rename_prepared(&src_file_path, &dst_file_path, &preparation)
         }
     };
     let result = run_blocking_namespace_operation(lease, operation).await;
@@ -2233,12 +2713,13 @@ fn prepare_rename_with_retry(
     dst_file_path: &Path,
     base_dir: &Path,
     publication_root: &PublicationRoot,
-) -> io::Result<(RenamePreparation, usize)> {
+) -> io::Result<RenamePreparation> {
+    let prune_budget = prepare_prune_budget(dst_file_path, base_dir);
     let mut attempt = 0;
     loop {
         match prepare_rename(src_file_path, dst_file_path, base_dir, publication_root) {
-            Ok(preparation) => return Ok((preparation, attempt)),
-            Err(err) if should_retry_rename(&err, attempt) => {
+            Ok(preparation) => return Ok(preparation),
+            Err(err) if should_retry_prepare(&err, attempt, prune_budget) => {
                 attempt += 1;
             }
             Err(err) => return Err(err),
@@ -2252,23 +2733,26 @@ fn prepare_rename_with_retry(
     dst_file_path: &Path,
     base_dir: &Path,
     publication_root: &PublicationRoot,
-) -> io::Result<(RenamePreparation, usize)> {
+) -> io::Result<RenamePreparation> {
     let source_parent = src_file_path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename source must have a parent directory"))?;
     let destination_parent = dst_file_path.parent();
-    let mut attempt = 0;
-    let prepare_destination_parent = |attempt: &mut usize| -> io::Result<Option<ExistingBaseDirectoryGuard>> {
+    let prune_budget = prepare_prune_budget(dst_file_path, base_dir);
+    // The destination walk and the source open below keep separate counters:
+    // exhausting one must not deny the other its own retry.
+    let prepare_destination_parent = || -> io::Result<Option<ExistingBaseDirectoryGuard>> {
+        let mut attempt = 0;
         loop {
             let result = destination_parent
                 .map(|parent| mkdir_all_below_existing_base_std(parent, base_dir, publication_root))
                 .transpose();
             match result {
                 Ok(parent_guard) => break Ok(parent_guard),
-                Err(err) if should_retry_rename(&err, *attempt) => {
+                Err(err) if should_retry_prepare(&err, attempt, prune_budget) => {
                     #[cfg(test)]
                     windows_rename_test_hooks::run_before_rename_retry(dst_file_path);
-                    *attempt += 1;
+                    attempt += 1;
                 }
                 Err(err) => break Err(err),
             }
@@ -2281,7 +2765,7 @@ fn prepare_rename_with_retry(
         None => false,
     };
     let (source_parent_guard, parent_guard, source_identity_anchor, expected_source_identity) = if same_parent {
-        let parent_guard = prepare_destination_parent(&mut attempt)?;
+        let parent_guard = prepare_destination_parent()?;
         let source_parent_guard = parent_guard
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename destination must have a parent directory"))?
@@ -2293,16 +2777,17 @@ fn prepare_rename_with_retry(
         let source_parent_guard = lock_windows_directory_tree(source_parent, destination_parent, publication_root)?;
         let (source_identity_anchor, expected_source_identity) =
             open_windows_rename_source_identity(src_file_path, &source_parent_guard)?;
-        let parent_guard = prepare_destination_parent(&mut attempt)?;
+        let parent_guard = prepare_destination_parent()?;
         (source_parent_guard, parent_guard, source_identity_anchor, expected_source_identity)
     };
+    let mut source_attempt = 0;
     let source = loop {
         match open_windows_rename_source(src_file_path, &source_parent_guard) {
             Ok(source) => break source,
-            Err(err) if should_retry_rename(&err, attempt) => {
+            Err(err) if should_retry_rename(&err, source_attempt) => {
                 #[cfg(test)]
                 windows_rename_test_hooks::run_before_rename_retry(dst_file_path);
-                attempt += 1;
+                source_attempt += 1;
             }
             Err(err) => return Err(err),
         }
@@ -2315,14 +2800,11 @@ fn prepare_rename_with_retry(
     }
     drop(source_identity_anchor);
 
-    Ok((
-        RenamePreparation {
-            parent_guard,
-            _source_parent_guard: source_parent_guard,
-            source,
-        },
-        attempt,
-    ))
+    Ok(RenamePreparation {
+        parent_guard,
+        _source_parent_guard: source_parent_guard,
+        source,
+    })
 }
 
 #[cfg(not(windows))]
@@ -2339,24 +2821,22 @@ fn prepare_rename(
     Ok(RenamePreparation { parent_guard })
 }
 
-fn rename_prepared(
-    _src_file_path: &Path,
-    dst_file_path: &Path,
-    preparation: &RenamePreparation,
-    attempt: usize,
-) -> io::Result<()> {
+/// Publish a prepared rename. The retry budget starts fresh here: preparation
+/// keeps its own counter, so a chain rebuilt after a concurrent prune must not
+/// cost the rename its one retry.
+fn rename_prepared(_src_file_path: &Path, dst_file_path: &Path, preparation: &RenamePreparation) -> io::Result<()> {
     #[cfg(windows)]
     {
         let parent_guard = preparation
             .parent_guard
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename destination must have a parent directory"))?;
-        rename_windows_prepared(dst_file_path, parent_guard, &preparation.source, attempt)
+        rename_windows_prepared(dst_file_path, parent_guard, &preparation.source, 0)
     }
 
     #[cfg(not(windows))]
     {
-        let mut attempt = attempt;
+        let mut attempt = 0;
         loop {
             let rename_result = rename_into_existing_parent(_src_file_path, dst_file_path, preparation.parent_guard.as_ref());
             match rename_result {
@@ -3756,6 +4236,8 @@ pub(crate) fn mkdir_all_below_existing_base_std(
         let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
         let mut parents = vec![open(base_dir, flags, Mode::empty()).map_err(io::Error::from)?];
 
+        #[cfg(test)]
+        let mut walked_path = base_dir.to_path_buf();
         for component in relative.components() {
             let Component::Normal(component) = component else {
                 continue;
@@ -3769,6 +4251,11 @@ pub(crate) fn mkdir_all_below_existing_base_std(
                 Err(err) => return Err(err.into()),
             }
             parents.push(openat(parent, component, flags, Mode::empty()).map_err(io::Error::from)?);
+            #[cfg(test)]
+            {
+                walked_path.push(component);
+                prepare_rename_test_hooks::run_after_component_opened(&walked_path);
+            }
         }
 
         Ok(parents)
@@ -3788,11 +4275,14 @@ pub(crate) fn mkdir_all_below_existing_base_std(
         let mut handles = Vec::with_capacity(capacity);
         handles.push(publication_root.directory.clone());
         let mut guard = ExistingBaseDirectoryGuard::new(handles);
-        for component in base_relative.components() {
+        let mut components = base_relative
+            .components()
+            .map(|component| (component, FILE_OPEN))
+            .chain(relative.components().map(|component| (component, FILE_OPEN_IF)))
+            .filter(|(component, _)| !matches!(component, Component::CurDir))
+            .peekable();
+        while let Some((component, disposition)) = components.next() {
             let Component::Normal(component) = component else {
-                if matches!(component, Component::CurDir) {
-                    continue;
-                }
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "rename base directory contains an invalid path component",
@@ -3802,40 +4292,22 @@ pub(crate) fn mkdir_all_below_existing_base_std(
                 .handles
                 .last()
                 .ok_or_else(|| io::Error::other("Windows publication root guard is empty"))?;
-            let child = open_windows_directory_component(parent, component, FILE_OPEN)?;
-            guard.handles.push(child);
-        }
-        for component in relative.components() {
-            let Component::Normal(component) = component else {
-                continue;
+            // The kernel opens the final parent for write during a relative
+            // rename. Share writes from its first open: a temporary read-only
+            // share would block another rename into the same trash directory.
+            // Ancestors stay strict and no handle shares delete access, keeping
+            // every retained directory identity pinned.
+            let share_access = if components.peek().is_none() {
+                FILE_SHARE_READ | FILE_SHARE_WRITE
+            } else {
+                FILE_SHARE_READ
             };
-            let parent = guard
-                .handles
-                .last()
-                .ok_or_else(|| io::Error::other("Windows base directory guard is empty"))?;
-            let child = open_windows_directory_component(parent, component, FILE_OPEN_IF)?;
+            let child = open_windows_relative_directory_component(parent, component, disposition, share_access)?;
             guard.handles.push(child);
-        }
-
-        // Windows resolves a handle-relative rename by opening the target for
-        // write. Keep every ancestor strict, but let that internal open share
-        // the final parent. Delete sharing remains omitted, so the retained
-        // directory entry cannot be renamed or removed during publication.
-        if guard.handles.len() > 1 {
-            let component = dir_path
-                .file_name()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename destination parent must have a name"))?;
-            let parent_index = guard.handles.len() - 2;
-            let parent = guard
-                .handles
-                .get(parent_index)
-                .ok_or_else(|| io::Error::other("Windows destination guard lost its parent handle"))?;
-            let rename_parent =
-                open_windows_relative_directory_component(parent, component, FILE_OPEN, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
-            *guard
-                .handles
-                .last_mut()
-                .ok_or_else(|| io::Error::other("Windows destination guard is empty"))? = rename_parent;
+            #[cfg(test)]
+            if components.peek().is_none() {
+                prepare_rename_test_hooks::run_after_component_opened(dir_path);
+            }
         }
 
         Ok(guard)
@@ -3866,9 +4338,49 @@ fn warn_reliable_rename_failure(src_file_path: &Path, dst_file_path: &Path, base
 /// cleanup renames (e.g. `move_to_trash` on an already-removed tmp path) a
 /// pointless second syscall. This predicate is shared by the `rename_data`
 /// commit path via `rename_all`, so any relaxation here must keep genuine
-/// transient errors retryable.
+/// transient errors retryable. The *preparation* phase deliberately uses
+/// [`should_retry_prepare`] instead — see there for why `NotFound` is
+/// recoverable while the destination parent chain is still being built.
 fn should_retry_rename(err: &io::Error, attempt: usize) -> bool {
     attempt == 0 && err.kind() != io::ErrorKind::NotFound
+}
+
+/// How many times rename preparation may retry a `NotFound`.
+///
+/// A pruning walk (`LocalDisk::delete_file`) removes empty ancestors
+/// monotonically upward and stops at the volume root, so it can invalidate
+/// each component *below* the base at most once. One attempt per such
+/// component therefore outlasts a pruning walk, and concurrent walks only
+/// steal an attempt by making that same upward progress. A destination whose
+/// parent *is* the base gets a budget of zero, keeping `NotFound` immediately
+/// terminal for speculative cleanup renames.
+fn prepare_prune_budget(dst_file_path: &Path, base_dir: &Path) -> usize {
+    dst_file_path
+        .parent()
+        .and_then(|parent| parent.strip_prefix(base_dir).ok())
+        .map(|relative| relative.components().count())
+        .unwrap_or(0)
+}
+
+/// Whether a failed rename *preparation* attempt (building the destination
+/// parent chain) should be retried.
+///
+/// Unlike [`should_retry_rename`], `NotFound` is recoverable here: a concurrent
+/// delete prunes now-empty parent directories, so it can unlink an intermediate
+/// destination component between this walk opening a directory and creating the
+/// next child inside it, which a handle-relative `mkdirat`/`openat` reports as
+/// `NotFound`. Each retry rebuilds the whole chain from the base directory,
+/// which no walk below it can remove; `prune_budget` bounds how far a pruner
+/// can push the walk back. A genuinely missing base directory fails identically
+/// on every attempt — the base is only ever opened, never created — so the
+/// missing-base contract holds at the cost of a few extra syscalls on an
+/// already-failing path.
+fn should_retry_prepare(err: &io::Error, attempt: usize, prune_budget: usize) -> bool {
+    if err.kind() == io::ErrorKind::NotFound {
+        attempt < prune_budget
+    } else {
+        attempt == 0
+    }
 }
 
 pub async fn reliable_mkdir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> io::Result<()> {
@@ -4402,6 +4914,141 @@ mod tests {
     }
 
     #[test]
+    fn prepare_retry_budget_covers_every_prunable_component() {
+        // A pruner can invalidate each component below the base once, so the
+        // budget must match the chain depth, not a fixed count.
+        let not_found = io::Error::new(io::ErrorKind::NotFound, "pruned");
+        assert!(should_retry_prepare(&not_found, 0, 2));
+        assert!(should_retry_prepare(&not_found, 1, 2));
+        assert!(!should_retry_prepare(&not_found, 2, 2));
+    }
+
+    #[test]
+    fn prepare_retry_keeps_other_errors_at_a_single_retry() {
+        // Only a prune produces a recoverable NotFound; everything else keeps
+        // the historical single retry so persistent failures stay cheap.
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert!(should_retry_prepare(&denied, 0, 3));
+        assert!(!should_retry_prepare(&denied, 1, 3));
+    }
+
+    #[test]
+    fn prepare_retry_budget_is_zero_when_the_parent_is_the_base() {
+        // Speculative cleanup renames (move_to_trash) land directly in their
+        // base, so a NotFound there is a missing base: terminal, not a prune.
+        let base = Path::new("/vol");
+        assert_eq!(prepare_prune_budget(Path::new("/vol/entry"), base), 0);
+        assert_eq!(prepare_prune_budget(Path::new("/vol/data-movement/sha/id/xl.meta"), base), 3);
+        let not_found = io::Error::new(io::ErrorKind::NotFound, "missing base");
+        assert!(!should_retry_prepare(&not_found, 0, 0));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_all_survives_concurrent_empty_parent_prune() {
+        // A multipart staging cleanup prunes the momentarily empty shared
+        // `data-movement/` prefix while a concurrent upload publishes its
+        // xl.meta below that same prefix. The writer's walk holds an fd to the
+        // pruned component, so its next handle-relative mkdirat fails
+        // NotFound; preparation must rebuild the chain and still publish.
+        let temp_dir = tempdir().expect("create temp dir");
+        let base = temp_dir.path().join("multipart-volume");
+        let shared = base.join("data-movement");
+        std::fs::create_dir_all(&shared).expect("create shared prefix");
+        let src = temp_dir.path().join("staged.meta");
+        std::fs::write(&src, b"payload").expect("write staged meta");
+        let dst = shared.join("sha").join("upload-id").join("xl.meta");
+
+        let pruned = shared.clone();
+        prepare_rename_test_hooks::queue_after_component_opened(&shared, move || {
+            // The cleanup chain's empty-parent prune lands after the writer
+            // opened the shared component but before it creates its child.
+            std::fs::remove_dir(&pruned).expect("prune the empty shared prefix");
+        });
+
+        rename_all(&src, &dst, &base)
+            .await
+            .expect("a concurrently pruned intermediate directory must not fail the publish");
+
+        assert_eq!(std::fs::read(&dst).expect("read published meta"), b"payload");
+        assert!(!src.exists(), "publish must consume the staged source");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_all_survives_a_prune_walking_up_every_shared_component() {
+        // The multipart data-movement chain has TWO shared components below the
+        // volume (`data-movement/` and the per-object `<sha>/`), so one cleanup
+        // walk pruning upward can invalidate the writer twice: once at <sha>,
+        // then again at data-movement while the writer rebuilds. A budget that
+        // covers only a single component would still break write quorum here.
+        let temp_dir = tempdir().expect("create temp dir");
+        let base = temp_dir.path().join("multipart-volume");
+        let movement = base.join("data-movement");
+        let sha = movement.join("sha");
+        std::fs::create_dir_all(&sha).expect("create shared chain");
+        let src = temp_dir.path().join("staged.meta");
+        std::fs::write(&src, b"payload").expect("write staged meta");
+        let dst = sha.join("upload-id").join("xl.meta");
+
+        // First visit of `data-movement` is the writer's initial walk, which the
+        // pruner has not reached yet; it prunes on the writer's rebuild.
+        prepare_rename_test_hooks::queue_after_component_opened(&movement, || {});
+        let pruned_sha = sha.clone();
+        prepare_rename_test_hooks::queue_after_component_opened(&sha, move || {
+            std::fs::remove_dir(&pruned_sha).expect("prune the empty per-object prefix");
+        });
+        let pruned_movement = movement.clone();
+        prepare_rename_test_hooks::queue_after_component_opened(&movement, move || {
+            std::fs::remove_dir(&pruned_movement).expect("prune the empty data-movement prefix");
+        });
+
+        rename_all(&src, &dst, &base)
+            .await
+            .expect("a prune walking up the whole shared chain must not fail the publish");
+
+        assert_eq!(std::fs::read(&dst).expect("read published meta"), b"payload");
+        assert!(!src.exists(), "publish must consume the staged source");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_all_rejects_a_symlink_swapped_in_between_prepare_attempts() {
+        // The retry must not become a traversal window: replacing the pruned
+        // component with a symlink out of the volume before the rebuilt walk
+        // reopens it must fail closed, exactly as a symlink staged before the
+        // first attempt does.
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("create temp dir");
+        let base = temp_dir.path().join("multipart-volume");
+        let shared = base.join("data-movement");
+        let outside = temp_dir.path().join("outside");
+        std::fs::create_dir_all(&shared).expect("create shared prefix");
+        std::fs::create_dir_all(&outside).expect("create outside target");
+        let src = temp_dir.path().join("staged.meta");
+        std::fs::write(&src, b"payload").expect("write staged meta");
+        let dst = shared.join("sha").join("upload-id").join("xl.meta");
+
+        let swapped = shared.clone();
+        let outside_target = outside.clone();
+        prepare_rename_test_hooks::queue_after_component_opened(&shared, move || {
+            std::fs::remove_dir(&swapped).expect("prune the shared prefix");
+            symlink(&outside_target, &swapped).expect("replace the pruned component with a symlink");
+        });
+
+        rename_all(&src, &dst, &base)
+            .await
+            .expect_err("a symlink swapped in between attempts must not be followed");
+
+        assert!(src.exists(), "rejected publish must preserve the staged source");
+        assert!(
+            !outside.join("sha").exists(),
+            "the rebuilt walk must not create or publish through the replacement symlink"
+        );
+    }
+
+    #[test]
     fn is_dir_not_empty_error_recognizes_directory_not_empty_kind() {
         let err = io::Error::from(io::ErrorKind::DirectoryNotEmpty);
         assert!(is_dir_not_empty_error(&err));
@@ -4849,6 +5496,111 @@ mod tests {
 
         assert!(!src.exists());
         assert_eq!(std::fs::read(dst).expect("read committed metadata"), b"metadata");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rename_all_concurrent_trash_renames_remove_every_rollback_directory() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let trash = temp_dir.path().join(".rustfs.sys/tmp/.trash");
+        std::fs::create_dir_all(&trash).expect("create trash directory");
+        let publication_root = PublicationRoot::new(temp_dir.path()).expect("open publication root");
+        let sources: Vec<_> = (0..16)
+            .map(|index| {
+                let source = temp_dir
+                    .path()
+                    .join(format!("bucket/{index}.mp4"))
+                    .join(uuid::Uuid::new_v4().to_string());
+                std::fs::create_dir_all(&source).expect("create rollback directory");
+                std::fs::write(source.join("xl.meta.bkp"), b"rollback metadata").expect("write metadata backup");
+                source
+            })
+            .collect();
+
+        let results = futures::future::join_all(sources.iter().enumerate().map(|(index, source)| {
+            super::rename_all_ignore_missing_source(source, trash.join(index.to_string()), &trash, &publication_root)
+        }))
+        .await;
+
+        for (index, (source, result)) in sources.iter().zip(results).enumerate() {
+            result.expect("concurrent rollback cleanup must reach the shared trash directory");
+            assert!(!source.exists(), "rollback cleanup must not leave a directory in the bucket");
+            assert_eq!(
+                std::fs::read(trash.join(index.to_string()).join("xl.meta.bkp")).expect("read moved metadata backup"),
+                b"rollback metadata",
+                "trash staging must retain the complete backup"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_trash_rename_succeeds_during_concurrent_parent_preparation() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::{
+            Foundation::{ERROR_SHARING_VIOLATION, GENERIC_WRITE},
+            Storage::FileSystem::{
+                DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                FILE_SHARE_WRITE,
+            },
+        };
+
+        // Exercise the final parent both in the existing base walk and in the
+        // creatable suffix walk. Neither may briefly deny write sharing.
+        for nested_parent in [false, true] {
+            let temp_dir = tempdir().expect("create temp dir");
+            let tmp = temp_dir.path().join(".rustfs.sys/tmp");
+            let trash = tmp.join(".trash");
+            std::fs::create_dir_all(&trash).expect("create trash directory");
+            let base = if nested_parent { &tmp } else { &trash };
+            let publication_root = PublicationRoot::new(temp_dir.path()).expect("open publication root");
+            let sources = ["first", "second"].map(|name| {
+                let source = temp_dir
+                    .path()
+                    .join("bucket")
+                    .join(name)
+                    .join(uuid::Uuid::new_v4().to_string());
+                std::fs::create_dir_all(&source).expect("create rollback directory");
+                std::fs::write(source.join("xl.meta.bkp"), name.as_bytes()).expect("write metadata backup");
+                source
+            });
+            let destinations = [trash.join("first"), trash.join("second")];
+            let first_preparation = prepare_rename_with_retry(&sources[0], &destinations[0], base, &publication_root)
+                .expect("prepare the first trash rename");
+            let first_source = sources[0].clone();
+            let first_destination = destinations[0].clone();
+            let interleaved = Arc::new(AtomicBool::new(false));
+            let interleaved_hook = Arc::clone(&interleaved);
+            prepare_rename_test_hooks::queue_after_component_opened(&trash, move || {
+                interleaved_hook.store(true, Ordering::Release);
+                rename_prepared(&first_source, &first_destination, &first_preparation)
+                    .expect("another preparation's first parent handle must allow the pending trash rename");
+            });
+
+            let second_preparation = prepare_rename_with_retry(&sources[1], &destinations[1], base, &publication_root)
+                .expect("prepare the second trash rename");
+            assert!(interleaved.load(Ordering::Acquire), "the competing parent-open window must be exercised");
+            for (path, access) in [(&tmp, GENERIC_WRITE), (&trash, DELETE)] {
+                let err = std::fs::OpenOptions::new()
+                    .access_mode(access)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(path)
+                    .expect_err("ancestor writes and final-parent deletion must remain excluded");
+                assert_eq!(
+                    err.raw_os_error(),
+                    Some(i32::try_from(ERROR_SHARING_VIOLATION).expect("Windows error code must fit i32"))
+                );
+            }
+            rename_prepared(&sources[1], &destinations[1], &second_preparation).expect("publish the second trash rename");
+            for (index, payload) in [b"first".as_slice(), b"second".as_slice()].into_iter().enumerate() {
+                assert!(!sources[index].exists(), "both rollback directories must leave the bucket");
+                assert_eq!(
+                    std::fs::read(destinations[index].join("xl.meta.bkp")).expect("read the staged backup"),
+                    payload
+                );
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -5921,6 +6673,245 @@ mod tests {
         wait_for_dst_dir_fsync_group_commit_idle().await;
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit)]
+    async fn grouped_fsync_physical_batch_keeps_all_owners_after_worker_cancellation() {
+        let temp_dir = tempdir().expect("fixture directory");
+        let dir = temp_dir.path().canonicalize().expect("canonical fsync path");
+        let first_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let second_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let first_owner = first_ctx.begin_namespace_commit();
+        let second_owner = second_ctx.begin_namespace_commit();
+        let first_probe = Arc::downgrade(&first_owner);
+        let second_probe = Arc::downgrade(&second_owner);
+        let (first_rx, group) = DST_DIR_FSYNC_GROUP_COMMIT
+            .enqueue_opened(
+                OpenedDstDirFsyncGroup::open(&dir).expect("open first waiter directory"),
+                Some(first_owner),
+            )
+            .expect("queue first real waiter");
+        let group = group.expect("first waiter starts the group");
+        let (second_rx, second_worker) = DST_DIR_FSYNC_GROUP_COMMIT
+            .enqueue_opened(
+                OpenedDstDirFsyncGroup::open(&dir).expect("open second waiter directory"),
+                Some(second_owner),
+            )
+            .expect("queue second real waiter");
+        assert!(second_worker.is_none(), "same directory must join the same batch");
+        assert_eq!(group.inner.lock().pending.len(), 2);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook =
+            prepared_publication_test_hooks::install_at(prepared_publication_test_hooks::Stage::DirFsync, &dir, move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            });
+        let worker = tokio::spawn(run_dst_dir_fsync_group_worker(group.clone()));
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("batch must reach its physical fsync")
+            .expect("physical fsync entry");
+        assert_eq!(fsync_dir_recorder::grouped_batch_sizes(&dir), vec![2]);
+        assert!(
+            group.inner.lock().pending.is_empty(),
+            "both waiters were transferred into the physical batch"
+        );
+        let queued_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let queued_owner = queued_ctx.begin_namespace_commit();
+        let queued_probe = Arc::downgrade(&queued_owner);
+        let queued_generation = queued_ctx.namespace_commit_generation();
+        let (queued_rx, queued_worker) = DST_DIR_FSYNC_GROUP_COMMIT
+            .enqueue_opened(
+                OpenedDstDirFsyncGroup::open(&dir).expect("open queued waiter directory"),
+                Some(queued_owner),
+            )
+            .expect("queue a waiter after the physical batch was frozen");
+        assert!(queued_worker.is_none());
+        assert_eq!(group.inner.lock().pending.len(), 1);
+        drop((first_rx, second_rx));
+        worker.abort();
+        assert!(worker.await.expect_err("cancel the async batch owner").is_cancelled());
+        assert!(queued_rx.await.is_err(), "an undispatched waiter must observe worker cancellation");
+        assert!(queued_probe.upgrade().is_none());
+        assert!(!queued_ctx.namespace_commits_pending());
+        assert!(queued_ctx.namespace_commit_generation() > queued_generation);
+        assert!(group.inner.lock().pending.is_empty());
+        assert!(!group.inner.lock().worker_running);
+        assert_eq!(DST_DIR_FSYNC_GROUP_COMMIT.counts_for_test(), (0, 0));
+        let first_pending = first_ctx.namespace_commits_pending() && first_probe.upgrade().is_some();
+        let second_pending = second_ctx.namespace_commits_pending() && second_probe.upgrade().is_some();
+        let generations = (first_ctx.namespace_commit_generation(), second_ctx.namespace_commit_generation());
+        drop(release_tx);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&group.dir_file) != 1
+                || first_probe.upgrade().is_some()
+                || second_probe.upgrade().is_some()
+                || first_ctx.namespace_commits_pending()
+                || second_ctx.namespace_commits_pending()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("physical fsync must release every batch owner");
+        assert!(fsync_dir_recorder::was_fsynced(&dir), "the detached syscall must really execute");
+        assert!(
+            first_pending && second_pending,
+            "one physical batch must preserve both independent namespace owners"
+        );
+        assert!(!first_ctx.namespace_commits_pending());
+        assert!(!second_ctx.namespace_commits_pending());
+        assert!(first_ctx.namespace_commit_generation() > generations.0);
+        assert!(second_ctx.namespace_commit_generation() > generations.1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit)]
+    async fn grouped_fsync_unpolled_worker_releases_queued_owner() {
+        let temp_dir = tempdir().expect("fixture directory");
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let owner = ctx.begin_namespace_commit();
+        let probe = Arc::downgrade(&owner);
+        let generation = ctx.namespace_commit_generation();
+        let (rx, group) = DST_DIR_FSYNC_GROUP_COMMIT
+            .enqueue_opened(
+                OpenedDstDirFsyncGroup::open(temp_dir.path()).expect("open queued waiter directory"),
+                Some(owner),
+            )
+            .expect("queue a real waiter");
+        let group = group.expect("first waiter starts the group");
+        let worker = run_dst_dir_fsync_group_worker(group.clone());
+        assert!(ctx.namespace_commits_pending());
+        drop(worker);
+        assert!(rx.await.is_err(), "shutdown before first poll must release the waiter");
+        assert!(probe.upgrade().is_none());
+        assert!(!ctx.namespace_commits_pending());
+        assert!(ctx.namespace_commit_generation() > generation);
+        assert!(group.inner.lock().pending.is_empty());
+        assert!(!group.inner.lock().worker_running);
+        assert_eq!(DST_DIR_FSYNC_GROUP_COMMIT.counts_for_test(), (0, 0));
+        assert!(
+            fsync_dir_recorder::grouped_batch_sizes(temp_dir.path()).is_empty(),
+            "the dropped future must not dispatch a physical batch"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_idle_group_cleanup_preserves_successor_registration() {
+        let temp_dir = tempdir().expect("fixture directory");
+        let registry = DstDirFsyncGroupCommit::default();
+        let (mut first_rx, first_worker) = registry.enqueue_for_test(temp_dir.path()).expect("enqueue first worker");
+        let old_group = first_worker.expect("first waiter starts a worker");
+        // W1 has completed its batch and marked G idle, but has not cleaned G up.
+        let first_waiter = old_group.inner.lock().pending.pop_front().expect("first batch waiter");
+        registry.complete_batch(1);
+        old_group.inner.lock().worker_running = false;
+
+        let (mut second_rx, second_worker) = registry.enqueue_for_test(temp_dir.path()).expect("enqueue second worker");
+        let reused_group = second_worker.expect("idle G starts another worker");
+        assert!(Arc::ptr_eq(&old_group, &reused_group));
+        let second_waiter = reused_group.inner.lock().pending.pop_front().expect("second batch waiter");
+        registry.complete_batch(1);
+        reused_group.inner.lock().worker_running = false;
+        registry.remove_idle_group(&reused_group);
+        assert_eq!(registry.counts_for_test(), (0, 0), "normal idle cleanup must remove G");
+        assert!(second_waiter.result_tx.send(Ok(())).is_ok());
+        assert!(second_rx.try_recv().expect("second worker reports completion").is_ok());
+
+        let (mut successor_rx, successor_worker) = registry.enqueue_for_test(temp_dir.path()).expect("enqueue successor");
+        let successor = successor_worker.expect("successor starts a new group");
+        assert!(!Arc::ptr_eq(&old_group, &successor));
+        assert_eq!(registry.counts_for_test(), (1, 1));
+        // W1 resumes with its old Arc after W2 removed G and W3 installed G2.
+        registry.remove_idle_group(&old_group);
+        assert!(first_waiter.result_tx.send(Ok(())).is_ok());
+        assert!(first_rx.try_recv().expect("first worker reports completion").is_ok());
+        assert!(
+            registry
+                .inner
+                .lock()
+                .groups
+                .get(&successor.key)
+                .is_some_and(|registered| Arc::ptr_eq(registered, &successor)),
+            "stale cleanup must retain the exact successor Arc"
+        );
+        assert_eq!(registry.counts_for_test(), (1, 1));
+        assert!(successor.inner.lock().worker_running);
+        assert_eq!(successor.inner.lock().pending.len(), 1);
+        assert!(matches!(successor_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+
+        let (_joined_rx, new_worker) = registry.enqueue_for_test(temp_dir.path()).expect("join successor");
+        assert!(new_worker.is_none(), "a later waiter must join G2 instead of creating G3");
+        assert_eq!(successor.inner.lock().pending.len(), 2);
+        assert_eq!(registry.counts_for_test(), (1, 2));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit)]
+    async fn stale_idle_cleanup_then_unpolled_worker_drop_releases_waiter_budget() {
+        wait_for_dst_dir_fsync_group_commit_idle().await;
+        let temp_dir = tempdir().expect("fixture directory");
+        let (old_rx, old_worker) = DST_DIR_FSYNC_GROUP_COMMIT
+            .enqueue_for_test(temp_dir.path())
+            .expect("enqueue old group");
+        let old_group = old_worker.expect("old group starts a worker");
+        tokio::time::timeout(Duration::from_secs(5), run_dst_dir_fsync_group_worker(old_group.clone()))
+            .await
+            .expect("old worker must finish its actual fsync");
+        assert!(old_rx.await.expect("old worker reports completion").is_ok());
+        assert!(fsync_dir_recorder::was_fsynced(temp_dir.path()));
+        assert_eq!(fsync_dir_recorder::grouped_batch_sizes(temp_dir.path()), vec![1]);
+        assert_eq!(DST_DIR_FSYNC_GROUP_COMMIT.counts_for_test(), (0, 0));
+
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let owner = ctx.begin_namespace_commit();
+        let probe = Arc::downgrade(&owner);
+        let generation = ctx.namespace_commit_generation();
+        let (rx, successor_worker) = DST_DIR_FSYNC_GROUP_COMMIT
+            .enqueue_opened(
+                OpenedDstDirFsyncGroup::open(temp_dir.path()).expect("open successor directory"),
+                Some(owner),
+            )
+            .expect("enqueue successor owner");
+        let successor = successor_worker.expect("successor starts a new group");
+        assert!(!Arc::ptr_eq(&old_group, &successor));
+        let worker = run_dst_dir_fsync_group_worker(successor.clone());
+        // The stale Arc represents W1 resuming after another worker removed G.
+        DST_DIR_FSYNC_GROUP_COMMIT.remove_idle_group(&old_group);
+        assert!(ctx.namespace_commits_pending());
+        assert!(probe.upgrade().is_some());
+        drop(worker);
+        let channel_closed = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("dropping the unpolled worker must release its channel")
+            .is_err();
+        let counts_after_drop = DST_DIR_FSYNC_GROUP_COMMIT.counts_for_test();
+        let owner_released = probe.upgrade().is_none();
+        let namespace_pending = ctx.namespace_commits_pending();
+        let generation_after_drop = ctx.namespace_commit_generation();
+        let successor_pending = successor.inner.lock().pending.len();
+        let worker_running = successor.inner.lock().worker_running;
+        // Preserve the observed result before cleanup, so a RED run cannot leak
+        // its phantom count into unrelated tests in the same process.
+        clear_dst_dir_fsync_group_commit_for_test();
+        assert!(channel_closed);
+        assert!(owner_released);
+        assert!(!namespace_pending);
+        assert!(generation_after_drop > generation);
+        assert_eq!(successor_pending, 0);
+        assert!(!worker_running);
+        assert_eq!(
+            fsync_dir_recorder::grouped_batch_sizes(temp_dir.path()),
+            vec![1],
+            "dropping the successor before its first poll must not dispatch another fsync"
+        );
+        assert_eq!(counts_after_drop, (0, 0), "stale cleanup must not strand a phantom waiter");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(dst_dir_fsync_group_commit)]
     async fn dst_dir_fsync_group_commit_cancellation_releases_waiter_state() {
@@ -6370,8 +7361,15 @@ mod tests {
         .await
         .expect("second waiter should enqueue during the configured wait budget");
         tokio::time::advance(wait_budget).await;
-        tokio::task::yield_now().await;
-        file_sync_probe::wait_for_active(1).await;
+        let batch_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while file_sync_probe::group_batches().is_empty() {
+            assert!(
+                std::time::Instant::now() < batch_deadline,
+                "timed out waiting for the wait-budget group batch; counts={:?}",
+                file_fdatasync_group_commit_counts_for_test()
+            );
+            tokio::task::yield_now().await;
+        }
 
         assert_eq!(
             file_sync_probe::group_batches(),

@@ -4,10 +4,18 @@
 # acceptance criteria recorded in rustfs/backlog#1733).
 #
 # The migration's goal is to shrink the direct s3s surface, so new code must
-# not grow it. Two counters are ratcheted, baselines verified on 2026-08-05:
+# not grow it. Two counters are ratcheted (verification dates live next to the
+# baseline values below):
 #
-#   - files referencing s3s paths:  rg -l "$S3S_PATH_PATTERN" --type rust (files)
-#   - s3_error! invocation lines:   rg -c 's3_error!' --type rust    (summed)
+#   - files referencing s3s paths:  rg -l "$S3S_PATH_PATTERN" --type rust . (files)
+#   - s3_error! invocation lines:   rg -c 's3_error!' --type rust .   (summed)
+#
+# Every rg invocation MUST pass an explicit path ('.' for repo-wide): without
+# one, rg searches stdin instead of the tree whenever stdin is a readable
+# pipe — which is exactly what GitHub Actions attaches to run steps — and
+# silently counts 0 (observed on run 32978746357, where both repo-wide
+# counters read 0 and were waved through as "shrank"). The sanity assertions
+# below fail hard if that ever regresses.
 #
 # Either count exceeding its baseline fails the check with the offending
 # delta. Baselines are LOWER-ONLY: when a PR shrinks the footprint, lower the
@@ -22,11 +30,48 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# Baselines verified on 2026-08-11. Lower-only; see header.
+# Baselines verified on 2026-08-26. Lower-only; see header.
 # Excludes crates/e2e_test/ — test infrastructure legitimately uses s3s
 # to verify S3 behavior and does not widen the production s3s surface.
-S3S_IMPORT_FILES_BASELINE=211
-S3_ERROR_LINES_BASELINE=1620
+# 208 → 215 on 2026-08-26: PR #6670 mechanically split
+# rustfs/src/app/object_usecase.rs into 8 per-operation modules (net +7
+# files, zero new s3s code — the same handler-layer surface redistributed).
+# The file counter is split-sensitive; the s3_error! line counter confirms
+# no growth (unchanged at 1620).
+# 1620 → 1616 on 2026-08-27: backlog#1840 moved the site-replication service
+# subsystem to rustfs/src/site_replication/ (s3s access funneled through the
+# root storage facade's s3 shim, keeping the file count at 215). The move
+# inlined one s3_error! call in transport.rs (+1); measured 1615 on the
+# pre-move main (after #6694) and 1616 after, so the slack 1620 baseline is
+# retightened to the measured 1616.
+# 215 → 213 on 2026-08-28: multipart foreground admission cleanup moved the
+# new usecase dependency behind the app object-domain facade while main had
+# already shed two direct s3s-importing files. Retighten the file counter only;
+# s3_error! stays flat at 1616.
+# 1616 → 1613 on 2026-09-02: dependency refresh verified the current tree has
+# already shed three s3_error! invocation lines; retighten the line counter.
+# 1613 → 1589 on 2026-09-06: rustfs/backlog#2309 and rustfs/rustfs#7225 both
+# folded the ten per-config arms of ExportBucketMetadata into one helper, which
+# now reports an unreadable configuration as a plain string instead of raising
+# an S3 error per arm (24 invocation lines removed from
+# rustfs/src/admin/handlers/bucket_meta.rs; measured after merging the two).
+# 1589 -> 1588 on 2026-09-08: the GA blocker set (rustfs/backlog#2366) added
+# three invocation lines to the endpoint-refresh paths and folded the five
+# copies of the concurrent-change error into one constructor, netting -1.
+# 1588 -> 1586 on 2026-09-10: the release merge no longer introduces direct
+# s3_error! constructors for heal percent-decoding or tagging not-found errors.
+# 2026-09-15 main -> release integration retains the reviewed diagnostics
+# handlers from main (+3 invocation lines relative to release) and release's
+# other reductions. The merged tree measures 209 import files and 1587
+# invocation lines, tightening main's reviewed 1592-line baseline by five.
+S3S_IMPORT_FILES_BASELINE=209
+S3_ERROR_LINES_BASELINE=1587
+# ecstore-scoped ratchet (rustfs/backlog#1842): the storage engine must not
+# know S3 wire/DTO types (ARCHITECTURE.md invariant 4). The S3-*consuming*
+# client was extracted to crates/s3-client, where s3s usage is legitimate;
+# this counter ratchets the remaining serving-side s3s references out of
+# crates/ecstore. Baseline verified on 2026-08-26.
+S3S_ECSTORE_FILES_BASELINE=36
 S3S_PATH_PATTERN='(^|[^"[:alnum:]_])s3s::'
 E2E_TEST_GLOB='--glob=!crates/e2e_test/**'
 
@@ -45,18 +90,43 @@ run_rg_to() {
     fi
 }
 
-run_rg_to "$TMP_DIR/import_files" -l "$S3S_PATH_PATTERN" --type rust $E2E_TEST_GLOB
-run_rg_to "$TMP_DIR/error_lines" -c 's3_error!' --type rust $E2E_TEST_GLOB
+# Explicit '.' path is load-bearing — see header. Never drop it.
+run_rg_to "$TMP_DIR/import_files" -l "$S3S_PATH_PATTERN" --type rust "$E2E_TEST_GLOB" .
+run_rg_to "$TMP_DIR/error_lines" -c 's3_error!' --type rust "$E2E_TEST_GLOB" .
+run_rg_to "$TMP_DIR/ecstore_files" -l "$S3S_PATH_PATTERN" --type rust crates/ecstore/src
 
 s3s_import_files="$(grep -c . "$TMP_DIR/import_files" || true)"
 s3_error_lines="$(awk -F: '{sum += $NF} END {print sum + 0}' "$TMP_DIR/error_lines")"
+s3s_ecstore_files="$(grep -c . "$TMP_DIR/ecstore_files" || true)"
 
-for value in "$s3s_import_files" "$s3_error_lines"; do
+for value in "$s3s_import_files" "$s3_error_lines" "$s3s_ecstore_files"; do
     if ! [[ "$value" =~ ^[0-9]+$ ]]; then
         echo "error: could not compute s3s footprint counts (got: '$value')" >&2
         exit 1
     fi
 done
+
+# Sanity assertions: a counter reading 0 while its baseline is positive, or
+# the repo-wide file count dropping below the ecstore-scoped one (a strict
+# subset of it), means the counter itself broke — most likely rg searching
+# stdin instead of the tree (see header) — not that the footprint shrank.
+# Fail hard rather than waving the ratchet through. If the footprint ever
+# genuinely reaches zero, lower the baseline to 0 in the same PR.
+sanity_nonzero() {
+    local label="$1" count="$2" baseline="$3"
+    if ((count == 0 && baseline > 0)); then
+        echo "error: $label counted 0 with a baseline of $baseline — the counter is" >&2
+        echo "  broken (rg likely searched stdin; every rg call needs an explicit path)." >&2
+        exit 1
+    fi
+}
+sanity_nonzero "files importing s3s" "$s3s_import_files" "$S3S_IMPORT_FILES_BASELINE"
+sanity_nonzero "s3_error! invocation lines" "$s3_error_lines" "$S3_ERROR_LINES_BASELINE"
+if ((s3s_import_files < s3s_ecstore_files)); then
+    echo "error: repo-wide s3s file count ($s3s_import_files) is below the ecstore-scoped" >&2
+    echo "  count ($s3s_ecstore_files); the repo-wide counter is broken (see header)." >&2
+    exit 1
+fi
 
 status=0
 
@@ -79,9 +149,11 @@ check_ratchet() {
 }
 
 check_ratchet "files importing s3s" "$s3s_import_files" "$S3S_IMPORT_FILES_BASELINE" \
-    "rg -l '$S3S_PATH_PATTERN' --type rust $E2E_TEST_GLOB"
+    "rg -l '$S3S_PATH_PATTERN' --type rust $E2E_TEST_GLOB ."
 check_ratchet "s3_error! invocation lines" "$s3_error_lines" "$S3_ERROR_LINES_BASELINE" \
-    "rg -c 's3_error!' --type rust $E2E_TEST_GLOB"
+    "rg -c 's3_error!' --type rust $E2E_TEST_GLOB ."
+check_ratchet "ecstore files referencing s3s" "$s3s_ecstore_files" "$S3S_ECSTORE_FILES_BASELINE" \
+    "rg -l '$S3S_PATH_PATTERN' --type rust crates/ecstore/src"
 
 if ((status != 0)); then
     exit 1

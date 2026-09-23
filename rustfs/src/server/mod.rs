@@ -27,6 +27,7 @@ mod readiness;
 mod runtime;
 pub(crate) mod runtime_sources;
 mod service_state;
+mod ssec_transport;
 pub mod tls_material;
 
 use tracing::warn;
@@ -47,7 +48,7 @@ pub use service_state::wait_for_shutdown;
 // Items only used within the library crate (admin handlers, server/http.rs, etc.).
 pub(crate) use event::{
     is_event_notifier_reconciled, mark_event_notifier_reconciled, mark_event_notifier_unreconciled,
-    reconcile_event_notifier_from_store, start_persisted_event_notifier_reconciler,
+    reconcile_event_notifier_from_store, start_persisted_event_notifier_reconciler, with_notify_runtime_reconcile_lock,
 };
 #[cfg(test)]
 pub(crate) use health::{
@@ -60,6 +61,7 @@ pub(crate) use health::{
 };
 pub(crate) use http::HeaderMapCarrier;
 pub(crate) use http::active_http_requests;
+pub use layer::s3_http_request_guard;
 pub(crate) use layer::{RequestContextLayer, is_sts_query_request};
 pub(crate) use module_switch::{
     MODULE_SWITCHES_SIGNAL_SUBSYSTEM, ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches,
@@ -71,7 +73,7 @@ pub(crate) use prefix::{
     HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE, MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX,
     MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_LIVE_PATH, MINIO_HEALTH_READY_PATH, PROFILE_CPU_PATH,
     PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX, TONIC_PREFIX,
-    VERSION, has_path_prefix, is_admin_path, is_table_catalog_path,
+    VERSION, console_prefix, has_path_prefix, init_console_prefix, is_admin_path, is_table_catalog_path,
 };
 pub(crate) use readiness::ReadinessDegradedReason;
 pub(crate) use readiness::ReadinessGateLayer;
@@ -82,6 +84,17 @@ pub(crate) use readiness::snapshot_dependency_readiness_report;
 pub(crate) use readiness::{collect_cluster_read_health_report, collect_cluster_write_health_report};
 
 pub use crate::shared_types::RemoteAddr;
+
+pub(crate) fn strip_valid_port_suffix(host: &str) -> &str {
+    if host.ends_with(']') {
+        return host;
+    }
+
+    match host.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok() => host,
+        _ => host,
+    }
+}
 
 pub struct ShutdownHandle {
     shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,

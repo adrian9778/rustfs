@@ -15,18 +15,20 @@
 // #730: data-movement migration keeps staged cleanup helpers until copy paths converge.
 
 pub(crate) mod backpressure;
+pub(crate) mod scanner_backlog;
 
+use crate::core::pools::{DecommissionCapacityOwner, decommission_capacity_mutation_id};
 use crate::error::{
     Error, Result, is_err_data_movement_overwrite, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found,
 };
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::storage_api_contracts::{
-    multipart::{CompletePart, MultipartOperations as _},
+    multipart::CompletePart,
     namespace::NamespaceLocking as _,
     object::{HTTPPreconditions, ObjectOperations as _},
 };
-use crate::store::{ECStore, ObjectLockDiagGuard, SourceCleanupMutationFence};
+use crate::store::{DecommissionFixedReadAnchor, ECStore, SourceCleanupMutationFence};
 use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, FileInfoVersions, ObjectPartInfo};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
@@ -160,6 +162,103 @@ pub fn mark_multipart_upload_completed(flag: &Arc<AtomicBool>) {
     flag.store(false, Ordering::Relaxed);
 }
 
+#[cfg(all(test, feature = "test-util"))]
+struct DataMovementMultipartAbortBarrierState {
+    bucket: String,
+    object: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) struct DataMovementMultipartAbortBarrier {
+    state: Arc<DataMovementMultipartAbortBarrierState>,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+static DATA_MOVEMENT_MULTIPART_ABORT_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<DataMovementMultipartAbortBarrierState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(all(test, feature = "test-util"))]
+impl DataMovementMultipartAbortBarrier {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(DataMovementMultipartAbortBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = DATA_MOVEMENT_MULTIPART_ABORT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("data movement multipart abort barrier mutex should not poison");
+        assert!(slot.is_none(), "data movement multipart abort barrier must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(StdDuration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("data movement multipart failure should reach abort cleanup");
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+impl Drop for DataMovementMultipartAbortBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = DATA_MOVEMENT_MULTIPART_ABORT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("data movement multipart abort barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+async fn pause_data_movement_multipart_before_abort(bucket: &str, object: &str) {
+    let barrier = DATA_MOVEMENT_MULTIPART_ABORT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("data movement multipart abort barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+fn data_movement_abort_opts(
+    object_info: &ObjectInfo,
+    src_pool_idx: usize,
+    expected_bucket_incarnation_id: Option<uuid::Uuid>,
+    lock_lost_signal: Option<&Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+    capacity_owner: Option<DecommissionCapacityOwner>,
+) -> ObjectOptions {
+    let mut opts = ObjectOptions {
+        data_movement: true,
+        src_pool_idx,
+        versioned: object_info.version_id.is_some(),
+        version_id: object_info.version_id.map(|version_id| version_id.to_string()),
+        mod_time: object_info.mod_time,
+        expected_bucket_incarnation_id,
+        ..Default::default()
+    };
+    if let Some(capacity_owner) = capacity_owner {
+        capacity_owner.apply_to(&mut opts);
+    }
+    if let Some(signal) = lock_lost_signal {
+        opts.add_namespace_lock_lost_signal(Arc::clone(signal));
+    }
+    opts
+}
+
 fn insert_data_movement_checksum(user_defined: &mut HashMap<String, String>, object_info: &ObjectInfo) {
     rustfs_utils::http::remove_header_map(user_defined, rustfs_utils::http::SUFFIX_REPLICATION_SSEC_CRC);
     if let Some(checksum) = object_info.checksum.as_ref().filter(|checksum| !checksum.is_empty()) {
@@ -171,14 +270,19 @@ fn insert_data_movement_checksum(user_defined: &mut HashMap<String, String>, obj
     }
 }
 
-fn data_movement_upload_identity(object_info: &ObjectInfo) -> String {
-    let version_id = object_info
-        .version_id
-        .map_or_else(|| "none".to_string(), |version_id| version_id.to_string());
-    let mod_time = object_info
-        .mod_time
-        .map_or_else(|| "none".to_string(), |mod_time| mod_time.unix_timestamp_nanos().to_string());
+fn data_movement_upload_identity_parts(version_id: Option<&str>, mod_time: Option<time::OffsetDateTime>) -> String {
+    let version_id = version_id.unwrap_or("none");
+    let mod_time = mod_time.map_or_else(|| "none".to_string(), |mod_time| mod_time.unix_timestamp_nanos().to_string());
     format!("v1:{version_id}:{mod_time}")
+}
+
+fn data_movement_upload_identity(object_info: &ObjectInfo) -> String {
+    let version_id = object_info.version_id.map(|version_id| version_id.to_string());
+    data_movement_upload_identity_parts(version_id.as_deref(), object_info.mod_time)
+}
+
+pub(crate) fn data_movement_upload_identity_from_options(opts: &ObjectOptions) -> String {
+    data_movement_upload_identity_parts(opts.version_id.as_deref(), opts.mod_time)
 }
 
 fn data_movement_new_multipart_opts(object_info: &ObjectInfo, src_pool_idx: usize) -> ObjectOptions {
@@ -192,7 +296,8 @@ fn data_movement_new_multipart_opts(object_info: &ObjectInfo, src_pool_idx: usiz
         preserve_etag: object_info.etag.clone(),
         src_pool_idx,
         data_movement: true,
-        ..Default::default()
+        shard_integrity_write_mode: Some(object_info.shard_integrity_write_mode()),
+        ..ObjectOptions::with_capacity_expected_data_bytes(usize::try_from(object_info.size).ok())
     }
 }
 
@@ -363,7 +468,7 @@ fn data_movement_complete_multipart_opts(
         preserve_etag: object_info.etag.clone(),
         user_defined,
         src_pool_idx,
-        ..Default::default()
+        ..ObjectOptions::with_capacity_expected_data_bytes(usize::try_from(object_info.size).ok())
     })
 }
 
@@ -372,6 +477,7 @@ fn data_movement_put_object_opts(object_info: &ObjectInfo, src_pool_idx: usize) 
         versioned: object_info.version_id.is_some(),
         src_pool_idx,
         data_movement: true,
+        shard_integrity_write_mode: Some(object_info.shard_integrity_write_mode()),
         version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
         http_preconditions: Some(data_movement_target_precondition()),
         mod_time: object_info.mod_time,
@@ -392,7 +498,7 @@ pub(crate) fn data_movement_target_precondition() -> HTTPPreconditions {
     }
 }
 
-fn is_owned_data_movement_target(target: &ObjectInfo) -> bool {
+pub(crate) fn is_owned_data_movement_target(target: &ObjectInfo) -> bool {
     let rustfs_marker = rustfs_utils::http::internal_key_rustfs(SUFFIX_DATA_MOVED);
     let minio_marker = format!("{}{SUFFIX_DATA_MOVED}", rustfs_utils::http::MINIO_INTERNAL_PREFIX);
     if rustfs_utils::http::get_consistent_str(&target.user_defined, SUFFIX_DATA_MOVED) != Some("true")
@@ -466,9 +572,12 @@ fn resolve_data_movement_abort_result(
     primary_err: Error,
     abort_err: Error,
 ) -> Error {
-    Error::other(format!(
-        "{op_label}: abort_multipart_upload failed for {bucket}/{object} upload {upload_id} after error {primary_err}: {abort_err}"
-    ))
+    data_movement_context_error(
+        format!(
+            "{op_label}: abort_multipart_upload failed for {bucket}/{object} upload {upload_id} after error {primary_err}: {abort_err}"
+        ),
+        abort_err,
+    )
 }
 
 /// A data-movement stage failure that keeps the error it wrapped.
@@ -496,15 +605,21 @@ impl std::error::Error for DataMovementStageError {
     }
 }
 
-fn data_movement_stage_error<E>(op_label: &str, stage: &str, bucket: &str, object: &str, err: E) -> Error
+pub(crate) fn data_movement_context_error<E>(rendered: String, err: E) -> Error
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    let rendered = format!("{op_label}: {stage} failed for {bucket}/{object}: {err}");
     Error::other(DataMovementStageError {
         rendered,
         source: Box::new(err),
     })
+}
+
+fn data_movement_stage_error<E>(op_label: &str, stage: &str, bucket: &str, object: &str, err: E) -> Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    data_movement_context_error(format!("{op_label}: {stage} failed for {bucket}/{object}: {err}"), err)
 }
 
 #[cfg(test)]
@@ -527,12 +642,28 @@ pub(crate) fn data_movement_stage_source(err: &Error) -> Option<&Error> {
         .downcast_ref::<Error>()
 }
 
+/// Recover a concrete typed error wrapped by [`data_movement_stage_error`].
+pub(crate) fn data_movement_stage_source_as<T>(err: &Error) -> Option<&T>
+where
+    T: std::error::Error + 'static,
+{
+    let Error::Io(io_err) = err else {
+        return None;
+    };
+    io_err
+        .get_ref()?
+        .downcast_ref::<DataMovementStageError>()?
+        .source
+        .downcast_ref::<T>()
+}
+
 fn schedule_data_movement_multipart_abort_cleanup(
     store: Arc<ECStore>,
     target_pool_idx: usize,
     bucket: String,
     object: String,
     upload_id: String,
+    opts: ObjectOptions,
     op_label: &str,
 ) {
     let op_label = op_label.to_string();
@@ -540,23 +671,32 @@ fn schedule_data_movement_multipart_abort_cleanup(
         for attempt in 1..=DATA_MOVEMENT_MULTIPART_ABORT_RETRY_ATTEMPTS {
             tokio::time::sleep(StdDuration::from_secs(DATA_MOVEMENT_MULTIPART_ABORT_RETRY_DELAY_SECS)).await;
 
-            let Some(pool) = store.pools.get(target_pool_idx).cloned() else {
+            if store.pools.get(target_pool_idx).is_none() {
                 error!(
                     "{op_label}: background abort_multipart_upload cleanup skipped for {bucket}/{object} upload {upload_id}: target pool {target_pool_idx} is out of range"
                 );
                 return;
+            }
+
+            let mut cleanup_opts = opts.clone();
+            let _multipart_mutation_fence = match DecommissionCapacityOwner::from_options(&cleanup_opts) {
+                Some(owner) => match store.acquire_decommission_multipart_mutation_fence(owner).await {
+                    Ok(fence) => {
+                        fence.add_namespace_lock_fence(&mut cleanup_opts);
+                        Some(fence)
+                    }
+                    Err(err) => {
+                        error!(
+                            "{op_label}: background abort_multipart_upload cleanup could not fence {bucket}/{object} upload {upload_id} on attempt {attempt}: {err:?}"
+                        );
+                        continue;
+                    }
+                },
+                None => None,
             };
 
-            match pool
-                .abort_multipart_upload(
-                    &bucket,
-                    &object,
-                    &upload_id,
-                    &ObjectOptions {
-                        data_movement: true,
-                        ..Default::default()
-                    },
-                )
+            match store
+                .abort_multipart_upload_for_data_movement(target_pool_idx, &bucket, &object, &upload_id, &cleanup_opts)
                 .await
             {
                 Ok(()) => {
@@ -613,8 +753,8 @@ fn is_equivalent_data_movement_part(source: &ObjectPartInfo, target: &ObjectPart
                 == target.checksums.as_ref().filter(|checksums| !checksums.is_empty()))
 }
 
-fn data_movement_parts_by_number(parts: &[ObjectPartInfo]) -> Option<BTreeMap<usize, &ObjectPartInfo>> {
-    let mut parts_by_number = BTreeMap::new();
+pub(crate) fn data_movement_parts_by_number(parts: &[ObjectPartInfo]) -> Option<HashMap<usize, &ObjectPartInfo>> {
+    let mut parts_by_number = HashMap::with_capacity(parts.len());
     for part in parts {
         if parts_by_number.insert(part.number, part).is_some() {
             return None;
@@ -813,7 +953,7 @@ pub(crate) fn is_equivalent_data_movement_metadata(
             .all(|(key, value)| source.user_defined.get(key) == Some(value))
 }
 
-fn is_equivalent_data_movement_object_identity(
+pub(crate) fn is_equivalent_data_movement_object_identity(
     source: &ObjectInfo,
     target: &ObjectInfo,
     compare_mod_time: bool,
@@ -1023,10 +1163,11 @@ pub(crate) enum SourceCleanupError {
     Storage(#[from] Error),
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct SourceCleanupBucketFence<'a> {
     pub(crate) expected_incarnation_id: Option<uuid::Uuid>,
     pub(crate) lifecycle_guard: Option<&'a rustfs_lock::NamespaceLockGuard>,
+    pub(crate) namespace_lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
     pub(crate) object_mutation_fence: Option<&'a SourceCleanupMutationFence>,
 }
 
@@ -1061,7 +1202,7 @@ pub(crate) async fn ensure_source_cleanup_versions_unchanged(
     ensure_source_cleanup_versions_match(expected, &current, allowed_missing)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 struct SourceCleanupDeleteBarrierState {
     bucket: String,
     object: String,
@@ -1071,26 +1212,26 @@ struct SourceCleanupDeleteBarrierState {
     release: tokio::sync::Notify,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 #[allow(
     dead_code,
     reason = "installed by set_disk object tests behind `--features test-util` (backlog#1823)"
 )]
-pub(crate) struct SourceCleanupDeleteBarrier {
+pub struct SourceCleanupDeleteBarrier {
     state: Arc<SourceCleanupDeleteBarrierState>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 static SOURCE_CLEANUP_DELETE_BARRIERS: std::sync::OnceLock<std::sync::Mutex<Vec<Arc<SourceCleanupDeleteBarrierState>>>> =
     std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 #[allow(
     dead_code,
     reason = "installed by set_disk object tests behind `--features test-util` (backlog#1823)"
 )]
 impl SourceCleanupDeleteBarrier {
-    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+    pub fn install(bucket: &str, object: &str) -> Self {
         let state = Arc::new(SourceCleanupDeleteBarrierState {
             bucket: bucket.to_string(),
             object: object.to_string(),
@@ -1113,7 +1254,7 @@ impl SourceCleanupDeleteBarrier {
         Self { state }
     }
 
-    pub(crate) async fn wait_until_paused(&self) {
+    pub async fn wait_until_paused(&self) {
         tokio::time::timeout(StdDuration::from_secs(30), self.state.arrived.notified())
             .await
             .expect("source cleanup should reach the pre-delete barrier");
@@ -1129,7 +1270,7 @@ impl SourceCleanupDeleteBarrier {
         self.state.is_paused.load(Ordering::Acquire)
     }
 
-    pub(crate) fn release(&self) {
+    pub fn release(&self) {
         self.state.release.notify_one();
     }
 }
@@ -1148,7 +1289,7 @@ pub(crate) fn notify_source_cleanup_mutation_fence_pending(bucket: &str, object:
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl Drop for SourceCleanupDeleteBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -1160,7 +1301,7 @@ impl Drop for SourceCleanupDeleteBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 async fn pause_source_cleanup_before_delete(bucket: &str, object: &str) {
     let barrier = SOURCE_CLEANUP_DELETE_BARRIERS
         .get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -1220,7 +1361,7 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
 
     ensure_source_cleanup_versions_unchanged(set.clone(), bucket, object, expected, allowed_missing, op_label).await?;
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pause_source_cleanup_before_delete(bucket, object).await;
 
     let mut opts = ObjectOptions {
@@ -1239,6 +1380,9 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
     }
     if let Some(bucket_lifecycle_guard) = bucket_fence.lifecycle_guard {
         opts.add_bucket_lifecycle_lock_guard(bucket_lifecycle_guard);
+    }
+    if let Some(signal) = bucket_fence.namespace_lock_lost_signal {
+        opts.add_namespace_lock_lost_signal(signal);
     }
     let result = set.delete_object(bucket, cleanup_key.as_str(), opts).await;
     if result.is_ok() {
@@ -1305,7 +1449,8 @@ fn resolve_data_movement_overwrite_resume_result_for(
     target_pool_idx: usize,
     compare_part_checksums: bool,
 ) -> Result<bool> {
-    if !should_check_data_movement_overwrite_resume(err)
+    if scanner_backlog::is_scanner_pause_backlog(&source.bucket, &source.name)
+        || !should_check_data_movement_overwrite_resume(err)
         || !should_check_data_movement_resume_target(src_pool_idx, target_pool_idx)
     {
         return Ok(false);
@@ -1330,27 +1475,43 @@ fn resolve_data_movement_overwrite_resume_result_for(
     Ok(matches!(err, Error::PreconditionFailed) && is_superseding_unversioned_data_movement_object(source, &target))
 }
 
+#[derive(Clone, Copy)]
+struct DataMovementOverwriteCapacity {
+    owner: Option<DecommissionCapacityOwner>,
+    expected_data_bytes: Option<usize>,
+}
+
 async fn should_treat_data_movement_overwrite_as_complete(
     store: &ECStore,
-    src_pool_idx: usize,
-    target_pool_idx: usize,
+    pool_indices: (usize, usize),
     bucket: &str,
     object_info: &ObjectInfo,
     err: &Error,
     compare_part_checksums: bool,
+    capacity: DataMovementOverwriteCapacity,
 ) -> Result<bool> {
     if !should_check_data_movement_overwrite_resume(err) {
         return Ok(false);
     }
+    let (src_pool_idx, target_pool_idx) = pool_indices;
 
-    resolve_data_movement_overwrite_resume_result_for(
+    let equivalent = resolve_data_movement_overwrite_resume_result_for(
         err,
         find_data_movement_target_info(store, target_pool_idx, bucket, object_info).await,
         object_info,
         src_pool_idx,
         target_pool_idx,
         compare_part_checksums,
-    )
+    )?;
+    if equivalent && let Some(owner) = capacity.owner {
+        let expected_data_bytes = capacity
+            .expected_data_bytes
+            .ok_or_else(|| Error::other("equivalent data-movement target cannot reconcile unknown committed data size"))?;
+        store
+            .reconcile_decommission_capacity_after_equivalent_target(owner, target_pool_idx, expected_data_bytes)
+            .await?;
+    }
+    Ok(equivalent)
 }
 
 fn data_movement_part_stage_error(
@@ -1359,9 +1520,27 @@ fn data_movement_part_stage_error(
     bucket: &str,
     object: &str,
     part_number: usize,
-    err: impl std::fmt::Display,
+    err: Error,
 ) -> Error {
-    Error::other(format!("{op_label}: {stage} failed for {bucket}/{object} part {part_number}: {err}"))
+    let rendered = format!("{op_label}: {stage} failed for {bucket}/{object} part {part_number}: {err}");
+    if matches!(&err, Error::DecommissionCapacityBlocked { .. }) {
+        return data_movement_context_error(rendered, err);
+    }
+    // A missing target part is not evidence that the source can be deleted.
+    // Keep other part errors opaque to the source-cleanup classifiers.
+    Error::other(rendered)
+}
+
+#[cfg(test)]
+pub(crate) fn data_movement_part_stage_error_for_test(
+    op_label: &str,
+    stage: &str,
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    err: Error,
+) -> Error {
+    data_movement_part_stage_error(op_label, stage, bucket, object, part_number, err)
 }
 
 fn is_data_movement_part_read_error(err: &Error) -> bool {
@@ -1391,9 +1570,10 @@ pub(crate) async fn migrate_decommission_object(
     rd: GetObjectReader,
     source_bucket_incarnation_id: Option<uuid::Uuid>,
     op_label: &str,
+    capacity_owner: Option<DecommissionCapacityOwner>,
 ) -> Result<()> {
     let source = rd.object_info.clone();
-    let _mutation_fence = store
+    let mutation_fence = store
         .acquire_decommission_object_mutation_fence(&bucket, &source.name)
         .await?;
     let current = find_data_movement_target_info(store.as_ref(), pool_idx, &bucket, &source)
@@ -1410,11 +1590,14 @@ pub(crate) async fn migrate_decommission_object(
         rd,
         source_bucket_incarnation_id,
         op_label,
-        Some(&_mutation_fence),
+        None,
+        capacity_owner,
+        Some(mutation_fence),
     )
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn migrate_object(
     store: Arc<ECStore>,
     pool_idx: usize,
@@ -1423,9 +1606,34 @@ pub(crate) async fn migrate_object(
     source_bucket_incarnation_id: Option<uuid::Uuid>,
     op_label: &str,
 ) -> Result<()> {
-    migrate_object_inner(store, pool_idx, bucket, rd, source_bucket_incarnation_id, op_label, None).await
+    migrate_object_with_lock_lost_signal(store, pool_idx, bucket, rd, source_bucket_incarnation_id, op_label, None).await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn migrate_object_with_lock_lost_signal(
+    store: Arc<ECStore>,
+    pool_idx: usize,
+    bucket: String,
+    rd: GetObjectReader,
+    source_bucket_incarnation_id: Option<uuid::Uuid>,
+    op_label: &str,
+    lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+) -> Result<()> {
+    migrate_object_inner(
+        store,
+        pool_idx,
+        bucket,
+        rd,
+        source_bucket_incarnation_id,
+        op_label,
+        lock_lost_signal,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn migrate_object_inner(
     store: Arc<ECStore>,
     pool_idx: usize,
@@ -1433,21 +1641,126 @@ async fn migrate_object_inner(
     rd: GetObjectReader,
     source_bucket_incarnation_id: Option<uuid::Uuid>,
     op_label: &str,
-    mutation_fence: Option<&ObjectLockDiagGuard>,
+    lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+    capacity_owner: Option<DecommissionCapacityOwner>,
+    mutation_fence: Option<DecommissionFixedReadAnchor>,
 ) -> Result<()> {
+    if scanner_backlog::is_scanner_pause_backlog(&bucket, &rd.object_info.name) {
+        return Err(Error::other("scanner pause backlog requires native retirement handoff"));
+    }
+    let mut mutation_fence = mutation_fence;
     let object_info = rd.object_info.clone();
+    let capacity_owner = capacity_owner.map(|owner| {
+        let version_id = object_info.version_id.map(|version_id| version_id.to_string());
+        let mutation_id = owner.mutation_id.unwrap_or_else(|| {
+            decommission_capacity_mutation_id(
+                owner,
+                &bucket,
+                &object_info.name,
+                version_id.as_deref(),
+                object_info.delete_marker,
+                object_info.mod_time,
+            )
+        });
+        owner.with_mutation_id(mutation_id)
+    });
+    // Capture the exact source/tier identity before any client-paced read, but
+    // defer both the tier lease and source/target write locks to the final
+    // publication. Decommission already owns main's fixed-domain mutation
+    // fence, so reacquiring that domain as a write lock would self-deadlock.
+    let remote_tuple_publication_fence = store
+        .acquire_remote_tuple_publication_fence(&bucket, pool_idx, &object_info, false)
+        .await?;
     let has_part_checksums = object_info
         .parts
         .iter()
         .any(|part| part.checksums.as_ref().is_some_and(|checksums| !checksums.is_empty()));
 
     let preserve_part_checksums = data_movement_part_checksum_writer_enabled();
+    let capacity_expected_data_bytes = usize::try_from(object_info.size).ok();
 
     if should_use_multipart_data_movement(&object_info, has_part_checksums) {
+        // The decommission object fence already covers the source/target
+        // namespace for this migration. Acquiring the synthetic multipart
+        // fence while holding that read lock deadlocks local lock domains;
+        // retain the extra fence only for callers without the outer fence.
+        let multipart_mutation_fence = match (capacity_owner, mutation_fence.is_some()) {
+            (Some(owner), false) => Some(store.acquire_decommission_multipart_mutation_fence(owner).await?),
+            _ => None,
+        };
         let mut new_multipart_opts = data_movement_new_multipart_opts(&object_info, pool_idx);
+        if let Some(capacity_owner) = capacity_owner {
+            capacity_owner.apply_to(&mut new_multipart_opts);
+        }
         new_multipart_opts.expected_bucket_incarnation_id = source_bucket_incarnation_id;
+        if let Some(signal) = lock_lost_signal.as_ref() {
+            new_multipart_opts.add_namespace_lock_lost_signal(Arc::clone(signal));
+        }
+        if let Some(fence) = multipart_mutation_fence.as_ref() {
+            fence.add_namespace_lock_fence(&mut new_multipart_opts);
+        }
+        if let Some(owner) = capacity_owner {
+            let existing_target_pool_idx = store
+                .select_data_movement_pool_idx(&bucket, &object_info.name, -1, &new_multipart_opts, false)
+                .await?;
+            if existing_target_pool_idx != pool_idx
+                && let Some(target) =
+                    find_data_movement_target_info(store.as_ref(), existing_target_pool_idx, &bucket, &object_info).await?
+                && is_equivalent_data_movement_object_identity(&object_info, &target, true, preserve_part_checksums)
+            {
+                let expected_data_bytes = capacity_expected_data_bytes
+                    .ok_or_else(|| Error::other("equivalent multipart target cannot reconcile unknown committed data size"))?;
+                store
+                    .reconcile_decommission_capacity_after_equivalent_target(owner, existing_target_pool_idx, expected_data_bytes)
+                    .await?;
+                info!(
+                    "{op_label}: multipart upload restart reconciled equivalent target for {}/{}",
+                    bucket.as_str(),
+                    object_info.name.as_str()
+                );
+                return Ok(());
+            }
+            let mut cleanup_opts = data_movement_abort_opts(
+                &object_info,
+                pool_idx,
+                source_bucket_incarnation_id,
+                lock_lost_signal.as_ref(),
+                capacity_owner,
+            );
+            if let Some(anchor) = mutation_fence.as_ref() {
+                anchor.guard().add_namespace_lock_fence(&mut cleanup_opts);
+            }
+            if let Some(fence) = multipart_mutation_fence.as_ref() {
+                fence.add_namespace_lock_fence(&mut cleanup_opts);
+            }
+            for target_pool_idx in store.decommission_capacity_cleanup_target_indices(owner).await? {
+                store
+                    .reconcile_multipart_uploads_for_data_movement(
+                        target_pool_idx,
+                        &bucket,
+                        &object_info.name,
+                        &data_movement_upload_identity(&object_info),
+                        &cleanup_opts,
+                    )
+                    .await
+                    .map_err(|err| {
+                        data_movement_stage_error(
+                            op_label,
+                            "reconcile_multipart_upload",
+                            bucket.as_str(),
+                            object_info.name.as_str(),
+                            err,
+                        )
+                    })?;
+            }
+        }
         let (res, target_pool_idx, expected_bucket_incarnation_id) = match store
-            .handle_new_multipart_upload_with_pool_idx(&bucket, &object_info.name, &new_multipart_opts, mutation_fence)
+            .handle_new_multipart_upload_with_pool_idx(
+                &bucket,
+                &object_info.name,
+                &new_multipart_opts,
+                mutation_fence.as_ref().map(DecommissionFixedReadAnchor::guard),
+            )
             .await
         {
             Ok(res) => res,
@@ -1490,7 +1803,7 @@ async fn migrate_object_inner(
                             err,
                         )
                     })?;
-                let part_opts = ObjectOptions {
+                let mut part_opts = ObjectOptions {
                     part_number: Some(part.number),
                     preserve_etag: Some(part.etag.clone()),
                     data_movement: true,
@@ -1498,6 +1811,15 @@ async fn migrate_object_inner(
                     expected_bucket_incarnation_id,
                     ..Default::default()
                 };
+                if let Some(capacity_owner) = capacity_owner {
+                    capacity_owner.apply_to(&mut part_opts);
+                }
+                if let Some(signal) = lock_lost_signal.as_ref() {
+                    part_opts.add_namespace_lock_lost_signal(Arc::clone(signal));
+                }
+                if let Some(fence) = multipart_mutation_fence.as_ref() {
+                    fence.add_namespace_lock_fence(&mut part_opts);
+                }
                 let pi = match store
                     .put_object_part_for_data_movement(
                         target_pool_idx,
@@ -1541,27 +1863,44 @@ async fn migrate_object_inner(
                         err,
                     )
                 })?;
+            if let Some(capacity_owner) = capacity_owner {
+                capacity_owner.apply_to(&mut complete_multipart_opts);
+            }
             complete_multipart_opts.expected_bucket_incarnation_id = expected_bucket_incarnation_id;
+            if let Some(signal) = lock_lost_signal.as_ref() {
+                complete_multipart_opts.add_namespace_lock_lost_signal(Arc::clone(signal));
+            }
+            if let Some(fence) = multipart_mutation_fence.as_ref() {
+                fence.add_namespace_lock_fence(&mut complete_multipart_opts);
+            }
+            let remote_tuple_publication_fence = match mutation_fence.take() {
+                Some(anchor) => remote_tuple_publication_fence.under_fixed_read_anchor(anchor)?,
+                None => remote_tuple_publication_fence,
+            };
             if let Err(err) = store
                 .clone()
-                .complete_multipart_upload_for_data_movement(
-                    (target_pool_idx, mutation_fence),
+                .complete_multipart_upload_for_data_movement_with_publication_fence(
+                    target_pool_idx,
                     &bucket,
                     &object_info.name,
                     &res.upload_id,
                     parts,
                     &complete_multipart_opts,
+                    remote_tuple_publication_fence,
                 )
                 .await
             {
                 if should_treat_data_movement_overwrite_as_complete(
                     store.as_ref(),
-                    pool_idx,
-                    target_pool_idx,
+                    (pool_idx, target_pool_idx),
                     bucket.as_str(),
                     &object_info,
                     &err,
                     preserve_part_checksums,
+                    DataMovementOverwriteCapacity {
+                        owner: capacity_owner,
+                        expected_data_bytes: capacity_expected_data_bytes,
+                    },
                 )
                 .await?
                 {
@@ -1589,18 +1928,26 @@ async fn migrate_object_inner(
         .await;
 
         if multipart_result.is_ok() && should_abort_multipart_upload(&abort_multipart_flag) {
+            let mut abort_opts = data_movement_abort_opts(
+                &object_info,
+                pool_idx,
+                expected_bucket_incarnation_id,
+                lock_lost_signal.as_ref(),
+                capacity_owner,
+            );
+            if let Some(anchor) = mutation_fence.as_ref() {
+                anchor.guard().add_namespace_lock_fence(&mut abort_opts);
+            }
+            if let Some(fence) = multipart_mutation_fence.as_ref() {
+                fence.add_namespace_lock_fence(&mut abort_opts);
+            }
             let abort_result = store
                 .abort_multipart_upload_for_data_movement(
                     target_pool_idx,
                     &bucket,
                     &object_info.name,
                     &res.upload_id,
-                    &ObjectOptions {
-                        data_movement: true,
-                        src_pool_idx: pool_idx,
-                        expected_bucket_incarnation_id,
-                        ..Default::default()
-                    },
+                    &abort_opts,
                 )
                 .await;
             match abort_result {
@@ -1608,12 +1955,15 @@ async fn migrate_object_inner(
                 Err(abort_err) if is_err_invalid_upload_id(&abort_err) => {
                     if should_treat_data_movement_overwrite_as_complete(
                         store.as_ref(),
-                        pool_idx,
-                        target_pool_idx,
+                        (pool_idx, target_pool_idx),
                         bucket.as_str(),
                         &object_info,
                         &abort_err,
                         preserve_part_checksums,
+                        DataMovementOverwriteCapacity {
+                            owner: capacity_owner,
+                            expected_data_bytes: capacity_expected_data_bytes,
+                        },
                     )
                     .await?
                     {
@@ -1643,6 +1993,7 @@ async fn migrate_object_inner(
                         bucket.clone(),
                         object_info.name.clone(),
                         res.upload_id.clone(),
+                        abort_opts,
                         op_label,
                     );
                     return Err(data_movement_stage_error(
@@ -1658,18 +2009,28 @@ async fn migrate_object_inner(
 
         if let Err(primary_err) = multipart_result {
             if should_abort_multipart_upload(&abort_multipart_flag) {
+                #[cfg(all(test, feature = "test-util"))]
+                pause_data_movement_multipart_before_abort(&bucket, &object_info.name).await;
+                let mut abort_opts = data_movement_abort_opts(
+                    &object_info,
+                    pool_idx,
+                    expected_bucket_incarnation_id,
+                    lock_lost_signal.as_ref(),
+                    capacity_owner,
+                );
+                if let Some(anchor) = mutation_fence.as_ref() {
+                    anchor.guard().add_namespace_lock_fence(&mut abort_opts);
+                }
+                if let Some(fence) = multipart_mutation_fence.as_ref() {
+                    fence.add_namespace_lock_fence(&mut abort_opts);
+                }
                 return match store
                     .abort_multipart_upload_for_data_movement(
                         target_pool_idx,
                         &bucket,
                         &object_info.name,
                         &res.upload_id,
-                        &ObjectOptions {
-                            data_movement: true,
-                            src_pool_idx: pool_idx,
-                            expected_bucket_incarnation_id,
-                            ..Default::default()
-                        },
+                        &abort_opts,
                     )
                     .await
                 {
@@ -1682,6 +2043,7 @@ async fn migrate_object_inner(
                             bucket.clone(),
                             object_info.name.clone(),
                             res.upload_id.clone(),
+                            abort_opts,
                             op_label,
                         );
                         Err(resolve_data_movement_abort_result(
@@ -1704,20 +2066,39 @@ async fn migrate_object_inner(
     let mut data = data_movement_put_object_reader(bucket.as_str(), &object_info, rd, op_label)?;
 
     let mut put_opts = data_movement_put_object_opts(&object_info, pool_idx);
+    if let Some(capacity_owner) = capacity_owner {
+        capacity_owner.apply_to(&mut put_opts);
+    }
     put_opts.expected_bucket_incarnation_id = source_bucket_incarnation_id;
+    if let Some(signal) = lock_lost_signal {
+        put_opts.add_namespace_lock_lost_signal(signal);
+    }
+    let remote_tuple_publication_fence = match mutation_fence.take() {
+        Some(anchor) => remote_tuple_publication_fence.under_fixed_read_anchor(anchor)?,
+        None => remote_tuple_publication_fence,
+    };
     let (target_pool_idx, put_result) = store
-        .put_object_for_data_movement(&bucket, &object_info.name, &mut data, &put_opts, mutation_fence)
+        .put_object_for_data_movement_with_publication_fence(
+            &bucket,
+            &object_info.name,
+            &mut data,
+            &put_opts,
+            remote_tuple_publication_fence,
+        )
         .await
         .map_err(|err| data_movement_stage_error(op_label, "prepare_put_object", &bucket, &object_info.name, err))?;
     if let Err(err) = put_result {
         if should_treat_data_movement_overwrite_as_complete(
             store.as_ref(),
-            pool_idx,
-            target_pool_idx,
+            (pool_idx, target_pool_idx),
             bucket.as_str(),
             &object_info,
             &err,
             preserve_part_checksums,
+            DataMovementOverwriteCapacity {
+                owner: capacity_owner,
+                expected_data_bytes: capacity_expected_data_bytes,
+            },
         )
         .await?
         {
@@ -1745,9 +2126,30 @@ async fn migrate_object_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_movement_retains_source_shard_integrity_mode() {
+        use crate::object_api::ShardIntegrityWriteMode;
+        let mut source = ObjectInfo::default();
+        for mode in [ShardIntegrityWriteMode::Legacy, ShardIntegrityWriteMode::Protected] {
+            if mode == ShardIntegrityWriteMode::Protected {
+                // A declaration selects protected I/O; the source reader still
+                // rejects this deliberately incomplete descriptor before commit.
+                rustfs_utils::http::insert_str(
+                    Arc::make_mut(&mut source.user_defined),
+                    rustfs_filemeta::shard_integrity::SUFFIX_SHARD_INTEGRITY,
+                    "invalid".to_owned(),
+                );
+            }
+            let put = data_movement_put_object_opts(&source, 0);
+            let multipart = data_movement_new_multipart_opts(&source, 0);
+            assert_eq!(put.shard_integrity_write_mode, Some(mode));
+            assert_eq!(multipart.shard_integrity_write_mode, Some(mode));
+        }
+    }
     use crate::bucket::replication::{ReplicationStatusType, VersionPurgeStatusType};
+    use rustfs_filemeta::metadata_keys;
     use rustfs_rio::{Checksum, ChecksumType};
-    use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
     use std::collections::HashMap;
     use std::io::Cursor;
     use std::sync::atomic::AtomicUsize;
@@ -1805,16 +2207,16 @@ mod tests {
         assert_eq!(source.version_purge_status_internal, target.version_purge_status_internal);
         assert_eq!(source.version_purge_status, target.version_purge_status);
         assert_eq!(
-            source.user_defined.get(X_AMZ_OBJECT_LOCK_MODE.as_str()),
-            target.user_defined.get(X_AMZ_OBJECT_LOCK_MODE.as_str())
+            source.user_defined.get(metadata_keys::OBJECT_LOCK_MODE),
+            target.user_defined.get(metadata_keys::OBJECT_LOCK_MODE)
         );
         assert_eq!(
-            source.user_defined.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str()),
-            target.user_defined.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str())
+            source.user_defined.get(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE),
+            target.user_defined.get(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE)
         );
         assert_eq!(
-            source.user_defined.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()),
-            target.user_defined.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str())
+            source.user_defined.get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD),
+            target.user_defined.get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD)
         );
         assert_eq!(source.parts.len(), target.parts.len());
         for (source_part, target_part) in source.parts.iter().zip(target.parts.iter()) {
@@ -1951,6 +2353,19 @@ mod tests {
     }
 
     #[test]
+    fn test_decommission_cleanup_preflight_accepts_migrated_free_version_consumed_from_source() {
+        let migrated = cleanup_test_file_info("object.txt", Uuid::from_u128(1), "migrated");
+        let mut free_version = cleanup_test_file_info("object.txt", Uuid::from_u128(2), "tier-cleanup");
+        free_version.deleted = true;
+        free_version.set_tier_free_version();
+        let expected = cleanup_test_versions(vec![migrated.clone(), free_version.clone()]);
+        let current = cleanup_test_versions(vec![migrated]);
+        let allowed_missing = vec![source_cleanup_version_identity(&free_version)];
+
+        assert!(source_cleanup_versions_match_with_allowed_missing(&expected, &current, &allowed_missing));
+    }
+
+    #[test]
     fn test_decommission_cleanup_preflight_rejects_unexpected_missing_version() {
         let migrated = cleanup_test_file_info("object.txt", Uuid::from_u128(1), "migrated");
         let protected = cleanup_test_file_info("object.txt", Uuid::from_u128(2), "protected");
@@ -2004,6 +2419,7 @@ mod tests {
         assert!(message.contains("bucket-a/object-a"));
         assert!(message.contains("upload upload-1"));
         assert!(message.contains(Error::SlowDown.to_string().as_str()));
+        assert!(matches!(data_movement_stage_source(&err), Some(Error::OperationCanceled)));
     }
 
     #[test]
@@ -2053,8 +2469,15 @@ mod tests {
         let err =
             data_movement_part_stage_error("rebalance_object", "put_object_part", "bucket-a", "object-a", 7, Error::SlowDown);
         let message = err.to_string();
-        assert!(message.contains("rebalance_object: put_object_part failed for bucket-a/object-a part 7"));
-        assert!(message.contains(Error::SlowDown.to_string().as_str()));
+        assert_eq!(
+            message,
+            Error::other(format!(
+                "rebalance_object: put_object_part failed for bucket-a/object-a part 7: {}",
+                Error::SlowDown
+            ))
+            .to_string()
+        );
+        assert!(data_movement_stage_source(&err).is_none());
     }
 
     #[test]
@@ -2318,7 +2741,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        assert!(!object_info.is_multipart());
+        assert!(object_info.is_multipart());
         assert!(should_use_multipart_data_movement(&object_info, false));
 
         let single_nonstandard_part = ObjectInfo {
@@ -2433,13 +2856,13 @@ mod tests {
         let mod_time = OffsetDateTime::UNIX_EPOCH;
         let metadata = Arc::new(HashMap::from([
             ("x-amz-meta-key".to_string(), "value".to_string()),
-            (rustfs_utils::http::AMZ_STORAGE_CLASS.to_string(), "STANDARD_IA".to_string()),
-            (X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(), "GOVERNANCE".to_string()),
+            (rustfs_filemeta::metadata_keys::STORAGE_CLASS.to_string(), "STANDARD_IA".to_string()),
+            (metadata_keys::OBJECT_LOCK_MODE.to_string(), "GOVERNANCE".to_string()),
             (
-                X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+                metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
                 "2030-01-01T00:00:00Z".to_string(),
             ),
-            (X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string()),
+            (metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string()),
         ]));
         let part = ObjectPartInfo {
             number: 1,
@@ -2479,12 +2902,12 @@ mod tests {
                     rustfs_utils::http::SUFFIX_REPLICATION_STATUS.to_string(),
                     "arn:minio:target=PENDING;".to_string(),
                 ),
-                (X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(), "COMPLIANCE".to_string()),
+                (metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string()),
                 (
-                    X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+                    metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
                     "2031-01-01T00:00:00Z".to_string(),
                 ),
-                (X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string()),
+                (metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string()),
             ])),
             ..Default::default()
         };
@@ -2497,15 +2920,15 @@ mod tests {
             Some(&"arn:minio:target=PENDING;".to_string())
         );
         assert_eq!(
-            new_multipart_opts.user_defined.get(X_AMZ_OBJECT_LOCK_MODE.as_str()),
+            new_multipart_opts.user_defined.get(metadata_keys::OBJECT_LOCK_MODE),
             Some(&"COMPLIANCE".to_string())
         );
         assert_eq!(
-            put_opts.user_defined.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str()),
+            put_opts.user_defined.get(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE),
             Some(&"2031-01-01T00:00:00Z".to_string())
         );
         assert_eq!(
-            new_multipart_opts.user_defined.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()),
+            new_multipart_opts.user_defined.get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD),
             Some(&"ON".to_string())
         );
     }
@@ -2695,7 +3118,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(!object_info.is_multipart());
+        assert!(object_info.is_multipart());
         assert!(object_info.parts.iter().any(|part| part.checksums.is_some()));
         let opts = data_movement_put_object_opts(&object_info, 0);
         assert!(!rustfs_utils::http::contains_key_str(&opts.user_defined, SUFFIX_PART_CHECKSUMS));
@@ -2931,6 +3354,141 @@ mod tests {
         let source = overwrite_equivalence_source();
 
         assert!(overwrite_resume_for_target(&source, source.clone()));
+    }
+
+    fn scanner_backlog_replica_pair() -> (ObjectInfo, ObjectInfo) {
+        let source = ObjectInfo {
+            bucket: crate::disk::RUSTFS_META_BUCKET.to_string(),
+            name: "buckets/.scanner-pause-backlog.json".to_string(),
+            version_id: None,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND),
+            ..overwrite_equivalence_source()
+        };
+        let target = ObjectInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..source.clone()
+        };
+        (source, target)
+    }
+
+    fn scanner_backlog_precondition_resumes(source: &ObjectInfo, target: ObjectInfo) -> bool {
+        resolve_data_movement_overwrite_resume_result_for(&Error::PreconditionFailed, Ok(Some(target)), source, 0, 1, true)
+            .expect("scanner replica conflict should be adjudicated")
+    }
+
+    #[test]
+    fn test_scanner_backlog_resume_requires_native_cohort_proof_even_for_identical_payload() {
+        let (source, target) = scanner_backlog_replica_pair();
+        assert!(!is_owned_data_movement_target(&target), "native scanner writes are not migration copies");
+        assert!(!is_equivalent_data_movement_object(&source, &target));
+        assert!(
+            !scanner_backlog_precondition_resumes(&source, target),
+            "a single identical replica cannot prove native cohort authority"
+        );
+    }
+
+    #[test]
+    fn test_scanner_backlog_resume_rejects_newer_timestamp_and_full_single_replica_identity() {
+        let (source, mut target) = scanner_backlog_replica_pair();
+        target.mod_time = source.mod_time.map(|time| time + time::Duration::SECOND);
+        target.etag = Some("different-native-ledger".to_string());
+        assert!(!scanner_backlog_precondition_resumes(&source, target));
+        assert!(!scanner_backlog_precondition_resumes(&source, source.clone()));
+    }
+
+    #[test]
+    fn test_scanner_backlog_resume_rejects_changed_payload_or_metadata() {
+        let (source, target) = scanner_backlog_replica_pair();
+        let mut different_etag = target.clone();
+        different_etag.etag = Some("different-ledger-generation".to_string());
+        let mut different_size = target.clone();
+        different_size.size += 1;
+        let mut different_checksum = target.clone();
+        different_checksum.checksum = Some(Bytes::from_static(b"different-checksum"));
+        let mut different_metadata = target.clone();
+        Arc::make_mut(&mut different_metadata.user_defined).insert("x-amz-meta-key".to_string(), "different".to_string());
+        let mut different_tags = target.clone();
+        different_tags.user_tags = Arc::new("tag=changed".to_string());
+        let mut different_parts = target.clone();
+        Arc::make_mut(&mut different_parts.parts)[0].etag = "different-part".to_string();
+        let mut different_tier = target;
+        different_tier.transitioned_object.tier = "different-tier".to_string();
+        for (label, different) in [
+            ("etag", different_etag),
+            ("size", different_size),
+            ("checksum", different_checksum),
+            ("metadata", different_metadata),
+            ("tags", different_tags),
+            ("parts", different_parts),
+            ("tier", different_tier),
+        ] {
+            assert!(
+                !scanner_backlog_precondition_resumes(&source, different),
+                "replica-local timestamps do not authorize a changed {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scanner_backlog_resume_rejects_other_namespaces_and_incomplete_identity() {
+        let (source, target) = scanner_backlog_replica_pair();
+        for (bucket, name) in [
+            ("user-bucket", "buckets/.scanner-pause-backlog.json"),
+            (crate::disk::RUSTFS_META_BUCKET, "buckets/.scanner-pause-backlog.json.bkp"),
+            (crate::disk::RUSTFS_META_BUCKET, "buckets/.usage-cache.bin"),
+        ] {
+            let mut source = source.clone();
+            let mut target = target.clone();
+            for replica in [&mut source, &mut target] {
+                replica.bucket = bucket.to_string();
+                replica.name = name.to_string();
+            }
+            assert!(!scanner_backlog_precondition_resumes(&source, target), "out-of-scope key {bucket}/{name}");
+        }
+        for missing in ["etag", "empty-etag", "source-time", "target-time", "version", "delete-marker"] {
+            let mut source = source.clone();
+            let mut target = target.clone();
+            match missing {
+                "etag" => {
+                    source.etag = None;
+                    target.etag = None;
+                }
+                "empty-etag" => {
+                    source.etag = Some(String::new());
+                    target.etag = Some(String::new());
+                }
+                "source-time" => source.mod_time = None,
+                "target-time" => target.mod_time = None,
+                "version" => {
+                    source.version_id = Some(Uuid::from_u128(1));
+                    target.version_id = source.version_id;
+                }
+                "delete-marker" => {
+                    source.delete_marker = true;
+                    target.delete_marker = true;
+                }
+                _ => unreachable!("all identity variants are enumerated above"),
+            }
+            assert!(!scanner_backlog_precondition_resumes(&source, target), "unsupported identity: {missing}");
+        }
+    }
+
+    #[test]
+    fn test_scanner_backlog_resume_requires_a_cross_pool_precondition_conflict() {
+        let (source, target) = scanner_backlog_replica_pair();
+        for (err, target_pool) in [
+            (Error::PreconditionFailed, 0),
+            (Error::SlowDown, 1),
+            (
+                Error::InvalidUploadID(source.bucket.clone(), source.name.clone(), "upload".to_string()),
+                1,
+            ),
+        ] {
+            assert!(
+                !resolve_data_movement_overwrite_resume_result_for(&err, Ok(Some(target.clone())), &source, 0, target_pool, true)
+                    .expect("non-resumable conflict should return false")
+            );
+        }
     }
 
     #[test]

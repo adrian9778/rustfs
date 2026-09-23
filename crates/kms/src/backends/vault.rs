@@ -22,15 +22,19 @@ use crate::backends::{
     BackendCapabilities, ExpiredKeyRemoval, KmsBackend, ListedKeyFailure, StateGatedOperation, UnreadableKeys,
     classify_listed_key_failure, empty_key_page, ensure_key_state_permits, ensure_key_status_permits,
     ensure_rewrap_context_matches, ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys, started_at_the_first_key,
+    validate_key_id_segment,
 };
 use crate::config::{KmsConfig, VaultConfig};
-use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
+use crate::encryption::{
+    AesDekCrypto, CONTEXT_BINDING_AAD_V1, DataKeyEnvelope, DekCrypto, context_aad, desired_context_binding,
+    envelope_aad_write_enabled, envelope_wrap_aad, generate_key_material,
+};
 use crate::error::{KmsError, Result};
 use crate::persisted_observability::{BoundedUnknownFieldName, UnknownFieldSummary};
 use crate::policy::{self, AttemptError, OpClass, RetryPolicy};
 use crate::types::*;
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose};
+use base64_simd::STANDARD as BASE64;
 use jiff::Zoned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -524,8 +528,8 @@ fn decode_stored_key_material(key_id: &str, encrypted_material: &str) -> Result<
 
     // Mirrors `decrypt_key_material`: stored material is currently base64 without an
     // additional encryption layer.
-    let key_material = general_purpose::STANDARD
-        .decode(encrypted_material)
+    let key_material = BASE64
+        .decode_to_vec(encrypted_material)
         .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key material is not valid base64: {e}")))?;
 
     // Key material must be exactly 32 bytes for AES-256.
@@ -546,11 +550,14 @@ impl VaultKmsClient {
     /// request issued through this client, plus the retry and fail-closed
     /// budgets for credential refresh.
     pub async fn new(config: VaultConfig, kms_config: &KmsConfig) -> Result<Self> {
+        let (ca_cert_paths, client_identity) = crate::backends::vault_credentials::vault_tls_materials(config.tls.as_ref())?;
         let settings = VaultConnectionSettings {
             address: config.address.clone(),
             namespace: config.namespace.clone(),
             attempt_timeout: kms_config.effective_timeout(),
             skip_tls_verify: config.tls.as_ref().is_some_and(|tls| tls.skip_verify),
+            ca_cert_paths,
+            client_identity,
         };
         let source = token_source_for(&config.auth_method, &settings)?;
         let policy = VaultCredentialPolicy::from_kms_config(
@@ -665,9 +672,17 @@ impl VaultKmsClient {
         policy::execute(operation, class, &self.retry, &self.cancel, attempt).await
     }
 
-    /// Get the full path for a key in Vault
-    fn key_path(&self, key_id: &str) -> String {
-        format!("{}/{}", self.key_path_prefix, key_id)
+    /// Get the full path for a key in Vault.
+    ///
+    /// Every KV2 path this backend reads, writes or deletes is derived here, so
+    /// refusing an identifier that is not a single path segment at this one
+    /// point keeps `create`, `describe`, `delete` and the metadata writes inside
+    /// `key_path_prefix`: `../evil` would otherwise address a record outside it
+    /// once the HTTP client normalises the URL, and `a/b` a nested path that the
+    /// listing reports as a directory rather than a key.
+    fn key_path(&self, key_id: &str) -> Result<String> {
+        validate_key_id_segment(key_id)?;
+        Ok(format!("{}/{}", self.key_path_prefix, key_id))
     }
 
     /// Get the path of the immutable record holding one version's material
@@ -687,7 +702,7 @@ impl VaultKmsClient {
     /// confidentiality. Any identity with KV read access to the key path can recover the
     /// plaintext master key.
     async fn encrypt_key_material(&self, key_material: &[u8]) -> Result<String> {
-        Ok(general_purpose::STANDARD.encode(key_material))
+        Ok(base64_simd::STANDARD.encode_to_string(key_material))
     }
 
     /// Read the immutable material record of one key version.
@@ -759,7 +774,7 @@ impl VaultKmsClient {
     /// Read the key record together with the KV2 secret version holding it, so a
     /// later write can be check-and-set against exactly this snapshot.
     async fn get_key_data_versioned(&self, key_id: &str) -> Result<(u32, VaultKeyData)> {
-        let path = self.key_path(key_id);
+        let path = self.key_path(key_id)?;
         let path = path.as_str();
 
         let metadata = self
@@ -800,7 +815,7 @@ impl VaultKmsClient {
     /// On success returns the secret version created by this write so a caller
     /// can chain further check-and-set writes.
     async fn try_cas_store_key_data(&self, key_id: &str, key_data: &VaultKeyData, cas: u32) -> Result<Option<u32>> {
-        let path = self.key_path(key_id);
+        let path = self.key_path(key_id)?;
         let path = path.as_str();
 
         // Single attempt: replaying a lost-response write would double-apply
@@ -904,7 +919,7 @@ impl VaultKmsClient {
     /// when a record already exists — i.e. a concurrent create committed
     /// first. An existing record is never overwritten.
     async fn try_create_key_data(&self, key_id: &str, key_data: &VaultKeyData) -> Result<bool> {
-        let path = self.key_path(key_id);
+        let path = self.key_path(key_id)?;
         let path = path.as_str();
 
         // Single attempt: the create-only CAS makes a duplicate replay fail
@@ -931,7 +946,7 @@ impl VaultKmsClient {
     /// records.
     #[cfg(test)]
     async fn store_key_data(&self, key_id: &str, key_data: &VaultKeyData) -> Result<()> {
-        let path = self.key_path(key_id);
+        let path = self.key_path(key_id)?;
         let path = path.as_str();
 
         self.run("vault_kv2_write_key", OpClass::MutatingNonIdempotent, move || async move {
@@ -978,7 +993,7 @@ impl VaultKmsClient {
 
     /// Retrieve key data from Vault
     async fn get_key_data(&self, key_id: &str) -> Result<VaultKeyData> {
-        let path = self.key_path(key_id);
+        let path = self.key_path(key_id)?;
         let path = path.as_str();
 
         let secret: VaultKeyData = self
@@ -1116,7 +1131,7 @@ impl VaultKmsClient {
 
     /// Physically delete a key from Vault storage
     async fn delete_key(&self, key_id: &str) -> Result<()> {
-        let path = self.key_path(key_id);
+        let path = self.key_path(key_id)?;
         let path = path.as_str();
 
         // Purge immutable version records first: if any purge fails, the top-level
@@ -1186,7 +1201,12 @@ impl VaultKmsClient {
                 warn!(key_id = %request.master_key_id, %error, "Vault KMS key material failed validation");
             })?;
         self.consume_wrap_budget(&request.master_key_id, key_data.version).await;
-        let (encrypted_key, nonce) = self.dek_crypto.encrypt(&key_material, &plaintext_key).await?;
+        let context_binding = envelope_aad_write_enabled().then_some(CONTEXT_BINDING_AAD_V1);
+        let wrap_aad = match context_binding {
+            Some(_) => context_aad(&request.encryption_context)?,
+            None => Vec::new(),
+        };
+        let (encrypted_key, nonce) = self.dek_crypto.encrypt(&key_material, &plaintext_key, &wrap_aad).await?;
 
         // Create data key envelope with master key version for rotation support
         let envelope = DataKeyEnvelope {
@@ -1198,6 +1218,7 @@ impl VaultKmsClient {
             encryption_context: request.encryption_context.clone(),
             created_at: Zoned::now(),
             master_key_version: Some(key_data.version),
+            context_binding,
         };
 
         // Serialize the envelope as the ciphertext
@@ -1220,7 +1241,12 @@ impl VaultKmsClient {
         let key_material = decode_stored_key_material(&request.key_id, &key_data.encrypted_key_material)
             .inspect_err(|error| warn!(key_id = %request.key_id, %error, "Vault KMS key material failed validation"))?;
         self.consume_wrap_budget(&request.key_id, key_data.version).await;
-        let (encrypted_key, nonce) = self.dek_crypto.encrypt(&key_material, &request.plaintext).await?;
+        let context_binding = envelope_aad_write_enabled().then_some(CONTEXT_BINDING_AAD_V1);
+        let wrap_aad = match context_binding {
+            Some(_) => context_aad(&request.encryption_context)?,
+            None => Vec::new(),
+        };
+        let (encrypted_key, nonce) = self.dek_crypto.encrypt(&key_material, &request.plaintext, &wrap_aad).await?;
 
         // Wrap the ciphertext in the same authenticated envelope that
         // generate_data_key emits, so decrypt() round-trips it and resolves
@@ -1234,6 +1260,7 @@ impl VaultKmsClient {
             encryption_context: request.encryption_context.clone(),
             created_at: Zoned::now(),
             master_key_version: Some(key_data.version),
+            context_binding,
         };
         let ciphertext = serde_json::to_vec(&envelope)?;
 
@@ -1258,13 +1285,12 @@ impl VaultKmsClient {
         let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)
             .map_err(|e| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {e}")))?;
 
-        // NOTE: this comparison is an authorization check, not a cryptographic
-        // binding. `DekCrypto` seals only the plaintext, so `encryption_context`
-        // rides in the envelope unauthenticated: anyone able to rewrite the
-        // stored envelope can rewrite this field and present a matching context.
-        // The Static and Vault Transit backends do bind it (as AEAD AAD and as
-        // the Transit KDF context respectively); closing the gap here needs a
-        // versioned envelope, since existing ciphertext was sealed without AAD.
+        // Two layers guard the context. On envelopes with a context binding,
+        // the stored `encryption_context` is authenticated: it was sealed into
+        // the wrap as AAD, so rewriting the stored field (or stripping the
+        // binding flag) makes the unwrap below fail. On legacy envelopes the
+        // field rides unauthenticated and only this comparison covers it —
+        // which is an authorization check, not a cryptographic binding.
         // Verify encryption context matches
         // Check that all keys in envelope.encryption_context are present in request.encryption_context
         // and their values match. This ensures the context used for decryption matches what was used for encryption.
@@ -1291,9 +1317,10 @@ impl VaultKmsClient {
         let key_material = self
             .get_key_material_for_version(&envelope.master_key_id, &key_data, version)
             .await?;
+        let wrap_aad = envelope_wrap_aad(&envelope)?;
         let plaintext = match self
             .dek_crypto
-            .decrypt(&key_material, &envelope.encrypted_key, &envelope.nonce)
+            .decrypt(&key_material, &envelope.encrypted_key, &envelope.nonce, &wrap_aad)
             .await
         {
             Ok(plaintext) => plaintext,
@@ -1337,8 +1364,12 @@ impl VaultKmsClient {
             // pre-versioning envelope resolves to the current version while
             // saying nothing, and `rewrap_data_key` rewrites exactly those to
             // stamp the version — so reporting them as current here would leave
-            // the sweep and the scan permanently disagreeing.
-            is_current: envelope.master_key_version == Some(current_version),
+            // the sweep and the scan permanently disagreeing. The context
+            // binding enters the same way: an envelope below the desired
+            // binding is one the sweep will rewrite, so the scan must not
+            // count it as done.
+            is_current: envelope.master_key_version == Some(current_version)
+                && envelope.context_binding == desired_context_binding(envelope.context_binding),
         })
     }
 
@@ -1376,11 +1407,17 @@ impl VaultKmsClient {
         ensure_key_status_permits(&envelope.master_key_id, &key_data.status, StateGatedOperation::Encrypt)?;
         let current_version = key_data.version;
 
-        if envelope.master_key_version == Some(current_version) {
-            // Already on the current version and saying so. Hand the input back
-            // untouched rather than producing an equivalent envelope with a
-            // fresh nonce: a re-run of a sweep must converge to zero writes, and
-            // the storage layer keys its write decision off these bytes.
+        // The binding never regresses and upgrades follow the write switch;
+        // the shared rule keeps this no-op condition and the scan's
+        // `is_current` in agreement (see `desired_context_binding`).
+        let destination_binding = desired_context_binding(envelope.context_binding);
+
+        if envelope.master_key_version == Some(current_version) && envelope.context_binding == destination_binding {
+            // Already on the current version and the desired binding, and
+            // saying so. Hand the input back untouched rather than producing an
+            // equivalent envelope with a fresh nonce: a re-run of a sweep must
+            // converge to zero writes, and the storage layer keys its write
+            // decision off these bytes.
             return Ok(RewrapDataKeyResponse {
                 ciphertext: request.ciphertext.clone(),
                 key_id: envelope.master_key_id,
@@ -1406,9 +1443,16 @@ impl VaultKmsClient {
         let destination_material = decode_stored_key_material(&envelope.master_key_id, &key_data.encrypted_key_material)
             .inspect_err(|error| warn!(key_id = %envelope.master_key_id, %error, "Vault KMS key material failed validation"))?;
 
+        // Both AADs are resolved before the plaintext exists, keeping the
+        // zeroize window free of fallible steps.
+        let source_aad = envelope_wrap_aad(&envelope)?;
+        let destination_aad = match destination_binding {
+            Some(_) => context_aad(&envelope.encryption_context)?,
+            None => Vec::new(),
+        };
         let mut plaintext_key = match self
             .dek_crypto
-            .decrypt(&source_material, &envelope.encrypted_key, &envelope.nonce)
+            .decrypt(&source_material, &envelope.encrypted_key, &envelope.nonce, &source_aad)
             .await
         {
             Ok(plaintext) => plaintext,
@@ -1418,7 +1462,10 @@ impl VaultKmsClient {
                     .await);
             }
         };
-        let rewrapped = self.dek_crypto.encrypt(&destination_material, &plaintext_key).await;
+        let rewrapped = self
+            .dek_crypto
+            .encrypt(&destination_material, &plaintext_key, &destination_aad)
+            .await;
         plaintext_key.zeroize();
         let (encrypted_key, nonce) = rewrapped?;
 
@@ -1431,6 +1478,7 @@ impl VaultKmsClient {
             encryption_context: envelope.encryption_context,
             created_at: envelope.created_at,
             master_key_version: Some(current_version),
+            context_binding: destination_binding,
         };
         let ciphertext = serde_json::to_vec(&rewrapped_envelope)?;
 
@@ -2257,6 +2305,7 @@ impl KmsBackend for VaultKmsBackend {
             .with_physical_delete(true)
             .with_update_key_metadata(true)
             .with_rewrap(true)
+            .with_production_supported(true)
     }
 
     async fn remove_expired_key(&self, key_id: &str, now: &Zoned) -> Result<ExpiredKeyRemoval> {
@@ -2365,7 +2414,7 @@ mod tests {
             tags: HashMap::new(),
             deletion_date: None,
             rotated_at: None,
-            encrypted_key_material: general_purpose::STANDARD.encode([0x42u8; 32]),
+            encrypted_key_material: base64_simd::STANDARD.encode_to_string([0x42u8; 32]),
             baseline_version: None,
             wrap_budget_reserved: 0,
         }
@@ -2396,6 +2445,42 @@ mod tests {
     /// A caller asking for no keys gets an empty page, and the page arithmetic
     /// never reaches for the element before an empty page. The scripted key
     /// listing stays unused: a request for zero keys has nothing to ask Vault.
+    /// A key identifier becomes a KV2 path by string join, so one that is not a
+    /// single segment is refused before any request leaves the process: `../x`
+    /// would otherwise read, overwrite or delete a record outside the key
+    /// prefix once the URL is normalised, and `a/b` would create a nested path
+    /// the listing reports as a directory rather than a key.
+    #[tokio::test]
+    async fn path_addressed_operations_refuse_key_ids_that_leave_the_key_prefix() {
+        let (vault, client) = scripted_client(vec![]).await;
+
+        for key_id in ["bad/name", "../escape", "..", ".", "", "back\\slash", "nul\0byte"] {
+            let err = client
+                .create_key(key_id, "AES_256", None)
+                .await
+                .expect_err("create must refuse a non-segment key id");
+            assert!(matches!(err, KmsError::InvalidKey { .. }), "create {key_id:?}: {err:?}");
+
+            let err = client
+                .get_key_data(key_id)
+                .await
+                .expect_err("read must refuse a non-segment key id");
+            assert!(matches!(err, KmsError::InvalidKey { .. }), "read {key_id:?}: {err:?}");
+
+            let err = client
+                .delete_key(key_id)
+                .await
+                .expect_err("delete must refuse a non-segment key id");
+            assert!(matches!(err, KmsError::InvalidKey { .. }), "delete {key_id:?}: {err:?}");
+        }
+
+        assert!(
+            vault.requests().is_empty(),
+            "a refused key id must never reach Vault: {:?}",
+            vault.requests()
+        );
+    }
+
     #[tokio::test]
     async fn zero_limit_list_returns_an_empty_page_without_calling_vault() {
         let (vault, client) =
@@ -2829,21 +2914,21 @@ mod tests {
         ));
 
         // Truncated material: valid base64 of fewer than 32 bytes.
-        let truncated = general_purpose::STANDARD.encode([0x42u8; 16]);
+        let truncated = base64_simd::STANDARD.encode_to_string([0x42u8; 16]);
         assert!(matches!(
             decode_stored_key_material("poisoned", &truncated),
             Err(KmsError::MaterialCorrupt { key_id, .. }) if key_id == "poisoned"
         ));
 
         // Oversized material: valid base64 of more than 32 bytes.
-        let oversized = general_purpose::STANDARD.encode([0x42u8; 33]);
+        let oversized = base64_simd::STANDARD.encode_to_string([0x42u8; 33]);
         assert!(matches!(
             decode_stored_key_material("poisoned", &oversized),
             Err(KmsError::MaterialCorrupt { key_id, .. }) if key_id == "poisoned"
         ));
 
         // Well-formed material still decodes.
-        let valid = general_purpose::STANDARD.encode([0x42u8; 32]);
+        let valid = base64_simd::STANDARD.encode_to_string([0x42u8; 32]);
         assert_eq!(
             decode_stored_key_material("healthy", &valid).expect("valid material must decode"),
             vec![0x42u8; 32]
@@ -2963,7 +3048,7 @@ mod tests {
             .await
             .expect("client");
 
-        assert_eq!(client.key_path("my-key"), "rustfs/kms/keys/my-key");
+        assert_eq!(client.key_path("my-key").expect("valid key id"), "rustfs/kms/keys/my-key");
         assert_eq!(client.key_versions_dir("my-key"), "rustfs/kms/keys/my-key/versions");
         assert_eq!(client.key_version_path("my-key", 3), "rustfs/kms/keys/my-key/versions/3");
     }
@@ -3006,7 +3091,7 @@ mod tests {
             description: None,
             metadata: HashMap::new(),
             tags: HashMap::new(),
-            encrypted_key_material: general_purpose::STANDARD.encode([0x42u8; 32]),
+            encrypted_key_material: base64_simd::STANDARD.encode_to_string([0x42u8; 32]),
             baseline_version: Some(1),
             deletion_date: None,
             rotated_at: None,
@@ -3720,7 +3805,7 @@ mod tests {
     /// Base64 material distinct from `healthy_key_data`'s, standing in for the
     /// material a concurrent rotation committed.
     fn rotated_material() -> String {
-        general_purpose::STANDARD.encode([0x43u8; 32])
+        base64_simd::STANDARD.encode_to_string([0x43u8; 32])
     }
 
     /// The issue's lost-update scenario: node A disables a key while node B's
@@ -4318,14 +4403,14 @@ mod tests {
         let material_v2 = [0x43u8; 32];
         let record_v2 = VaultKeyVersionRecord {
             version: 2,
-            encrypted_key_material: general_purpose::STANDARD.encode(material_v2),
+            encrypted_key_material: base64_simd::STANDARD.encode_to_string(material_v2),
             created_at: Zoned::now(),
         };
         // A well-formed envelope wrapped under version 2 — under a reverted
         // guard this decrypt would *succeed*, which is exactly the masked
         // rollback this test pins down.
         let (encrypted_key, nonce) = AesDekCrypto::new()
-            .encrypt(&material_v2, b"dek-plaintext")
+            .encrypt(&material_v2, b"dek-plaintext", &[])
             .await
             .expect("wrap test DEK");
         let envelope = DataKeyEnvelope {
@@ -4337,6 +4422,7 @@ mod tests {
             encryption_context: HashMap::new(),
             created_at: Zoned::now(),
             master_key_version: Some(2),
+            context_binding: None,
         };
         let ciphertext = serde_json::to_vec(&envelope).expect("serialize envelope");
 
@@ -4750,7 +4836,7 @@ mod tests {
     async fn wired_decrypt_reports_erased_baseline_for_pre_versioning_envelope() {
         let baseline_material = [0x41u8; 32];
         let (encrypted_key, nonce) = AesDekCrypto::new()
-            .encrypt(&baseline_material, b"dek-plaintext")
+            .encrypt(&baseline_material, b"dek-plaintext", &[])
             .await
             .expect("wrap test DEK under the baseline material");
         // A pre-versioning envelope: no master_key_version field.
@@ -4763,6 +4849,7 @@ mod tests {
             encryption_context: HashMap::new(),
             created_at: Zoned::now(),
             master_key_version: None,
+            context_binding: None,
         };
         let ciphertext = serde_json::to_vec(&envelope).expect("serialize envelope");
 
@@ -4810,7 +4897,7 @@ mod tests {
     #[tokio::test]
     async fn wired_decrypt_keeps_original_error_when_key_was_never_rotated() {
         let (encrypted_key, nonce) = AesDekCrypto::new()
-            .encrypt(&[0x41u8; 32], b"dek-plaintext")
+            .encrypt(&[0x41u8; 32], b"dek-plaintext", &[])
             .await
             .expect("wrap test DEK");
         let envelope = DataKeyEnvelope {
@@ -4822,6 +4909,7 @@ mod tests {
             encryption_context: HashMap::new(),
             created_at: Zoned::now(),
             master_key_version: None,
+            context_binding: None,
         };
         let ciphertext = serde_json::to_vec(&envelope).expect("serialize envelope");
 
@@ -4857,11 +4945,11 @@ mod tests {
     #[tokio::test]
     async fn wired_decrypt_of_pre_versioning_envelope_adds_no_request() {
         let key_data = healthy_key_data();
-        let key_material = general_purpose::STANDARD
-            .decode(&key_data.encrypted_key_material)
+        let key_material = BASE64
+            .decode_to_vec(&key_data.encrypted_key_material)
             .expect("decode fixture material");
         let (encrypted_key, nonce) = AesDekCrypto::new()
-            .encrypt(&key_material, b"dek-plaintext")
+            .encrypt(&key_material, b"dek-plaintext", &[])
             .await
             .expect("wrap test DEK under the current material");
         let envelope = DataKeyEnvelope {
@@ -4873,6 +4961,7 @@ mod tests {
             encryption_context: HashMap::new(),
             created_at: Zoned::now(),
             master_key_version: None,
+            context_binding: None,
         };
         let ciphertext = serde_json::to_vec(&envelope).expect("serialize envelope");
 
@@ -5274,6 +5363,170 @@ mod tests {
         let (again, _) = rewrap_scripted(&state_v2, &response.ciphertext).await;
         assert!(!again.rewrapped);
         assert_eq!(again.ciphertext, encrypted_v2.ciphertext);
+    }
+
+    /// With the AAD write switch on, the stored encryption context is sealed
+    /// into the wrap. Rewriting the stored field — or stripping the binding
+    /// flag — must fail authentication even when the presented request context
+    /// matches the rewritten stored one, which the legacy field comparison
+    /// alone would accept.
+    #[tokio::test]
+    async fn wired_kv2_bound_envelope_authenticates_its_stored_context() {
+        let state = KeyState::new(healthy_key_data());
+        let encrypted = temp_env::async_with_vars(
+            [(crate::config::ENV_KMS_ENVELOPE_AAD, Some("true"))],
+            encrypt_scripted(&state, b"bound-data-key"),
+        )
+        .await;
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&encrypted.ciphertext).expect("envelope must parse");
+        assert_eq!(envelope.context_binding, Some(CONTEXT_BINDING_AAD_V1));
+
+        // The bound envelope round-trips; reading needs no switch.
+        let (plaintext, _) = decrypt_scripted(&state, &encrypted.ciphertext).await;
+        assert_eq!(plaintext, b"bound-data-key".to_vec());
+
+        // Rewrite the stored context and present a matching request context:
+        // the comparison passes, the authentication does not.
+        let mut tampered: serde_json::Value = serde_json::from_slice(&encrypted.ciphertext).expect("envelope must parse");
+        tampered["encryption_context"] = serde_json::json!({"bucket": "stolen"});
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::ok(kv2_read_data(&state.key_data))]).await;
+        let error = client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext: serde_json::to_vec(&tampered).expect("serialize tampered envelope"),
+                    encryption_context: HashMap::from([("bucket".to_string(), "stolen".to_string())]),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect_err("a rewritten stored context must fail authentication");
+        assert!(
+            !matches!(error, KmsError::ContextMismatch { .. }),
+            "the failure must come from the AAD, not the field comparison: {error:?}"
+        );
+
+        // Strip the binding flag: the unwrap then runs with empty AAD against
+        // ciphertext sealed with the context bound, and must fail.
+        let mut stripped: serde_json::Value = serde_json::from_slice(&encrypted.ciphertext).expect("envelope must parse");
+        stripped
+            .as_object_mut()
+            .expect("envelope is a JSON object")
+            .remove("context_binding")
+            .expect("the bound envelope must carry the flag");
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::ok(kv2_read_data(&state.key_data))]).await;
+        let error = client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext: serde_json::to_vec(&stripped).expect("serialize stripped envelope"),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect_err("stripping the binding flag must fail authentication");
+        assert!(!matches!(error, KmsError::ContextMismatch { .. }), "got {error:?}");
+    }
+
+    /// The write switch defaults off and legacy interchange holds in both
+    /// directions: default writes keep the historical JSON shape (no
+    /// `context_binding` key at all), and an unbound envelope written that way
+    /// still decrypts on a node whose write switch is already on.
+    #[tokio::test]
+    async fn wired_kv2_write_switch_defaults_off_and_legacy_envelopes_interchange() {
+        let state = KeyState::new(healthy_key_data());
+        let encrypted = encrypt_scripted(&state, b"legacy-data-key").await;
+
+        let value: serde_json::Value = serde_json::from_slice(&encrypted.ciphertext).expect("envelope must parse");
+        assert!(
+            !value
+                .as_object()
+                .expect("envelope is a JSON object")
+                .contains_key("context_binding"),
+            "default writes must keep the historical envelope shape"
+        );
+
+        let plaintext = temp_env::async_with_vars(
+            [(crate::config::ENV_KMS_ENVELOPE_AAD, Some("true"))],
+            decrypt_scripted(&state, &encrypted.ciphertext),
+        )
+        .await
+        .0;
+        assert_eq!(plaintext, b"legacy-data-key".to_vec());
+    }
+
+    /// An unrecognized binding version is a format from a newer release;
+    /// decrypting it while ignoring the binding would silently drop an
+    /// authentication the writer relied on, so it fails closed instead.
+    #[tokio::test]
+    async fn wired_kv2_unknown_context_binding_version_fails_closed() {
+        let state = KeyState::new(healthy_key_data());
+        let encrypted = encrypt_scripted(&state, b"future-data-key").await;
+        let mut future: serde_json::Value = serde_json::from_slice(&encrypted.ciphertext).expect("envelope must parse");
+        future["context_binding"] = serde_json::json!(9);
+
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::ok(kv2_read_data(&state.key_data))]).await;
+        let error = client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext: serde_json::to_vec(&future).expect("serialize future envelope"),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect_err("an unknown binding version must fail closed");
+        assert!(error.to_string().contains("context binding version"), "got {error:?}");
+    }
+
+    /// Rewrap is how existing envelopes migrate to the bound format: with the
+    /// switch on, an unbound envelope already on the current version is
+    /// rewritten to carry the binding — and the result converges, so a sweep
+    /// re-run performs zero writes. With the switch off the binding never
+    /// regresses: a bound envelope stays bound.
+    #[tokio::test]
+    async fn wired_kv2_rewrap_migrates_binding_without_ever_regressing_it() {
+        let state = KeyState::new(healthy_key_data());
+        let unbound = encrypt_scripted(&state, b"data-key-to-upgrade").await;
+
+        // With the switch off, the unbound envelope is current: the scan must
+        // not demand a rewrite the sweep would refuse to perform.
+        let described = describe_wrapping_scripted(&state, &unbound.ciphertext).await;
+        assert!(described.is_current, "an unbound envelope is current while the switch is off");
+
+        let (upgraded, again) = temp_env::async_with_vars([(crate::config::ENV_KMS_ENVELOPE_AAD, Some("true"))], async {
+            // With the switch on, the scan and the sweep agree the envelope
+            // needs rewriting — is_current flips before anything is rewrapped.
+            let described = describe_wrapping_scripted(&state, &unbound.ciphertext).await;
+            assert!(!described.is_current, "an unbound envelope is not current once the switch is on");
+
+            let (upgraded, _) = rewrap_scripted(&state, &unbound.ciphertext).await;
+            let described = describe_wrapping_scripted(&state, &upgraded.ciphertext).await;
+            assert!(described.is_current, "the scan must agree the upgraded envelope is done");
+
+            let (again, _) = rewrap_scripted(&state, &upgraded.ciphertext).await;
+            (upgraded, again)
+        })
+        .await;
+
+        assert!(upgraded.rewrapped, "an unbound envelope on the current version must still be upgraded");
+        let upgraded_envelope: DataKeyEnvelope =
+            serde_json::from_slice(&upgraded.ciphertext).expect("upgraded envelope must parse");
+        assert_eq!(upgraded_envelope.context_binding, Some(CONTEXT_BINDING_AAD_V1));
+        assert_eq!(upgraded.source_key_version, upgraded.destination_key_version);
+        assert!(!again.rewrapped, "the upgrade must converge on the second pass");
+        assert_eq!(again.ciphertext, upgraded.ciphertext);
+
+        // The upgraded envelope still yields the data key.
+        let (plaintext, _) = decrypt_scripted(&state, &upgraded.ciphertext).await;
+        assert_eq!(plaintext, b"data-key-to-upgrade".to_vec());
+
+        // Switch off again: the bound envelope is not downgraded.
+        let (kept, _) = rewrap_scripted(&state, &upgraded.ciphertext).await;
+        assert!(!kept.rewrapped, "a bound envelope must never regress to the unbound format");
+        assert_eq!(kept.ciphertext, upgraded.ciphertext);
     }
 
     /// A pre-versioning envelope carries no version at all, so it can never

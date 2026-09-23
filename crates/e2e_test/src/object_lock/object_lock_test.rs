@@ -24,9 +24,11 @@
 //! - PutObjectRetention modification restrictions
 //! - Default bucket retention is applied to new objects
 
+use std::borrow::Borrow;
+
 use super::common::*;
 use aws_sdk_s3::Client;
-use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::{ByteStream, DateTimeFormat};
 use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, Delete, MetadataDirective, ObjectIdentifier, ObjectLockLegalHoldStatus,
@@ -70,25 +72,49 @@ fn retention_timestamp(days: i64) -> aws_sdk_s3::primitives::DateTime {
         .expect("retention timestamp should parse")
 }
 
-fn assert_access_denied<T, E: std::fmt::Debug>(result: Result<T, E>, context: &str) {
-    let err = match result {
-        Ok(_) => panic!("{context}"),
-        Err(err) => format!("{err:?}"),
-    };
-    assert!(
-        err.contains("AccessDenied") || err.to_lowercase().contains("access denied"),
-        "{context}: expected AccessDenied, got: {err}"
+fn assert_access_denied<T, E, R>(result: Result<T, R>, context: &str)
+where
+    T: std::fmt::Debug,
+    E: ProvideErrorMetadata + std::fmt::Debug,
+    R: Borrow<SdkError<E>> + std::fmt::Debug,
+{
+    let error = result.expect_err(context);
+    let sdk_error = error.borrow();
+    assert_eq!(
+        sdk_error.raw_response().map(|response| response.status().as_u16()),
+        Some(403),
+        "{context}: expected HTTP 403, got: {error:?}"
+    );
+    assert_eq!(
+        sdk_error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("AccessDenied"),
+        "{context}: expected AccessDenied, got: {error:?}"
     );
 }
 
-fn assert_invalid_object_lock_retention_pair<T, E: std::fmt::Debug>(result: Result<T, E>, context: &str) {
-    let err = match result {
-        Ok(_) => panic!("{context}"),
-        Err(err) => format!("{err:?}"),
-    };
-    assert!(
-        err.contains("InvalidRequest") || err.contains("must both be supplied"),
-        "{context}: expected invalid paired retention headers, got: {err}"
+fn assert_invalid_object_lock_retention_pair<T, E, R>(result: Result<T, R>, context: &str)
+where
+    T: std::fmt::Debug,
+    E: ProvideErrorMetadata + std::fmt::Debug,
+    R: Borrow<SdkError<E>> + std::fmt::Debug,
+{
+    let error = result.expect_err(context);
+    let sdk_error = error.borrow();
+    assert_eq!(
+        sdk_error.raw_response().map(|response| response.status().as_u16()),
+        Some(400),
+        "{context}: expected HTTP 400, got: {error:?}"
+    );
+    let service_error = sdk_error.as_service_error().expect("expected an S3 service error");
+    assert_eq!(
+        service_error.code(),
+        Some("InvalidRequest"),
+        "{context}: expected InvalidRequest, got: {error:?}"
+    );
+    assert_eq!(
+        service_error.message(),
+        Some("x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied"),
+        "{context}: unexpected error message: {error:?}"
     );
 }
 
@@ -129,14 +155,15 @@ async fn test_delete_object_blocked_by_compliance_retention() {
         .unwrap();
 
     // Attempt to delete - should fail
-    let delete_result = delete_object_with_bypass(&client, bucket, key, Some(&version_id), false).await;
-    assert!(delete_result.is_err(), "Delete should fail for COMPLIANCE locked object");
+    assert_access_denied(
+        delete_object_with_bypass(&client, bucket, key, Some(&version_id), false).await,
+        "Delete should fail for COMPLIANCE locked object",
+    );
 
     // Even with bypass header, COMPLIANCE should not allow deletion
-    let delete_with_bypass_result = delete_object_with_bypass(&client, bucket, key, Some(&version_id), true).await;
-    assert!(
-        delete_with_bypass_result.is_err(),
-        "Delete with bypass should still fail for COMPLIANCE mode"
+    assert_access_denied(
+        delete_object_with_bypass(&client, bucket, key, Some(&version_id), true).await,
+        "Delete with bypass should still fail for COMPLIANCE mode",
     );
 
     info!("✅ Test passed: COMPLIANCE retention blocks deletion");
@@ -165,8 +192,10 @@ async fn test_delete_object_blocked_by_governance_without_bypass() {
         .unwrap();
 
     // Attempt to delete without bypass - should fail
-    let delete_result = delete_object_with_bypass(&client, bucket, key, Some(&version_id), false).await;
-    assert!(delete_result.is_err(), "Delete without bypass should fail for GOVERNANCE locked object");
+    assert_access_denied(
+        delete_object_with_bypass(&client, bucket, key, Some(&version_id), false).await,
+        "Delete without bypass should fail for GOVERNANCE locked object",
+    );
 
     info!("✅ Test passed: GOVERNANCE retention blocks deletion without bypass");
 }
@@ -198,14 +227,19 @@ async fn test_delete_object_allowed_by_governance_with_bypass() {
     assert!(delete_result.is_ok(), "Delete with bypass should succeed for GOVERNANCE mode");
 
     // Verify object is deleted
-    let head_result = client
+    let head_error = client
         .head_object()
         .bucket(bucket)
         .key(key)
         .version_id(&version_id)
         .send()
-        .await;
-    assert!(head_result.is_err(), "Object should be deleted");
+        .await
+        .expect_err("Object should be deleted");
+    assert_eq!(
+        head_error.raw_response().map(|response| response.status().as_u16()),
+        Some(404),
+        "deleted version should return HTTP 404: {head_error:?}"
+    );
 
     info!("✅ Test passed: GOVERNANCE retention allows deletion with bypass");
 }
@@ -240,17 +274,18 @@ async fn test_delete_object_creates_delete_marker_for_retained_current_version()
         .expect("delete marker should have a version id")
         .to_string();
 
-    let protected_delete = delete_object_with_bypass(&client, bucket, key, Some(&retained_version_id), false).await;
-    assert!(protected_delete.is_err(), "Retained version should still reject direct deletion");
+    assert_access_denied(
+        delete_object_with_bypass(&client, bucket, key, Some(&retained_version_id), false).await,
+        "Retained version should still reject direct deletion",
+    );
 
     delete_object_with_bypass(&client, bucket, key, Some(&delete_marker_version_id), false)
         .await
         .unwrap();
 
-    let still_protected = delete_object_with_bypass(&client, bucket, key, Some(&retained_version_id), false).await;
-    assert!(
-        still_protected.is_err(),
-        "Retained version should remain protected after delete marker removal"
+    assert_access_denied(
+        delete_object_with_bypass(&client, bucket, key, Some(&retained_version_id), false).await,
+        "Retained version should remain protected after delete marker removal",
     );
 
     delete_object_with_bypass(&client, bucket, key, Some(&retained_version_id), true)
@@ -282,12 +317,16 @@ async fn test_delete_object_blocked_by_legal_hold() {
         .unwrap();
 
     // Attempt to delete - should fail (legal hold cannot be bypassed)
-    let delete_result = delete_object_with_bypass(&client, bucket, key, Some(&version_id), false).await;
-    assert!(delete_result.is_err(), "Delete should fail for legal hold object");
+    assert_access_denied(
+        delete_object_with_bypass(&client, bucket, key, Some(&version_id), false).await,
+        "Delete should fail for legal hold object",
+    );
 
     // Even with bypass header, legal hold should block deletion
-    let delete_with_bypass_result = delete_object_with_bypass(&client, bucket, key, Some(&version_id), true).await;
-    assert!(delete_with_bypass_result.is_err(), "Delete with bypass should still fail for legal hold");
+    assert_access_denied(
+        delete_object_with_bypass(&client, bucket, key, Some(&version_id), true).await,
+        "Delete with bypass should still fail for legal hold",
+    );
 
     info!("✅ Test passed: Legal Hold blocks deletion");
 }
@@ -315,14 +354,19 @@ async fn test_delete_object_allowed_with_legal_hold_off() {
     let delete_result = delete_object_with_bypass(&client, bucket, key, Some(&version_id), false).await;
     assert!(delete_result.is_ok(), "Delete should succeed when legal hold is OFF");
 
-    let head_result = client
+    let head_error = client
         .head_object()
         .bucket(bucket)
         .key(key)
         .version_id(&version_id)
         .send()
-        .await;
-    assert!(head_result.is_err(), "Object should be deleted when legal hold is OFF");
+        .await
+        .expect_err("Object should be deleted when legal hold is OFF");
+    assert_eq!(
+        head_error.raw_response().map(|response| response.status().as_u16()),
+        Some(404),
+        "deleted version should return HTTP 404: {head_error:?}"
+    );
 
     info!("✅ Test passed: Legal Hold OFF allows deletion");
 }
@@ -545,8 +589,10 @@ async fn test_put_object_overwrite_creates_new_version_under_legal_hold() {
         "held version must keep its legal hold after the overwrite"
     );
 
-    let delete_result = delete_object_with_bypass(&client, bucket, key, Some(&held_version_id), false).await;
-    assert!(delete_result.is_err(), "held version must stay delete-protected after the overwrite");
+    assert_access_denied(
+        delete_object_with_bypass(&client, bucket, key, Some(&held_version_id), false).await,
+        "held version must stay delete-protected after the overwrite",
+    );
 }
 
 #[tokio::test]
@@ -768,8 +814,10 @@ async fn test_copy_object_overwrite_creates_new_version_under_legal_hold() {
         "held destination version must keep its legal hold after the copy"
     );
 
-    let delete_result = delete_object_with_bypass(&client, bucket, dst_key, Some(&held_version_id), false).await;
-    assert!(delete_result.is_err(), "held destination version must stay delete-protected");
+    assert_access_denied(
+        delete_object_with_bypass(&client, bucket, dst_key, Some(&held_version_id), false).await,
+        "held destination version must stay delete-protected",
+    );
 }
 
 #[tokio::test]
@@ -909,10 +957,9 @@ async fn test_create_multipart_upload_creates_new_version_under_compliance_reten
 
     // COMPLIANCE retention on the previous version survives the overwrite and
     // cannot be bypassed.
-    let delete_result = delete_object_with_bypass(&client, bucket, key, Some(&retained_version_id), true).await;
-    assert!(
-        delete_result.is_err(),
-        "retained version must stay delete-protected even with governance bypass"
+    assert_access_denied(
+        delete_object_with_bypass(&client, bucket, key, Some(&retained_version_id), true).await,
+        "retained version must stay delete-protected even with governance bypass",
     );
 }
 
@@ -971,8 +1018,10 @@ async fn test_delete_completed_multipart_object_blocked_by_legal_hold() {
         .unwrap();
 
     let version_id = complete_output.version_id().expect("multipart object should be versioned");
-    let delete_result = delete_object_with_bypass(&client, bucket, key, Some(version_id), false).await;
-    assert!(delete_result.is_err(), "Delete should fail for multipart object protected by legal hold");
+    assert_access_denied(
+        delete_object_with_bypass(&client, bucket, key, Some(version_id), false).await,
+        "Delete should fail for multipart object protected by legal hold",
+    );
 }
 
 #[tokio::test]
@@ -1032,8 +1081,10 @@ async fn test_delete_completed_multipart_object_blocked_by_retention() {
         .unwrap();
 
     let version_id = complete_output.version_id().expect("multipart object should be versioned");
-    let delete_result = delete_object_with_bypass(&client, bucket, key, Some(version_id), false).await;
-    assert!(delete_result.is_err(), "Delete should fail for multipart object protected by retention");
+    assert_access_denied(
+        delete_object_with_bypass(&client, bucket, key, Some(version_id), false).await,
+        "Delete should fail for multipart object protected by retention",
+    );
 }
 
 #[tokio::test]
@@ -1111,8 +1162,10 @@ async fn test_complete_multipart_upload_creates_new_version_under_legal_hold() {
         "held version must keep its legal hold after multipart completion"
     );
 
-    let delete_result = delete_object_with_bypass(&client, bucket, key, Some(&held_version_id), false).await;
-    assert!(delete_result.is_err(), "held version must stay delete-protected");
+    assert_access_denied(
+        delete_object_with_bypass(&client, bucket, key, Some(&held_version_id), false).await,
+        "held version must stay delete-protected",
+    );
 }
 
 #[tokio::test]
@@ -1181,10 +1234,9 @@ async fn test_complete_multipart_upload_creates_new_version_under_compliance_ret
 
     // COMPLIANCE retention on the previous version survives the overwrite and
     // cannot be bypassed.
-    let delete_result = delete_object_with_bypass(&client, bucket, key, Some(&retained_version_id), true).await;
-    assert!(
-        delete_result.is_err(),
-        "retained version must stay delete-protected even with governance bypass"
+    assert_access_denied(
+        delete_object_with_bypass(&client, bucket, key, Some(&retained_version_id), true).await,
+        "retained version must stay delete-protected even with governance bypass",
     );
 }
 
@@ -1438,7 +1490,7 @@ async fn test_put_retention_compliance_cannot_shorten() {
     )
     .await;
 
-    assert!(shorten_result.is_err(), "Shortening COMPLIANCE retention should fail");
+    assert_access_denied(shorten_result, "Shortening COMPLIANCE retention should fail");
 
     info!("✅ Test passed: Cannot shorten COMPLIANCE retention");
 }
@@ -1561,10 +1613,7 @@ async fn test_put_retention_governance_shorten_requires_bypass() {
     )
     .await;
 
-    assert!(
-        shorten_without_bypass.is_err(),
-        "Shortening GOVERNANCE retention without bypass should fail"
-    );
+    assert_access_denied(shorten_without_bypass, "Shortening GOVERNANCE retention without bypass should fail");
 
     // Shorten with bypass - should succeed
     let shorten_with_bypass = put_object_retention(
@@ -1621,8 +1670,10 @@ async fn test_default_retention_applied_to_new_objects() {
     let version_id = response.version_id().unwrap();
 
     // Try to delete without bypass - should fail due to default retention
-    let delete_result = delete_object_with_bypass(&client, bucket, key, Some(version_id), false).await;
-    assert!(delete_result.is_err(), "Delete should fail for object with default retention applied");
+    assert_access_denied(
+        delete_object_with_bypass(&client, bucket, key, Some(version_id), false).await,
+        "Delete should fail for object with default retention applied",
+    );
 
     let retention = client
         .get_object_retention()
@@ -1710,8 +1761,10 @@ async fn test_delete_object_creates_delete_marker_for_default_retained_current_v
         .expect("delete marker should have a version id")
         .to_string();
 
-    let protected_delete = delete_object_with_bypass(&client, bucket, key, Some(&retained_version_id), false).await;
-    assert!(protected_delete.is_err(), "Default-retained version should still reject direct deletion");
+    assert_access_denied(
+        delete_object_with_bypass(&client, bucket, key, Some(&retained_version_id), false).await,
+        "Default-retained version should still reject direct deletion",
+    );
 
     let retention_after_delete_marker = client
         .get_object_retention()
@@ -2011,11 +2064,9 @@ async fn test_copy_object_retention_uses_destination_policy() {
 
     // COMPLIANCE retention on the previous destination version survives the
     // overwrite and cannot be bypassed.
-    let delete_result =
-        delete_object_with_bypass(&client, dst_bucket, "locked-destination", Some(&retained_version_id), true).await;
-    assert!(
-        delete_result.is_err(),
-        "retained destination version must stay delete-protected even with governance bypass"
+    assert_access_denied(
+        delete_object_with_bypass(&client, dst_bucket, "locked-destination", Some(&retained_version_id), true).await,
+        "retained destination version must stay delete-protected even with governance bypass",
     );
 }
 
@@ -2268,9 +2319,9 @@ async fn test_versioning_auto_enabled_with_object_lock() {
 // ============================================================================
 
 #[tokio::test]
-async fn test_error_message_distinguishes_legal_hold_from_retention() {
+async fn test_legal_hold_and_retention_delete_errors_are_exact_and_non_mutating() {
     init_logging();
-    info!("🧪 Test: Error messages distinguish Legal Hold from Retention");
+    info!("🧪 Test: Legal Hold and Retention reject deletes without mutating objects");
 
     let mut env = ObjectLockTestEnvironment::new().await.unwrap();
     env.start_rustfs().await.unwrap();
@@ -2295,7 +2346,6 @@ async fn test_error_message_distinguishes_legal_hold_from_retention() {
             .await
             .unwrap();
 
-    // Delete legal hold object - check error
     let lh_delete_result = client
         .delete_object()
         .bucket(bucket)
@@ -2303,18 +2353,8 @@ async fn test_error_message_distinguishes_legal_hold_from_retention() {
         .version_id(&lh_version)
         .send()
         .await;
+    assert_access_denied(lh_delete_result, "Legal Hold must reject deleting the protected version");
 
-    if let Err(e) = lh_delete_result {
-        let error_str = format!("{:?}", e);
-        info!("Legal hold delete error: {}", error_str);
-        // Error should mention legal hold
-        assert!(
-            error_str.to_lowercase().contains("legal") || error_str.to_lowercase().contains("hold"),
-            "Error should mention legal hold"
-        );
-    }
-
-    // Delete retention object - check error
     let ret_delete_result = client
         .delete_object()
         .bucket(bucket)
@@ -2322,16 +2362,24 @@ async fn test_error_message_distinguishes_legal_hold_from_retention() {
         .version_id(&ret_version)
         .send()
         .await;
+    assert_access_denied(ret_delete_result, "COMPLIANCE retention must reject deleting the protected version");
 
-    if let Err(e) = ret_delete_result {
-        let error_str = format!("{:?}", e);
-        info!("Retention delete error: {}", error_str);
-        // Error should mention retention
-        assert!(
-            error_str.to_lowercase().contains("retention") || error_str.to_lowercase().contains("compliance"),
-            "Error should mention retention"
-        );
+    for (key, version_id) in [(legal_hold_key, &lh_version), (retention_key, &ret_version)] {
+        let body = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version_id)
+            .send()
+            .await
+            .expect("rejected delete must leave the protected version readable")
+            .body
+            .collect()
+            .await
+            .expect("protected version body should remain readable")
+            .into_bytes();
+        assert_eq!(body.as_ref(), b"data", "rejected delete mutated protected object {key}");
     }
 
-    info!("✅ Test passed: Error messages distinguish lock types");
+    info!("✅ Test passed: protected deletes are exact and non-mutating");
 }

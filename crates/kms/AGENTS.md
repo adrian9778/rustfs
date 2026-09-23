@@ -22,8 +22,9 @@ When changing key-management behavior, verify compatibility with:
 For local KMS end-to-end tests, keep proxy bypass settings:
 
 ```bash
+python3 scripts/e2e_binary.py build
 NO_PROXY=127.0.0.1,localhost HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= \
-cargo test --package e2e_test test_local_kms_end_to_end -- --nocapture --test-threads=1
+python3 scripts/e2e_binary.py run -- cargo test --package e2e_test test_local_kms_end_to_end -- --nocapture --test-threads=1
 ```
 
 ### Black-box behavior suite and the Vault lane
@@ -51,14 +52,17 @@ prior key versions would go green.
 
 The lane creates real keys under unique names (`behavior-kv2-*`,
 `behavior-transit-*`) and does not remove them, so a dev Vault accumulates them
-across runs. Clear them out periodically — against a dev server only:
+across runs. On a dev server, remove only exact keys confirmed to belong to the
+current task. A shared prefix does not prove ownership; preserve another run's
+keys and leave ambiguous keys for the operator.
 
 ```bash
-vault list -format=json transit/keys | jq -r '.[] | select(startswith("behavior-transit-"))' | while read -r k; do vault write "transit/keys/$k/config" deletion_allowed=true >/dev/null && vault delete "transit/keys/$k"; done
+vault write transit/keys/<task-owned-transit-key>/config deletion_allowed=true
+vault delete transit/keys/<task-owned-transit-key>
 ```
 
 ```bash
-vault list -format=json secret/metadata/rustfs/kms/keys | jq -r '.[] | select(startswith("behavior-kv2-"))' | xargs -I{} vault kv metadata delete secret/rustfs/kms/keys/{}
+vault kv metadata delete secret/rustfs/kms/keys/<task-owned-kv2-key>
 ```
 
 ## Local Key Export for SSE-S3 Migration Tests

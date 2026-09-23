@@ -21,6 +21,133 @@ use std::sync::Arc;
 const TABLE_CATALOG_TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 #[test]
+fn table_data_plane_index_miss_scan_rejects_catalogs_above_its_object_limit() {
+    let objects = vec![
+        "catalog/table-1/table-entry.json".to_string(),
+        "catalog/namespace.json".to_string(),
+        "catalog/table-2/table-entry.json".to_string(),
+    ];
+
+    assert_eq!(
+        bounded_table_entry_objects_for_data_plane_scan(objects.clone(), false, 3).unwrap(),
+        vec![
+            "catalog/table-1/table-entry.json".to_string(),
+            "catalog/table-2/table-entry.json".to_string(),
+        ]
+    );
+    assert_matches!(
+        bounded_table_entry_objects_for_data_plane_scan(objects, false, 2),
+        Err(TableCatalogStoreError::Unavailable(message)) if message.contains("2-catalog-object safety limit")
+    );
+    assert_matches!(
+        bounded_table_entry_objects_for_data_plane_scan(vec!["catalog/table-entry.json".to_string()], true, 1),
+        Err(TableCatalogStoreError::Unavailable(message)) if message.contains("1-catalog-object safety limit")
+    );
+}
+
+#[test]
+fn catalog_lock_authority_failures_are_typed_as_unavailable() {
+    for error in [
+        rustfs_lock::LockError::timeout("table-publication", StdDuration::from_secs(5)),
+        rustfs_lock::LockError::Network {
+            message: "peer unavailable".to_string(),
+            source: Box::new(std::io::Error::other("peer unavailable")),
+        },
+        rustfs_lock::LockError::AlreadyLocked {
+            resource: "table-publication".to_string(),
+            owner: "another-node".to_string(),
+        },
+        rustfs_lock::LockError::InsufficientNodes {
+            required: 3,
+            available: 1,
+        },
+        rustfs_lock::LockError::QuorumNotReached {
+            required: 3,
+            achieved: 1,
+        },
+        rustfs_lock::LockError::QueueFull {
+            message: "lock queue is full".to_string(),
+        },
+    ] {
+        assert_matches!(
+            super::store::catalog_lock_acquisition_error("acquire catalog table lock", error),
+            TableCatalogStoreError::Unavailable(_)
+        );
+    }
+
+    assert_matches!(
+        super::store::catalog_lock_acquisition_error(
+            "acquire catalog table lock",
+            rustfs_lock::LockError::configuration("invalid lock configuration"),
+        ),
+        TableCatalogStoreError::Internal(_)
+    );
+}
+
+#[test]
+fn catalog_storage_quorum_failures_are_typed_as_unavailable() {
+    for error in [
+        StorageError::ErasureReadQuorum,
+        StorageError::ErasureWriteQuorum,
+        StorageError::InsufficientReadQuorum(".rustfs.sys".to_string(), "snapshot.json".to_string()),
+        StorageError::InsufficientWriteQuorum(".rustfs.sys".to_string(), "snapshot.json".to_string()),
+        StorageError::NamespaceLockQuorumUnavailable {
+            mode: "read",
+            bucket: ".rustfs.sys".to_string(),
+            object: "s3tables/catalog/strong-backing/snapshot.json".to_string(),
+            required: 2,
+            achieved: 0,
+        },
+    ] {
+        assert_matches!(
+            storage_error_to_catalog("stat catalog object", error),
+            TableCatalogStoreError::Unavailable(_)
+        );
+    }
+
+    assert_matches!(
+        storage_error_to_catalog("stat catalog object", StorageError::FileCorrupt),
+        TableCatalogStoreError::Internal(_)
+    );
+}
+
+#[test]
+fn catalog_storage_retryable_lock_failures_are_typed_as_unavailable() {
+    for error in [
+        rustfs_lock::LockError::timeout("catalog", StdDuration::from_secs(5)),
+        rustfs_lock::LockError::network("peer unavailable", std::io::Error::other("peer unavailable")),
+        rustfs_lock::LockError::already_locked("catalog", "another-node"),
+        rustfs_lock::LockError::InsufficientNodes {
+            required: 3,
+            available: 1,
+        },
+        rustfs_lock::LockError::QuorumNotReached {
+            required: 3,
+            achieved: 1,
+        },
+        rustfs_lock::LockError::QueueFull {
+            message: "lock queue is full".to_string(),
+        },
+    ] {
+        assert_matches!(
+            storage_error_to_catalog("stat catalog object", StorageError::Lock(error)),
+            TableCatalogStoreError::Unavailable(_)
+        );
+    }
+
+    for error in [
+        rustfs_lock::LockError::internal("lock backend failure"),
+        rustfs_lock::LockError::configuration("invalid lock configuration"),
+        rustfs_lock::LockError::resource_not_found("catalog"),
+    ] {
+        assert_matches!(
+            storage_error_to_catalog("stat catalog object", StorageError::Lock(error)),
+            TableCatalogStoreError::Internal(_)
+        );
+    }
+}
+
+#[test]
 fn reserved_table_object_key_matches_exact_prefix_and_children_only() {
     assert!(is_reserved_table_object_key(".rustfs-table"));
     assert!(is_reserved_table_object_key(".rustfs-table/"));
@@ -78,6 +205,7 @@ fn catalog_entry_structures_serialize_stable_fields() {
         warehouse_root: "s3://analytics/".to_string(),
         state: TableCatalogEntryState::Active,
         properties: BTreeMap::from([("owner".to_string(), "platform".to_string())]),
+        active_rename_id: None,
         created_at: Some("2026-05-23T00:00:00Z".to_string()),
         updated_at: Some("2026-05-23T00:00:00Z".to_string()),
     };
@@ -3375,6 +3503,7 @@ fn test_bucket_entry(bucket: &str) -> TableBucketEntry {
         warehouse_root: format!("s3://{bucket}/"),
         state: TableCatalogEntryState::Active,
         properties: BTreeMap::new(),
+        active_rename_id: None,
         created_at: None,
         updated_at: None,
     }
@@ -3812,6 +3941,96 @@ async fn table_data_plane_resource_resolves_registered_warehouse_prefix() {
 }
 
 #[tokio::test]
+async fn table_metadata_data_plane_resource_resolves_only_current_metadata() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+    backend.reset_call_counts().await;
+
+    let resource = table_metadata_data_plane_resource_for_object(&store, bucket, &current)
+        .await
+        .expect("metadata ownership lookup should succeed")
+        .expect("current metadata should resolve to its table");
+    assert_eq!(resource.namespace, "sales");
+    assert_eq!(resource.table, "orders");
+    assert_eq!(backend.list_call_count().await, 1);
+    assert_eq!(backend.read_call_count().await, 2);
+    assert_eq!(backend.metadata_call_count().await, 1);
+
+    let historical = default_table_metadata_file_path(&namespace, &table, "00000.metadata.json");
+    assert!(
+        table_metadata_data_plane_resource_for_object(&store, bucket, &historical)
+            .await
+            .expect("historical metadata lookup should succeed")
+            .is_none()
+    );
+    assert!(
+        table_metadata_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/file.parquet")
+            .await
+            .expect("ordinary object lookup should succeed")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn table_metadata_data_plane_resource_follows_a_renamed_table() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend);
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+    store
+        .rename_table(bucket, "sales", "orders", "sales", "archived_orders")
+        .await
+        .expect("table rename should succeed");
+
+    let resource = table_metadata_data_plane_resource_for_object(&store, bucket, &current)
+        .await
+        .expect("renamed metadata ownership lookup should succeed")
+        .expect("current metadata should remain owned after rename");
+    assert_eq!(resource.namespace, "sales");
+    assert_eq!(resource.table, "archived_orders");
+}
+
+#[tokio::test]
+async fn table_metadata_data_plane_resource_rejects_multiple_active_owners() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend);
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+    store
+        .rename_table(bucket, "sales", "orders", "sales", "archived_orders")
+        .await
+        .expect("table rename should succeed");
+
+    let mut replacement = test_table_entry(bucket, &namespace, &table, current.clone());
+    replacement.table_id = "replacement-table-id".to_string();
+    replacement.table_uuid = "replacement-table-uuid".to_string();
+    replacement.warehouse_location = format!("s3://{bucket}/tables/replacement-table-id");
+    store
+        .create_table(replacement)
+        .await
+        .expect("replacement table should be created");
+
+    assert_matches!(
+        table_metadata_data_plane_resource_for_object(&store, bucket, &current).await,
+        Err(TableCatalogStoreError::Invalid(message)) if message.contains("multiple active tables")
+    );
+}
+
+#[tokio::test]
 async fn table_data_plane_resource_does_not_match_sibling_prefix() {
     let backend = TestCatalogObjectBackend::default();
     let store = ObjectTableCatalogStore::new(backend.clone());
@@ -3829,6 +4048,38 @@ async fn table_data_plane_resource_does_not_match_sibling_prefix() {
 
     assert!(resource.is_none());
     assert_eq!(backend.list_call_count().await, 1);
+}
+
+#[tokio::test]
+async fn object_catalog_registration_scans_warehouse_prefixes_once() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .unwrap();
+
+    let mut reads = Vec::new();
+    for name in ["orders", "returns", "shipments"] {
+        let table = IdentifierSegment::parse(name).expect("table should parse");
+        let mut entry = test_table_entry(
+            bucket,
+            &namespace,
+            &table,
+            default_table_metadata_file_path(&namespace, &table, "00001.metadata.json"),
+        );
+        entry.table_id = format!("table-{name}");
+        entry.warehouse_location = format!("s3://{bucket}/tables/{name}");
+        backend.reset_call_counts().await;
+        store.create_table(entry).await.expect("table should be created");
+        reads.push(backend.read_call_count().await);
+        assert_eq!(backend.list_call_count().await, 2, "one table scan and one warehouse index scan");
+    }
+    assert_eq!(reads[2] - reads[1], 2, "each existing table and its index should be read once");
+    assert_eq!(store.list_tables(bucket, &namespace.public_name()).await.unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -4291,6 +4542,8 @@ async fn table_data_plane_resource_scans_when_a_ready_index_entry_is_missing() {
         .delete_object(RUSTFS_META_BUCKET, &store.paths.warehouse_index_entry_path(bucket, "tables/table-id/"))
         .await
         .expect("warehouse index entry should be removed");
+    let migration_lock = store.paths.backing_migration_fence_lock_path(bucket);
+    let migration_permits_before = backend.read_lock_acquisition_count(RUSTFS_META_BUCKET, &migration_lock).await;
     backend.reset_call_counts().await;
 
     let resource = table_data_plane_resource_for_object(&store, bucket, object)
@@ -4299,7 +4552,120 @@ async fn table_data_plane_resource_scans_when_a_ready_index_entry_is_missing() {
         .expect("the table scan must retain table-aware protection");
 
     assert_eq!(resource.table, "orders");
-    assert!(backend.list_call_count().await > 0);
+    assert_eq!(backend.list_call_count().await, 1);
+    assert_eq!(
+        backend.read_lock_acquisition_count(RUSTFS_META_BUCKET, &migration_lock).await,
+        migration_permits_before + 1,
+        "repairing a missing warehouse index must hold the object-backed migration permit"
+    );
+    assert!(
+        store
+            .read_entry::<TableWarehouseIndexEntry>(
+                RUSTFS_META_BUCKET,
+                &store.paths.warehouse_index_entry_path(bucket, "tables/table-id/"),
+            )
+            .await
+            .expect("repaired warehouse index lookup should succeed")
+            .is_some(),
+        "the bounded scan should repair the missing index"
+    );
+
+    backend.reset_call_counts().await;
+    let indexed = table_data_plane_resource_for_object(&store, bucket, object)
+        .await
+        .expect("repaired warehouse index lookup should succeed")
+        .expect("repaired warehouse index should retain table-aware protection");
+    assert_eq!(indexed.table, "orders");
+    assert_eq!(backend.list_call_count().await, 0);
+    assert_eq!(
+        backend.read_lock_acquisition_count(RUSTFS_META_BUCKET, &migration_lock).await,
+        migration_permits_before + 1,
+        "an indexed lookup must not acquire a write permit"
+    );
+}
+
+#[tokio::test]
+async fn operator_backfill_reconciles_a_missing_ready_index_above_the_data_plane_limit() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let object = "tables/table-id/data/part-00001.parquet";
+    let index_path = store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+    backend
+        .delete_object(RUSTFS_META_BUCKET, &index_path)
+        .await
+        .expect("warehouse index entry should be removed");
+    let catalog_prefix = store.paths.namespace_entries_prefix(bucket);
+    for index in 0..TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS {
+        backend
+            .seed_object(RUSTFS_META_BUCKET, &format!("{catalog_prefix}noise-{index}.json"), b"{}".to_vec())
+            .await;
+    }
+
+    assert_matches!(
+        table_data_plane_resource_for_object(&store, bucket, object).await,
+        Err(TableCatalogStoreError::Unavailable(message)) if message.contains("4096-catalog-object safety limit")
+    );
+    store
+        .backfill_table_warehouse_index(bucket)
+        .await
+        .expect("operator backfill should reconcile a ready index without the data-plane limit");
+    assert!(
+        store
+            .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+            .await
+            .expect("reconciled warehouse index lookup should succeed")
+            .is_some(),
+        "operator reconciliation must recreate the missing ready-state index"
+    );
+
+    backend.reset_call_counts().await;
+    let resource = table_data_plane_resource_for_object(&store, bucket, object)
+        .await
+        .expect("reconciled index lookup should succeed")
+        .expect("reconciled index should retain table-aware protection");
+    assert_eq!(resource.table, "orders");
+    assert_eq!(backend.list_call_count().await, 0);
+}
+
+#[tokio::test]
+async fn table_data_plane_index_repair_honors_an_active_migration_fence() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let object = "tables/table-id/data/part-00001.parquet";
+    let index_path = store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+    store
+        .materialize_durable_strong_backing_migration(bucket)
+        .await
+        .expect("durable strong migration should install its object-backed write fence");
+    backend
+        .delete_object(RUSTFS_META_BUCKET, &index_path)
+        .await
+        .expect("warehouse index entry should be removed after migration fencing");
+
+    assert_matches!(
+        table_data_plane_resource_for_object(&store, bucket, object).await,
+        Err(TableCatalogStoreError::Conflict(message)) if message.contains("writes are fenced")
+    );
+    assert!(
+        store
+            .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+            .await
+            .expect("warehouse index lookup should succeed")
+            .is_none(),
+        "a fenced object-backed catalog must not repair the missing warehouse index"
+    );
 }
 
 #[tokio::test]
@@ -4344,7 +4710,7 @@ async fn table_data_plane_resource_scans_when_an_index_disappears_during_backfil
 }
 
 #[tokio::test]
-async fn table_data_plane_resource_fails_closed_for_an_inactive_ready_index() {
+async fn active_catalog_owner_takes_precedence_over_a_warehouse_tombstone() {
     let backend = TestCatalogObjectBackend::default();
     let store = ObjectTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
@@ -4354,7 +4720,7 @@ async fn table_data_plane_resource_fails_closed_for_an_inactive_ready_index() {
     let prefix = "tables/table-id/";
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
-    let inactive = TableWarehouseIndexEntry {
+    let tombstone = TableWarehouseIndexEntry {
         version: TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
@@ -4367,16 +4733,58 @@ async fn table_data_plane_resource_fails_closed_for_an_inactive_ready_index() {
         .write_entry(
             store.catalog_bucket(),
             &store.paths.warehouse_index_entry_path(bucket, prefix),
-            &inactive,
+            &tombstone,
             TableCatalogPutPrecondition::Any,
         )
         .await
-        .expect("inactive warehouse index should be seeded");
+        .expect("warehouse tombstone should be seeded");
 
-    assert_matches!(
-        table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet").await,
-        Err(TableCatalogStoreError::Internal(message)) if message.contains("inactive while the index is authoritative")
-    );
+    let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
+        .await
+        .expect("active catalog owner should resolve ahead of the tombstone")
+        .expect("active catalog owner should retain table-aware protection");
+
+    assert_eq!(resource.table_id, "table-id");
+    assert_eq!(resource.warehouse_object_prefix, prefix);
+}
+
+#[tokio::test]
+async fn table_data_plane_resource_fails_closed_for_a_transient_ready_index() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend);
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let prefix = "tables/table-id/";
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+    for state in [TableCatalogEntryState::Renaming, TableCatalogEntryState::Deleting] {
+        let index = TableWarehouseIndexEntry {
+            version: TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: bucket.to_string(),
+            namespace: namespace.public_name(),
+            table: table.as_str().to_string(),
+            table_id: "table-id".to_string(),
+            warehouse_object_prefix: prefix.to_string(),
+            state,
+        };
+        store
+            .write_entry(
+                store.catalog_bucket(),
+                &store.paths.warehouse_index_entry_path(bucket, prefix),
+                &index,
+                TableCatalogPutPrecondition::Any,
+            )
+            .await
+            .expect("transient warehouse index should be seeded");
+
+        assert_matches!(
+            table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet").await,
+            Err(TableCatalogStoreError::Internal(message))
+                if message.contains("invalid transient state while the index is authoritative")
+        );
+    }
 }
 
 #[tokio::test]
@@ -4929,7 +5337,7 @@ async fn table_data_plane_resource_falls_back_to_scan_without_index_state() {
         .expect("legacy table entry should resolve");
 
     assert_eq!(resource.table, "orders");
-    assert!(backend.list_call_count().await > 0);
+    assert_eq!(backend.list_call_count().await, 1);
     assert!(store.warehouse_index_ready(bucket).await.unwrap());
 
     backend.reset_call_counts().await;
@@ -5041,7 +5449,8 @@ async fn object_catalog_pagination_bounds_reads_and_covers_rest_resources() {
         .await
         .expect("first table page should load");
     assert_eq!(table_page.entries[0].table, "alpha");
-    assert_eq!(backend.read_call_count().await, 1);
+    // One read snapshots the bucket rename fence and one loads the page entry.
+    assert_eq!(backend.read_call_count().await, 2);
     let table_page = store
         .list_tables_page(bucket, &namespace_name, table_page.next_cursor.as_deref(), one)
         .await
@@ -5200,19 +5609,130 @@ async fn object_table_catalog_store_rolls_back_warehouse_index_when_table_entry_
 }
 
 #[tokio::test]
-async fn object_table_catalog_store_keeps_table_when_drop_index_delete_fails() {
+async fn object_catalog_prefix_reuse_preserves_protection_on_write_failure() {
+    for failure in ["index", "table", "rollback", "ambiguous"] {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let first = IdentifierSegment::parse("orders").unwrap();
+        let second = IdentifierSegment::parse("returns").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &first, "00001.metadata.json");
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &first, current).await;
+        store
+            .drop_table(bucket, &namespace.public_name(), first.as_str())
+            .await
+            .unwrap();
+
+        let index_path = store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+        let table_path = store.paths.table_entry_path(bucket, &namespace, &second);
+        let index_attempts = backend.put_attempt_count(RUSTFS_META_BUCKET, &index_path).await;
+        if failure == "index" {
+            backend
+                .fail_put_attempt(RUSTFS_META_BUCKET, &index_path, index_attempts + 2)
+                .await;
+        } else if failure == "ambiguous" {
+            backend.fail_after_next_put(RUSTFS_META_BUCKET, &table_path).await;
+        } else {
+            backend.fail_next_put(RUSTFS_META_BUCKET, &table_path).await;
+            if failure == "rollback" {
+                backend
+                    .fail_put_attempt(RUSTFS_META_BUCKET, &index_path, index_attempts + 3)
+                    .await;
+            }
+        }
+
+        let metadata = default_table_metadata_file_path(&namespace, &second, "00001.metadata.json");
+        let mut entry = test_table_entry(bucket, &namespace, &second, metadata);
+        entry.table_id = "replacement-table-id".to_string();
+        entry.warehouse_location = format!("s3://{bucket}/tables/table-id");
+        assert_matches!(store.create_table(entry.clone()).await, Err(TableCatalogStoreError::Internal(_)));
+        assert_eq!(
+            store
+                .load_table(bucket, &namespace.public_name(), second.as_str())
+                .await
+                .unwrap()
+                .is_some(),
+            failure == "ambiguous"
+        );
+
+        let restarted = ObjectTableCatalogStore::new(backend.clone());
+        let resource = table_data_plane_resource_for_object(&restarted, bucket, "tables/table-id/data/file.parquet").await;
+        if failure == "rollback" {
+            assert_matches!(resource, Err(TableCatalogStoreError::Internal(_)));
+        } else {
+            let resource = resource
+                .expect("lookup should succeed")
+                .expect("failed prefix reuse must retain protection");
+            assert_eq!(
+                resource.table_id,
+                if failure == "ambiguous" {
+                    "replacement-table-id"
+                } else {
+                    "table-id"
+                },
+                "failure at {failure}"
+            );
+        }
+        let (index, _) = restarted
+            .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+            .await
+            .unwrap()
+            .expect("failed prefix reuse must not remove the warehouse index");
+        assert_eq!(
+            index.state,
+            if matches!(failure, "rollback" | "ambiguous") {
+                TableCatalogEntryState::Active
+            } else {
+                TableCatalogEntryState::Deleted
+            }
+        );
+
+        if failure == "rollback" {
+            let third = IdentifierSegment::parse("retry_returns").unwrap();
+            let mut retry = entry.clone();
+            retry.table = third.as_str().to_string();
+            retry.table_id = "retry-table-id".to_string();
+            retry.metadata_location = default_table_metadata_file_path(&namespace, &third, "00001.metadata.json");
+            backend
+                .fail_next_put(RUSTFS_META_BUCKET, &store.paths.table_entry_path(bucket, &namespace, &third))
+                .await;
+            assert_matches!(restarted.create_table(retry).await, Err(TableCatalogStoreError::Internal(_)));
+            assert_matches!(
+                table_data_plane_resource_for_object(&restarted, bucket, "tables/table-id/data/file.parquet").await,
+                Err(TableCatalogStoreError::Internal(_))
+            );
+        }
+        if failure != "ambiguous" {
+            restarted
+                .create_table(entry)
+                .await
+                .expect("prefix reuse should remain retryable");
+        }
+        restarted
+            .drop_table(bucket, &namespace.public_name(), second.as_str())
+            .await
+            .expect("replacement table should remain droppable");
+        let resource = table_data_plane_resource_for_object(&restarted, bucket, "tables/table-id/data/file.parquet")
+            .await
+            .unwrap()
+            .expect("replacement tombstone should protect the reused prefix");
+        assert_eq!(resource.table_id, "replacement-table-id");
+    }
+}
+
+#[tokio::test]
+async fn object_table_catalog_store_keeps_table_when_drop_index_tombstone_write_fails() {
     let backend = TestCatalogObjectBackend::default();
     let store = ObjectTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
     let namespace = Namespace::parse("sales").expect("namespace should parse");
     let table = IdentifierSegment::parse("orders").expect("table should parse");
     let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
-    let table_path = store.paths.table_entry_path(bucket, &namespace, &table);
     let index_path = store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
-    backend.fail_delete_attempt(RUSTFS_META_BUCKET, &index_path, 1).await;
-    backend.fail_next_put(RUSTFS_META_BUCKET, &table_path).await;
+    backend.fail_next_put(RUSTFS_META_BUCKET, &index_path).await;
 
     let error = store
         .drop_table(bucket, &namespace.public_name(), table.as_str())
@@ -5277,6 +5797,50 @@ async fn object_table_catalog_store_rejects_drop_when_warehouse_index_owner_chan
 }
 
 #[tokio::test]
+async fn object_table_catalog_store_rejects_drop_when_deleted_warehouse_index_owner_changed() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend);
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let index_path = store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+    let conflicting_index = TableWarehouseIndexEntry {
+        version: TABLE_CATALOG_ENTRY_VERSION,
+        table_bucket: bucket.to_string(),
+        namespace: "finance".to_string(),
+        table: "returns".to_string(),
+        table_id: "other-table-id".to_string(),
+        warehouse_object_prefix: "tables/table-id/".to_string(),
+        state: TableCatalogEntryState::Deleted,
+    };
+    store
+        .write_entry(store.catalog_bucket(), &index_path, &conflicting_index, TableCatalogPutPrecondition::Any)
+        .await
+        .expect("conflicting warehouse tombstone should be seeded");
+
+    assert_matches!(
+        store.drop_table(bucket, &namespace.public_name(), table.as_str()).await,
+        Err(TableCatalogStoreError::Conflict(message)) if message.contains("owner changed")
+    );
+    assert!(
+        store
+            .load_table(bucket, &namespace.public_name(), table.as_str())
+            .await
+            .expect("retained table lookup should succeed")
+            .is_some()
+    );
+    let (retained_index, _) = store
+        .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+        .await
+        .expect("conflicting warehouse tombstone lookup should succeed")
+        .expect("conflicting warehouse tombstone should remain present");
+    assert_eq!(retained_index, conflicting_index);
+}
+
+#[tokio::test]
 async fn object_table_catalog_store_drops_table_when_warehouse_index_is_missing() {
     let backend = TestCatalogObjectBackend::default();
     let store = ObjectTableCatalogStore::new(backend);
@@ -5315,6 +5879,76 @@ async fn object_table_catalog_store_drops_table_when_warehouse_index_is_missing(
             .expect("dropped table lookup should succeed")
             .is_none()
     );
+    let (tombstone, _) = store
+        .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+        .await
+        .expect("warehouse tombstone lookup should succeed")
+        .expect("warehouse tombstone should be created");
+    assert_eq!(tombstone.state, TableCatalogEntryState::Deleted);
+    let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
+        .await
+        .expect("dropped table data-plane lookup should succeed")
+        .expect("dropped warehouse prefix should remain protected");
+    assert_eq!(resource.table_id, "table-id");
+}
+
+#[tokio::test]
+async fn active_table_warehouse_prefix_takes_precedence_over_a_deleted_parent() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend);
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let parent = IdentifierSegment::parse("orders").expect("table should parse");
+    let child = IdentifierSegment::parse("returns").expect("table should parse");
+    let parent_metadata = default_table_metadata_file_path(&namespace, &parent, "00001.metadata.json");
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &parent, parent_metadata).await;
+    store
+        .drop_table(bucket, &namespace.public_name(), parent.as_str())
+        .await
+        .expect("parent table should be dropped");
+
+    let child_metadata = default_table_metadata_file_path(&namespace, &child, "00001.metadata.json");
+    let mut child_entry = test_table_entry(bucket, &namespace, &child, child_metadata);
+    child_entry.table_id = "child-table-id".to_string();
+    child_entry.warehouse_location = format!("s3://{bucket}/tables/table-id/child");
+    store.create_table(child_entry).await.expect("child table should be created");
+
+    let child_resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/child/data/file.parquet")
+        .await
+        .expect("child data-plane lookup should succeed")
+        .expect("active child table should protect its prefix");
+    assert_eq!(child_resource.table_id, "child-table-id");
+
+    let parent_resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/orphan/file.parquet")
+        .await
+        .expect("deleted parent data-plane lookup should succeed")
+        .expect("deleted parent should keep protecting its remaining prefix");
+    assert_eq!(parent_resource.table_id, "table-id");
+
+    store
+        .drop_table(bucket, &namespace.public_name(), child.as_str())
+        .await
+        .unwrap();
+    assert_matches!(
+        table_data_plane_resource_for_object(&store, bucket, "tables/table-id/child/data/file.parquet").await,
+        Err(TableCatalogStoreError::Invalid(message)) if message.contains("overlapping deleted table warehouse indexes")
+    );
+    let grandchild = IdentifierSegment::parse("nested_returns").unwrap();
+    let mut entry = test_table_entry(
+        bucket,
+        &namespace,
+        &grandchild,
+        default_table_metadata_file_path(&namespace, &grandchild, "00001.metadata.json"),
+    );
+    entry.table_id = "grandchild-table-id".to_string();
+    entry.warehouse_location = format!("s3://{bucket}/tables/table-id/child/nested");
+    store.create_table(entry).await.unwrap();
+    let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/child/nested/data/file.parquet")
+        .await
+        .unwrap()
+        .expect("active owner should take precedence over both tombstones");
+    assert_eq!(resource.table_id, "grandchild-table-id");
 }
 
 #[tokio::test]
@@ -5347,6 +5981,7 @@ async fn object_table_catalog_store_restores_index_when_table_entry_delete_fails
         .expect("restored warehouse index lookup should succeed")
         .expect("warehouse index should be restored");
     assert_eq!(restored_index.table_id, "table-id");
+    assert_eq!(restored_index.state, TableCatalogEntryState::Active);
     let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
         .await
         .expect("restored index lookup should succeed")
@@ -5355,7 +5990,7 @@ async fn object_table_catalog_store_restores_index_when_table_entry_delete_fails
 }
 
 #[tokio::test]
-async fn object_table_catalog_store_falls_back_to_scan_when_drop_index_restore_fails() {
+async fn object_table_catalog_store_uses_tombstone_when_drop_index_restore_fails() {
     let backend = TestCatalogObjectBackend::default();
     let store = ObjectTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
@@ -5367,7 +6002,10 @@ async fn object_table_catalog_store_falls_back_to_scan_when_drop_index_restore_f
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
     backend.fail_delete_attempt(RUSTFS_META_BUCKET, &table_path, 1).await;
-    backend.fail_next_put(RUSTFS_META_BUCKET, &index_path).await;
+    let restore_attempt = backend.put_attempt_count(RUSTFS_META_BUCKET, &index_path).await + 2;
+    backend
+        .fail_put_attempt(RUSTFS_META_BUCKET, &index_path, restore_attempt)
+        .await;
 
     assert_matches!(
         store.drop_table(bucket, &namespace.public_name(), table.as_str()).await,
@@ -5379,18 +6017,16 @@ async fn object_table_catalog_store_falls_back_to_scan_when_drop_index_restore_f
         .expect("retained table lookup should succeed")
         .expect("table entry should remain present");
     assert_eq!(retained.table_id, "table-id");
-    assert!(
-        store
-            .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
-            .await
-            .expect("warehouse index lookup should succeed")
-            .is_none(),
-        "the injected index restore failure must leave the scan fallback under test"
-    );
+    let (tombstone, _) = store
+        .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+        .await
+        .expect("warehouse index lookup should succeed")
+        .expect("the failed restore should retain the warehouse tombstone");
+    assert_eq!(tombstone.state, TableCatalogEntryState::Deleted);
     let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
         .await
-        .expect("catalog scan fallback should succeed")
-        .expect("catalog scan fallback should keep data-plane protection");
+        .expect("tombstone fallback should succeed")
+        .expect("tombstone fallback should keep data-plane protection");
     assert_eq!(resource.table, "orders");
 }
 
@@ -5418,12 +6054,11 @@ async fn object_table_catalog_store_accepts_ambiguous_delete_when_table_is_absen
             .expect("dropped table lookup should succeed")
             .is_none()
     );
-    assert!(
-        table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
-            .await
-            .expect("dropped table data-plane lookup should succeed")
-            .is_none()
-    );
+    let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
+        .await
+        .expect("dropped table data-plane lookup should succeed")
+        .expect("dropped warehouse prefix should remain protected");
+    assert_eq!(resource.table_id, "table-id");
 }
 
 #[tokio::test]
@@ -5476,6 +6111,30 @@ async fn object_table_catalog_store_rejects_invalid_table_warehouse_location() {
         error,
         TableCatalogStoreError::Invalid(message) if message.contains("invalid path segment")
     ));
+}
+
+#[test]
+fn warehouse_locations_reject_the_reserved_catalog_prefix() {
+    for location in [
+        "s3://analytics/.rustfs-table",
+        "s3://analytics/.rustfs-table/",
+        "s3://analytics/.rustfs-table/warehouses/default",
+    ] {
+        let table_error = validate_table_warehouse_location("analytics", location).unwrap_err();
+        assert!(matches!(
+            table_error,
+            TableCatalogStoreError::Invalid(message) if message.contains("reserved table catalog prefix")
+        ));
+
+        let view_error = validate_view_warehouse_location("analytics", location).unwrap_err();
+        assert!(matches!(
+            view_error,
+            TableCatalogStoreError::Invalid(message) if message.contains("reserved table catalog prefix")
+        ));
+    }
+
+    assert!(validate_table_warehouse_location("analytics", "s3://analytics/.rustfs-table-other/table-id").is_ok());
+    assert!(validate_table_warehouse_location("analytics", "s3://analytics/user/.rustfs-table/table-id").is_ok());
 }
 
 #[tokio::test]
@@ -12381,24 +13040,268 @@ async fn strong_catalog_backing_resolves_data_plane_resource_without_catalog_sca
 }
 
 #[tokio::test]
+async fn strong_catalog_table_metadata_data_plane_resource_resolves_only_current_metadata() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = StrongTableCatalogStore::new(backend);
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .expect("namespace should be created");
+    store
+        .create_table(test_table_entry(bucket, &namespace, &table, current.clone()))
+        .await
+        .expect("table should be created");
+
+    let resource = table_metadata_data_plane_resource_for_object(&store, bucket, &current)
+        .await
+        .expect("metadata ownership lookup should succeed")
+        .expect("current metadata should resolve to its table");
+    assert_eq!(resource.namespace, "sales");
+    assert_eq!(resource.table, "orders");
+
+    let historical = default_table_metadata_file_path(&namespace, &table, "00000.metadata.json");
+    assert!(
+        table_metadata_data_plane_resource_for_object(&store, bucket, &historical)
+            .await
+            .expect("historical metadata lookup should succeed")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn strong_catalog_drop_keeps_warehouse_tombstone_after_restart() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = StrongTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .expect("namespace should be created");
+    store
+        .create_table(test_table_entry(bucket, &namespace, &table, current))
+        .await
+        .expect("table should be created");
+    store
+        .drop_table(bucket, &namespace.public_name(), table.as_str())
+        .await
+        .expect("table should be dropped");
+
+    let restarted = StrongTableCatalogStore::new(backend.clone());
+    assert!(
+        restarted
+            .load_table(bucket, &namespace.public_name(), table.as_str())
+            .await
+            .expect("dropped table lookup should succeed")
+            .is_none()
+    );
+    let resource = table_data_plane_resource_for_object(&restarted, bucket, "tables/table-id/data/file.parquet")
+        .await
+        .expect("dropped table data-plane lookup should succeed")
+        .expect("dropped warehouse prefix should remain protected");
+    assert_eq!(resource.table_id, "table-id");
+
+    let object_store = ObjectTableCatalogStore::new(backend);
+    let index_path = object_store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+    let (tombstone, _) = object_store
+        .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+        .await
+        .expect("warehouse tombstone lookup should succeed")
+        .expect("warehouse tombstone should remain durable");
+    assert_eq!(tombstone.state, TableCatalogEntryState::Deleted);
+}
+
+#[tokio::test]
+async fn strong_catalog_failed_drop_keeps_active_table_ahead_of_tombstone() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = StrongTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .expect("namespace should be created");
+    store
+        .create_table(test_table_entry(bucket, &namespace, &table, current))
+        .await
+        .expect("table should be created");
+    let snapshot_path = StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path();
+    backend.fail_next_put(RUSTFS_META_BUCKET, &snapshot_path).await;
+
+    assert_matches!(
+        store.drop_table(bucket, &namespace.public_name(), table.as_str()).await,
+        Err(TableCatalogStoreError::Internal(_))
+    );
+    assert!(
+        store
+            .load_table(bucket, &namespace.public_name(), table.as_str())
+            .await
+            .expect("retained table lookup should succeed")
+            .is_some()
+    );
+    let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/file.parquet")
+        .await
+        .expect("retained table data-plane lookup should succeed")
+        .expect("active table should remain protected after the failed drop");
+    assert_eq!(resource.table_id, "table-id");
+
+    let object_store = ObjectTableCatalogStore::new(backend);
+    let index_path = object_store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+    let (tombstone, _) = object_store
+        .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+        .await
+        .expect("warehouse tombstone lookup should succeed")
+        .expect("failed snapshot write should retain the warehouse tombstone");
+    assert_eq!(tombstone.state, TableCatalogEntryState::Deleted);
+}
+
+#[tokio::test]
+async fn strong_catalog_reused_warehouse_prefix_replaces_the_old_tombstone_on_drop() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = StrongTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let first = IdentifierSegment::parse("orders").expect("table should parse");
+    let second = IdentifierSegment::parse("returns").expect("table should parse");
+    let first_metadata = default_table_metadata_file_path(&namespace, &first, "00001.metadata.json");
+
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .expect("namespace should be created");
+    store
+        .create_table(test_table_entry(bucket, &namespace, &first, first_metadata))
+        .await
+        .expect("first table should be created");
+    store
+        .drop_table(bucket, &namespace.public_name(), first.as_str())
+        .await
+        .expect("first table should be dropped");
+
+    let second_metadata = default_table_metadata_file_path(&namespace, &second, "00001.metadata.json");
+    let mut second_entry = test_table_entry(bucket, &namespace, &second, second_metadata);
+    second_entry.table_id = "second-table-id".to_string();
+    second_entry.warehouse_location = format!("s3://{bucket}/tables/table-id");
+    store
+        .create_table(second_entry)
+        .await
+        .expect("second table should reuse the prefix");
+    store
+        .drop_table(bucket, &namespace.public_name(), second.as_str())
+        .await
+        .expect("second table should replace the old tombstone when dropped");
+
+    let object_store = ObjectTableCatalogStore::new(backend);
+    let index_path = object_store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+    let (tombstone, _) = object_store
+        .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+        .await
+        .expect("warehouse tombstone lookup should succeed")
+        .expect("warehouse tombstone should remain durable");
+    assert_eq!(tombstone.state, TableCatalogEntryState::Deleted);
+    assert_eq!(tombstone.table_id, "second-table-id");
+    assert_eq!(tombstone.table, "returns");
+}
+
+#[tokio::test]
+async fn strong_catalog_fails_closed_for_an_unowned_active_external_warehouse_index() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = StrongTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+
+    let object_store = ObjectTableCatalogStore::new(backend);
+    let index_path = object_store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+    let unowned = TableWarehouseIndexEntry {
+        version: TABLE_CATALOG_ENTRY_VERSION,
+        table_bucket: bucket.to_string(),
+        namespace: "sales".to_string(),
+        table: "orders".to_string(),
+        table_id: "table-id".to_string(),
+        warehouse_object_prefix: "tables/table-id/".to_string(),
+        state: TableCatalogEntryState::Active,
+    };
+    object_store
+        .write_entry(
+            object_store.catalog_bucket(),
+            &index_path,
+            &unowned,
+            TableCatalogPutPrecondition::IfAbsent,
+        )
+        .await
+        .expect("unowned active warehouse index should be seeded");
+
+    assert_matches!(
+        table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/file.parquet").await,
+        Err(TableCatalogStoreError::Internal(message)) if message.contains("authoritative strong catalog")
+    );
+}
+
+#[tokio::test]
 async fn strong_catalog_data_plane_fails_closed_for_missing_bucket_snapshot() {
     let store = StrongTableCatalogStore::new(TestCatalogObjectBackend::default());
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
 
     let error = table_data_plane_resource_for_object(&store, "analytics", "tables/table-id/data/file.parquet")
         .await
         .expect_err("a table-enabled bucket missing from the strong snapshot must fail closed");
 
     assert_matches!(error, TableCatalogStoreError::Internal(message) if message.contains("no entry for table-enabled bucket"));
+
+    let error = table_metadata_data_plane_resource_for_object(&store, "analytics", &metadata)
+        .await
+        .expect_err("metadata access must reject a missing strong bucket snapshot");
+    assert_matches!(error, TableCatalogStoreError::Internal(message) if message.contains("no entry for table-enabled bucket"));
 }
 
 #[tokio::test]
 async fn object_catalog_data_plane_fails_closed_for_missing_bucket_entry() {
     let store = ObjectTableCatalogStore::new(TestCatalogObjectBackend::default());
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
 
     let error = table_data_plane_resource_for_object(&store, "analytics", "tables/table-id/data/file.parquet")
         .await
         .expect_err("a table-enabled bucket missing from the object catalog must fail closed");
 
+    assert_matches!(error, TableCatalogStoreError::Internal(message) if message.contains("no entry for table-enabled bucket"));
+
+    let error = table_metadata_data_plane_resource_for_object(&store, "analytics", &metadata)
+        .await
+        .expect_err("metadata access must reject a missing object-backed bucket entry");
     assert_matches!(error, TableCatalogStoreError::Internal(message) if message.contains("no entry for table-enabled bucket"));
 }
 
@@ -12406,6 +13309,9 @@ async fn object_catalog_data_plane_fails_closed_for_missing_bucket_entry() {
 async fn catalog_backings_fail_closed_for_inactive_table_bucket_data_plane() {
     let bucket = "analytics";
     let object = "tables/table-id/data/file.parquet";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
     let mut inactive = test_bucket_entry(bucket);
     inactive.state = TableCatalogEntryState::Deleted;
 
@@ -12417,6 +13323,13 @@ async fn catalog_backings_fail_closed_for_inactive_table_bucket_data_plane() {
     let object_error = table_data_plane_resource_for_object(&object_store, bucket, object)
         .await
         .expect_err("inactive object-backed table buckets must fail closed");
+    assert_matches!(
+        object_error,
+        TableCatalogStoreError::Internal(message) if message.contains("inactive object-backed catalog entry")
+    );
+    let object_error = table_metadata_data_plane_resource_for_object(&object_store, bucket, &metadata)
+        .await
+        .expect_err("metadata access must reject an inactive object-backed table bucket");
     assert_matches!(
         object_error,
         TableCatalogStoreError::Internal(message) if message.contains("inactive object-backed catalog entry")
@@ -12434,6 +13347,13 @@ async fn catalog_backings_fail_closed_for_inactive_table_bucket_data_plane() {
         strong_error,
         TableCatalogStoreError::Internal(message) if message.contains("inactive durable strong catalog entry")
     );
+    let strong_error = table_metadata_data_plane_resource_for_object(&strong_store, bucket, &metadata)
+        .await
+        .expect_err("metadata access must reject an inactive durable strong table bucket");
+    assert_matches!(
+        strong_error,
+        TableCatalogStoreError::Internal(message) if message.contains("inactive durable strong catalog entry")
+    );
 }
 
 #[tokio::test]
@@ -12442,18 +13362,19 @@ async fn strong_catalog_data_plane_requires_v2_snapshot_after_fleet_confirmation
     let bucket = "analytics";
     let namespace = Namespace::parse("sales").expect("namespace should parse");
     let table = IdentifierSegment::parse("orders").expect("table should parse");
-    let table_entry = test_table_entry(
-        bucket,
-        &namespace,
-        &table,
-        default_table_metadata_file_path(&namespace, &table, "00001.metadata.json"),
-    );
+    let metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let table_entry = test_table_entry(bucket, &namespace, &table, metadata.clone());
     seed_strong_snapshot(&backend, &test_strong_snapshot(bucket, &namespace, vec![table_entry], Vec::new())).await;
     let store = StrongTableCatalogStore::new_with_snapshot_write_version(backend.clone(), STRONG_TABLE_CATALOG_SNAPSHOT_VERSION);
 
     let error = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/file.parquet")
         .await
         .expect_err("fleet-confirmed readers must reject a version 1 snapshot on the data plane");
+    assert_matches!(error, TableCatalogStoreError::Internal(message) if message.contains("requires a version 2 snapshot"));
+
+    let error = table_metadata_data_plane_resource_for_object(&store, bucket, &metadata)
+        .await
+        .expect_err("fleet-confirmed readers must reject metadata from a version 1 snapshot");
     assert_matches!(error, TableCatalogStoreError::Internal(message) if message.contains("requires a version 2 snapshot"));
 
     store
@@ -12465,6 +13386,12 @@ async fn strong_catalog_data_plane_requires_v2_snapshot_after_fleet_confirmation
         table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/file.parquet")
             .await
             .expect("version 2 data-plane lookup should succeed")
+            .is_some()
+    );
+    assert!(
+        table_metadata_data_plane_resource_for_object(&store, bucket, &metadata)
+            .await
+            .expect("version 2 metadata lookup should succeed")
             .is_some()
     );
 }
@@ -14975,6 +15902,7 @@ async fn object_table_catalog_store_commits_with_token_match_and_writes_log() {
         .unwrap();
     backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
 
+    backend.reset_call_counts().await;
     let result = store
         .commit_table(TableCommitRequest {
             table_bucket: bucket.to_string(),
@@ -14992,6 +15920,11 @@ async fn object_table_catalog_store_commits_with_token_match_and_writes_log() {
         .await
         .unwrap();
 
+    assert_eq!(
+        backend.list_call_count().await,
+        0,
+        "an unchanged warehouse must not trigger a catalog scan"
+    );
     assert_eq!(result.table.metadata_location, new_metadata);
     assert_ne!(result.table.version_token, "token-v1");
     assert_eq!(result.table.generation, 2);
@@ -16349,12 +17282,26 @@ fn table_metadata_pointer_json_round_trips() {
 
 #[test]
 fn object_mutation_entrypoints_call_reserved_prefix_guard() {
-    let source = include_str!("../app/object_usecase.rs");
-    let delete_object = source
+    let source = [
+        include_str!("../app/object/mod.rs"),
+        include_str!("../app/object/shared.rs"),
+        include_str!("../app/object/extract.rs"),
+        include_str!("../app/object/put.rs"),
+        include_str!("../app/object/copy.rs"),
+        include_str!("../app/object/delete.rs"),
+        include_str!("../app/object/head.rs"),
+        include_str!("../app/object/restore.rs"),
+    ]
+    .concat();
+    let delete_module = include_str!("../app/object/delete.rs");
+    let delete_object = delete_module
         .split_once("pub async fn execute_delete_object")
-        .and_then(|(_, remainder)| remainder.split_once("pub async fn execute_head_object"))
-        .map(|(delete_object, _)| delete_object)
-        .expect("delete object entrypoint should remain in the object usecase");
+        .map(|(_, remainder)| {
+            remainder
+                .split_once("\nmod tests")
+                .map_or(remainder, |(entrypoints, _)| entrypoints)
+        })
+        .expect("delete object entrypoints should remain in app/object/delete.rs");
 
     for expected in [
         "validate_object_key(&key, request_method_name)?;\n        validate_table_catalog_object_mutation(&bucket, &key).await?;",
@@ -16362,7 +17309,7 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
         "if let Err(err) = validate_table_catalog_object_mutation(&bucket, &obj_id.key).await",
         "validate_table_catalog_object_mutation(&bucket, &object).await?;",
         "validate_object_key(&key, \"PUT\")?;\n        validate_table_catalog_object_mutation(&bucket, &key).await?;",
-        "validate_table_catalog_object_mutation(&bucket, &fpath).await?;",
+        "extract_try!(validate_table_catalog_object_mutation(&bucket, &fpath).await);",
     ] {
         assert!(source.contains(expected), "missing object mutation guard: {expected}");
     }
@@ -16534,13 +17481,16 @@ fn namespace_property_update_and_limits_reject_ambiguous_or_oversized_state() {
 }
 
 #[tokio::test]
-async fn configured_object_catalog_rejects_namespace_property_update_without_mutation() {
+async fn configured_object_catalog_updates_namespace_properties() {
     let backend = TestCatalogObjectBackend::default();
     let store = ConfiguredTableCatalogStore::new_for_test(backend, TableCatalogBackingMode::ObjectBacked);
     let bucket = "analytics";
     let namespace = Namespace::parse("sales").expect("namespace should parse");
     let mut entry = test_namespace_entry(bucket, &namespace);
-    entry.properties = BTreeMap::from([("owner".to_string(), "lakehouse".to_string())]);
+    entry.properties = BTreeMap::from([
+        ("obsolete".to_string(), "true".to_string()),
+        ("owner".to_string(), "lakehouse".to_string()),
+    ]);
     store
         .put_table_bucket(test_bucket_entry(bucket))
         .await
@@ -16551,18 +17501,354 @@ async fn configured_object_catalog_rejects_namespace_property_update_without_mut
         .update_namespace_properties(
             bucket,
             "sales",
-            NamespacePropertiesUpdate::try_new(Vec::new(), BTreeMap::from([("owner".to_string(), "platform".to_string())]))
-                .expect("namespace update should validate"),
+            NamespacePropertiesUpdate::try_new(
+                vec!["obsolete".to_string(), "missing".to_string()],
+                BTreeMap::from([
+                    ("owner".to_string(), "platform".to_string()),
+                    ("retention".to_string(), "30d".to_string()),
+                ]),
+            )
+            .expect("namespace update should validate"),
         )
         .await
-        .expect_err("object-backed namespace property update should be unsupported");
-    assert_matches!(result, TableCatalogStoreError::Unsupported(_));
+        .expect("object-backed namespace properties should update");
+    assert_eq!(result.updated, vec!["owner".to_string(), "retention".to_string()]);
+    assert_eq!(result.removed, vec!["obsolete".to_string()]);
+    assert_eq!(result.missing, vec!["missing".to_string()]);
     let stored = store
         .get_namespace(bucket, "sales")
         .await
         .expect("namespace lookup should succeed")
         .expect("namespace should remain");
-    assert_eq!(stored.properties.get("owner").map(String::as_str), Some("lakehouse"));
+    assert_eq!(
+        stored.properties,
+        BTreeMap::from([
+            ("owner".to_string(), "platform".to_string()),
+            ("retention".to_string(), "30d".to_string()),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn object_catalog_namespace_property_update_materializes_implicit_parent() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend);
+    let bucket = "analytics";
+    let parent = Namespace::parse("sales").expect("parent namespace should parse");
+    let child = Namespace::parse("sales.daily").expect("child namespace should parse");
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket entry should be seeded");
+    let child_entry = test_namespace_entry(bucket, &child);
+    store
+        .create_namespace(child_entry.clone())
+        .await
+        .expect("child namespace should be created");
+
+    let no_change = store
+        .update_namespace_properties(
+            bucket,
+            &parent.public_name(),
+            NamespacePropertiesUpdate::try_new(vec!["missing".to_string()], BTreeMap::new())
+                .expect("namespace update should validate"),
+        )
+        .await
+        .expect("implicit parent no-op should succeed");
+    assert_eq!(no_change.missing, vec!["missing".to_string()]);
+    let parent_path = store.paths.namespace_entry_path(bucket, &parent);
+    assert!(
+        store
+            .read_entry::<NamespaceEntry>(store.catalog_bucket(), &parent_path)
+            .await
+            .expect("implicit parent lookup should succeed")
+            .is_none()
+    );
+
+    let result = store
+        .update_namespace_properties(
+            bucket,
+            &parent.public_name(),
+            NamespacePropertiesUpdate::try_new(
+                vec!["missing".to_string()],
+                BTreeMap::from([("owner".to_string(), "platform".to_string())]),
+            )
+            .expect("namespace update should validate"),
+        )
+        .await
+        .expect("implicit parent should materialize");
+
+    assert_eq!(result.updated, vec!["owner".to_string()]);
+    assert!(result.removed.is_empty());
+    assert_eq!(result.missing, vec!["missing".to_string()]);
+    let (materialized, _) = store
+        .read_entry::<NamespaceEntry>(store.catalog_bucket(), &parent_path)
+        .await
+        .expect("materialized parent should load")
+        .expect("parent should have an explicit entry");
+    assert_eq!(materialized.properties.get("owner").map(String::as_str), Some("platform"));
+    assert_eq!(
+        store
+            .get_namespace(bucket, &child.public_name())
+            .await
+            .expect("child lookup should succeed"),
+        Some(child_entry)
+    );
+}
+
+#[tokio::test]
+async fn object_catalog_namespace_property_update_materializes_resource_only_parents() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let table_namespace = Namespace::parse("table_only").expect("table namespace should parse");
+    let view_namespace = Namespace::parse("view_only").expect("view namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let view = IdentifierSegment::parse("recent_orders").expect("view should parse");
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket entry should be seeded");
+
+    let table_entry = test_table_entry(
+        bucket,
+        &table_namespace,
+        &table,
+        default_table_metadata_file_path(&table_namespace, &table, "00001.metadata.json"),
+    );
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &store.paths.table_entry_path(bucket, &table_namespace, &table),
+            serde_json::to_vec(&table_entry).expect("table entry should serialize"),
+        )
+        .await;
+    let view_entry = test_view_entry(
+        bucket,
+        &view_namespace,
+        &view,
+        default_view_metadata_file_path(&view_namespace, &view, "00001.view.json"),
+    );
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &store.paths.view_entry_path(bucket, &view_namespace, &view),
+            serde_json::to_vec(&view_entry).expect("view entry should serialize"),
+        )
+        .await;
+
+    let table_before = store
+        .load_table(bucket, &table_namespace.public_name(), table.as_str())
+        .await
+        .expect("table should load before materializing its namespace");
+    let view_before = store
+        .load_view(bucket, &view_namespace.public_name(), view.as_str())
+        .await
+        .expect("view should load before materializing its namespace");
+
+    for namespace in [&table_namespace, &view_namespace] {
+        let result = store
+            .update_namespace_properties(
+                bucket,
+                &namespace.public_name(),
+                NamespacePropertiesUpdate::try_new(Vec::new(), BTreeMap::from([("owner".to_string(), "platform".to_string())]))
+                    .expect("namespace update should validate"),
+            )
+            .await
+            .expect("active resource should prove the implicit namespace");
+        assert_eq!(result.updated, vec!["owner".to_string()]);
+        let materialized = store
+            .get_namespace(bucket, &namespace.public_name())
+            .await
+            .expect("materialized namespace should load")
+            .expect("materialized namespace should exist");
+        assert_eq!(materialized.properties.get("owner").map(String::as_str), Some("platform"));
+    }
+
+    assert_eq!(
+        store
+            .load_table(bucket, &table_namespace.public_name(), table.as_str())
+            .await
+            .expect("table should load after materializing its namespace"),
+        table_before
+    );
+    assert_eq!(
+        store
+            .load_view(bucket, &view_namespace.public_name(), view.as_str())
+            .await
+            .expect("view should load after materializing its namespace"),
+        view_before
+    );
+}
+
+#[tokio::test]
+async fn object_catalog_namespace_property_update_requires_etag_and_skips_noop_writes() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket entry should be seeded");
+
+    let etagless = Namespace::parse("etagless").expect("namespace should parse");
+    let mut etagless_entry = test_namespace_entry(bucket, &etagless);
+    etagless_entry.properties.insert("owner".to_string(), "lakehouse".to_string());
+    store
+        .create_namespace(etagless_entry)
+        .await
+        .expect("etagless namespace should be seeded");
+    let etagless_path = store.paths.namespace_entry_path(bucket, &etagless);
+    backend.omit_etag_for_object(RUSTFS_META_BUCKET, &etagless_path).await;
+    let etagless_puts = backend.put_attempt_count(RUSTFS_META_BUCKET, &etagless_path).await;
+
+    assert_matches!(
+        store
+            .update_namespace_properties(
+                bucket,
+                &etagless.public_name(),
+                NamespacePropertiesUpdate::try_new(Vec::new(), BTreeMap::from([("owner".to_string(), "platform".to_string())]),)
+                    .expect("namespace update should validate"),
+            )
+            .await,
+        Err(TableCatalogStoreError::Internal(_))
+    );
+    assert_eq!(backend.put_attempt_count(RUSTFS_META_BUCKET, &etagless_path).await, etagless_puts);
+    let unchanged = store
+        .get_namespace(bucket, &etagless.public_name())
+        .await
+        .expect("etagless namespace should still load")
+        .expect("etagless namespace should remain");
+    assert_eq!(unchanged.properties.get("owner").map(String::as_str), Some("lakehouse"));
+
+    let no_op = Namespace::parse("no_op").expect("namespace should parse");
+    let mut no_op_entry = test_namespace_entry(bucket, &no_op);
+    no_op_entry.properties.insert("owner".to_string(), "lakehouse".to_string());
+    store
+        .create_namespace(no_op_entry)
+        .await
+        .expect("no-op namespace should be seeded");
+    let no_op_path = store.paths.namespace_entry_path(bucket, &no_op);
+    backend.fail_next_put(RUSTFS_META_BUCKET, &no_op_path).await;
+    let puts_before_no_op = backend.put_attempt_count(RUSTFS_META_BUCKET, &no_op_path).await;
+
+    let result = store
+        .update_namespace_properties(
+            bucket,
+            &no_op.public_name(),
+            NamespacePropertiesUpdate::try_new(Vec::new(), BTreeMap::from([("owner".to_string(), "lakehouse".to_string())]))
+                .expect("namespace update should validate"),
+        )
+        .await
+        .expect("unchanged namespace properties should not write");
+    assert_eq!(result.updated, vec!["owner".to_string()]);
+    assert_eq!(backend.put_attempt_count(RUSTFS_META_BUCKET, &no_op_path).await, puts_before_no_op);
+
+    assert_matches!(
+        store
+            .update_namespace_properties(
+                bucket,
+                &no_op.public_name(),
+                NamespacePropertiesUpdate::try_new(Vec::new(), BTreeMap::from([("owner".to_string(), "platform".to_string())]),)
+                    .expect("namespace update should validate"),
+            )
+            .await,
+        Err(TableCatalogStoreError::Internal(_))
+    );
+    let unchanged = store
+        .get_namespace(bucket, &no_op.public_name())
+        .await
+        .expect("namespace should load after failed write")
+        .expect("namespace should remain");
+    assert_eq!(unchanged.properties.get("owner").map(String::as_str), Some("lakehouse"));
+}
+
+#[tokio::test]
+async fn object_catalog_namespace_property_update_rejects_missing_inactive_and_corrupt_entries() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket entry should be seeded");
+    let update = || {
+        NamespacePropertiesUpdate::try_new(Vec::new(), BTreeMap::from([("owner".to_string(), "platform".to_string())]))
+            .expect("namespace update should validate")
+    };
+
+    assert_matches!(
+        store.update_namespace_properties(bucket, "missing", update()).await,
+        Err(TableCatalogStoreError::NotFound(_))
+    );
+
+    let inactive = Namespace::parse("inactive").expect("inactive namespace should parse");
+    let mut inactive_entry = test_namespace_entry(bucket, &inactive);
+    inactive_entry.state = TableCatalogEntryState::Deleted;
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &store.paths.namespace_entry_path(bucket, &inactive),
+            serde_json::to_vec(&inactive_entry).expect("inactive namespace should encode"),
+        )
+        .await;
+    assert_matches!(
+        store
+            .update_namespace_properties(bucket, &inactive.public_name(), update())
+            .await,
+        Err(TableCatalogStoreError::NotFound(_))
+    );
+
+    let corrupt = Namespace::parse("corrupt").expect("corrupt namespace should parse");
+    backend
+        .seed_object(RUSTFS_META_BUCKET, &store.paths.namespace_entry_path(bucket, &corrupt), b"{".to_vec())
+        .await;
+    assert_matches!(
+        store
+            .update_namespace_properties(bucket, &corrupt.public_name(), update())
+            .await,
+        Err(TableCatalogStoreError::Invalid(_))
+    );
+
+    let semantically_corrupt = Namespace::parse("semantically_corrupt").expect("corrupt namespace should parse");
+    let mut semantically_corrupt_entry = test_namespace_entry(bucket, &semantically_corrupt);
+    semantically_corrupt_entry.properties = (0..=NAMESPACE_PROPERTIES_MAX_ENTRIES)
+        .map(|index| (format!("key{index}"), "value".to_string()))
+        .collect();
+    let semantically_corrupt_path = store.paths.namespace_entry_path(bucket, &semantically_corrupt);
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &semantically_corrupt_path,
+            serde_json::to_vec(&semantically_corrupt_entry).expect("corrupt namespace should encode"),
+        )
+        .await;
+    let put_attempts = backend
+        .put_attempt_count(RUSTFS_META_BUCKET, &semantically_corrupt_path)
+        .await;
+    let repair_update =
+        NamespacePropertiesUpdate::try_new(vec![format!("key{NAMESPACE_PROPERTIES_MAX_ENTRIES}")], BTreeMap::new())
+            .expect("repair request should validate structurally");
+
+    assert_matches!(
+        store
+            .update_namespace_properties(bucket, &semantically_corrupt.public_name(), repair_update,)
+            .await,
+        Err(TableCatalogStoreError::Invalid(_))
+    );
+    assert_eq!(
+        backend
+            .put_attempt_count(RUSTFS_META_BUCKET, &semantically_corrupt_path)
+            .await,
+        put_attempts
+    );
+    let persisted = store
+        .read_entry::<NamespaceEntry>(RUSTFS_META_BUCKET, &semantically_corrupt_path)
+        .await
+        .expect("corrupt namespace lookup should succeed")
+        .expect("corrupt namespace should remain")
+        .0;
+    assert_eq!(persisted.properties.len(), NAMESPACE_PROPERTIES_MAX_ENTRIES + 1);
 }
 
 #[tokio::test]
@@ -16895,6 +18181,59 @@ async fn object_catalog_namespace_replacement_is_fenced_by_observed_etag() {
     );
     let stored = store
         .get_namespace(bucket, &recreated.public_name())
+        .await
+        .expect("winning namespace should load")
+        .expect("winning namespace should remain");
+    assert_eq!(stored.properties.get("owner").map(String::as_str), Some("winner"));
+}
+
+#[tokio::test]
+async fn object_catalog_namespace_property_update_is_fenced_by_observed_etag() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .expect("namespace should be created");
+
+    let namespace_path = store.paths.namespace_entry_path(bucket, &namespace);
+    let pause = backend.pause_next_put(RUSTFS_META_BUCKET, &namespace_path).await;
+    let stale_store = store.clone();
+    let stale_update = tokio::spawn(async move {
+        stale_store
+            .update_namespace_properties(
+                bucket,
+                "sales",
+                NamespacePropertiesUpdate::try_new(Vec::new(), BTreeMap::from([("owner".to_string(), "stale".to_string())]))
+                    .expect("namespace update should validate"),
+            )
+            .await
+    });
+    pause.wait_started().await;
+
+    let mut winner = test_namespace_entry(bucket, &namespace);
+    winner.properties.insert("owner".to_string(), "winner".to_string());
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &namespace_path,
+            serde_json::to_vec(&winner).expect("winning namespace should encode"),
+        )
+        .await;
+    pause.release();
+
+    assert_matches!(
+        stale_update.await.expect("stale namespace update task should finish"),
+        Err(TableCatalogStoreError::Conflict(_))
+    );
+    let stored = store
+        .get_namespace(bucket, &namespace.public_name())
         .await
         .expect("winning namespace should load")
         .expect("winning namespace should remain");
@@ -17672,7 +19011,461 @@ async fn strong_catalog_table_rename_returns_success_after_committed_snapshot_re
 }
 
 #[tokio::test]
-async fn configured_object_catalog_rejects_table_rename() {
+async fn object_catalog_table_rename_preserves_identity_index_and_reuses_source_tombstone() {
+    let backend = TestCatalogObjectBackend {
+        content_addressed_etags: true,
+        ..Default::default()
+    };
+    let store = ObjectTableCatalogStore::new(backend);
+    let bucket = "analytics";
+    let source_namespace = Namespace::parse("sales").expect("source namespace should parse");
+    let destination_namespace = Namespace::parse("curated").expect("destination namespace should parse");
+    let source_table = IdentifierSegment::parse("orders").expect("source table should parse");
+    store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &source_namespace))
+        .await
+        .unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &destination_namespace))
+        .await
+        .unwrap();
+    let source = test_table_entry(
+        bucket,
+        &source_namespace,
+        &source_table,
+        default_table_metadata_file_path(&source_namespace, &source_table, "00001.metadata.json"),
+    );
+    store.create_table(source.clone()).await.unwrap();
+    let bucket_object = store.paths.table_bucket_entry_path(bucket);
+    let bucket_etag_before = store
+        .read_entry::<TableBucketEntry>(RUSTFS_META_BUCKET, &bucket_object)
+        .await
+        .unwrap()
+        .unwrap()
+        .1
+        .expect("table bucket should have an etag");
+
+    store
+        .rename_table(bucket, "sales", "orders", "curated", "orders_v2")
+        .await
+        .expect("object-backed table rename should complete");
+    let bucket_etag_after = store
+        .read_entry::<TableBucketEntry>(RUSTFS_META_BUCKET, &bucket_object)
+        .await
+        .unwrap()
+        .unwrap()
+        .1
+        .expect("table bucket should have an etag");
+    assert_ne!(bucket_etag_after, bucket_etag_before);
+
+    assert!(store.load_table(bucket, "sales", "orders").await.unwrap().is_none());
+    let destination = store
+        .load_table(bucket, "curated", "orders_v2")
+        .await
+        .unwrap()
+        .expect("destination table should exist");
+    let mut expected_destination = source.clone();
+    expected_destination.namespace = "curated".to_string();
+    expected_destination.table = "orders_v2".to_string();
+    assert_ne!(destination.updated_at, source.updated_at);
+    expected_destination.updated_at.clone_from(&destination.updated_at);
+    assert_eq!(destination, expected_destination);
+
+    let source_object = store.paths.table_entry_path(bucket, &source_namespace, &source_table);
+    let source_tombstone = store
+        .read_entry::<TableEntry>(RUSTFS_META_BUCKET, &source_object)
+        .await
+        .unwrap()
+        .expect("source tombstone should remain")
+        .0;
+    assert_eq!(source_tombstone.state, TableCatalogEntryState::Deleted);
+    assert_eq!(source_tombstone.table_id, destination.table_id);
+    assert!(
+        store
+            .get_table_bucket(bucket)
+            .await
+            .unwrap()
+            .expect("table bucket should exist")
+            .active_rename_id
+            .is_none()
+    );
+
+    let destination_index = table_warehouse_index_entry(&destination).unwrap();
+    let index_object = store
+        .paths
+        .warehouse_index_entry_path(bucket, &destination_index.warehouse_object_prefix);
+    let persisted_index = store
+        .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_object)
+        .await
+        .unwrap()
+        .expect("warehouse index should exist")
+        .0;
+    assert_eq!(persisted_index, destination_index);
+    let resource = store
+        .resolve_table_data_plane_resource(bucket, "tables/table-id/data/part.parquet")
+        .await
+        .unwrap()
+        .expect("renamed table should resolve its stable warehouse prefix");
+    assert_eq!(resource.namespace, "curated");
+    assert_eq!(resource.table, "orders_v2");
+    store
+        .backfill_table_warehouse_index(bucket)
+        .await
+        .expect("retained source tombstone should not make the warehouse index ambiguous");
+    let migration = store.plan_durable_strong_backing_migration(bucket).await.unwrap();
+    assert_eq!(migration.table_count, 1);
+    assert!(
+        !migration
+            .blockers
+            .contains(&TableCatalogBackingMigrationBlocker::DuplicateTableIdentity)
+    );
+
+    store
+        .rename_table(bucket, "curated", "orders_v2", "sales", "orders")
+        .await
+        .expect("rename should conditionally replace the retained source tombstone");
+    store
+        .rename_table(bucket, "sales", "orders", "curated", "orders_v2")
+        .await
+        .expect("rename should conditionally replace a destination tombstone");
+
+    let mut replacement = test_table_entry(
+        bucket,
+        &source_namespace,
+        &source_table,
+        default_table_metadata_file_path(&source_namespace, &source_table, "00002.metadata.json"),
+    );
+    replacement.table_id = "replacement-table-id".to_string();
+    replacement.table_uuid = "replacement-table-uuid".to_string();
+    replacement.warehouse_location = "s3://analytics/tables/replacement-table-id".to_string();
+    store
+        .create_table(replacement.clone())
+        .await
+        .expect("create should conditionally replace the source tombstone");
+    assert_eq!(
+        store
+            .load_table(bucket, "sales", "orders")
+            .await
+            .unwrap()
+            .expect("source identifier should be reusable"),
+        replacement
+    );
+}
+
+#[tokio::test]
+async fn object_catalog_table_rename_rejects_missing_and_conflicting_destinations() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend);
+    let bucket = "analytics";
+    let source_namespace = Namespace::parse("sales").unwrap();
+    let destination_namespace = Namespace::parse("curated").unwrap();
+    let source_table = IdentifierSegment::parse("orders").unwrap();
+    let destination_table = IdentifierSegment::parse("orders_v2").unwrap();
+    store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &source_namespace))
+        .await
+        .unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &destination_namespace))
+        .await
+        .unwrap();
+    store
+        .create_table(test_table_entry(
+            bucket,
+            &source_namespace,
+            &source_table,
+            default_table_metadata_file_path(&source_namespace, &source_table, "00001.metadata.json"),
+        ))
+        .await
+        .unwrap();
+
+    assert_matches!(
+        store.rename_table(bucket, "sales", "orders", "missing", "orders_v2").await,
+        Err(TableCatalogStoreError::NamespaceNotFound(_))
+    );
+    assert_matches!(
+        store.rename_table(bucket, "sales", "missing", "curated", "orders_v2").await,
+        Err(TableCatalogStoreError::TableNotFound(_))
+    );
+    let mut existing = test_table_entry(
+        bucket,
+        &destination_namespace,
+        &destination_table,
+        default_table_metadata_file_path(&destination_namespace, &destination_table, "00001.metadata.json"),
+    );
+    existing.table_id = "destination-table-id".to_string();
+    existing.table_uuid = "destination-table-uuid".to_string();
+    existing.warehouse_location = "s3://analytics/tables/destination-table-id".to_string();
+    store.create_table(existing).await.unwrap();
+    assert_matches!(
+        store.rename_table(bucket, "sales", "orders", "curated", "orders_v2").await,
+        Err(TableCatalogStoreError::AlreadyExists(_))
+    );
+    let destination_view = IdentifierSegment::parse("orders_view").unwrap();
+    store
+        .create_view(test_view_entry(
+            bucket,
+            &destination_namespace,
+            &destination_view,
+            default_view_metadata_file_path(&destination_namespace, &destination_view, "00001.metadata.json"),
+        ))
+        .await
+        .unwrap();
+    assert_matches!(
+        store.rename_table(bucket, "sales", "orders", "curated", "orders_view").await,
+        Err(TableCatalogStoreError::AlreadyExists(_))
+    );
+    assert!(store.load_table(bucket, "sales", "orders").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn object_catalog_table_rename_fails_closed_around_durable_fence_creation() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let source_namespace = Namespace::parse("sales").unwrap();
+    let destination_namespace = Namespace::parse("curated").unwrap();
+    let source_table = IdentifierSegment::parse("orders").unwrap();
+    store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &source_namespace))
+        .await
+        .unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &destination_namespace))
+        .await
+        .unwrap();
+    store
+        .create_table(test_table_entry(
+            bucket,
+            &source_namespace,
+            &source_table,
+            default_table_metadata_file_path(&source_namespace, &source_table, "00001.metadata.json"),
+        ))
+        .await
+        .unwrap();
+
+    let bucket_object = store.paths.table_bucket_entry_path(bucket);
+    backend.fail_next_put(RUSTFS_META_BUCKET, &bucket_object).await;
+    assert_matches!(
+        store.rename_table(bucket, "sales", "orders", "curated", "orders_v2").await,
+        Err(TableCatalogStoreError::Internal(_))
+    );
+    assert!(
+        store
+            .get_table_bucket(bucket)
+            .await
+            .unwrap()
+            .expect("table bucket should remain")
+            .active_rename_id
+            .is_none()
+    );
+    assert!(store.load_table(bucket, "sales", "orders").await.unwrap().is_some());
+    assert!(store.load_table(bucket, "curated", "orders_v2").await.unwrap().is_none());
+
+    let mut fenced_bucket = store.get_table_bucket(bucket).await.unwrap().unwrap();
+    fenced_bucket.active_rename_id = Some("missing-intent".to_string());
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &bucket_object,
+            serde_json::to_vec(&fenced_bucket).expect("fenced bucket should serialize"),
+        )
+        .await;
+    assert_matches!(
+        store.rename_table(bucket, "sales", "orders", "curated", "orders_v2").await,
+        Err(TableCatalogStoreError::Unavailable(_))
+    );
+    assert_eq!(
+        store
+            .get_table_bucket(bucket)
+            .await
+            .unwrap()
+            .expect("table bucket should remain fail-closed")
+            .active_rename_id
+            .as_deref(),
+        Some("missing-intent")
+    );
+    assert_matches!(
+        store
+            .resolve_table_data_plane_resource(bucket, "tables/table-id/data/part.parquet")
+            .await,
+        Err(TableCatalogStoreError::Unavailable(_))
+    );
+}
+
+#[tokio::test]
+async fn object_catalog_table_rename_recovers_after_destination_publish_and_fences_concurrent_mutations() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let source_namespace = Namespace::parse("sales").expect("source namespace should parse");
+    let destination_namespace = Namespace::parse("curated").expect("destination namespace should parse");
+    let source_table = IdentifierSegment::parse("orders").expect("source table should parse");
+    store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &source_namespace))
+        .await
+        .unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &destination_namespace))
+        .await
+        .unwrap();
+    let source = test_table_entry(
+        bucket,
+        &source_namespace,
+        &source_table,
+        default_table_metadata_file_path(&source_namespace, &source_table, "00001.metadata.json"),
+    );
+    store.create_table(source.clone()).await.unwrap();
+
+    let source_object = store.paths.table_entry_path(bucket, &source_namespace, &source_table);
+    let source_tombstone_attempt = backend.put_attempt_count(RUSTFS_META_BUCKET, &source_object).await + 2;
+    let source_tombstone_pause = backend
+        .pause_put_attempt(RUSTFS_META_BUCKET, &source_object, source_tombstone_attempt)
+        .await;
+    let rename_store = store.clone();
+    let rename = tokio::spawn(async move {
+        rename_store
+            .rename_table(bucket, "sales", "orders", "curated", "orders_v2")
+            .await
+    });
+    source_tombstone_pause.wait_started().await;
+
+    let active_rename_id = store
+        .get_table_bucket(bucket)
+        .await
+        .unwrap()
+        .expect("table bucket should exist")
+        .active_rename_id
+        .expect("rename fence should be durable before destination publication");
+    assert_matches!(
+        store.load_table(bucket, "sales", "orders").await,
+        Err(TableCatalogStoreError::Unavailable(_))
+    );
+    assert_matches!(store.list_tables(bucket, "sales").await, Err(TableCatalogStoreError::Unavailable(_)));
+    assert_matches!(
+        store
+            .resolve_table_data_plane_resource(bucket, "tables/table-id/data/part.parquet")
+            .await,
+        Err(TableCatalogStoreError::Unavailable(_))
+    );
+    let migration = store.plan_durable_strong_backing_migration(bucket).await.unwrap();
+    assert_eq!(migration.status, TableCatalogBackingMigrationStatus::RecoveryRequired);
+    assert!(
+        migration
+            .blockers
+            .contains(&TableCatalogBackingMigrationBlocker::TableRenameRecoveryRequired)
+    );
+
+    let publication_lock = default_table_bucket_publication_lock_path();
+    let publication_attempts = backend.write_lock_acquisition_count(bucket, &publication_lock).await;
+    let commit_store = store.clone();
+    let commit = tokio::spawn(async move {
+        commit_store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: "sales".to_string(),
+                table: "orders".to_string(),
+                commit_id: "concurrent-commit".to_string(),
+                idempotency_key: None,
+                operation: "append".to_string(),
+                expected_version_token: source.version_token,
+                expected_metadata_location: source.metadata_location,
+                new_metadata_location: "unused.metadata.json".to_string(),
+                requirements: Vec::new(),
+                writer: Some("rename-test".to_string()),
+            })
+            .await
+    });
+    let drop_store = store.clone();
+    let drop_table = tokio::spawn(async move { drop_store.drop_table(bucket, "sales", "orders").await });
+    let create_store = store.clone();
+    let mut replacement = test_table_entry(
+        bucket,
+        &source_namespace,
+        &source_table,
+        default_table_metadata_file_path(&source_namespace, &source_table, "00002.metadata.json"),
+    );
+    replacement.table_id = "replacement-table-id".to_string();
+    replacement.table_uuid = "replacement-table-uuid".to_string();
+    replacement.warehouse_location = "s3://analytics/tables/replacement-table-id".to_string();
+    let create = tokio::spawn(async move { create_store.create_table(replacement).await });
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, async {
+        while backend.write_lock_acquisition_count(bucket, &publication_lock).await < publication_attempts + 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("concurrent mutations should reach the table-bucket publication fence");
+    assert!(!commit.is_finished());
+    assert!(!drop_table.is_finished());
+    assert!(!create.is_finished());
+    commit.abort();
+    drop_table.abort();
+    create.abort();
+
+    rename.abort();
+    source_tombstone_pause.release();
+    let _ = rename.await;
+    let destination_object = store.paths.table_entry_path(
+        bucket,
+        &destination_namespace,
+        &IdentifierSegment::parse("orders_v2").expect("destination table should parse"),
+    );
+    let source_fence = store
+        .read_entry::<TableEntry>(RUSTFS_META_BUCKET, &source_object)
+        .await
+        .unwrap()
+        .expect("source rename fence should be durable")
+        .0;
+    let destination_fence = store
+        .read_entry::<TableEntry>(RUSTFS_META_BUCKET, &destination_object)
+        .await
+        .unwrap()
+        .expect("destination rename fence should be durable")
+        .0;
+    assert_eq!(source_fence.state, TableCatalogEntryState::Renaming);
+    assert_eq!(destination_fence.state, TableCatalogEntryState::Renaming);
+    assert_matches!(
+        store.load_table(bucket, "curated", "orders_v2").await,
+        Err(TableCatalogStoreError::Unavailable(_))
+    );
+    assert_matches!(
+        store.rename_table(bucket, "sales", "orders", "curated", "orders_v2").await,
+        Err(TableCatalogStoreError::TableNotFound(_))
+    );
+
+    assert!(store.load_table(bucket, "sales", "orders").await.unwrap().is_none());
+    let destination = store
+        .load_table(bucket, "curated", "orders_v2")
+        .await
+        .unwrap()
+        .expect("recovery should finish the destination publication");
+    assert_eq!(destination.table_id, "table-id");
+    assert!(
+        store
+            .get_table_bucket(bucket)
+            .await
+            .unwrap()
+            .expect("table bucket should exist")
+            .active_rename_id
+            .is_none()
+    );
+    let intent_object = store.paths.table_rename_intent_path(bucket, &active_rename_id);
+    let intent = store
+        .read_entry::<TableRenameIntent>(RUSTFS_META_BUCKET, &intent_object)
+        .await
+        .unwrap()
+        .expect("completed rename intent should be retained as a recovery record")
+        .0;
+    assert_eq!(intent.state, TableRenameIntentState::Completed);
+}
+
+#[tokio::test]
+async fn configured_object_catalog_dispatches_table_rename() {
     let store =
         ConfiguredTableCatalogStore::new_for_test(TestCatalogObjectBackend::default(), TableCatalogBackingMode::ObjectBacked);
 
@@ -17680,6 +19473,6 @@ async fn configured_object_catalog_rejects_table_rename() {
         store
             .rename_table("analytics", "sales", "orders", "curated", "orders_v2")
             .await,
-        Err(TableCatalogStoreError::Unsupported(_))
+        Err(TableCatalogStoreError::NotFound(_))
     );
 }

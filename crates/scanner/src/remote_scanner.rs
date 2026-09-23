@@ -52,6 +52,9 @@ static REMOTE_SCANNER_CYCLE_REFRESH: LazyLock<AsyncMutex<()>> = LazyLock::new(||
 
 mod stream;
 
+#[cfg(test)]
+pub(crate) use stream::checkpoint_fixture_partial_return;
+
 pub use stream::{RemoteScannerAdmission, RemoteScannerRequest, serve_remote_scanner_request};
 pub(crate) use stream::{RemoteScannerOutcome, RemoteScannerScanSpec, scan_remote_bucket};
 use stream::{RemoteScannerReplayCache, RemoteScannerRequestWire, RemoteScannerValidatedCycle};
@@ -167,7 +170,7 @@ fn cached_remote_scanner_fence_matches(
         .is_some_and(|cached| cached.matches(requested_cycle, requested_leader_epoch, now)))
 }
 
-async fn validate_remote_scanner_request_fence_with_store(
+pub(crate) async fn validate_remote_scanner_request_fence_with_store(
     requested_cycle: u64,
     requested_leader_epoch: u64,
     store: Arc<impl ScannerObjectIO>,

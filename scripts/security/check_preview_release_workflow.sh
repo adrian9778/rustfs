@@ -31,6 +31,11 @@ require_absent() {
   fi
 }
 
+require_line "$build_workflow" "              cargo zigbuild --release --target \${{ matrix.target }} \"\${FEATURE_ARGS[@]}\" -p rustfs --bin \"\$binary\"" "cross builds must keep matrix features"
+require_line "$build_workflow" "              cargo build --release --target \${{ matrix.target }} \"\${FEATURE_ARGS[@]}\" -p rustfs --bin \"\$binary\"" "native builds must keep matrix features"
+require_absent "$build_workflow" "              cargo zigbuild --release --target \${{ matrix.target }} -p rustfs --bin \"\$binary\"" "cross builds must not drop matrix features"
+require_absent "$build_workflow" "              cargo build --release --target \${{ matrix.target }} -p rustfs --bin \"\$binary\"" "native builds must not drop matrix features"
+
 extract_job_if() {
   local file="$1"
   local job="$2"
@@ -140,6 +145,14 @@ done
 latest_guard="startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')"
 require_job_if "$build_workflow" "update-latest-version" "    if: $latest_guard"
 require_line "$build_workflow" "    needs: [ build-check, publish-release ]" "latest update must follow release publication"
+
+# Preview releases are internal validation artifacts: once the deliverable
+# release is published they are deleted, while their tags stay behind.
+require_job_if "$build_workflow" "cleanup-preview-releases" "    if: $latest_guard"
+require_line "$build_workflow" "            gh release delete \"\$preview_tag\" --repo \"\${GITHUB_REPOSITORY}\" --yes" "preview release cleanup after publication"
+require_line "$build_workflow" "              | select(.tag_name | startswith(\$tag + \"-preview.\"))" "cleanup must match the target's own preview tags"
+require_line "$build_workflow" "              | select(.tag_name | ltrimstr(\$tag + \"-preview.\") | test(\"^[0-9]+\$\"))" "cleanup must match a numeric preview iteration"
+require_absent "$build_workflow" "--cleanup-tag" "preview tags must survive their release cleanup"
 require_line "$build_workflow" "          TARGET_COMMITISH=\$(git rev-parse --verify \"refs/tags/\${TAG}^{commit}\")" "release target commit resolution"
 require_line "$build_workflow" "          ./scripts/release/create_or_update_release.sh \\" "managed release creation"
 require_absent "$build_workflow" "git tag -l --format='%(contents)'" "annotated tag messages must not become release notes"
@@ -190,8 +203,7 @@ IFS= read -r -d '' expected_docker_automatic_guard <<'EOF' || true
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_branch != 'main' &&
-       !contains(github.event.workflow_run.head_branch, '-preview'))
+       github.event.workflow_run.head_branch != 'main')
 EOF
 expected_docker_automatic_guard=${expected_docker_automatic_guard%$'\n'}
 require_job_if "$docker_workflow" "build-check" "$expected_docker_automatic_guard"
@@ -203,15 +215,7 @@ require_line "$docker_workflow" '          SOURCE_REVISION="$(git rev-parse HEAD
 require_line "$docker_workflow" '          LABELS="$LABELS,org.opencontainers.image.revision=$SOURCE_REVISION"' "Docker revision label"
 require_absent "$docker_workflow" 'org.opencontainers.image.revision=${{ github.sha }}' "Docker revision must not use the workflow branch SHA"
 
-docker_manual_guard=$(awk '
-  $0 == "              *-preview*)" { in_preview = 1 }
-  in_preview { print }
-  in_preview && $0 == "                ;;" { exit }
-' "$docker_workflow")
-for assignment in 'build_type="preview"' 'is_prerelease=true' 'should_build=false' 'should_push=false'; do
-  name="${assignment%%=*}"
-  require_assignment "$docker_manual_guard" "$name" "${assignment#*=}"
-done
+python3 scripts/test_docker_workflow.py
 
 IFS= read -r -d '' expected_helm_guard <<'EOF' || true
     if: |

@@ -13,15 +13,19 @@
 // limitations under the License.
 
 use crate::cluster::rpc::client::{
-    AuthenticatedChannel, TonicInterceptor, embedded_tonic_status, gen_tonic_signature_interceptor, heal_control_time_out_client,
-    is_network_like_status, message_has_network_needle, node_service_time_out_client, tier_mutation_control_time_out_client,
+    AuthenticatedChannel, TonicInterceptor, clear_peer_replay_state_for_addr, embedded_tonic_status,
+    gen_tonic_signature_interceptor, heal_control_time_out_client, is_network_like_status, message_has_network_needle,
+    node_service_time_out_client, tier_mutation_control_time_out_client,
 };
 use crate::cluster::rpc::{set_tonic_canonical_body_digest, set_tonic_mutation_body_digest, verify_tonic_rpc_response_proof};
 use crate::error::{Error, Result};
 use crate::storage_api_contracts::internode::{
     SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION,
+    SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES,
+    SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
 };
 use crate::{
+    bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats, TierDailyStatsWire},
     bucket::replication::BucketStats,
     disk::disk_store::{get_drive_active_check_interval, get_drive_active_check_timeout},
     layout::endpoints::EndpointServerPools,
@@ -44,18 +48,21 @@ use rustfs_protos::proto_gen::node_service::{
     GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest, GetSysConfigRequest, GetSysErrorsRequest,
     HealControlRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest,
     LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
-    LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ReplacementRecoveryStatusRequest,
-    ScannerActivityRequest, ScannerActivityResponse, ServerInfoRequest, SignalServiceRequest, SignalServiceResponse,
-    StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest, TierMutationAbortRequest, TierMutationCommitRequest,
-    TierMutationControlResponse, TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
-    tier_mutation_control_service_client::TierMutationControlServiceClient,
+    LocalStorageInfoRequest, Mss, PingRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest,
+    ReplacementRecoveryStatusRequest, ScannerActivityRequest, ScannerActivityResponse, ScannerDirtyUsageSnapshotRequest,
+    ScannerDirtyUsageSnapshotResponse, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
+    ScannerPublicationLeaseResponse, ScannerScopedDirtyUsageAckRequest, ScannerScopedDirtyUsageAckResponse,
+    ScannerScopedDirtyUsageEntry, ServerInfoRequest, SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest,
+    StartProfilingRequest, StopRebalanceRequest, TierDailyStatsRequest, TierMutationAbortRequest, TierMutationCommitRequest,
+    TierMutationControlResponse, TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest,
+    node_service_client::NodeServiceClient, tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
 pub use rustfs_protos::{PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS};
 use rustfs_protos::{TierMutationRpcPhase, evict_failed_connection};
 use rustfs_utils::XHost;
 use serde::{Deserialize, Serialize as _};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::Cursor,
     sync::{
         Arc, Weak,
@@ -63,7 +70,10 @@ use std::{
     },
     time::SystemTime,
 };
-use tokio::{net::TcpStream, time::Duration};
+use tokio::{
+    net::TcpStream,
+    time::{Duration, timeout},
+};
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tracing::{debug, info, warn};
@@ -84,6 +94,12 @@ const HEAL_CONTROL_PAYLOAD_MAX_SIZE: usize = 64 * 1024;
 const PEER_REST_RECOVERY_MAX_ATTEMPTS: u32 = 60;
 const PEER_REST_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SCANNER_ACTIVITY_MAX_MESSAGE_SIZE: usize = 1024;
+const SCANNER_SCOPED_DIRTY_USAGE_STAGE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Reserve time for the acquire response's network/clock uncertainty.  The
+/// server owns the real expiry; this local deadline is intentionally earlier
+/// so a coordinator never starts a bounded persistence operation at the edge
+/// of a remote lease.
+const SCANNER_PUBLICATION_LEASE_SAFETY_MARGIN: Duration = Duration::from_secs(5);
 const REPLICATION_STATS_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 const BUCKET_METADATA_RELOAD_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -103,6 +119,36 @@ fn peer_failure_without_details(op: &str, bucket: Option<&str>) -> Error {
     match bucket {
         Some(bucket) => Error::other(format!("{op}({bucket}): peer returned failure without error details")),
         None => Error::other(format!("{op}: peer returned failure without error details")),
+    }
+}
+
+fn heal_control_status_error(status: tonic::Status) -> Error {
+    if status.code() == tonic::Code::InvalidArgument {
+        return Error::InvalidArgument("heal".to_string(), "control".to_string(), status.message().to_owned());
+    }
+    Error::from(status)
+}
+
+/// Decode a control-plane response failure. Peers at or above the typed
+/// `ControlPlaneErrorCode` change (backlog#1845) carry a machine-readable
+/// discriminant beside the legacy `error_info` string; prefer it, then fall
+/// back to the string, then to the detail-free per-op failure.
+/// RUSTFS_COMPAT_TODO(not-initialized-error-code-v1): string fallback for peers that predate the typed wire code. Remove after the minimum supported RustFS peer version always sends error_code.
+fn control_plane_failure(op: &str, bucket: Option<&str>, error_code: Option<i32>, error_info: Option<String>) -> Error {
+    if error_code == Some(rustfs_protos::proto_gen::node_service::ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32) {
+        return Error::RemoteNotInitialized;
+    }
+    if error_code == Some(rustfs_protos::proto_gen::node_service::ControlPlaneErrorCode::ControlPlaneErrorInvalidArgument as i32)
+    {
+        return Error::InvalidArgument(
+            "control-plane".to_string(),
+            op.to_string(),
+            error_info.unwrap_or_else(|| format!("{op}: peer rejected invalid argument without details")),
+        );
+    }
+    match error_info {
+        Some(msg) => Error::other(msg),
+        None => peer_failure_without_details(op, bucket),
     }
 }
 
@@ -150,6 +196,138 @@ pub struct ScannerPeerActivity {
     pub data_movement_active: Option<bool>,
     pub dirty_usage_generation: Option<u64>,
     pub dirty_usage_pending: Option<bool>,
+    pub movement_generation: Option<u64>,
+    pub publication_blocked: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScannerPeerDirtyUsageSnapshot {
+    pub owner_id: String,
+    pub instance_id: String,
+    pub generation: u64,
+    pub pending_bucket_count: u64,
+    pub protocol_version: u32,
+    pub complete: bool,
+    pub buckets: BTreeMap<String, ScannerPeerDirtyUsageBucket>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScannerPeerDirtyUsageBucket {
+    pub bucket_incarnation: Uuid,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScannerScopedDirtyUsageAckEntry {
+    pub bucket: String,
+    pub bucket_incarnation: Uuid,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScannerDirtyUsageAcknowledgement {
+    Generation {
+        host: String,
+        instance_id: String,
+        generation: u64,
+    },
+    Scoped {
+        host: String,
+        owner_id: String,
+        instance_id: String,
+        entries: Vec<ScannerScopedDirtyUsageAckEntry>,
+    },
+}
+
+fn scanner_scoped_dirty_usage_ack_payloads(
+    owner_id: String,
+    instance_id: String,
+    probe_only: bool,
+    entries: Vec<ScannerScopedDirtyUsageAckEntry>,
+) -> Result<Vec<ScannerScopedDirtyUsageAckRequest>> {
+    use rustfs_protos::scoped_dirty_usage::*;
+
+    if entries.is_empty() {
+        return Err(Error::other("scoped dirty usage acknowledgement entries must be nonempty"));
+    }
+
+    let mut payloads = Vec::with_capacity(entries.len().div_ceil(SCOPED_DIRTY_USAGE_MAX_ENTRIES as usize));
+    let mut batch = Vec::with_capacity(SCOPED_DIRTY_USAGE_MAX_ENTRIES as usize);
+    for entry in entries {
+        batch.push(ScannerScopedDirtyUsageEntry {
+            bucket: entry.bucket,
+            bucket_incarnation: entry.bucket_incarnation.as_bytes().to_vec().into(),
+            generation: entry.generation,
+        });
+        if batch.len() == SCOPED_DIRTY_USAGE_MAX_ENTRIES as usize {
+            payloads.push(scanner_scoped_dirty_usage_ack_payload(
+                &owner_id,
+                &instance_id,
+                probe_only,
+                std::mem::take(&mut batch),
+            )?);
+        }
+    }
+    if !batch.is_empty() {
+        payloads.push(scanner_scoped_dirty_usage_ack_payload(&owner_id, &instance_id, probe_only, batch)?);
+    }
+
+    Ok(payloads)
+}
+
+fn scanner_scoped_dirty_usage_ack_payload(
+    owner_id: &str,
+    instance_id: &str,
+    probe_only: bool,
+    entries: Vec<ScannerScopedDirtyUsageEntry>,
+) -> Result<ScannerScopedDirtyUsageAckRequest> {
+    use rustfs_protos::scoped_dirty_usage::*;
+
+    let payload = ScannerScopedDirtyUsageAckRequest {
+        challenge: Uuid::new_v4().as_bytes().to_vec().into(),
+        protocol_version: SCOPED_DIRTY_USAGE_PROTOCOL_VERSION,
+        owner_id: owner_id.to_string(),
+        instance_id: instance_id.to_string(),
+        scope: SCOPED_DIRTY_USAGE_BUCKET_SCOPE,
+        probe_only,
+        entries,
+    };
+    canonical_scoped_dirty_usage_request(&payload).map_err(|err| Error::other(err.to_string()))?;
+    Ok(payload)
+}
+
+fn scanner_scoped_dirty_usage_ack_response_matches(
+    request: &ScannerScopedDirtyUsageAckRequest,
+    response: &ScannerScopedDirtyUsageAckResponse,
+) -> bool {
+    let cleared_within_request = u64::try_from(request.entries.len())
+        .is_ok_and(|entry_count| response.cleared <= entry_count && (!request.probe_only || response.cleared == 0));
+    response.protocol_version == rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_PROTOCOL_VERSION
+        && response.owner_id == request.owner_id
+        && response.instance_id == request.instance_id
+        && response.max_entries == rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_MAX_ENTRIES
+        && response.max_request_bytes == rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES
+        && cleared_within_request
+}
+
+fn scanner_scoped_dirty_usage_ack_reconciled(
+    activity: &ScannerPeerActivity,
+    expected_instance_id: &str,
+    expected_generation: u64,
+) -> bool {
+    activity.instance_id == expected_instance_id
+        && activity.dirty_usage_pending == Some(false)
+        && activity
+            .dirty_usage_generation
+            .is_some_and(|generation| generation >= expected_generation)
+}
+
+fn scanner_instance_id_is_valid(instance_id: &str) -> bool {
+    instance_id.len() == 32
+        && instance_id
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
 fn decode_scanner_activity_with_verifier(
@@ -158,15 +336,17 @@ fn decode_scanner_activity_with_verifier(
     verify_proof: impl FnOnce(&[u8], &[u8]) -> Result<()>,
 ) -> Result<ScannerPeerActivity> {
     let instance_id = &response.instance_id;
-    if instance_id.len() != 32
-        || !instance_id
-            .as_bytes()
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-    {
+    if !scanner_instance_id_is_valid(instance_id) {
         return Err(Error::other("peer returned an invalid scanner activity instance ID"));
     }
-    let (topology_digest, data_movement_active, dirty_usage_generation, dirty_usage_pending) = match response.protocol_version {
+    let (
+        topology_digest,
+        data_movement_active,
+        dirty_usage_generation,
+        dirty_usage_pending,
+        movement_generation,
+        publication_blocked,
+    ) = match response.protocol_version {
         // RUSTFS_COMPAT_TODO(ns-scanner-rpc-v3): legacy response fields are unauthenticated. Remove after protocol v0 peers are unsupported.
         SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION
             if response.topology_digest.is_empty()
@@ -175,7 +355,7 @@ fn decode_scanner_activity_with_verifier(
                 && response.dirty_usage_generation == 0
                 && !response.dirty_usage_pending =>
         {
-            (None, None, None, None)
+            (None, None, None, None, None, None)
         }
         SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION => {
             return Err(Error::other("legacy scanner activity peer returned unexpected extended fields"));
@@ -198,9 +378,11 @@ fn decode_scanner_activity_with_verifier(
                 Some(response.data_movement_active),
                 None,
                 None,
+                None,
+                None,
             )
         }
-        SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+        SCANNER_ACTIVITY_V6_PROTOCOL_VERSION => {
             if response.dirty_usage_pending && response.dirty_usage_generation == 0 {
                 return Err(Error::other("scanner activity peer returned pending dirty usage without a generation"));
             }
@@ -218,11 +400,42 @@ fn decode_scanner_activity_with_verifier(
                 Some(response.data_movement_active),
                 Some(response.dirty_usage_generation),
                 Some(response.dirty_usage_pending),
+                None,
+                None,
             )
         }
-        version => {
-            return Err(Error::other(format!("peer returned unsupported scanner activity protocol {version}")));
+        SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+            if response.dirty_usage_pending && response.dirty_usage_generation == 0 {
+                return Err(Error::other("scanner activity peer returned pending dirty usage without a generation"));
+            }
+            let movement_generation = response
+                .movement_generation
+                .ok_or_else(|| Error::other("scanner activity peer omitted its movement generation"))?;
+            let publication_blocked = response
+                .publication_blocked
+                .ok_or_else(|| Error::other("scanner activity peer omitted its publication blocked state"))?;
+            if movement_generation == u64::MAX {
+                return Err(Error::other("scanner activity peer exhausted its movement generation"));
+            }
+            let canonical = rustfs_protos::canonical_scanner_activity_v7_response_body(challenge, &response)
+                .map_err(|_| Error::other("scanner activity peer response is too large to authenticate"))?;
+            verify_proof(&canonical, &response.response_proof)?;
+            (
+                Some(
+                    response
+                        .topology_digest
+                        .as_ref()
+                        .try_into()
+                        .map_err(|_| Error::other("peer returned an invalid scanner topology digest"))?,
+                ),
+                Some(response.data_movement_active),
+                Some(response.dirty_usage_generation),
+                Some(response.dirty_usage_pending),
+                Some(movement_generation),
+                Some(publication_blocked),
+            )
         }
+        version => return Err(Error::other(format!("peer returned unsupported scanner activity protocol {version}"))),
     };
     Ok(ScannerPeerActivity {
         instance_id: response.instance_id,
@@ -233,6 +446,8 @@ fn decode_scanner_activity_with_verifier(
         data_movement_active,
         dirty_usage_generation,
         dirty_usage_pending,
+        movement_generation,
+        publication_blocked,
     })
 }
 
@@ -243,6 +458,112 @@ fn decode_scanner_activity(response: ScannerActivityResponse, challenge: &[u8; 1
     })
 }
 
+fn decode_scanner_dirty_usage_snapshot_with_verifier(
+    response: ScannerDirtyUsageSnapshotResponse,
+    challenge: &[u8; 16],
+    verify_proof: impl FnOnce(&[u8], &[u8]) -> Result<()>,
+) -> Result<ScannerPeerDirtyUsageSnapshot> {
+    let canonical = rustfs_protos::canonical_scanner_dirty_usage_snapshot_response_body(challenge, &response)
+        .map_err(|_| Error::other("peer scanner dirty usage snapshot is too large to authenticate"))?;
+    verify_proof(&canonical, &response.response_proof)?;
+
+    if response.protocol_version != SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION {
+        return Err(Error::other("peer returned unsupported scanner dirty usage snapshot protocol"));
+    }
+    if !scanner_instance_id_is_valid(&response.instance_id) {
+        return Err(Error::other("peer returned an invalid scanner dirty usage snapshot instance ID"));
+    }
+    let owner_id = Uuid::parse_str(&response.owner_id)
+        .ok()
+        .filter(|owner_id| !owner_id.is_nil())
+        .map(|owner_id| owner_id.to_string())
+        .ok_or_else(|| Error::other("peer returned an invalid scanner dirty usage snapshot owner"))?;
+    if response.generation == u64::MAX {
+        return Err(Error::other("peer scanner dirty usage snapshot exhausted its generation"));
+    }
+    if response.pending_bucket_count > 0 && response.generation == 0 {
+        return Err(Error::other("peer scanner dirty usage snapshot has pending buckets without a generation"));
+    }
+    if response.buckets.len() > SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES {
+        return Err(Error::other("peer scanner dirty usage snapshot exceeds the entry limit"));
+    }
+    let bucket_count = u64::try_from(response.buckets.len())
+        .map_err(|_| Error::other("peer scanner dirty usage snapshot entry count cannot be represented"))?;
+    let max_entries = u64::try_from(SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES).unwrap_or(u64::MAX);
+    if response.complete {
+        if response.pending_bucket_count != bucket_count {
+            return Err(Error::other(
+                "complete peer scanner dirty usage snapshot has an inconsistent bucket count",
+            ));
+        }
+    } else if !response.buckets.is_empty() || response.pending_bucket_count <= max_entries {
+        return Err(Error::other(
+            "incomplete peer scanner dirty usage snapshot must represent an entry-limit overflow",
+        ));
+    }
+    for pair in response.buckets.windows(2) {
+        if pair[0].bucket >= pair[1].bucket {
+            return Err(Error::other("peer scanner dirty usage snapshot buckets are not strictly ordered"));
+        }
+    }
+    for bucket in &response.buckets {
+        if bucket.bucket.is_empty() {
+            return Err(Error::other("peer scanner dirty usage snapshot contains an empty bucket name"));
+        }
+        if bucket.generation == 0 || bucket.generation > response.generation {
+            return Err(Error::other("peer scanner dirty usage snapshot contains an invalid bucket generation"));
+        }
+        Uuid::from_slice(bucket.bucket_incarnation.as_ref())
+            .ok()
+            .filter(|bucket_incarnation| !bucket_incarnation.is_nil())
+            .ok_or_else(|| Error::other("peer scanner dirty usage snapshot contains an invalid bucket incarnation"))?;
+    }
+
+    Ok(ScannerPeerDirtyUsageSnapshot {
+        owner_id,
+        instance_id: response.instance_id,
+        generation: response.generation,
+        pending_bucket_count: response.pending_bucket_count,
+        protocol_version: response.protocol_version,
+        complete: response.complete,
+        buckets: response
+            .buckets
+            .into_iter()
+            .map(|bucket| {
+                (
+                    bucket.bucket,
+                    ScannerPeerDirtyUsageBucket {
+                        bucket_incarnation: Uuid::from_slice(bucket.bucket_incarnation.as_ref())
+                            .expect("bucket incarnation was validated"),
+                        generation: bucket.generation,
+                    },
+                )
+            })
+            .collect(),
+    })
+}
+
+fn decode_scanner_dirty_usage_snapshot(
+    response: ScannerDirtyUsageSnapshotResponse,
+    challenge: &[u8; 16],
+) -> Result<ScannerPeerDirtyUsageSnapshot> {
+    decode_scanner_dirty_usage_snapshot_with_verifier(response, challenge, |canonical, proof| {
+        verify_tonic_rpc_response_proof(canonical, proof)
+            .map_err(|_| Error::other("peer returned an invalid scanner dirty usage snapshot response proof"))
+    })
+}
+
+fn scanner_activity_protocol_unsupported(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Io(io_err)
+            if embedded_tonic_status(io_err).is_some_and(|status| {
+                status.code() == tonic::Code::FailedPrecondition
+                    && status.message().starts_with("unsupported scanner activity request protocol")
+            })
+    )
+}
+
 fn validate_heal_control_capability_proof(canonical_ack: &[u8], proof: &[u8]) -> Result<()> {
     verify_tonic_rpc_response_proof(canonical_ack, proof)
         .map_err(|_| Error::other("peer returned an invalid heal control capability proof"))
@@ -251,6 +572,36 @@ fn validate_heal_control_capability_proof(canonical_ack: &[u8], proof: &[u8]) ->
 fn validate_heal_control_response_proof(canonical_response: &[u8], proof: &[u8]) -> Result<()> {
     verify_tonic_rpc_response_proof(canonical_response, proof)
         .map_err(|_| Error::other("peer returned an invalid heal control response proof"))
+}
+
+fn heal_control_auth_may_need_replay_scope_refresh(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Io(io_err)
+            if embedded_tonic_status(io_err).is_some_and(|status| {
+                status.code() == tonic::Code::Unauthenticated && status.message() == "No valid auth token"
+            })
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HealControlRetryAction {
+    Reconnect,
+    RefreshReplayScope,
+}
+
+fn heal_control_retry_action(
+    err: &Error,
+    reconnect_attempted: bool,
+    replay_scope_refresh_attempted: bool,
+) -> Option<HealControlRetryAction> {
+    if !replay_scope_refresh_attempted && heal_control_auth_may_need_replay_scope_refresh(err) {
+        return Some(HealControlRetryAction::RefreshReplayScope);
+    }
+    if !reconnect_attempted && PeerRestClient::is_network_like_error(err) {
+        return Some(HealControlRetryAction::Reconnect);
+    }
+    None
 }
 
 fn decode_remote_version_state_capability(expected_member: &str, result: &[u8]) -> Result<Uuid> {
@@ -286,6 +637,76 @@ pub struct PeerLiveEventsBatch {
 }
 
 #[derive(Clone, Debug)]
+pub struct ScannerPublicationLease {
+    pub token: Uuid,
+    pub movement_generation: u64,
+    /// Stable storage owner identity. This is distinct from the activity
+    /// session and is bound into both acquire and release proofs.
+    pub owner_id: String,
+    /// Process/session nonce observed by the final activity probe.
+    pub session_id: String,
+    pub expires_at: std::time::Instant,
+}
+
+impl ScannerPublicationLease {
+    pub fn is_valid(&self) -> bool {
+        std::time::Instant::now() < self.expires_at
+    }
+}
+
+fn validate_scanner_publication_lease_response_fields(
+    response: &ScannerPublicationLeaseResponse,
+    expected_session_id: &str,
+    expected_generation: u64,
+) -> Result<(Uuid, String)> {
+    if !response.success {
+        return Err(Error::other(
+            response
+                .error
+                .as_ref()
+                .map(|error| error.error_info.clone())
+                .unwrap_or_else(|| "peer rejected scanner publication lease".to_string()),
+        ));
+    }
+    if response.movement_generation != expected_generation {
+        return Err(Error::other("peer returned a different scanner publication lease generation"));
+    }
+    if response.session_id != expected_session_id {
+        return Err(Error::other("peer returned a different scanner publication lease session"));
+    }
+    let owner_id = Uuid::parse_str(&response.owner_id)
+        .ok()
+        .filter(|owner_id| !owner_id.is_nil())
+        .map(|owner_id| owner_id.to_string())
+        .ok_or_else(|| Error::other("peer returned an invalid scanner publication lease owner"))?;
+    if response.lease_ttl_ms != crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS {
+        return Err(Error::other("peer returned an unsupported scanner publication lease TTL"));
+    }
+    let token = Uuid::from_slice(response.token.as_ref())
+        .map_err(|_| Error::other("peer returned an invalid scanner publication lease token"))?;
+    Ok((token, owner_id))
+}
+
+fn scanner_publication_lease_deadline(
+    request_started: std::time::Instant,
+    response_received: std::time::Instant,
+    lease_ttl_ms: u64,
+) -> Result<std::time::Instant> {
+    let lease_window = Duration::from_millis(lease_ttl_ms)
+        .checked_sub(SCANNER_PUBLICATION_LEASE_SAFETY_MARGIN)
+        .ok_or_else(|| Error::other("scanner publication lease TTL is shorter than its safety margin"))?;
+    let elapsed = response_received
+        .checked_duration_since(request_started)
+        .ok_or_else(|| Error::other("scanner publication lease response clock moved backwards"))?;
+    if elapsed >= lease_window {
+        return Err(Error::other("scanner publication lease response arrived after its safety window"));
+    }
+    request_started
+        .checked_add(lease_window)
+        .ok_or_else(|| Error::other("scanner publication lease deadline overflowed"))
+}
+
+#[derive(Clone, Debug)]
 pub struct PeerRestClient {
     pub host: XHost,
     pub grid_host: String,
@@ -307,6 +728,31 @@ pub struct PeerTierMutationOutcome {
     pub applied: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct TierMutationDefinitelyRejected {
+    message: String,
+}
+
+fn tier_mutation_definitely_rejected_error(message: String) -> Error {
+    Error::other(TierMutationDefinitelyRejected { message })
+}
+
+#[cfg(test)]
+pub(crate) fn test_tier_mutation_definitely_rejected_error(message: &str) -> Error {
+    tier_mutation_definitely_rejected_error(message.to_string())
+}
+
+pub(crate) fn tier_mutation_error_is_definitely_rejected(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Io(io_error)
+            if io_error
+                .get_ref()
+                .is_some_and(|source| source.downcast_ref::<TierMutationDefinitelyRejected>().is_some())
+    )
+}
+
 fn validate_tier_mutation_response_proof(
     version: u32,
     phase: TierMutationRpcPhase,
@@ -314,6 +760,16 @@ fn validate_tier_mutation_response_proof(
     canonical_payload: &[u8],
     response: &TierMutationControlResponse,
 ) -> Result<()> {
+    if response.response_proof.len() > rustfs_protos::TIER_MUTATION_RPC_MAX_RESPONSE_PROOF_SIZE {
+        return Err(Error::other("peer tier mutation response proof exceeds size limit"));
+    }
+    if response
+        .error_info
+        .as_ref()
+        .is_some_and(|error| error.len() > rustfs_protos::TIER_MUTATION_RPC_MAX_ERROR_INFO_SIZE)
+    {
+        return Err(Error::other("peer tier mutation error response exceeds size limit"));
+    }
     let canonical_response =
         rustfs_protos::canonical_tier_mutation_rpc_response_body(rustfs_protos::TierMutationRpcResponseProofInput {
             version,
@@ -324,6 +780,7 @@ fn validate_tier_mutation_response_proof(
             state: response.state,
             applied: response.applied,
             error_info: response.error_info.as_deref(),
+            failure_class: response.failure_class,
         })
         .map_err(|_| Error::other("tier mutation response length cannot be represented"))?;
     verify_tonic_rpc_response_proof(&canonical_response, &response.response_proof)
@@ -345,9 +802,9 @@ fn validate_tier_mutation_payload_len(phase: TierMutationRpcPhase, payload_len: 
         TierMutationRpcPhase::Commit => rustfs_protos::TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE,
         TierMutationRpcPhase::Abort => {
             if payload_len == 0 {
-                return Ok(());
+                return Err(Error::other("tier mutation abort payload is empty"));
             }
-            return Err(Error::other("tier mutation abort payload must be empty"));
+            rustfs_protos::TIER_MUTATION_RPC_MAX_ABORT_PAYLOAD_SIZE
         }
         _ => return Err(Error::other("tier mutation rpc phase is unsupported")),
     };
@@ -366,8 +823,29 @@ fn tier_mutation_phase_label(phase: TierMutationRpcPhase) -> &'static str {
     }
 }
 
-fn tier_mutation_control_status_error(phase: TierMutationRpcPhase, status: tonic::Status) -> Error {
-    Error::other(format!("peer tier mutation {} RPC failed: {status}", tier_mutation_phase_label(phase)))
+fn tier_mutation_control_status_error(phase: TierMutationRpcPhase, requested_version: u32, status: tonic::Status) -> Error {
+    let message = format!("peer tier mutation {} RPC failed: {status}", tier_mutation_phase_label(phase));
+    let legacy_rejection = format!("unsupported tier mutation peer protocol version: {requested_version}");
+    // RUSTFS_COMPAT_TODO(backlog-2097-tier-mutation-v4-error-text): retain this exact v3-server rejection classifier for mixed-version peers. Remove after every supported peer returns the signed v4 failure class.
+    if requested_version == rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION
+        && status.code() == tonic::Code::FailedPrecondition
+        && status.message().as_bytes() == legacy_rejection.as_bytes()
+    {
+        return tier_mutation_definitely_rejected_error(message);
+    }
+    Error::other(message)
+}
+
+fn tier_mutation_failed_response_error(version: u32, failure_class: i32, error_info: Option<String>) -> Error {
+    let message = error_info.unwrap_or_else(|| "peer tier mutation failed without an error".to_string());
+    if version == rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION
+        && TierMutationFailureClass::try_from(failure_class).ok() == Some(TierMutationFailureClass::PreDispatchRejected)
+    {
+        return tier_mutation_definitely_rejected_error(message);
+    }
+    // Missing/zero, unknown, and explicit Ambiguous are deliberately the same
+    // fail-closed result: the coordinator must include this peer in Abort.
+    Error::other(message)
 }
 
 impl PeerRestClient {
@@ -494,13 +972,13 @@ impl PeerRestClient {
     pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         if self.offline.load(Ordering::Acquire) {
             self.mark_offline_and_spawn_recovery();
-            return Err(Error::other(format!("peer {} is temporarily offline", self.grid_host)));
+            return Err(Error::RemoteClientUnavailable(format!("peer {} is temporarily offline", self.grid_host)));
         }
 
         node_service_time_out_client(&self.grid_host, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
             .map_err(|err| {
-                let storage_err = Error::other(format!("can not get client, err: {err}"));
+                let storage_err = Error::RemoteClientUnavailable(format!("can not get client, err: {err}"));
                 if Self::is_network_like_error(&storage_err) {
                     self.mark_offline_and_spawn_recovery();
                 }
@@ -517,13 +995,13 @@ impl PeerRestClient {
     > {
         if self.offline.load(Ordering::Acquire) {
             self.mark_offline_and_spawn_recovery();
-            return Err(Error::other(format!("peer {} is temporarily offline", self.grid_host)));
+            return Err(Error::RemoteClientUnavailable(format!("peer {} is temporarily offline", self.grid_host)));
         }
 
         heal_control_time_out_client(&self.grid_host, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
             .map_err(|err| {
-                let storage_err = Error::other(format!("can not get heal control client, err: {err}"));
+                let storage_err = Error::RemoteClientUnavailable(format!("can not get heal control client, err: {err}"));
                 if Self::is_network_like_error(&storage_err) {
                     self.mark_offline_and_spawn_recovery();
                 }
@@ -536,13 +1014,13 @@ impl PeerRestClient {
     ) -> Result<TierMutationControlServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         if self.offline.load(Ordering::Acquire) {
             self.mark_offline_and_spawn_recovery();
-            return Err(Error::other(format!("peer {} is temporarily offline", self.grid_host)));
+            return Err(Error::RemoteClientUnavailable(format!("peer {} is temporarily offline", self.grid_host)));
         }
 
         tier_mutation_control_time_out_client(&self.grid_host, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
             .map_err(|err| {
-                let storage_err = Error::other(format!("can not get tier mutation control client, err: {err}"));
+                let storage_err = Error::RemoteClientUnavailable(format!("can not get tier mutation control client, err: {err}"));
                 if Self::is_network_like_error(&storage_err) {
                     self.mark_offline_and_spawn_recovery();
                 }
@@ -570,6 +1048,16 @@ impl PeerRestClient {
         self.offline.store(false, Ordering::Release);
     }
 
+    /// Prepare a retry without allowing connection-cache cleanup to extend the
+    /// caller's probe deadline. The offline gate is cleared even when eviction
+    /// times out so a cancelled cleanup cannot strand the peer in fast-fail
+    /// mode; a later request can perform a fresh eviction if needed.
+    pub async fn prepare_retry_with_timeout(&self, timeout_duration: Duration) -> bool {
+        let evicted = timeout(timeout_duration, self.evict_connection()).await.is_ok();
+        self.offline.store(false, Ordering::Release);
+        evicted
+    }
+
     /// Whether this failure means the peer is unreachable, so it should be
     /// gated offline and its connection evicted.
     ///
@@ -578,7 +1066,7 @@ impl PeerRestClient {
     /// never take it offline no matter what its message says. The substring
     /// fallback only covers failures that exist purely as text, such as the
     /// dial errors `get_client` wraps.
-    fn is_network_like_error(err: &Error) -> bool {
+    pub(crate) fn is_network_like_error(err: &Error) -> bool {
         if let Error::Io(io_err) = err
             && let Some(status) = embedded_tonic_status(io_err)
         {
@@ -713,10 +1201,12 @@ impl PeerRestClient {
 
         let response = client.local_storage_info(request).await?.into_inner();
         if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
-            }
-            return Err(peer_failure_without_details("local_storage_info", None));
+            return Err(control_plane_failure(
+                "local_storage_info",
+                None,
+                response.error_code,
+                response.error_info,
+            ));
         }
         let data = response.storage_info;
 
@@ -770,6 +1260,40 @@ impl PeerRestClient {
         let cpus: Cpus = Deserialize::deserialize(&mut buf)?;
 
         Ok(cpus)
+    }
+
+    /// This peer's own rolling-day transition counters, per remote tier.
+    ///
+    /// The response is untrusted peer input: a ring of the wrong width or an
+    /// unrepresentable clock is rejected here rather than merged, so a corrupt
+    /// answer makes the node non-reporting instead of silently shifting a
+    /// cluster total.
+    pub async fn tier_daily_stats(&self) -> Result<DailyAllTierStats> {
+        self.finalize_result(self.tier_daily_stats_inner().await).await
+    }
+
+    async fn tier_daily_stats_inner(&self) -> Result<DailyAllTierStats> {
+        let mut client = self.get_client().await?;
+        let request = Request::new(TierDailyStatsRequest {});
+
+        let response = client.tier_daily_stats(request).await?.into_inner();
+        if !response.success {
+            if let Some(msg) = response.error_info {
+                return Err(Error::other(msg));
+            }
+            return Err(peer_failure_without_details("tier_daily_stats", None));
+        }
+
+        let mut buf = Deserializer::new(Cursor::new(response.tier_daily_stats));
+        let wire: HashMap<String, TierDailyStatsWire> = Deserialize::deserialize(&mut buf)?;
+
+        wire.into_iter()
+            .map(|(tier, stats)| {
+                LastDayTierStats::from_wire(stats)
+                    .map(|stats| (tier, stats))
+                    .map_err(Error::from)
+            })
+            .collect()
     }
 
     pub async fn get_net_info(&self) -> Result<NetInfo> {
@@ -1103,11 +1627,10 @@ impl PeerRestClient {
                     Err(status) => return Err(status.into()),
                 };
                 if !response.success {
-                    return Err(Error::other(
-                        response
-                            .error_info
-                            .unwrap_or_else(|| "peer background heal status failed without an error".to_string()),
-                    ));
+                    return Err(match (response.error_code, response.error_info) {
+                        (None, None) => Error::other("peer background heal status failed without an error"),
+                        (error_code, error_info) => control_plane_failure("background_heal_status", None, error_code, error_info),
+                    });
                 }
                 Ok(Some(response.bg_heal_state.to_vec()))
             }
@@ -1135,11 +1658,12 @@ impl PeerRestClient {
                     Err(status) => return Err(status.into()),
                 };
                 if !response.success {
-                    return Err(Error::other(
-                        response
-                            .error_info
-                            .unwrap_or_else(|| "peer replacement recovery status failed without an error".to_string()),
-                    ));
+                    return Err(match (response.error_code, response.error_info) {
+                        (None, None) => Error::other("peer replacement recovery status failed without an error"),
+                        (error_code, error_info) => {
+                            control_plane_failure("replacement_recovery_status", None, error_code, error_info)
+                        }
+                    });
                 }
                 Ok(Some(response.recovery_status.to_vec()))
             }
@@ -1158,8 +1682,12 @@ impl PeerRestClient {
             .await
     }
 
-    pub async fn abort_tier_mutation(&self, mutation_id: Uuid) -> Result<PeerTierMutationOutcome> {
-        self.tier_mutation_control(TierMutationRpcPhase::Abort, mutation_id, Bytes::new())
+    pub async fn abort_tier_mutation(
+        &self,
+        mutation_id: Uuid,
+        canonical_prepare_payload: Bytes,
+    ) -> Result<PeerTierMutationOutcome> {
+        self.tier_mutation_control(TierMutationRpcPhase::Abort, mutation_id, canonical_prepare_payload)
             .await
     }
 
@@ -1193,7 +1721,7 @@ impl PeerRestClient {
                         client
                             .prepare_tier_mutation(request)
                             .await
-                            .map_err(|status| tier_mutation_control_status_error(phase, status))?
+                            .map_err(|status| tier_mutation_control_status_error(phase, version, status))?
                             .into_inner()
                     }
                     TierMutationRpcPhase::Commit => {
@@ -1206,7 +1734,7 @@ impl PeerRestClient {
                         client
                             .commit_tier_mutation(request)
                             .await
-                            .map_err(|status| tier_mutation_control_status_error(phase, status))?
+                            .map_err(|status| tier_mutation_control_status_error(phase, version, status))?
                             .into_inner()
                     }
                     TierMutationRpcPhase::Abort => {
@@ -1219,18 +1747,19 @@ impl PeerRestClient {
                         client
                             .abort_tier_mutation(request)
                             .await
-                            .map_err(|status| tier_mutation_control_status_error(phase, status))?
+                            .map_err(|status| tier_mutation_control_status_error(phase, version, status))?
                             .into_inner()
                     }
                     _ => return Err(Error::other("tier mutation rpc phase is unsupported")),
                 };
                 validate_tier_mutation_response_proof(version, phase, mutation_id, &canonical_payload, &response)?;
                 if !response.success {
-                    return Err(Error::other(
-                        response
-                            .error_info
-                            .unwrap_or_else(|| "peer tier mutation failed without an error".to_string()),
-                    ));
+                    return Err(tier_mutation_failed_response_error(version, response.failure_class, response.error_info));
+                }
+                if version == rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION
+                    && response.failure_class != TierMutationFailureClass::Unspecified as i32
+                {
+                    return Err(Error::other("successful peer tier mutation response carried a failure class"));
                 }
                 let state = decode_tier_mutation_peer_state(response.state)?;
                 Ok(PeerTierMutationOutcome {
@@ -1251,45 +1780,83 @@ impl PeerRestClient {
             return Err(Error::other("heal control command exceeds size limit"));
         }
         let capability_probe = rustfs_protos::is_heal_control_capability_probe(&command);
-        self.finalize_result(
-            async {
-                let mut client = self
-                    .get_heal_control_client()
-                    .await?
-                    .max_encoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE)
-                    .max_decoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE);
-                let canonical_body = rustfs_protos::canonical_heal_control_request_body(version, &topology_fingerprint, &command)
-                    .map_err(|_| Error::other("heal control request length cannot be represented"))?;
-                let mut request = Request::new(HealControlRequest {
-                    version,
-                    topology_fingerprint: topology_fingerprint.clone(),
-                    command: command.clone().into(),
-                });
-                request.set_timeout(rustfs_protos::heal_control_execution_timeout());
-                set_tonic_canonical_body_digest(&mut request, &canonical_body)?;
-                let response = client.heal_control(request).await?.into_inner();
-                if !response.success {
-                    return Err(Error::other(
-                        response
-                            .error_info
-                            .unwrap_or_else(|| "peer heal control failed without an error".to_string()),
-                    ));
-                }
-                if !capability_probe {
-                    let canonical_response = rustfs_protos::canonical_heal_control_response_body(
-                        version,
-                        &topology_fingerprint,
-                        &command,
-                        &response.result,
-                    )
-                    .map_err(|_| Error::other("heal control response length cannot be represented"))?;
-                    validate_heal_control_response_proof(&canonical_response, &response.response_proof)?;
-                }
-                Ok(response.result.to_vec())
+        let mut reconnect_attempted = false;
+        let mut replay_scope_refresh_attempted = false;
+        loop {
+            let result = self
+                .heal_control_once(version, &topology_fingerprint, &command, capability_probe)
+                .await;
+            let Some(action) = result
+                .as_ref()
+                .err()
+                .and_then(|err| heal_control_retry_action(err, reconnect_attempted, replay_scope_refresh_attempted))
+            else {
+                return self.finalize_result(result).await;
+            };
+            match action {
+                HealControlRetryAction::Reconnect => reconnect_attempted = true,
+                HealControlRetryAction::RefreshReplayScope => replay_scope_refresh_attempted = true,
             }
-            .await,
-        )
-        .await
+            self.prepare_heal_control_retry(action).await;
+        }
+    }
+
+    async fn prepare_heal_control_retry(&self, action: HealControlRetryAction) {
+        if action == HealControlRetryAction::RefreshReplayScope
+            && let Err(err) = clear_peer_replay_state_for_addr(&self.grid_host)
+        {
+            debug!(
+                peer = %self.grid_host,
+                error = %err,
+                "could not clear heal control replay state before retry"
+            );
+        }
+        // A restart can leave both the local offline gate and the peer replay
+        // epoch stale. Clear the gate on either recovery step so the next
+        // bounded attempt reaches a fresh channel instead of fast-failing.
+        self.prepare_retry().await;
+    }
+
+    async fn heal_control_once(
+        &self,
+        version: u32,
+        topology_fingerprint: &str,
+        command: &[u8],
+        capability_probe: bool,
+    ) -> Result<Vec<u8>> {
+        let mut client = self
+            .get_heal_control_client()
+            .await?
+            .max_encoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE)
+            .max_decoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE);
+        let canonical_body = rustfs_protos::canonical_heal_control_request_body(version, topology_fingerprint, command)
+            .map_err(|_| Error::other("heal control request length cannot be represented"))?;
+        let mut request = Request::new(HealControlRequest {
+            version,
+            topology_fingerprint: topology_fingerprint.to_string(),
+            command: command.to_vec().into(),
+        });
+        request.set_timeout(rustfs_protos::heal_control_execution_timeout());
+        set_tonic_canonical_body_digest(&mut request, &canonical_body)?;
+        let response = client
+            .heal_control(request)
+            .await
+            .map_err(heal_control_status_error)?
+            .into_inner();
+        if !response.success {
+            return Err(Error::other(
+                response
+                    .error_info
+                    .unwrap_or_else(|| "peer heal control failed without an error".to_string()),
+            ));
+        }
+        if !capability_probe {
+            let canonical_response =
+                rustfs_protos::canonical_heal_control_response_body(version, topology_fingerprint, command, &response.result)
+                    .map_err(|_| Error::other("heal control response length cannot be represented"))?;
+            validate_heal_control_response_proof(&canonical_response, &response.response_proof)?;
+        }
+        Ok(response.result.to_vec())
     }
 
     /// Confirms that a peer supports the current heal-control coordination
@@ -1330,6 +1897,24 @@ impl PeerRestClient {
         Ok((self.topology_member.clone(), supported_version, epoch))
     }
 
+    pub async fn probe_ilm_recovery_export(&self, topology_fingerprint: String) -> Result<(String, Uuid)> {
+        let probe = rustfs_protos::ilm_recovery_export_capability_probe(Uuid::new_v4().as_bytes());
+        let result = self
+            .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, topology_fingerprint, probe)
+            .await?;
+        let epoch = decode_remote_version_state_capability(&self.topology_member, &result)?;
+        Ok((self.topology_member.clone(), epoch))
+    }
+
+    pub async fn probe_transition_transaction_compaction(&self, topology_fingerprint: String) -> Result<(String, Uuid)> {
+        let probe = rustfs_protos::transition_transaction_compaction_capability_probe(Uuid::new_v4().as_bytes());
+        let result = self
+            .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, topology_fingerprint, probe)
+            .await?;
+        let epoch = decode_remote_version_state_capability(&self.topology_member, &result)?;
+        Ok((self.topology_member.clone(), epoch))
+    }
+
     pub async fn load_bucket_metadata(&self, bucket: &str, scanner_maintenance_change: bool) -> Result<()> {
         let result = tokio::time::timeout(BUCKET_METADATA_RELOAD_TIMEOUT, async {
             let result = self.load_bucket_metadata_once(bucket, scanner_maintenance_change).await;
@@ -1357,10 +1942,12 @@ impl PeerRestClient {
 
         let response = client.load_bucket_metadata(request).await?.into_inner();
         if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
-            }
-            return Err(peer_failure_without_details("load_bucket_metadata", Some(bucket)));
+            return Err(control_plane_failure(
+                "load_bucket_metadata",
+                Some(bucket),
+                response.error_code,
+                response.error_info,
+            ));
         }
         Ok(())
     }
@@ -1399,10 +1986,7 @@ impl PeerRestClient {
 
                 let response = client.delete_policy(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("delete_policy", None));
+                    return Err(control_plane_failure("delete_policy", None, response.error_code, response.error_info));
                 }
                 Ok(())
             }
@@ -1422,10 +2006,7 @@ impl PeerRestClient {
 
                 let response = client.load_policy(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("load_policy", None));
+                    return Err(control_plane_failure("load_policy", None, response.error_code, response.error_info));
                 }
                 Ok(())
             }
@@ -1447,10 +2028,12 @@ impl PeerRestClient {
 
                 let response = client.load_policy_mapping(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("load_policy_mapping", None));
+                    return Err(control_plane_failure(
+                        "load_policy_mapping",
+                        None,
+                        response.error_code,
+                        response.error_info,
+                    ));
                 }
                 Ok(())
             }
@@ -1470,10 +2053,7 @@ impl PeerRestClient {
 
                 let response = client.delete_user(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("delete_user", None));
+                    return Err(control_plane_failure("delete_user", None, response.error_code, response.error_info));
                 }
                 Ok(())
             }
@@ -1493,10 +2073,12 @@ impl PeerRestClient {
 
                 let response = client.delete_service_account(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("delete_service_account", None));
+                    return Err(control_plane_failure(
+                        "delete_service_account",
+                        None,
+                        response.error_code,
+                        response.error_info,
+                    ));
                 }
                 Ok(())
             }
@@ -1517,10 +2099,7 @@ impl PeerRestClient {
 
                 let response = client.load_user(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("load_user", None));
+                    return Err(control_plane_failure("load_user", None, response.error_code, response.error_info));
                 }
                 Ok(())
             }
@@ -1540,10 +2119,12 @@ impl PeerRestClient {
 
                 let response = client.load_service_account(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("load_service_account", None));
+                    return Err(control_plane_failure(
+                        "load_service_account",
+                        None,
+                        response.error_code,
+                        response.error_info,
+                    ));
                 }
                 Ok(())
             }
@@ -1563,10 +2144,7 @@ impl PeerRestClient {
 
                 let response = client.load_group(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("load_group", None));
+                    return Err(control_plane_failure("load_group", None, response.error_code, response.error_info));
                 }
                 Ok(())
             }
@@ -1584,10 +2162,12 @@ impl PeerRestClient {
 
                 let response = client.reload_site_replication_config(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("reload_site_replication_config", None));
+                    return Err(control_plane_failure(
+                        "reload_site_replication_config",
+                        None,
+                        response.error_code,
+                        response.error_info,
+                    ));
                 }
                 Ok(())
             }
@@ -1640,10 +2220,11 @@ impl PeerRestClient {
         .await
     }
 
-    async fn scanner_activity_request(
+    async fn scanner_activity_request_with_protocol(
         &self,
         acknowledge_instance_id: String,
         acknowledge_dirty_usage_generation: u64,
+        protocol_version: u32,
     ) -> Result<ScannerPeerActivity> {
         self.finalize_result(
             async {
@@ -1655,7 +2236,7 @@ impl PeerRestClient {
                     .max_encoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE);
                 let mut request = Request::new(ScannerActivityRequest {
                     challenge: challenge.as_bytes().to_vec().into(),
-                    protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+                    protocol_version,
                     acknowledge_instance_id,
                     acknowledge_dirty_usage_generation,
                 });
@@ -1671,11 +2252,301 @@ impl PeerRestClient {
     }
 
     pub async fn scanner_activity(&self) -> Result<ScannerPeerActivity> {
-        self.scanner_activity_request(String::new(), 0).await
+        let result = self
+            .scanner_activity_request_with_protocol(String::new(), 0, SCANNER_ACTIVITY_PROTOCOL_VERSION)
+            .await;
+        if result.as_ref().err().is_some_and(scanner_activity_protocol_unsupported) {
+            // A v6 peer cannot parse the v7 marker.  Its authenticated
+            // response is still decoded as untrusted terminal state, so the
+            // scanner will defer publication until every peer is v7.
+            self.scanner_activity_request_with_protocol(String::new(), 0, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION)
+                .await
+        } else {
+            result
+        }
+    }
+
+    pub async fn scanner_dirty_usage_snapshot(&self) -> Result<ScannerPeerDirtyUsageSnapshot> {
+        self.finalize_result(
+            async {
+                let challenge = Uuid::new_v4();
+                let mut client = self
+                    .get_client()
+                    .await?
+                    .max_decoding_message_size(SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE);
+                let mut request = Request::new(ScannerDirtyUsageSnapshotRequest {
+                    challenge: challenge.as_bytes().to_vec().into(),
+                    protocol_version: SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION,
+                });
+                let canonical = rustfs_protos::canonical_scanner_dirty_usage_snapshot_request_body(request.get_ref())
+                    .map_err(|_| Error::other("scanner dirty usage snapshot request is too large to authenticate"))?;
+                set_tonic_canonical_body_digest(&mut request, &canonical)?;
+                let response = client.scanner_dirty_usage_snapshot(request).await?.into_inner();
+                decode_scanner_dirty_usage_snapshot(response, challenge.as_bytes())
+            }
+            .await,
+        )
+        .await
+    }
+
+    /// Probe only: scoped ACK production requires a durable per-bucket proof.
+    pub async fn scanner_scoped_dirty_usage_capability(
+        &self,
+        owner_id: String,
+        instance_id: String,
+        entries: Vec<ScannerScopedDirtyUsageAckEntry>,
+    ) -> Result<bool> {
+        use rustfs_protos::scoped_dirty_usage::*;
+        let payloads = scanner_scoped_dirty_usage_ack_payloads(owner_id, instance_id, true, entries)?;
+        self.finalize_result(
+            async {
+                let mut client = super::client::scanner_control_time_out_client(
+                    &self.grid_host,
+                    TonicInterceptor::Signature(gen_tonic_signature_interceptor()),
+                )
+                .await?;
+                for payload in payloads {
+                    let canonical =
+                        canonical_scoped_dirty_usage_request(&payload).map_err(|err| Error::other(err.to_string()))?;
+                    let mut request = Request::new(payload.clone());
+                    set_tonic_canonical_body_digest(&mut request, &canonical)?;
+                    let response = client.scanner_scoped_dirty_usage_ack(request).await?.into_inner();
+                    let body = canonical_scoped_dirty_usage_response(&canonical, &response)
+                        .map_err(|_| Error::other("scoped dirty usage capability response is too large"))?;
+                    verify_tonic_rpc_response_proof(&body, response.response_proof.as_ref())?;
+                    if !scanner_scoped_dirty_usage_ack_response_matches(&payload, &response) {
+                        return Err(Error::other("scoped dirty usage capability response does not match request"));
+                    }
+                    if !response.supported {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            .await,
+        )
+        .await
+    }
+
+    pub async fn acknowledge_scanner_scoped_dirty_usage(
+        &self,
+        owner_id: String,
+        instance_id: String,
+        entries: Vec<ScannerScopedDirtyUsageAckEntry>,
+    ) -> Result<ScannerPeerActivity> {
+        use rustfs_protos::scoped_dirty_usage::*;
+        let expected_generation = entries.iter().map(|entry| entry.generation).max().unwrap_or(0);
+        let payloads = scanner_scoped_dirty_usage_ack_payloads(owner_id, instance_id.clone(), false, entries)?;
+        let ack_attempt = async {
+            let mut client = super::client::scanner_control_time_out_client(
+                &self.grid_host,
+                TonicInterceptor::Signature(gen_tonic_signature_interceptor()),
+            )
+            .await?;
+            for payload in payloads {
+                let canonical = canonical_scoped_dirty_usage_request(&payload).map_err(|err| Error::other(err.to_string()))?;
+                let mut request = Request::new(payload.clone());
+                set_tonic_canonical_body_digest(&mut request, &canonical)?;
+                let response = client.scanner_scoped_dirty_usage_ack(request).await?.into_inner();
+                let body = canonical_scoped_dirty_usage_response(&canonical, &response)
+                    .map_err(|_| Error::other("scoped dirty usage acknowledgement response is too large"))?;
+                verify_tonic_rpc_response_proof(&body, response.response_proof.as_ref())?;
+                if !scanner_scoped_dirty_usage_ack_response_matches(&payload, &response) || !response.supported {
+                    return Err(Error::other("scoped dirty usage acknowledgement response does not match request"));
+                }
+            }
+            Ok(())
+        };
+        let result = match timeout(SCANNER_SCOPED_DIRTY_USAGE_STAGE_TIMEOUT, ack_attempt).await {
+            Ok(result) => self.finalize_result(result).await,
+            Err(_) => {
+                self.prepare_retry_with_timeout(SCANNER_SCOPED_DIRTY_USAGE_STAGE_TIMEOUT)
+                    .await;
+                Err(Error::other("scoped dirty usage acknowledgement deadline elapsed"))
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                let activity = self.scanner_scoped_dirty_usage_activity_confirmation().await?;
+                if activity.instance_id == instance_id {
+                    Ok(activity)
+                } else {
+                    Err(Error::other(
+                        "scoped dirty usage acknowledgement peer restarted before activity confirmation",
+                    ))
+                }
+            }
+            Err(err) => {
+                if Self::is_network_like_error(&err) {
+                    self.prepare_retry_with_timeout(SCANNER_SCOPED_DIRTY_USAGE_STAGE_TIMEOUT)
+                        .await;
+                }
+                match self.scanner_scoped_dirty_usage_activity_confirmation().await {
+                    Ok(activity) if scanner_scoped_dirty_usage_ack_reconciled(&activity, &instance_id, expected_generation) => {
+                        Ok(activity)
+                    }
+                    _ => Err(err),
+                }
+            }
+        }
+    }
+
+    async fn scanner_scoped_dirty_usage_activity_confirmation(&self) -> Result<ScannerPeerActivity> {
+        timeout(SCANNER_SCOPED_DIRTY_USAGE_STAGE_TIMEOUT, self.scanner_activity())
+            .await
+            .map_err(|_| Error::other("scoped dirty usage activity confirmation timed out"))?
     }
 
     pub async fn acknowledge_scanner_dirty_usage(&self, instance_id: String, generation: u64) -> Result<ScannerPeerActivity> {
-        self.scanner_activity_request(instance_id, generation).await
+        let result = self
+            .scanner_activity_request_with_protocol(instance_id.clone(), generation, SCANNER_ACTIVITY_PROTOCOL_VERSION)
+            .await;
+        if result.as_ref().err().is_some_and(scanner_activity_protocol_unsupported) {
+            self.scanner_activity_request_with_protocol(instance_id, generation, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION)
+                .await
+        } else {
+            result
+        }
+    }
+
+    /// Acquire a bounded, storage-owned read admission on the peer that
+    /// produced the final activity generation. Older peers do not implement
+    /// the lease form and are rejected rather than downgraded.
+    pub async fn acquire_scanner_publication_lease(
+        &self,
+        expected_session_id: &str,
+        expected_generation: u64,
+    ) -> Result<ScannerPublicationLease> {
+        let request_started = std::time::Instant::now();
+        self.finalize_result(
+            async {
+                let challenge = Uuid::new_v4();
+                let mut client = self
+                    .get_client()
+                    .await?
+                    .max_decoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE);
+                let mut request = Request::new(ScannerPublicationLeaseRequest {
+                    challenge: challenge.as_bytes().to_vec().into(),
+                    expected_movement_generation: expected_generation,
+                    ttl_ms: crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS,
+                    expected_session_id: expected_session_id.to_string(),
+                    token: Bytes::new(),
+                });
+                let canonical = rustfs_protos::canonical_scanner_publication_lease_request_body(request.get_ref())
+                    .map_err(|_| Error::other("scanner publication lease request is too large to authenticate"))?;
+                set_tonic_canonical_body_digest(&mut request, &canonical)?;
+                let response = client.acquire_scanner_publication_lease(request).await?.into_inner();
+                let response_body =
+                    rustfs_protos::canonical_scanner_publication_lease_response_body(challenge.as_bytes(), &response)
+                        .map_err(|_| Error::other("scanner publication lease response is too large to authenticate"))?;
+                verify_tonic_rpc_response_proof(&response_body, &response.response_proof)
+                    .map_err(|_| Error::other("peer returned an invalid scanner publication lease proof"))?;
+                let (token, owner_id) =
+                    validate_scanner_publication_lease_response_fields(&response, expected_session_id, expected_generation)?;
+                Ok(ScannerPublicationLease {
+                    token,
+                    movement_generation: response.movement_generation,
+                    owner_id,
+                    session_id: response.session_id,
+                    expires_at: scanner_publication_lease_deadline(
+                        request_started,
+                        std::time::Instant::now(),
+                        response.lease_ttl_ms,
+                    )?,
+                })
+            }
+            .await,
+        )
+        .await
+    }
+
+    /// Revalidate the exact token immediately before the coordinator commits
+    /// its final publication.  The peer keeps the original movement read
+    /// guard in its token table; a restart drops that table and changes the
+    /// activity session, so this proof fails closed instead of accepting an
+    /// ABA generation value.
+    pub async fn validate_scanner_publication_lease(&self, lease: &ScannerPublicationLease) -> Result<()> {
+        self.finalize_result(
+            async {
+                let challenge = Uuid::new_v4();
+                let mut client = self
+                    .get_client()
+                    .await?
+                    .max_decoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE);
+                let mut request = Request::new(ScannerPublicationLeaseRequest {
+                    challenge: challenge.as_bytes().to_vec().into(),
+                    expected_movement_generation: lease.movement_generation,
+                    ttl_ms: crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS,
+                    expected_session_id: lease.session_id.clone(),
+                    token: lease.token.as_bytes().to_vec().into(),
+                });
+                let canonical = rustfs_protos::canonical_scanner_publication_lease_request_body(request.get_ref())
+                    .map_err(|_| Error::other("scanner publication lease validation request is too large to authenticate"))?;
+                set_tonic_canonical_body_digest(&mut request, &canonical)?;
+                let response = client.acquire_scanner_publication_lease(request).await?.into_inner();
+                let response_body =
+                    rustfs_protos::canonical_scanner_publication_lease_response_body(challenge.as_bytes(), &response).map_err(
+                        |_| Error::other("scanner publication lease validation response is too large to authenticate"),
+                    )?;
+                verify_tonic_rpc_response_proof(&response_body, &response.response_proof)
+                    .map_err(|_| Error::other("peer returned an invalid scanner publication lease validation proof"))?;
+                let (token, owner_id) =
+                    validate_scanner_publication_lease_response_fields(&response, &lease.session_id, lease.movement_generation)?;
+                if token != lease.token {
+                    return Err(Error::other("peer returned a different scanner publication lease token"));
+                }
+                if owner_id != lease.owner_id {
+                    return Err(Error::other("peer returned a different scanner publication lease owner"));
+                }
+                Ok(())
+            }
+            .await,
+        )
+        .await
+    }
+
+    pub async fn release_scanner_publication_lease(&self, lease: &ScannerPublicationLease) -> Result<()> {
+        self.finalize_result(
+            async {
+                let challenge = Uuid::new_v4();
+                let mut client = self.get_client().await?;
+                let mut request = Request::new(ScannerPublicationLeaseReleaseRequest {
+                    challenge: challenge.as_bytes().to_vec().into(),
+                    token: lease.token.as_bytes().to_vec().into(),
+                    owner_id: lease.owner_id.clone(),
+                    session_id: lease.session_id.clone(),
+                });
+                let canonical = rustfs_protos::canonical_scanner_publication_lease_release_request_body(request.get_ref())
+                    .map_err(|_| Error::other("scanner publication lease release request is too large to authenticate"))?;
+                set_tonic_canonical_body_digest(&mut request, &canonical)?;
+                let request_body = request.get_ref().clone();
+                let response = client.release_scanner_publication_lease(request).await?.into_inner();
+                let response_body = rustfs_protos::canonical_scanner_publication_lease_release_response_body(
+                    challenge.as_bytes(),
+                    &request_body,
+                    &response,
+                )
+                .map_err(|_| Error::other("scanner publication lease release response is too large to authenticate"))?;
+                verify_tonic_rpc_response_proof(&response_body, &response.response_proof)
+                    .map_err(|_| Error::other("peer returned an invalid scanner publication lease release proof"))?;
+                if response.success {
+                    Ok(())
+                } else {
+                    Err(Error::other(
+                        response
+                            .error
+                            .map(|error| error.error_info)
+                            .unwrap_or_else(|| "peer rejected scanner publication lease release".to_string()),
+                    ))
+                }
+            }
+            .await,
+        )
+        .await
     }
 
     pub async fn get_metacache_listing(&self) -> Result<()> {
@@ -1697,10 +2568,7 @@ impl PeerRestClient {
 
                 let response = client.reload_pool_meta(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("reload_pool_meta", None));
+                    return Err(control_plane_failure("reload_pool_meta", None, response.error_code, response.error_info));
                 }
 
                 Ok(())
@@ -1721,10 +2589,7 @@ impl PeerRestClient {
 
                 let response = client.stop_rebalance(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("stop_rebalance", None));
+                    return Err(control_plane_failure("stop_rebalance", None, response.error_code, response.error_info));
                 }
 
                 Ok(())
@@ -1755,10 +2620,12 @@ impl PeerRestClient {
                     "peer rebalance metadata response"
                 );
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("load_rebalance_meta", None));
+                    return Err(control_plane_failure(
+                        "load_rebalance_meta",
+                        None,
+                        response.error_code,
+                        response.error_info,
+                    ));
                 }
 
                 Ok(())
@@ -1783,10 +2650,12 @@ impl PeerRestClient {
 
                 let response = client.start_decommission(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("start_decommission", None));
+                    return Err(control_plane_failure(
+                        "start_decommission",
+                        None,
+                        response.error_code,
+                        response.error_info,
+                    ));
                 }
 
                 Ok(())
@@ -1807,10 +2676,12 @@ impl PeerRestClient {
 
                 let response = client.cancel_decommission(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("decommission_cancel", None));
+                    return Err(control_plane_failure(
+                        "decommission_cancel",
+                        None,
+                        response.error_code,
+                        response.error_info,
+                    ));
                 }
 
                 Ok(())
@@ -1831,10 +2702,12 @@ impl PeerRestClient {
 
                 let response = client.clear_decommission(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("clear_decommission", None));
+                    return Err(control_plane_failure(
+                        "clear_decommission",
+                        None,
+                        response.error_code,
+                        response.error_info,
+                    ));
                 }
 
                 Ok(())
@@ -1887,10 +2760,25 @@ impl PeerRestClient {
 
         let response = match client.load_transition_tier_config(request).await {
             Ok(response) => response.into_inner(),
+            Err(status)
+                if status.code() == tonic::Code::Unauthenticated && status.message() == "RPC peer replay capability changed" =>
+            {
+                // A restart can revoke the pinned capability. A signed read-only probe
+                // lets the peer prove its new epoch without bypassing the mutation guard.
+                let mut probe = Request::new(PingRequest {
+                    version: 1,
+                    body: Bytes::new(),
+                });
+                probe.set_timeout(rustfs_protos::heal_control_execution_timeout());
+                return match client.ping(probe).await {
+                    Ok(_) => TierConfigReloadOutcome::TransientRetrySameChannel(status.into()),
+                    Err(probe_status) => tier_config_reload_status_outcome(probe_status),
+                };
+            }
             Err(status) => return tier_config_reload_status_outcome(status),
         };
         if !response.success {
-            return tier_config_reload_remote_failure(response.error_info);
+            return tier_config_reload_remote_failure(response.error_code, response.error_info);
         }
 
         TierConfigReloadOutcome::Success
@@ -1923,17 +2811,14 @@ fn tier_config_reload_connection_outcome(err: Error) -> TierConfigReloadOutcome 
 }
 
 fn is_tier_config_reload_connection_failure(err: &Error) -> bool {
-    let message = err.to_string();
-    // A bare "unavailable" is only trusted inside the local dial-failure
-    // wrapper from `get_client`, never in application text.
-    if message
-        .to_ascii_lowercase()
-        .split_once("can not get client, err:")
-        .is_some_and(|(_, local_error)| local_error.contains("unavailable"))
+    // A bare "unavailable" is only trusted inside the local dial failure from
+    // `get_client` (typed as RemoteClientUnavailable), never in application text.
+    if let Error::RemoteClientUnavailable(detail) = err
+        && detail.to_ascii_lowercase().contains("unavailable")
     {
         return true;
     }
-    message_has_network_needle(&message)
+    message_has_network_needle(&err.to_string())
 }
 
 /// Classifies a reload the peer answered but refused to apply.
@@ -1952,7 +2837,13 @@ fn is_tier_config_reload_connection_failure(err: &Error) -> bool {
 /// reload every `TIER_CONFIG_RELOAD_RETRY_CAP`, and `Terminal` stays reachable
 /// for transport and gRPC status failures, which is where a genuinely
 /// unrecoverable peer surfaces.
-fn tier_config_reload_remote_failure(error_info: Option<String>) -> TierConfigReloadOutcome {
+fn tier_config_reload_remote_failure(error_code: Option<i32>, error_info: Option<String>) -> TierConfigReloadOutcome {
+    // Remote rejections are transient by design (see the doc comment above);
+    // the typed not-initialized code keeps the error typed for downstream
+    // classifiers instead of a bare string (backlog#1845).
+    if error_code == Some(rustfs_protos::proto_gen::node_service::ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32) {
+        return TierConfigReloadOutcome::TransientRetrySameChannel(Error::RemoteNotInitialized);
+    }
     TierConfigReloadOutcome::TransientRetrySameChannel(Error::other(error_info.unwrap_or_default()))
 }
 
@@ -1981,6 +2872,7 @@ mod tests {
     use super::*;
     use crate::config::com::STORAGE_CLASS_SUB_SYS;
     use crate::disk::error::DiskError;
+
     use crate::disk::error_reduce::reduce_errs;
     use crate::layout::{disks_layout::DisksLayout, endpoints::SetupType};
     use rustfs_config::{ENV_KUBERNETES_SERVICE_HOST, ENV_LOCAL_ENDPOINT_HOST, ENV_STARTUP_TOPOLOGY_WAIT_MODE};
@@ -1990,6 +2882,158 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use temp_env::async_with_vars;
     use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
+
+    #[test]
+    fn heal_selector_rpc_error_preserves_invalid_argument_without_retry() {
+        let err = heal_control_status_error(tonic::Status::invalid_argument("heal pool index 99 is out of range"));
+        assert!(matches!(&err, Error::InvalidArgument(_, _, message) if message == "heal pool index 99 is out of range"));
+        assert!(heal_control_retry_action(&err, false, false).is_none());
+        assert!(!PeerRestClient::is_network_like_error(&err));
+
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::Internal,
+            tonic::Code::FailedPrecondition,
+        ] {
+            let err = heal_control_status_error(tonic::Status::new(code, "invalid selector"));
+            assert!(!matches!(err, Error::InvalidArgument(..)), "classify by code, not message");
+            let Error::Io(io_error) = &err else {
+                panic!("non-argument RPC failures must retain their typed transport status: {err:?}");
+            };
+            assert_eq!(
+                embedded_tonic_status(io_error)
+                    .expect("transport status should be preserved")
+                    .code(),
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn control_plane_failure_prefers_typed_not_initialized_code() {
+        use rustfs_protos::proto_gen::node_service::ControlPlaneErrorCode;
+        let code = Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32);
+
+        // Typed code wins even when the legacy string is present (dual-write).
+        let err = control_plane_failure("load_bucket_metadata", Some("b"), code, Some("errServerNotInitialized".to_string()));
+        assert!(matches!(err, Error::RemoteNotInitialized));
+        assert!(crate::error::is_err_not_initialized(&err), "typed variant must satisfy the predicate");
+
+        // Legacy peers: no code, string only — the substring fallback still classifies.
+        let err = control_plane_failure("load_bucket_metadata", Some("b"), None, Some("errServerNotInitialized".to_string()));
+        assert!(crate::error::is_err_not_initialized(&err), "legacy string form must keep classifying");
+
+        // No code, no string: detail-free per-op failure, not misread as not-initialized.
+        let err = control_plane_failure("load_bucket_metadata", Some("b"), None, None);
+        assert!(!crate::error::is_err_not_initialized(&err));
+        assert!(err.to_string().contains("load_bucket_metadata"));
+
+        // Unspecified code behaves like no code.
+        let err = control_plane_failure(
+            "load_bucket_metadata",
+            None,
+            Some(ControlPlaneErrorCode::ControlPlaneErrorUnspecified as i32),
+            Some("boom".to_string()),
+        );
+        assert!(!matches!(err, Error::RemoteNotInitialized));
+        assert_eq!(err.to_string(), "Io error: boom");
+    }
+
+    #[test]
+    fn control_plane_not_initialized_wire_value_is_pinned() {
+        // The discriminant is wire contract: old peers ignore it, but a renumber
+        // would silently flip classification on mixed-version clusters.
+        use rustfs_protos::proto_gen::node_service::ControlPlaneErrorCode;
+        assert_eq!(ControlPlaneErrorCode::ControlPlaneErrorUnspecified as i32, 0);
+        assert_eq!(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32, 1);
+        assert_eq!(ControlPlaneErrorCode::ControlPlaneErrorInvalidArgument as i32, 2);
+    }
+
+    #[test]
+    fn control_plane_failure_preserves_typed_invalid_argument_reason() {
+        use rustfs_protos::proto_gen::node_service::ControlPlaneErrorCode;
+
+        let reason = "durable unresolved-entry recovery requires pool metadata V2 or V3";
+        let err = control_plane_failure(
+            "start_decommission",
+            None,
+            Some(ControlPlaneErrorCode::ControlPlaneErrorInvalidArgument as i32),
+            Some(reason.to_string()),
+        );
+
+        assert!(
+            matches!(
+                err,
+                Error::InvalidArgument(ref scope, ref operation, ref actual_reason)
+                    if scope == "control-plane" && operation == "start_decommission" && actual_reason == reason
+            ),
+            "forwarded validation failures must remain typed and actionable"
+        );
+    }
+
+    #[test]
+    fn tier_config_reload_remote_failure_keeps_typed_not_initialized() {
+        use rustfs_protos::proto_gen::node_service::ControlPlaneErrorCode;
+        let outcome = tier_config_reload_remote_failure(
+            Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
+            Some("errServerNotInitialized".to_string()),
+        );
+        match outcome {
+            TierConfigReloadOutcome::TransientRetrySameChannel(err) => {
+                assert!(matches!(err, Error::RemoteNotInitialized));
+            }
+            TierConfigReloadOutcome::TransientReconnect(err) | TierConfigReloadOutcome::Terminal(err) => {
+                panic!("not-initialized must stay retry-same-channel, got {err}")
+            }
+            TierConfigReloadOutcome::Success => panic!("a rejection cannot classify as success"),
+        }
+    }
+
+    #[test]
+    fn scanner_publication_lease_response_rejects_stale_generation_and_session() {
+        let token = Uuid::new_v4();
+        let response = ScannerPublicationLeaseResponse {
+            success: true,
+            token: token.as_bytes().to_vec().into(),
+            movement_generation: 7,
+            lease_ttl_ms: crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS,
+            error: None,
+            response_proof: Bytes::new(),
+            owner_id: Uuid::new_v4().to_string(),
+            session_id: "session-a".to_string(),
+        };
+
+        assert!(validate_scanner_publication_lease_response_fields(&response, "session-a", 7).is_ok());
+
+        let stale_generation = ScannerPublicationLeaseResponse {
+            movement_generation: 6,
+            ..response.clone()
+        };
+        let error = validate_scanner_publication_lease_response_fields(&stale_generation, "session-a", 7)
+            .expect_err("a response from an older movement generation must be rejected");
+        assert!(error.to_string().contains("different scanner publication lease generation"));
+
+        let stale_session = ScannerPublicationLeaseResponse {
+            session_id: "session-b".to_string(),
+            ..response
+        };
+        let error = validate_scanner_publication_lease_response_fields(&stale_session, "session-a", 7)
+            .expect_err("a response from an older scanner session must be rejected");
+        assert!(error.to_string().contains("different scanner publication lease session"));
+    }
+
+    #[test]
+    fn scanner_publication_lease_deadline_accounts_for_delayed_rpc_response() {
+        let started = std::time::Instant::now();
+        let expected_deadline = started + Duration::from_secs(55);
+        let deadline = scanner_publication_lease_deadline(started, started + Duration::from_secs(10), 60_000)
+            .expect("a response inside the safety window should retain the original deadline");
+        assert_eq!(deadline, expected_deadline);
+
+        let error = scanner_publication_lease_deadline(started, started + Duration::from_secs(55), 60_000)
+            .expect_err("a response arriving at the safety boundary must fail closed");
+        assert!(error.to_string().contains("after its safety window"));
+    }
 
     #[test]
     fn replication_stats_response_decodes_valid_empty_provider() {
@@ -2100,6 +3144,294 @@ mod tests {
                 .then_some(())
                 .ok_or_else(|| Error::other("peer returned an invalid scanner activity response proof"))
         })
+    }
+
+    fn decode_test_scanner_dirty_usage_snapshot(
+        response: ScannerDirtyUsageSnapshotResponse,
+    ) -> Result<ScannerPeerDirtyUsageSnapshot> {
+        decode_scanner_dirty_usage_snapshot_with_verifier(response, &[9; 16], |_canonical, proof| {
+            (proof == b"proof")
+                .then_some(())
+                .ok_or_else(|| Error::other("peer returned an invalid scanner dirty usage snapshot response proof"))
+        })
+    }
+
+    fn test_scanner_dirty_usage_snapshot_response() -> ScannerDirtyUsageSnapshotResponse {
+        ScannerDirtyUsageSnapshotResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            generation: 7,
+            pending_bucket_count: 2,
+            protocol_version: SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION,
+            complete: true,
+            buckets: vec![
+                rustfs_protos::proto_gen::node_service::ScannerDirtyUsageBucket {
+                    bucket: "archive".to_string(),
+                    generation: 3,
+                    bucket_incarnation: Uuid::from_u128(0x11111111111111111111111111111111).as_bytes().to_vec().into(),
+                },
+                rustfs_protos::proto_gen::node_service::ScannerDirtyUsageBucket {
+                    bucket: "photos".to_string(),
+                    generation: 7,
+                    bucket_incarnation: Uuid::from_u128(0x22222222222222222222222222222222).as_bytes().to_vec().into(),
+                },
+            ],
+            response_proof: b"proof".to_vec().into(),
+            owner_id: "33333333-3333-3333-3333-333333333333".to_string(),
+        }
+    }
+
+    #[test]
+    fn scanner_scoped_dirty_usage_ack_payloads_split_at_protocol_limit() {
+        use rustfs_protos::scoped_dirty_usage::{SCOPED_DIRTY_USAGE_MAX_ENTRIES, canonical_scoped_dirty_usage_request};
+
+        let entries = (0..=SCOPED_DIRTY_USAGE_MAX_ENTRIES)
+            .map(|index| ScannerScopedDirtyUsageAckEntry {
+                bucket: format!("bucket-{index:02}"),
+                bucket_incarnation: Uuid::from_u128(0x11111111111111111111111111111111),
+                generation: 9,
+            })
+            .collect::<Vec<_>>();
+
+        let payloads = scanner_scoped_dirty_usage_ack_payloads(
+            "33333333-3333-3333-3333-333333333333".to_string(),
+            "0123456789abcdef0123456789abcdef".to_string(),
+            false,
+            entries,
+        )
+        .expect("33 entries should split into valid scoped dirty usage requests");
+
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0].entries.len(), SCOPED_DIRTY_USAGE_MAX_ENTRIES as usize);
+        assert_eq!(payloads[1].entries.len(), 1);
+        assert_eq!(payloads[0].entries.first().map(|entry| entry.bucket.as_str()), Some("bucket-00"));
+        assert_eq!(payloads[0].entries.last().map(|entry| entry.bucket.as_str()), Some("bucket-31"));
+        assert_eq!(payloads[1].entries.first().map(|entry| entry.bucket.as_str()), Some("bucket-32"));
+        for payload in payloads {
+            canonical_scoped_dirty_usage_request(&payload).expect("each split scoped ACK payload should be canonical");
+        }
+    }
+
+    #[test]
+    fn scanner_scoped_dirty_usage_ack_response_bounds_cleared_entries_to_request() {
+        use rustfs_protos::scoped_dirty_usage::{
+            SCOPED_DIRTY_USAGE_MAX_ENTRIES, SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES, SCOPED_DIRTY_USAGE_PROTOCOL_VERSION,
+        };
+
+        let mut request = scanner_scoped_dirty_usage_ack_payload(
+            "33333333-3333-3333-3333-333333333333",
+            "0123456789abcdef0123456789abcdef",
+            false,
+            vec![
+                ScannerScopedDirtyUsageEntry {
+                    bucket: "archive".to_string(),
+                    bucket_incarnation: Uuid::from_u128(0x11111111111111111111111111111111).as_bytes().to_vec().into(),
+                    generation: 3,
+                },
+                ScannerScopedDirtyUsageEntry {
+                    bucket: "photos".to_string(),
+                    bucket_incarnation: Uuid::from_u128(0x22222222222222222222222222222222).as_bytes().to_vec().into(),
+                    generation: 7,
+                },
+            ],
+        )
+        .expect("two ordered entries should form a valid scoped ACK request");
+        let mut response = ScannerScopedDirtyUsageAckResponse {
+            protocol_version: SCOPED_DIRTY_USAGE_PROTOCOL_VERSION,
+            owner_id: request.owner_id.clone(),
+            instance_id: request.instance_id.clone(),
+            supported: true,
+            max_entries: SCOPED_DIRTY_USAGE_MAX_ENTRIES,
+            max_request_bytes: SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES,
+            cleared: 1,
+            response_proof: Bytes::new(),
+        };
+
+        assert!(scanner_scoped_dirty_usage_ack_response_matches(&request, &response));
+        response.cleared = 2;
+        assert!(scanner_scoped_dirty_usage_ack_response_matches(&request, &response));
+        response.cleared = 3;
+        assert!(
+            !scanner_scoped_dirty_usage_ack_response_matches(&request, &response),
+            "a peer cannot clear more entries than the signed request contains"
+        );
+
+        request.probe_only = true;
+        response.cleared = 1;
+        assert!(
+            !scanner_scoped_dirty_usage_ack_response_matches(&request, &response),
+            "a capability probe cannot report a mutation"
+        );
+        response.cleared = 0;
+        assert!(scanner_scoped_dirty_usage_ack_response_matches(&request, &response));
+    }
+
+    #[test]
+    fn scanner_scoped_dirty_usage_ack_reconciliation_requires_same_clean_instance() {
+        let activity = |instance_id: &str, generation, pending| ScannerPeerActivity {
+            instance_id: instance_id.to_string(),
+            namespace_generation: 1,
+            maintenance_generation: 1,
+            protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            topology_digest: Some([1; 32]),
+            data_movement_active: Some(false),
+            dirty_usage_generation: generation,
+            dirty_usage_pending: pending,
+            movement_generation: Some(1),
+            publication_blocked: Some(false),
+        };
+
+        assert!(scanner_scoped_dirty_usage_ack_reconciled(
+            &activity("0123456789abcdef0123456789abcdef", Some(9), Some(false)),
+            "0123456789abcdef0123456789abcdef",
+            9
+        ));
+        assert!(scanner_scoped_dirty_usage_ack_reconciled(
+            &activity("0123456789abcdef0123456789abcdef", Some(10), Some(false)),
+            "0123456789abcdef0123456789abcdef",
+            9
+        ));
+        assert!(!scanner_scoped_dirty_usage_ack_reconciled(
+            &activity("0123456789abcdef0123456789abcdef", Some(8), Some(false)),
+            "0123456789abcdef0123456789abcdef",
+            9
+        ));
+        assert!(!scanner_scoped_dirty_usage_ack_reconciled(
+            &activity("0123456789abcdef0123456789abcdef", None, Some(false)),
+            "0123456789abcdef0123456789abcdef",
+            9
+        ));
+        assert!(!scanner_scoped_dirty_usage_ack_reconciled(
+            &activity("0123456789abcdef0123456789abcdef", Some(9), Some(true)),
+            "0123456789abcdef0123456789abcdef",
+            9
+        ));
+        assert!(!scanner_scoped_dirty_usage_ack_reconciled(
+            &activity("fedcba9876543210fedcba9876543210", Some(9), Some(false)),
+            "0123456789abcdef0123456789abcdef",
+            9
+        ));
+    }
+
+    #[test]
+    fn scanner_dirty_usage_snapshot_requires_a_complete_authenticated_ordered_view() {
+        let decoded = decode_test_scanner_dirty_usage_snapshot(test_scanner_dirty_usage_snapshot_response())
+            .expect("a complete authenticated dirty usage snapshot should decode");
+        assert_eq!(decoded.instance_id, "0123456789abcdef0123456789abcdef");
+        assert_eq!(decoded.generation, 7);
+        assert_eq!(decoded.pending_bucket_count, 2);
+        assert_eq!(decoded.protocol_version, SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION);
+        assert_eq!(decoded.owner_id, "33333333-3333-3333-3333-333333333333");
+        assert!(decoded.complete);
+        assert_eq!(
+            decoded.buckets.get("archive").map(|bucket| bucket.bucket_incarnation),
+            Some(Uuid::from_u128(0x11111111111111111111111111111111))
+        );
+        assert_eq!(decoded.buckets.get("archive").map(|bucket| bucket.generation), Some(3));
+        assert_eq!(
+            decoded.buckets.get("photos").map(|bucket| bucket.bucket_incarnation),
+            Some(Uuid::from_u128(0x22222222222222222222222222222222))
+        );
+        assert_eq!(decoded.buckets.get("photos").map(|bucket| bucket.generation), Some(7));
+
+        let overflow_count =
+            u64::try_from(SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES + 1).expect("the test snapshot entry limit should fit in u64");
+        let overflow = decode_test_scanner_dirty_usage_snapshot(ScannerDirtyUsageSnapshotResponse {
+            pending_bucket_count: overflow_count,
+            complete: false,
+            buckets: Vec::new(),
+            ..test_scanner_dirty_usage_snapshot_response()
+        })
+        .expect("an explicit all-or-nothing overflow snapshot should decode");
+        assert!(!overflow.complete);
+        assert!(overflow.buckets.is_empty());
+    }
+
+    #[test]
+    fn scanner_dirty_usage_snapshot_rejects_inconsistent_or_partial_peer_data() {
+        let mut cases = Vec::new();
+
+        let mut invalid_instance = test_scanner_dirty_usage_snapshot_response();
+        invalid_instance.instance_id = "ABCDEF0123456789ABCDEF0123456789".to_string();
+        cases.push((invalid_instance, "instance ID"));
+
+        let mut unsupported = test_scanner_dirty_usage_snapshot_response();
+        unsupported.protocol_version = SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION + 1;
+        cases.push((unsupported, "unsupported"));
+
+        let mut exhausted = test_scanner_dirty_usage_snapshot_response();
+        exhausted.generation = u64::MAX;
+        cases.push((exhausted, "exhausted"));
+
+        let mut inconsistent_count = test_scanner_dirty_usage_snapshot_response();
+        inconsistent_count.pending_bucket_count = 3;
+        cases.push((inconsistent_count, "bucket count"));
+
+        let mut unordered = test_scanner_dirty_usage_snapshot_response();
+        unordered.buckets.reverse();
+        cases.push((unordered, "strictly ordered"));
+
+        let mut future_bucket = test_scanner_dirty_usage_snapshot_response();
+        future_bucket.buckets[0].generation = 8;
+        cases.push((future_bucket, "bucket generation"));
+
+        let mut zero_generation = test_scanner_dirty_usage_snapshot_response();
+        zero_generation.buckets[0].generation = 0;
+        cases.push((zero_generation, "bucket generation"));
+
+        let mut empty_bucket = test_scanner_dirty_usage_snapshot_response();
+        empty_bucket.buckets[0].bucket.clear();
+        cases.push((empty_bucket, "empty bucket name"));
+
+        let mut invalid_owner = test_scanner_dirty_usage_snapshot_response();
+        invalid_owner.owner_id.clear();
+        cases.push((invalid_owner, "snapshot owner"));
+
+        let mut invalid_incarnation = test_scanner_dirty_usage_snapshot_response();
+        invalid_incarnation.buckets[0].bucket_incarnation = Uuid::nil().as_bytes().to_vec().into();
+        cases.push((invalid_incarnation, "bucket incarnation"));
+
+        let mut partial = test_scanner_dirty_usage_snapshot_response();
+        partial.complete = false;
+        cases.push((partial, "entry-limit overflow"));
+
+        let too_many_buckets = ScannerDirtyUsageSnapshotResponse {
+            generation: 1,
+            pending_bucket_count: u64::try_from(SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES + 1)
+                .expect("the test snapshot entry limit should fit in u64"),
+            buckets: (0..=SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES)
+                .map(|index| rustfs_protos::proto_gen::node_service::ScannerDirtyUsageBucket {
+                    bucket: format!("bucket-{index:04}"),
+                    generation: 1,
+                    bucket_incarnation: Uuid::from_u128(0x11111111111111111111111111111111).as_bytes().to_vec().into(),
+                })
+                .collect(),
+            ..test_scanner_dirty_usage_snapshot_response()
+        };
+        cases.push((too_many_buckets, "exceeds the entry limit"));
+
+        let overflow_count =
+            u64::try_from(SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES + 1).expect("the test snapshot entry limit should fit in u64");
+        let invalid_overflow = ScannerDirtyUsageSnapshotResponse {
+            generation: 0,
+            pending_bucket_count: overflow_count,
+            complete: false,
+            buckets: Vec::new(),
+            ..test_scanner_dirty_usage_snapshot_response()
+        };
+        cases.push((invalid_overflow, "without a generation"));
+
+        for (response, expected) in cases {
+            let err =
+                decode_test_scanner_dirty_usage_snapshot(response).expect_err("malformed dirty usage snapshots must fail closed");
+            assert!(err.to_string().contains(expected), "expected {expected:?} in {err}");
+        }
+
+        let mut invalid_proof = test_scanner_dirty_usage_snapshot_response();
+        invalid_proof.protocol_version = SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION + 1;
+        invalid_proof.response_proof = b"invalid".to_vec().into();
+        let err = decode_test_scanner_dirty_usage_snapshot(invalid_proof)
+            .expect_err("an invalid response proof must fail before peer fields are trusted");
+        assert!(err.to_string().contains("response proof"));
     }
 
     #[test]
@@ -2229,6 +3561,8 @@ mod tests {
             response_proof: Vec::new().into(),
             dirty_usage_generation: 0,
             dirty_usage_pending: false,
+            movement_generation: None,
+            publication_blocked: None,
         })
         .expect("legacy peers should retain their activity generations during a rolling upgrade");
         assert_eq!(
@@ -2242,6 +3576,8 @@ mod tests {
                 data_movement_active: None,
                 dirty_usage_generation: None,
                 dirty_usage_pending: None,
+                movement_generation: None,
+                publication_blocked: None,
             }
         );
 
@@ -2255,6 +3591,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 0,
             dirty_usage_pending: false,
+            movement_generation: None,
+            publication_blocked: None,
         })
         .expect("protocol v4 peers should remain observable during a rolling upgrade");
         assert_eq!(
@@ -2268,8 +3606,28 @@ mod tests {
                 data_movement_active: Some(true),
                 dirty_usage_generation: None,
                 dirty_usage_pending: None,
+                movement_generation: None,
+                publication_blocked: None,
             }
         );
+
+        let v6 = decode_test_scanner_activity(ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: SCANNER_ACTIVITY_V6_PROTOCOL_VERSION,
+            topology_digest: vec![7; 32].into(),
+            data_movement_active: true,
+            response_proof: b"proof".to_vec().into(),
+            dirty_usage_generation: 11,
+            dirty_usage_pending: true,
+            movement_generation: None,
+            publication_blocked: None,
+        })
+        .expect("v6 peers should remain readable without a v7 publication proof");
+        assert_eq!(v6.movement_generation, None);
+        assert_eq!(v6.publication_blocked, None);
+        assert_eq!(v6.dirty_usage_generation, Some(11));
 
         let malformed_topology = ScannerActivityResponse {
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
@@ -2281,6 +3639,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: Some(19),
+            publication_blocked: Some(false),
         };
         assert!(
             decode_test_scanner_activity(malformed_topology)
@@ -2299,6 +3659,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: Some(19),
+            publication_blocked: Some(false),
         };
         assert!(
             decode_test_scanner_activity(missing_instance)
@@ -2317,6 +3679,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: Some(19),
+            publication_blocked: Some(false),
         };
         assert!(
             decode_test_scanner_activity(malformed_instance)
@@ -2335,6 +3699,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: Some(19),
+            publication_blocked: Some(false),
         })
         .expect("complete activity responses should be accepted");
         assert_eq!(
@@ -2348,7 +3714,29 @@ mod tests {
                 data_movement_active: Some(true),
                 dirty_usage_generation: Some(11),
                 dirty_usage_pending: Some(true),
+                movement_generation: Some(19),
+                publication_blocked: Some(false),
             }
+        );
+
+        let missing_movement_generation = ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            topology_digest: vec![7; 32].into(),
+            data_movement_active: false,
+            response_proof: b"proof".to_vec().into(),
+            dirty_usage_generation: 11,
+            dirty_usage_pending: false,
+            movement_generation: None,
+            publication_blocked: Some(false),
+        };
+        assert!(
+            decode_test_scanner_activity(missing_movement_generation)
+                .expect_err("v7 activity must carry movement generation")
+                .to_string()
+                .contains("movement generation")
         );
 
         let pending_without_generation = ScannerActivityResponse {
@@ -2361,6 +3749,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 0,
             dirty_usage_pending: true,
+            movement_generation: Some(19),
+            publication_blocked: Some(false),
         };
         assert!(
             decode_test_scanner_activity(pending_without_generation)
@@ -2379,6 +3769,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: None,
+            publication_blocked: None,
         };
         assert!(
             decode_test_scanner_activity(previous_with_dirty_usage)
@@ -2397,6 +3789,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 0,
             dirty_usage_pending: false,
+            movement_generation: None,
+            publication_blocked: None,
         };
         assert!(
             decode_test_scanner_activity(legacy_with_topology)
@@ -2415,6 +3809,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: None,
+            publication_blocked: None,
         };
         assert!(
             decode_test_scanner_activity(unsupported_protocol)
@@ -2433,6 +3829,8 @@ mod tests {
             response_proof: Vec::new().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: Some(19),
+            publication_blocked: Some(false),
         };
         assert!(
             decode_test_scanner_activity(missing_proof)
@@ -2534,6 +3932,67 @@ mod tests {
     }
 
     #[test]
+    fn heal_control_auth_retry_is_limited_to_transport_auth_rejection() {
+        assert!(heal_control_auth_may_need_replay_scope_refresh(&Error::from(
+            tonic::Status::unauthenticated("No valid auth token")
+        )));
+        assert!(!heal_control_auth_may_need_replay_scope_refresh(&Error::from(
+            tonic::Status::permission_denied("bad signature")
+        )));
+        assert!(!heal_control_auth_may_need_replay_scope_refresh(&Error::from(
+            tonic::Status::unauthenticated("application rejected heal control")
+        )));
+        assert!(!heal_control_auth_may_need_replay_scope_refresh(&Error::other(
+            "Io error: code: 'Unauthenticated', message: \"No valid auth token\""
+        )));
+    }
+
+    #[test]
+    fn heal_control_retry_plan_allows_one_reconnect_and_one_epoch_refresh() {
+        let offline = Error::RemoteClientUnavailable("peer http://127.0.0.1:9000 is temporarily offline".to_string());
+        let stale_epoch = Error::from(tonic::Status::unauthenticated("No valid auth token"));
+
+        assert_eq!(heal_control_retry_action(&offline, false, false), Some(HealControlRetryAction::Reconnect));
+        assert_eq!(heal_control_retry_action(&offline, true, false), None);
+        assert_eq!(
+            heal_control_retry_action(&stale_epoch, true, false),
+            Some(HealControlRetryAction::RefreshReplayScope),
+            "a reconnect may expose the restarted peer's stale replay epoch"
+        );
+        assert_eq!(heal_control_retry_action(&stale_epoch, true, true), None);
+        assert_eq!(
+            heal_control_retry_action(&stale_epoch, false, false),
+            Some(HealControlRetryAction::RefreshReplayScope)
+        );
+        assert_eq!(
+            heal_control_retry_action(&offline, false, true),
+            Some(HealControlRetryAction::Reconnect),
+            "an epoch refresh may be followed by one bounded reconnect"
+        );
+        assert_eq!(heal_control_retry_action(&offline, true, true), None);
+        assert_eq!(
+            heal_control_retry_action(&Error::from(tonic::Status::permission_denied("bad signature")), false, false),
+            None,
+            "authorization failures must never be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_control_epoch_refresh_clears_offline_gate() {
+        let client = test_peer_client();
+        client.offline.store(true, Ordering::Release);
+
+        client
+            .prepare_heal_control_retry(HealControlRetryAction::RefreshReplayScope)
+            .await;
+
+        assert!(
+            !client.offline.load(Ordering::Acquire),
+            "epoch refresh must not leave the following attempt behind the offline gate"
+        );
+    }
+
+    #[test]
     fn peer_rest_client_network_classifier_keeps_slow_peers_online() {
         // The per-RPC channel deadline (RUSTFS_INTERNODE_RPC_TIMEOUT, 30s)
         // surfaces as Cancelled "Timeout expired" carrying the transport
@@ -2632,11 +4091,11 @@ mod tests {
         // retired: the channel is healthy, so the rejection reflects remote state
         // that the next attempt can find healed.
         assert!(matches!(
-            tier_config_reload_remote_failure(Some("backend unavailable".to_string())),
+            tier_config_reload_remote_failure(None, Some("backend unavailable".to_string())),
             TierConfigReloadOutcome::TransientRetrySameChannel(_)
         ));
         assert!(matches!(
-            tier_config_reload_remote_failure(Some("errServerNotInitialized".to_string())),
+            tier_config_reload_remote_failure(None, Some("errServerNotInitialized".to_string())),
             TierConfigReloadOutcome::TransientRetrySameChannel(_)
         ));
         assert!(matches!(
@@ -2644,15 +4103,20 @@ mod tests {
             TierConfigReloadOutcome::Terminal(_)
         ));
         assert!(matches!(
-            tier_config_reload_connection_outcome(Error::other("can not get client, err: connection unavailable")),
+            tier_config_reload_connection_outcome(Error::RemoteClientUnavailable("connection unavailable".to_string())),
             TierConfigReloadOutcome::TransientReconnect(_)
         ));
-        // The bare word is trusted only to the right of the dial-failure
-        // prefix, not anywhere in the message.
+        // The bare word is trusted only inside the typed local dial failure,
+        // not anywhere in application text — including text that mimics the
+        // old "can not get client" string form, which is retired.
         assert!(matches!(
             tier_config_reload_connection_outcome(Error::other(
                 "bucket unavailable-logs rejected it, then: can not get client, err: some other reason"
             )),
+            TierConfigReloadOutcome::Terminal(_)
+        ));
+        assert!(matches!(
+            tier_config_reload_connection_outcome(Error::other("can not get client, err: connection unavailable")),
             TierConfigReloadOutcome::Terminal(_)
         ));
     }
@@ -2676,7 +4140,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    tier_config_reload_remote_failure(Some(error_info.to_string())),
+                    tier_config_reload_remote_failure(None, Some(error_info.to_string())),
                     TierConfigReloadOutcome::TransientRetrySameChannel(_)
                 ),
                 "a peer that rejected the apply must stay retryable so it converges: {error_info}"
@@ -2685,7 +4149,7 @@ mod tests {
 
         // An absent error message is still a rejection, not a reason to stop.
         assert!(matches!(
-            tier_config_reload_remote_failure(None),
+            tier_config_reload_remote_failure(None, None),
             TierConfigReloadOutcome::TransientRetrySameChannel(_)
         ));
 
@@ -2820,6 +4284,7 @@ mod tests {
         state: i32,
         applied: bool,
         error_info: Option<&'a str>,
+        failure_class: i32,
     }
 
     fn signed_tier_mutation_response(input: TierMutationResponseFixture<'_>) -> TierMutationControlResponse {
@@ -2833,6 +4298,7 @@ mod tests {
                 state: input.state,
                 applied: input.applied,
                 error_info: input.error_info,
+                failure_class: input.failure_class,
             })
             .expect("small tier mutation response should encode");
         let response_proof =
@@ -2843,6 +4309,7 @@ mod tests {
             applied: input.applied,
             error_info: input.error_info.map(str::to_string),
             response_proof: response_proof.into(),
+            failure_class: input.failure_class,
         }
     }
 
@@ -2860,6 +4327,7 @@ mod tests {
             state: TierMutationPeerState::Prepared as i32,
             applied: true,
             error_info: None,
+            failure_class: TierMutationFailureClass::Unspecified as i32,
         });
         validate_tier_mutation_response_proof(
             rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
@@ -2884,6 +4352,10 @@ mod tests {
                 applied: false,
                 ..response.clone()
             },
+            TierMutationControlResponse {
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
+                ..response.clone()
+            },
         ] {
             let err = validate_tier_mutation_response_proof(
                 rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
@@ -2905,6 +4377,44 @@ mod tests {
         )
         .expect_err("response proof must bind request phase");
         assert!(err.to_string().contains("invalid tier mutation response proof"));
+    }
+
+    #[test]
+    fn tier_mutation_response_rejects_oversized_proof_and_error_before_verification() {
+        let mutation_id = Uuid::new_v4();
+        let payload = b"tier-mutation-prepare";
+        let oversized_proof = TierMutationControlResponse {
+            success: false,
+            state: TierMutationPeerState::Unspecified as i32,
+            applied: false,
+            error_info: None,
+            response_proof: vec![0; rustfs_protos::TIER_MUTATION_RPC_MAX_RESPONSE_PROOF_SIZE + 1].into(),
+            failure_class: TierMutationFailureClass::Ambiguous as i32,
+        };
+        let err = validate_tier_mutation_response_proof(
+            rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            payload,
+            &oversized_proof,
+        )
+        .expect_err("oversized proof must fail before cryptographic verification");
+        assert!(err.to_string().contains("response proof exceeds size limit"));
+
+        let oversized_error = TierMutationControlResponse {
+            response_proof: Bytes::new(),
+            error_info: Some("e".repeat(rustfs_protos::TIER_MUTATION_RPC_MAX_ERROR_INFO_SIZE + 1)),
+            ..oversized_proof
+        };
+        let err = validate_tier_mutation_response_proof(
+            rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            payload,
+            &oversized_error,
+        )
+        .expect_err("oversized error detail must fail before proof construction");
+        assert!(err.to_string().contains("error response exceeds size limit"));
     }
 
     #[test]
@@ -2951,8 +4461,17 @@ mod tests {
             )
             .is_err()
         );
-        validate_tier_mutation_payload_len(TierMutationRpcPhase::Abort, 0).expect("empty abort payload should fit");
-        assert!(validate_tier_mutation_payload_len(TierMutationRpcPhase::Abort, 1).is_err());
+        assert!(validate_tier_mutation_payload_len(TierMutationRpcPhase::Abort, 0).is_err());
+        validate_tier_mutation_payload_len(TierMutationRpcPhase::Abort, 1).expect("non-empty abort payload should fit");
+        validate_tier_mutation_payload_len(TierMutationRpcPhase::Abort, rustfs_protos::TIER_MUTATION_RPC_MAX_ABORT_PAYLOAD_SIZE)
+            .expect("max abort payload should fit");
+        assert!(
+            validate_tier_mutation_payload_len(
+                TierMutationRpcPhase::Abort,
+                rustfs_protos::TIER_MUTATION_RPC_MAX_ABORT_PAYLOAD_SIZE + 1,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2967,7 +4486,7 @@ mod tests {
                 tonic::Status::deadline_exceeded("peer tier mutation control timed out"),
                 tonic::Status::unavailable("peer tier mutation control unavailable"),
             ] {
-                let err = tier_mutation_control_status_error(phase, status);
+                let err = tier_mutation_control_status_error(phase, rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION, status);
                 let rendered = err.to_string();
                 assert!(rendered.contains(&format!("peer tier mutation {label} RPC failed")), "{rendered}");
                 assert!(
@@ -2979,6 +4498,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn tier_mutation_v4_to_v3_rejection_classification_requires_exact_status_and_message() {
+        let version = rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION;
+        let exact = format!("unsupported tier mutation peer protocol version: {version}");
+        let rejected = tier_mutation_control_status_error(
+            TierMutationRpcPhase::Prepare,
+            version,
+            tonic::Status::failed_precondition(exact.clone()),
+        );
+        assert!(tier_mutation_error_is_definitely_rejected(&rejected));
+
+        for status in [
+            tonic::Status::failed_precondition(format!("{exact}.")),
+            tonic::Status::failed_precondition(format!("unsupported tier mutation peer protocol version: {}", version - 1)),
+            tonic::Status::invalid_argument(exact.clone()),
+            tonic::Status::unimplemented(exact),
+        ] {
+            let ambiguous = tier_mutation_control_status_error(TierMutationRpcPhase::Prepare, version, status);
+            assert!(
+                !tier_mutation_error_is_definitely_rejected(&ambiguous),
+                "near-text, wrong-code, and Unimplemented failures must remain ambiguous"
+            );
+        }
+    }
+
+    #[test]
+    fn tier_mutation_v4_failure_class_is_typed_and_fails_closed() {
+        let version = rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION;
+        let rejected = tier_mutation_failed_response_error(
+            version,
+            TierMutationFailureClass::PreDispatchRejected as i32,
+            Some("rejected".to_string()),
+        );
+        assert!(tier_mutation_error_is_definitely_rejected(&rejected));
+
+        for failure_class in [
+            TierMutationFailureClass::Unspecified as i32,
+            TierMutationFailureClass::Ambiguous as i32,
+            99,
+        ] {
+            let ambiguous = tier_mutation_failed_response_error(version, failure_class, None);
+            assert!(
+                !tier_mutation_error_is_definitely_rejected(&ambiguous),
+                "missing, unknown, and explicit ambiguous classes must trigger Abort fanout"
+            );
+        }
+
+        let v3_ignores_v4_class = tier_mutation_failed_response_error(
+            rustfs_protos::TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION,
+            TierMutationFailureClass::PreDispatchRejected as i32,
+            Some("legacy failure".to_string()),
+        );
+        assert!(!tier_mutation_error_is_definitely_rejected(&v3_ignores_v4_class));
     }
 
     #[tokio::test]
@@ -3189,13 +4763,23 @@ mod tests {
         // reduce_errs groups Io errors by kind plus rendered message: peers failing the
         // same operation must stay a single dominant error instead of one bucket per peer.
         let per_peer_errs = (0..4)
-            .map(|_| Some(DiskError::from(peer_failure_without_details("load_bucket_metadata", Some("shared")))))
+            .map(|_| {
+                Some(
+                    peer_failure_without_details("load_bucket_metadata", Some("shared"))
+                        .narrow_to_disk()
+                        .unwrap_or_else(DiskError::other),
+                )
+            })
             .collect::<Vec<_>>();
         let (count, dominant) = reduce_errs(&per_peer_errs, &[]);
         assert_eq!(count, 4, "one shared failure must not split into per-peer buckets");
         assert_eq!(
             dominant,
-            Some(DiskError::from(peer_failure_without_details("load_bucket_metadata", Some("shared"))))
+            Some(
+                peer_failure_without_details("load_bucket_metadata", Some("shared"))
+                    .narrow_to_disk()
+                    .unwrap_or_else(DiskError::other)
+            )
         );
 
         assert_ne!(

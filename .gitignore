@@ -33,6 +33,7 @@ profile.json
 *.zst
 .secrets
 *.go
+!crates/zip/tests/fixtures/snowball/**/generate/*.go
 *.pb
 *.svg
 deploy/logs/*.log.*
@@ -51,15 +52,15 @@ docs
 __pycache__/
 !docs/
 docs/*
+!docs/README.md
 !docs/architecture/
 !docs/architecture/**
 !docs/operations/
 !docs/operations/**
+!docs/postmortems/
+!docs/postmortems/**
 !docs/testing/
 !docs/testing/**
-docs/heal-scanner-logging-governance.md
-docs/benchmark/rustfs-target-bench/
-docs/benchmark/*.md
 .codegraph/*
 .docker/test/compat/data/*
 .docker/test/compat/kms/*
@@ -83,6 +84,8 @@ worktrees/*
 
 # Local AI-agent review artifacts (omo evidence dumps)
 .omo/
+# Legacy per-tool skill dir; skills live in .agents/skills (shared by all agents)
+.mimocode/
 
 # insta scratch files; the accepted .snap files ARE the assertions and are committed
 *.snap.new

@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Erasure coding implementation using reed-solomon-erasure (GF(2^8)).
+//! Erasure coding implementation using rustfs-erasure-codec (GF(2^8)).
 //! Supports legacy (reed-solomon-simd) for reading/healing old-version files.
 //!
 
 use bytes::{Bytes, BytesMut};
-use reed_solomon_erasure::galois_8::ReedSolomon;
 use reed_solomon_simd;
+use rustfs_erasure_codec::galois_8::ReedSolomon;
 use smallvec::SmallVec;
 use std::{
     collections::HashMap,
@@ -69,7 +69,7 @@ impl EncodedBlock {
     }
 }
 
-const MODERN_MAX_TOTAL_SHARDS: usize = <reed_solomon_erasure::galois_8::Field as reed_solomon_erasure::Field>::ORDER;
+const MODERN_MAX_TOTAL_SHARDS: usize = <rustfs_erasure_codec::galois_8::Field as rustfs_erasure_codec::Field>::ORDER;
 const MODERN_REED_SOLOMON_CACHE_MAX_ENTRIES: usize = 64;
 const LEGACY_REED_SOLOMON_CACHE_MAX_ENTRIES: usize = 16;
 // Vec growth may retain twice the requested logical length. Keeping the logical
@@ -109,7 +109,7 @@ pub enum ErasureConstructionError {
     #[error("failed to construct modern Reed-Solomon encoder")]
     ModernEncoder {
         #[source]
-        source: reed_solomon_erasure::Error,
+        source: rustfs_erasure_codec::Error,
     },
 
     /// The legacy encoder wrapper failed to initialize.
@@ -354,7 +354,7 @@ impl LegacyReedSolomonEncoder {
     }
 }
 
-/// Reed-Solomon encoder using reed-solomon-erasure
+/// Reed-Solomon encoder using rustfs-erasure-codec
 pub struct ReedSolomonEncoder {
     data_shards: usize,
     parity_shards: usize,
@@ -372,7 +372,7 @@ impl Clone for ReedSolomonEncoder {
 }
 
 impl ReedSolomonEncoder {
-    fn try_new_typed(data_shards: usize, parity_shards: usize) -> Result<Self, reed_solomon_erasure::Error> {
+    fn try_new_typed(data_shards: usize, parity_shards: usize) -> Result<Self, rustfs_erasure_codec::Error> {
         let encoder = if parity_shards > 0 {
             Some(cached_modern_reed_solomon(data_shards, parity_shards)?)
         } else {
@@ -445,7 +445,7 @@ impl ReedSolomonEncoder {
     }
 }
 
-fn cached_modern_reed_solomon(data_shards: usize, parity_shards: usize) -> Result<Arc<ReedSolomon>, reed_solomon_erasure::Error> {
+fn cached_modern_reed_solomon(data_shards: usize, parity_shards: usize) -> Result<Arc<ReedSolomon>, rustfs_erasure_codec::Error> {
     let key = (data_shards, parity_shards);
     let cache = MODERN_REED_SOLOMON_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
 
@@ -657,6 +657,10 @@ pub fn calc_shard_size(block_size: usize, data_shards: usize) -> usize {
 }
 
 impl Erasure {
+    pub(crate) fn uses_legacy_codec(&self) -> bool {
+        self.uses_legacy
+    }
+
     /// Create a new Erasure instance
     ///
     /// # Arguments
@@ -933,8 +937,29 @@ impl Erasure {
     }
 
     pub(crate) fn decode_data_with_reconstruction_verification(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+        self.decode_data_with_reconstruction_verification_policy(shards, false)
+    }
+
+    pub(crate) fn decode_data_with_reconstruction_verification_for_lockstep(
+        &self,
+        shards: &mut [Option<Vec<u8>>],
+    ) -> io::Result<()> {
+        self.decode_data_with_reconstruction_verification_policy(shards, true)
+    }
+
+    fn decode_data_with_reconstruction_verification_policy(
+        &self,
+        shards: &mut [Option<Vec<u8>>],
+        require_surplus_source: bool,
+    ) -> io::Result<()> {
         let missing_data_source = shards.iter().take(self.data_shards).any(|shard| shard.is_none());
         let available_shards = shards.iter().filter(|shard| shard.is_some()).count();
+        if require_surplus_source && missing_data_source && available_shards == self.data_shards {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "insufficient source shards to verify reconstructed data",
+            ));
+        }
         let source_parity = if missing_data_source && available_shards > self.data_shards {
             shards
                 .iter()
@@ -1386,11 +1411,11 @@ mod tests {
     #[test]
     fn construction_errors_preserve_encoder_sources() {
         let modern = ErasureConstructionError::ModernEncoder {
-            source: reed_solomon_erasure::Error::TooManyShards,
+            source: rustfs_erasure_codec::Error::TooManyShards,
         };
         assert!(
             std::error::Error::source(&modern)
-                .and_then(|source| source.downcast_ref::<reed_solomon_erasure::Error>())
+                .and_then(|source| source.downcast_ref::<rustfs_erasure_codec::Error>())
                 .is_some()
         );
 
@@ -1866,6 +1891,31 @@ mod tests {
             .expect_err("verified decode must reject inconsistent parity");
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decode_data_with_verification_scopes_exact_quorum_to_lockstep() {
+        for uses_legacy in [false, true] {
+            let erasure = Erasure::new_with_options(3, 2, 128, uses_legacy);
+            let data = b"verified reads must not accept reconstruction without a surplus source";
+            let encoded = erasure.encode_data(data).expect("encode should succeed");
+            let mut exact_quorum = optional_shards(&encoded);
+            exact_quorum[0] = None;
+            exact_quorum[erasure.total_shard_count() - 1] = None;
+
+            let mut default_shards = exact_quorum.clone();
+            erasure
+                .decode_data_with_reconstruction_verification(&mut default_shards)
+                .expect("default decode must preserve exact-quorum reconstruction");
+            assert_eq!(default_shards[0].as_deref(), Some(encoded[0].as_ref()));
+
+            let err = erasure
+                .decode_data_with_reconstruction_verification_for_lockstep(&mut exact_quorum)
+                .expect_err("data-shards-only lockstep must reject an exact decode quorum");
+
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("insufficient source shards"));
+        }
     }
 
     #[test]

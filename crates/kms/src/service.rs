@@ -23,7 +23,6 @@ use crate::encryption::context_aad;
 use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
 use crate::types::*;
-use base64::Engine;
 use jiff::Zoned;
 use md5::{Digest as Md5Digest, Md5};
 use rand::random;
@@ -40,7 +39,7 @@ use zeroize::Zeroize;
 fn md5_hex(input: impl AsRef<[u8]>) -> String {
     let mut hasher = Md5::new();
     hasher.update(input.as_ref());
-    hex::encode(hasher.finalize())
+    hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower)
 }
 
 /// Data key for object encryption
@@ -303,6 +302,41 @@ impl ObjectEncryptionService {
     ///
     pub fn backend_capabilities(&self) -> crate::backends::BackendCapabilities {
         self.kms_manager.backend_capabilities()
+    }
+
+    /// Re-wrap an object's encrypted data key onto its master key's current
+    /// version, without the plaintext data key ever reaching the caller.
+    ///
+    /// Pure passthrough: the backend owns the format and the no-op decision
+    /// ([`RewrapDataKeyResponse::rewrapped`] false means nothing to persist).
+    /// The context must be the object's own — the backend refuses an envelope
+    /// whose recorded context the caller cannot reproduce.
+    pub async fn rewrap_data_key(
+        &self,
+        encrypted_key: &[u8],
+        context: &ObjectEncryptionContext,
+    ) -> Result<crate::types::RewrapDataKeyResponse> {
+        self.kms_manager
+            .rewrap_data_key(crate::types::RewrapDataKeyRequest {
+                ciphertext: encrypted_key.to_vec(),
+                encryption_context: request_encryption_context(context),
+            })
+            .await
+    }
+
+    /// Report which master key version wraps an object's encrypted data key,
+    /// and whether a rewrap would change anything.
+    pub async fn describe_data_key_wrapping(
+        &self,
+        encrypted_key: &[u8],
+        context: &ObjectEncryptionContext,
+    ) -> Result<crate::types::DescribeDataKeyWrappingResponse> {
+        self.kms_manager
+            .describe_data_key_wrapping(crate::types::DescribeDataKeyWrappingRequest {
+                ciphertext: encrypted_key.to_vec(),
+                encryption_context: request_encryption_context(context),
+            })
+            .await
     }
 
     /// Create a data encryption key for object encryption
@@ -801,19 +835,16 @@ impl ObjectEncryptionService {
         // Internal headers for decryption
         headers.insert(
             INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
-            base64::engine::general_purpose::STANDARD.encode(&metadata.iv),
+            base64_simd::STANDARD.encode_to_string(&metadata.iv),
         );
 
         if let Some(ref tag) = metadata.tag {
-            headers.insert(
-                INTERNAL_ENCRYPTION_TAG_HEADER.to_string(),
-                base64::engine::general_purpose::STANDARD.encode(tag),
-            );
+            headers.insert(INTERNAL_ENCRYPTION_TAG_HEADER.to_string(), base64_simd::STANDARD.encode_to_string(tag));
         }
 
         headers.insert(
             INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),
-            base64::engine::general_purpose::STANDARD.encode(&metadata.encrypted_data_key),
+            base64_simd::STANDARD.encode_to_string(&metadata.encrypted_data_key),
         );
 
         // Whatever the object was sealed under is what gets stored: for a
@@ -871,14 +902,14 @@ impl ObjectEncryptionService {
         let iv = headers
             .get(INTERNAL_ENCRYPTION_IV_HEADER)
             .ok_or_else(|| KmsError::validation_error("Missing IV header"))?;
-        let iv = base64::engine::general_purpose::STANDARD
-            .decode(iv)
+        let iv = base64_simd::STANDARD
+            .decode_to_vec(iv)
             .map_err(|e| KmsError::validation_error(format!("Invalid IV: {e}")))?;
 
         let tag = if let Some(tag_str) = headers.get(INTERNAL_ENCRYPTION_TAG_HEADER) {
             Some(
-                base64::engine::general_purpose::STANDARD
-                    .decode(tag_str)
+                base64_simd::STANDARD
+                    .decode_to_vec(tag_str)
                     .map_err(|e| KmsError::validation_error(format!("Invalid tag: {e}")))?,
             )
         } else {
@@ -886,8 +917,8 @@ impl ObjectEncryptionService {
         };
 
         let encrypted_data_key = if let Some(key_str) = headers.get(INTERNAL_ENCRYPTION_KEY_HEADER) {
-            base64::engine::general_purpose::STANDARD
-                .decode(key_str)
+            base64_simd::STANDARD
+                .decode_to_vec(key_str)
                 .map_err(|e| KmsError::validation_error(format!("Invalid encrypted key: {e}")))?
         } else {
             Vec::new() // Empty for SSE-C

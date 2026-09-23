@@ -19,7 +19,7 @@ use crate::bucket::{
 };
 use crate::error::is_err_bucket_not_found;
 use crate::runtime::sources as runtime_sources;
-use crate::set_disk::get_lock_acquire_timeout;
+use crate::set_disk::{BucketInfoQuorum, get_lock_acquire_timeout};
 use crate::storage_api_contracts::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, SRBucketDeleteOp};
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use futures::stream::{self, StreamExt};
@@ -29,9 +29,64 @@ use std::future::Future;
 
 const DELETED_BUCKETS_PREFIX: &str = ".deleted";
 const SCANNER_BUCKET_LIST_SET_CONCURRENCY: usize = 4;
+const EVENT_BUCKET_DELETE_BLOCKED: &str = "bucket_delete_blocked";
+const EVENT_BUCKET_DELETE_ROLLBACK_FAILED: &str = "bucket_delete_rollback_failed";
 
-fn scanner_bucket_list_set_concurrency(set_count: usize) -> usize {
-    set_count.clamp(1, SCANNER_BUCKET_LIST_SET_CONCURRENCY)
+/// Record why `DeleteBucket` refused, and at a level that matches who can act
+/// on it.
+///
+/// `DeleteBucket` answers from a raw per-disk residue scan, not from a listing,
+/// so the server can refuse for a reason the client has no way to observe: the
+/// caller drained every version the S3 API will show and still gets
+/// `BucketNotEmpty`, with nothing to go on. This event is the only record of
+/// which residue blocked it and where — and it used to be emitted at `debug`,
+/// below both the `error` default log level and the `info` the CI s3-tests lane
+/// runs at, so in practice it was never written down. An intermittent
+/// `BucketNotEmpty` in that lane left a server log with no trace of the refusal
+/// at all, which is not a diagnosable state.
+///
+/// A blocker the client can still see and delete is ordinary — the 409 already
+/// says everything useful — so it stays at `warn`. Residue the client cannot
+/// reach through the API is a server-side integrity problem and is reported at
+/// `error`, which is what makes it survive a default deployment's filter.
+fn record_bucket_delete_blocker(bucket: &str, kind: BucketDeleteBlockerKind, residue: &BucketMetadataLessResidue) {
+    metrics::counter!("rustfs_bucket_delete_blockers_total", "kind" => kind.as_str()).increment(1);
+    if kind.is_client_visible() {
+        warn!(
+            event = EVENT_BUCKET_DELETE_BLOCKED,
+            component = "ecstore",
+            subsystem = "bucket",
+            bucket,
+            blocker = kind.as_str(),
+            files = residue.files,
+            uuid_data_dirs = residue.uuid_data_dirs,
+            entries_scanned = residue.entries_scanned,
+            diagnostic_bytes_read = residue.diagnostic_bytes_read,
+            diagnostic_truncated = residue.diagnostic_truncated,
+            sample = residue.sample.as_deref().unwrap_or("<none>"),
+            "Bucket deletion was blocked by durable local state"
+        );
+        return;
+    }
+
+    error!(
+        event = EVENT_BUCKET_DELETE_BLOCKED,
+        component = "ecstore",
+        subsystem = "bucket",
+        bucket,
+        blocker = kind.as_str(),
+        files = residue.files,
+        uuid_data_dirs = residue.uuid_data_dirs,
+        entries_scanned = residue.entries_scanned,
+        diagnostic_bytes_read = residue.diagnostic_bytes_read,
+        diagnostic_truncated = residue.diagnostic_truncated,
+        sample = residue.sample.as_deref().unwrap_or("<none>"),
+        "Bucket deletion was blocked by residue the client cannot reach through the S3 API"
+    );
+}
+
+fn bucket_list_set_concurrency(set_count: usize, max_concurrency: usize) -> usize {
+    set_count.clamp(1, max_concurrency.max(1))
 }
 
 fn should_override_created_from_metadata(created: OffsetDateTime) -> bool {
@@ -153,7 +208,65 @@ where
     await_bucket_namespace_operation(guard, bucket, "physical bucket deletion", future).await
 }
 
+async fn bucket_delete_local_blocker(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    budget: &mut BucketDeleteDiagnosticBudget,
+) -> Result<Option<StorageError>> {
+    let local_disks = runtime_sources::local_disks_in(ctx).await;
+    let mut residue = BucketMetadataLessResidue::default();
+
+    for disk in local_disks.iter() {
+        let Some(bucket_path) = disk.get_bucket_path_for_io_if_local(bucket) else {
+            continue;
+        };
+        let scan = scan_metadata_less_residue_with_budget(&bucket_path?, budget).await?;
+        if scan.xlmeta_found {
+            record_bucket_delete_blocker(bucket, scan.xlmeta_blocker.unwrap_or(BucketDeleteBlockerKind::UnknownXlMeta), &scan);
+            return Ok(Some(StorageError::BucketNotEmpty(bucket.to_string())));
+        }
+        residue.files = residue.files.saturating_add(scan.files);
+        residue.uuid_data_dirs = residue.uuid_data_dirs.saturating_add(scan.uuid_data_dirs);
+        residue.entries_scanned = residue.entries_scanned.saturating_add(scan.entries_scanned);
+        residue.diagnostic_bytes_read = residue.diagnostic_bytes_read.saturating_add(scan.diagnostic_bytes_read);
+        if residue.sample.is_none() {
+            residue.sample = scan.sample.clone();
+        }
+        if scan.diagnostic_truncated {
+            residue.diagnostic_truncated = true;
+            if residue.files == 0 {
+                // A zero-evidence timeout is inconclusive. Preflight still uses
+                // non-recursive `force_if_empty`; post-failure keeps the physical error.
+                return Ok(None);
+            }
+            record_bucket_delete_blocker(bucket, BucketDeleteBlockerKind::DiagnosticBudgetExceeded, &residue);
+            return Ok(Some(StorageError::BucketNotEmptyWithDetails {
+                bucket: bucket.to_string(),
+                details: residue.describe(),
+            }));
+        }
+    }
+
+    if residue.has_residue_without_xlmeta() {
+        record_bucket_delete_blocker(bucket, BucketDeleteBlockerKind::OrphanDirectory, &residue);
+        return Ok(Some(StorageError::BucketNotEmptyWithDetails {
+            bucket: bucket.to_string(),
+            details: residue.describe(),
+        }));
+    }
+
+    Ok(None)
+}
+
 impl ECStore {
+    fn bucket_sets(&self) -> impl Iterator<Item = (usize, usize, Arc<crate::set_disk::SetDisks>)> + '_ {
+        self.pools.iter().flat_map(|pool| {
+            pool.disk_set
+                .iter()
+                .map(|set| (set.pool_index, set.set_index, Arc::clone(set)))
+        })
+    }
+
     pub async fn get_bucket_metadata(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
         let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
         sys.read().await.get(bucket).await
@@ -216,11 +329,11 @@ impl ECStore {
     /// reuse its result, which is sound because bucket deletion/recreation
     /// requires the lifecycle WRITE lock and therefore cannot have run while
     /// any read guard was continuously held.
-    pub(crate) async fn acquire_bucket_incarnation_fence(
+    pub async fn acquire_bucket_incarnation_fence(
         &self,
         bucket: &str,
         expected: uuid::Uuid,
-    ) -> Result<super::bucket_fence::BucketIncarnationFenceGuard> {
+    ) -> Result<super::BucketIncarnationFenceGuard> {
         let inner = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
         let pieces = super::bucket_fence::FencePieces {
             registry: self.bucket_fence_registry.clone(),
@@ -251,6 +364,19 @@ impl ECStore {
         Ok(pieces.into_guard(bucket, registration.token))
     }
 
+    /// Hold this guard through recursive-delete authorization and mutation so
+    /// writers cannot introduce an unchecked object into the deletion scope.
+    pub async fn lock_bucket_for_recursive_delete(&self, bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
+        if self.ctx.lock_manager().is_disabled() {
+            return Err(StorageError::InvalidArgument(
+                bucket.to_owned(),
+                String::new(),
+                "Recursive deletion requires namespace locking".to_owned(),
+            ));
+        }
+        self.acquire_bucket_lifecycle_write_lock(bucket).await
+    }
+
     pub(crate) async fn acquire_bucket_lifecycle_write_lock(&self, bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
         let lock = self.new_ns_lock(bucket, BUCKET_LIFECYCLE_LOCK_OBJECT).await?;
         lock.get_write_lock(get_lock_acquire_timeout())
@@ -272,18 +398,94 @@ impl ECStore {
     async fn mark_bucket_deleted(&self, bucket: &str) -> Result<()> {
         let marker_volume = bucket_deleted_marker_volume(bucket);
 
-        self.peer_sys
-            .make_bucket(
-                marker_volume.as_str(),
-                &MakeBucketOptions {
-                    force_create: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| to_object_err(e.into(), vec![bucket]))?;
+        self.make_bucket_on_sets(
+            marker_volume.as_str(),
+            &MakeBucketOptions {
+                force_create: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|err| to_object_err(err, vec![bucket]))?;
 
         Ok(())
+    }
+
+    async fn make_bucket_on_sets(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
+        let results = futures::future::join_all(
+            self.bucket_sets()
+                .map(|(_, _, set)| async move { set.make_bucket(bucket, opts).await }),
+        )
+        .await;
+        if results.is_empty() {
+            return Err(StorageError::ErasureWriteQuorum);
+        }
+
+        let mut bucket_exists_error = None;
+        let mut first_hard_error = None;
+        for result in results {
+            let Err(err) = result else {
+                continue;
+            };
+            if matches!(err, StorageError::VolumeExists) || is_err_bucket_exists(&err) {
+                if bucket_exists_error.is_none() {
+                    bucket_exists_error = Some(err);
+                }
+            } else if first_hard_error.is_none() {
+                first_hard_error = Some(err);
+            }
+        }
+
+        match first_hard_error.or(bucket_exists_error) {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    async fn delete_bucket_on_sets(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
+        let results = futures::future::join_all(
+            self.bucket_sets()
+                .map(|(_, _, set)| async move { set.delete_bucket(bucket, opts).await }),
+        )
+        .await;
+        if results.is_empty() {
+            return Err(StorageError::ErasureWriteQuorum);
+        }
+
+        let mut deleted = false;
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok(()) => deleted = true,
+                Err(err) if is_err_strict_volume_not_found(&err) => {}
+                Err(err) if first_error.is_none() => first_error = Some(err),
+                Err(_) => {}
+            }
+        }
+
+        if let Some(delete_error) = first_error {
+            if !opts.no_recreate {
+                let rollback_opts = MakeBucketOptions {
+                    force_create: true,
+                    no_lock: true,
+                    ..Default::default()
+                };
+                if let Err(rollback_error) = self.make_bucket_on_sets(bucket, &rollback_opts).await {
+                    warn!(
+                        event = EVENT_BUCKET_DELETE_ROLLBACK_FAILED,
+                        component = "ecstore",
+                        subsystem = "bucket",
+                        bucket,
+                        deletion_error = ?delete_error,
+                        rollback_error = ?rollback_error,
+                        "Bucket deletion rollback could not restore every bucket volume"
+                    );
+                }
+            }
+            return Err(delete_error);
+        }
+
+        if deleted { Ok(()) } else { Err(StorageError::VolumeNotFound) }
     }
 
     async fn cleanup_deleted_bucket_metadata(
@@ -355,10 +557,9 @@ impl ECStore {
         };
         if let Err(err) =
             await_bucket_lifecycle_operation(lifecycle_guard, namespace_guard, bucket, "failed bucket creation rollback", async {
-                self.peer_sys
-                    .delete_bucket(bucket, &rollback_opts)
+                self.delete_bucket_on_sets(bucket, &rollback_opts)
                     .await
-                    .map_err(|rollback_err| to_object_err(rollback_err.into(), vec![bucket]))
+                    .map_err(|rollback_err| to_object_err(rollback_err, vec![bucket]))
             })
             .await
         {
@@ -425,10 +626,9 @@ impl ECStore {
             None
         };
 
-        let existing_bucket_info = match self.peer_sys.get_bucket_info(bucket, &BucketOptions::default()).await {
+        let existing_bucket_info = match self.get_bucket_info_from_sets(bucket, &BucketOptions::default()).await {
             Ok(info) => Some(info),
             Err(err) => {
-                let err: StorageError = err.into();
                 if is_err_bucket_not_found(&err) {
                     None
                 } else {
@@ -445,6 +645,17 @@ impl ECStore {
                     .as_ref()
                     .and_then(|info| info.created)
                     .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+                // A sidecar left by an interrupted legacy migration is the
+                // bucket's published incarnation; keep it rather than minting
+                // one that would invalidate fences taken on the stored value.
+                // A retired incarnation is residue of a deleted bucket and
+                // must not come back.
+                let store = metadata_sys::object_store_in(&self.ctx).await?;
+                if let Some(stored) = crate::bucket::metadata::load_bucket_incarnation(store.clone(), bucket).await?
+                    && !crate::bucket::retirement::is_retired(store, bucket, stored).await?
+                {
+                    metadata.bucket_incarnation_id = stored;
+                }
             } else if !metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() {
                 return Err(Error::other(format!(
                     "bucket incarnation sidecar is missing for new-format metadata: {bucket}"
@@ -517,10 +728,9 @@ impl ECStore {
                 bucket,
                 "bucket creation metadata transaction",
                 async {
-                    self.peer_sys
-                        .make_bucket(bucket, opts)
+                    self.make_bucket_on_sets(bucket, opts)
                         .await
-                        .map_err(|err| to_object_err(err.into(), vec![bucket]))
+                        .map_err(|err| to_object_err(err, vec![bucket]))
                 },
             ),
         )
@@ -539,7 +749,7 @@ impl ECStore {
             {
                 warn!("best-effort bucket heal after BucketExists failed: {heal_err}");
             }
-            if !is_err_bucket_exists(&err) && ns_guard.as_ref().is_none_or(|guard| !guard.is_lock_lost()) {
+            if confirmed_missing && !is_err_bucket_exists(&err) && ns_guard.as_ref().is_none_or(|guard| !guard.is_lock_lost()) {
                 error!("make bucket failed: {err}");
                 self.rollback_failed_bucket_creation(bucket, bucket_lifecycle_guard.as_ref(), ns_guard.as_ref())
                     .await;
@@ -584,9 +794,94 @@ impl ECStore {
         Ok(())
     }
 
+    /// Prove a live bucket generation before repairing missing expansion volumes.
+    /// Unlike request validation, repair only needs one erasure set to confirm
+    /// existence; an incomplete expansion set is precisely what repair fixes.
+    /// Callers must hold the bucket namespace lock through the subsequent heal.
+    pub(crate) async fn bucket_exists_for_heal(&self, bucket: &str) -> Result<bool> {
+        let results = futures::future::join_all(
+            self.bucket_sets()
+                .map(|(_, _, set)| async move { set.get_bucket_info(bucket, &BucketOptions::default()).await }),
+        )
+        .await;
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok(_) => return Ok(true),
+                Err(err) if is_err_strict_volume_not_found(&err) => {}
+                Err(err) if first_error.is_none() => first_error = Some(err),
+                Err(_) => {}
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(false),
+        }
+    }
+
+    #[instrument(skip(self))]
+    pub(crate) async fn get_bucket_info_from_sets(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
+        self.get_bucket_info_from_sets_with_quorum(bucket, opts, BucketInfoQuorum::Write)
+            .await
+    }
+
+    pub(crate) async fn get_bucket_info_from_sets_at_read_quorum(
+        &self,
+        bucket: &str,
+        opts: &BucketOptions,
+    ) -> Result<BucketInfo> {
+        self.get_bucket_info_from_sets_with_quorum(bucket, opts, BucketInfoQuorum::Read)
+            .await
+    }
+
+    async fn get_bucket_info_from_sets_with_quorum(
+        &self,
+        bucket: &str,
+        opts: &BucketOptions,
+        quorum: BucketInfoQuorum,
+    ) -> Result<BucketInfo> {
+        // One host may participate in several pools after expansion. Resolve the
+        // namespace against each erasure set so disks from different pools can
+        // never be combined into one bucket quorum.
+        // Bucket validation is request-path IO. Keep the previous peer fanout's
+        // latency shape by probing every set concurrently; scanner listings use
+        // a separate bounded path below because they run continuously.
+        let mut scoped_results = futures::future::join_all(self.bucket_sets().map(|(pool_index, set_index, set)| async move {
+            let result = match quorum {
+                BucketInfoQuorum::Read => set.stat_bucket_with_quorum(bucket, quorum).await,
+                BucketInfoQuorum::Write => set.get_bucket_info(bucket, opts).await,
+            };
+            (pool_index, set_index, result)
+        }))
+        .await;
+        scoped_results.sort_unstable_by_key(|(pool_index, set_index, _)| (*pool_index, *set_index));
+
+        let mut first_info = None;
+        let mut first_error = None;
+        for (_, _, result) in scoped_results {
+            match result {
+                Ok(info) if first_info.is_none() => first_info = Some(info),
+                Ok(_) => {}
+                Err(err) if is_err_strict_volume_not_found(&err) => {}
+                Err(err) if first_error.is_none() => first_error = Some(err),
+                Err(_) => {}
+            }
+        }
+
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+
+        first_info.ok_or(Error::VolumeNotFound)
+    }
+
     #[instrument(skip(self))]
     pub(super) async fn handle_get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
-        let mut info = self.peer_sys.get_bucket_info(bucket, opts).await?;
+        let mut info = match self.get_bucket_info_from_sets(bucket, opts).await {
+            Ok(info) => info,
+            Err(Error::ErasureWriteQuorum) => return self.get_bucket_info_at_read_quorum(bucket, opts).await,
+            Err(err) => return Err(err),
+        };
 
         if let Ok(sys) = metadata_sys::get_in(&self.ctx, bucket).await {
             if should_override_created_from_metadata(sys.created) {
@@ -599,39 +894,56 @@ impl ECStore {
         Ok(info)
     }
 
+    async fn get_bucket_info_at_read_quorum(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
+        // Lock order: bucket lifecycle -> internal metadata object read locks.
+        // Keep create/delete from changing the namespace while a read quorum
+        // confirms both physical presence and persisted bucket metadata.
+        let guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
+        await_bucket_namespace_operation(Some(&guard), bucket, "bucket read quorum validation", async {
+            let mut info = self
+                .get_bucket_info_from_sets_with_quorum(bucket, opts, BucketInfoQuorum::Read)
+                .await?;
+            let (metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
+            if !persisted {
+                // A minority of directories left by failed creation is not an
+                // authoritative bucket. Never turn fabricated defaults into
+                // permission to serve degraded reads.
+                return Err(Error::ErasureReadQuorum);
+            }
+            if metadata.name != bucket {
+                return Err(Error::FileCorrupt);
+            }
+            if should_override_created_from_metadata(metadata.created) {
+                info.created = Some(metadata.created);
+            }
+            info.versioning = metadata.versioning();
+            info.object_locking = metadata.object_locking();
+            Ok(info)
+        })
+        .await
+    }
+
     #[instrument(skip(self))]
     pub(super) async fn handle_list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         // TODO(backlog): support cached bucket listing via opts.cached
-
-        let mut buckets = self.peer_sys.list_bucket(opts).await?;
-
-        if !opts.no_metadata {
-            for bucket in buckets.iter_mut() {
-                if let Ok(created) = metadata_sys::created_at_in(&self.ctx, &bucket.name).await
-                    && should_override_created_from_metadata(created)
-                {
-                    bucket.created = Some(created);
-                }
-            }
-        }
-        Ok(buckets)
+        Ok(self.list_bucket_from_sets(opts, usize::MAX).await?.buckets)
     }
 
     pub async fn list_bucket_for_scanner(&self, opts: &BucketOptions) -> Result<crate::cluster::rpc::ScannerBucketListing> {
-        let sets = self
-            .pools
-            .iter()
-            .flat_map(|pool| {
-                pool.disk_set
-                    .iter()
-                    .map(|set| (set.pool_index, set.set_index, Arc::clone(set)))
-            })
-            .collect::<Vec<_>>();
-        let set_count = sets.len();
+        self.list_bucket_from_sets(opts, SCANNER_BUCKET_LIST_SET_CONCURRENCY).await
+    }
+
+    async fn list_bucket_from_sets(
+        &self,
+        opts: &BucketOptions,
+        max_concurrency: usize,
+    ) -> Result<crate::cluster::rpc::ScannerBucketListing> {
+        let set_count = self.pools.iter().map(|pool| pool.disk_set.len()).sum();
+        let concurrency = bucket_list_set_concurrency(set_count, max_concurrency);
         let deleted = opts.deleted;
         let cached = opts.cached;
         let no_metadata = opts.no_metadata;
-        let mut set_listings = stream::iter(sets.into_iter().map(move |(pool_index, set_index, set)| {
+        let mut set_listings = stream::iter(self.bucket_sets().map(move |(pool_index, set_index, set)| {
             let opts = BucketOptions {
                 deleted,
                 cached,
@@ -643,7 +955,7 @@ impl ECStore {
                     .map(|(buckets, complete)| (pool_index, set_index, buckets, complete))
             }
         }))
-        .buffer_unordered(scanner_bucket_list_set_concurrency(set_count));
+        .buffer_unordered(concurrency);
         let mut topology_complete = set_count != 0;
         let mut bucket_map = BTreeMap::<String, BucketInfo>::new();
         let mut scoped_buckets = Vec::with_capacity(set_count);
@@ -693,6 +1005,16 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
+        self.handle_delete_bucket_with_diagnostic_budget(bucket, opts, BucketDeleteDiagnosticBudget::new())
+            .await
+    }
+
+    async fn handle_delete_bucket_with_diagnostic_budget(
+        &self,
+        bucket: &str,
+        opts: &DeleteBucketOptions,
+        mut diagnostic_budget: BucketDeleteDiagnosticBudget,
+    ) -> Result<()> {
         if is_meta_bucketname(bucket) {
             return Err(StorageError::BucketNameInvalid(bucket.to_string()));
         }
@@ -738,37 +1060,24 @@ impl ECStore {
         let sr_purge = opts.srdelete_op == SRBucketDeleteOp::Purge;
         let sr_delete = sr_mark_delete || sr_purge;
         let mut delete_opts = opts.clone();
-        let bucket_exists = match self.peer_sys.get_bucket_info(bucket, &BucketOptions::default()).await {
+        let bucket_exists = match self.get_bucket_info_from_sets(bucket, &BucketOptions::default()).await {
             Ok(_) => true,
             Err(err) => {
-                let storage_err: StorageError = err.into();
-                if is_err_strict_volume_not_found(&storage_err) && sr_delete {
+                if is_err_strict_volume_not_found(&err) && sr_delete {
                     false
-                } else if is_err_strict_volume_not_found(&storage_err) {
+                } else if is_err_strict_volume_not_found(&err) {
                     return Err(StorageError::BucketNotFound(bucket.to_string()));
                 } else {
-                    return Err(to_object_err(storage_err, vec![bucket]));
+                    return Err(to_object_err(err, vec![bucket]));
                 }
             }
         };
-
         if bucket_exists {
             validate_table_bucket_delete_guard(&self.ctx, bucket).await?;
 
-            // Check bucket is empty before deletion (per S3 API spec)
-            // If bucket is not empty (contains actual objects with xl.meta files) and force
-            // is not set, return BucketNotEmpty error.
-            // Note: Empty directories (left after object deletion) should NOT count as objects.
             if !opts.force {
-                let local_disks = runtime_sources::local_disks_in(&self.ctx).await;
-                for disk in local_disks.iter() {
-                    let Some(bucket_path) = disk.get_bucket_path_for_io_if_local(bucket) else {
-                        continue;
-                    };
-                    let bucket_path = bucket_path?;
-                    if has_xlmeta_files(&bucket_path).await? {
-                        return Err(StorageError::BucketNotEmpty(bucket.to_string()));
-                    }
+                if let Some(blocker) = bucket_delete_local_blocker(&self.ctx, bucket, &mut diagnostic_budget).await? {
+                    return Err(blocker);
                 }
                 delete_opts.force_if_empty = true;
             }
@@ -777,6 +1086,9 @@ impl ECStore {
         if sr_delete && !bucket_exists {
             delete_opts.force_if_empty = true;
         }
+
+        #[cfg(test)]
+        crate::cluster::rpc::peer_s3_client::pause_after_delete_bucket_empty_scan().await;
 
         if sr_mark_delete {
             await_bucket_lifecycle_operation(
@@ -789,22 +1101,62 @@ impl ECStore {
             .await?;
         }
 
+        // Capture the authoritative old identity before its namespace disappears.
+        // Legacy buckets without a stamp cannot produce retirement authority.
+        let retirement = if bucket_exists && bucket_lifecycle_guard.is_some() && !is_meta_bucketname(bucket) {
+            if let Some(store) = metadata_sys::object_store_if_initialized_in(&self.ctx).await {
+                crate::bucket::metadata::load_bucket_incarnation(store.clone(), bucket)
+                    .await?
+                    .map(|incarnation| (store, incarnation))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let delete_result = await_bucket_namespace_operation(
             bucket_lifecycle_guard.as_ref(),
             bucket,
             "physical bucket deletion",
             run_physical_bucket_deletion(ns_guard.as_ref(), bucket, async {
-                self.peer_sys
-                    .delete_bucket(bucket, &delete_opts)
+                self.delete_bucket_on_sets(bucket, &delete_opts)
                     .await
-                    .map_err(|err| to_object_err(err.into(), vec![bucket]))
+                    .map_err(|err| to_object_err(err, vec![bucket]))
             }),
         )
         .await;
         if let Err(err) = delete_result
             && (!sr_delete || !is_err_strict_volume_not_found(&err))
         {
+            if delete_opts.force_if_empty && matches!(&err, StorageError::BucketNotEmpty(_)) {
+                let mut diagnostic_budget = BucketDeleteDiagnosticBudget::new();
+                if let Some(blocker) = bucket_delete_local_blocker(&self.ctx, bucket, &mut diagnostic_budget).await? {
+                    return Err(blocker);
+                }
+            }
             return Err(err);
+        }
+
+        if let Some((store, incarnation)) = retirement {
+            let mut record_opts = ObjectOptions {
+                max_parity: true,
+                ..Default::default()
+            };
+            if let Some(guard) = bucket_lifecycle_guard.as_ref() {
+                record_opts.add_bucket_lifecycle_lock_guard(guard);
+            }
+            if let Some(guard) = ns_guard.as_ref() {
+                record_opts.add_namespace_lock_guard(guard);
+            }
+            await_bucket_lifecycle_operation(
+                bucket_lifecycle_guard.as_ref(),
+                ns_guard.as_ref(),
+                bucket,
+                "bucket retirement publication",
+                crate::bucket::retirement::commit_retirement(store, bucket, incarnation, &record_opts),
+            )
+            .await?;
         }
 
         self.cleanup_bucket_usage_best_effort(bucket, ns_guard.as_ref()).await;
@@ -829,19 +1181,24 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        SCANNER_BUCKET_LIST_SET_CONCURRENCY, await_bucket_namespace_operation, bucket_delete_metadata_cleanup_prefixes,
-        bucket_deleted_marker_prefix, bucket_deleted_marker_volume, run_bucket_usage_cleanup, run_physical_bucket_deletion,
-        scanner_bucket_list_set_concurrency, should_override_created_from_metadata, validate_table_bucket_delete_allowed,
+        BUCKET_DELETE_DIAGNOSTIC_MAX_ELAPSED, BUCKET_DELETE_DIAGNOSTIC_MAX_ENTRIES, BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES,
+        BucketDeleteBlockerKind, BucketDeleteDiagnosticBudget, BucketMetadataLessResidue, SCANNER_BUCKET_LIST_SET_CONCURRENCY,
+        await_bucket_namespace_operation, bucket_delete_metadata_cleanup_prefixes, bucket_deleted_marker_prefix,
+        bucket_deleted_marker_volume, bucket_list_set_concurrency, record_bucket_delete_blocker, run_bucket_usage_cleanup,
+        run_physical_bucket_deletion, scan_metadata_less_residue, scan_metadata_less_residue_with_budget,
+        should_override_created_from_metadata, validate_table_bucket_delete_allowed,
     };
-    use crate::bucket::metadata::table_bucket_catalog_metadata_prefix;
+    use crate::bucket::metadata::{BucketMetadata, table_bucket_catalog_metadata_prefix};
     use crate::bucket::metadata_sys;
     use crate::cluster::rpc::peer_s3_client::install_delete_bucket_empty_scan_barrier;
-    use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
+    use crate::disk::{BUCKET_META_PREFIX, DiskAPI, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE};
     use crate::error::StorageError;
     use crate::object_api::{ObjectOptions, PutObjReader};
     use crate::runtime::instance::InstanceContext;
     use crate::storage_api_contracts::{
         bucket::{BucketOperations as _, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp},
+        list::ListOperations as _,
+        namespace::NamespaceLocking as _,
         object::{ObjectIO as _, ObjectOperations as _},
     };
     use crate::store::{ECStore, init_local_disks_with_instance_ctx};
@@ -850,6 +1207,7 @@ mod tests {
         layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     };
     use rustfs_data_usage::{BucketUsageInfo, DATA_USAGE_OBJECT_NAME, DataUsageInfo};
+    use rustfs_filemeta::{FileInfo, FileMeta, TRANSITION_COMPLETE};
     use rustfs_lock::{LocalClient, LockRequest, LockType, NamespaceLock, ObjectKey};
     use serial_test::serial;
     use std::path::{Path, PathBuf};
@@ -857,11 +1215,94 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, SystemTime};
     use time::OffsetDateTime;
+    use tokio::io::AsyncReadExt;
     use tokio::sync::{Notify, OnceCell};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     static BUCKET_DELETE_TEST_ENV: OnceCell<(Vec<PathBuf>, Arc<ECStore>)> = OnceCell::const_new();
+
+    #[tokio::test(start_paused = true)]
+    async fn bucket_delete_diagnostic_budget_starts_with_first_scan_io_and_latches_once() {
+        let mut budget = BucketDeleteDiagnosticBudget::with_limits(8, Duration::from_millis(100));
+        tokio::time::advance(Duration::from_secs(10)).await;
+
+        let first_polled = Arc::new(AtomicBool::new(false));
+        let first_polled_for_io = first_polled.clone();
+        let first = budget
+            .run_io(async move {
+                first_polled_for_io.store(true, Ordering::SeqCst);
+                Ok::<_, std::io::Error>(7_u8)
+            })
+            .await
+            .expect("the first diagnostic IO should succeed");
+        assert_eq!(first, Some(7));
+        assert!(first_polled.load(Ordering::SeqCst));
+
+        tokio::time::advance(Duration::from_millis(101)).await;
+        let expired_polled = Arc::new(AtomicBool::new(false));
+        let expired_polled_for_io = expired_polled.clone();
+        let expired = budget
+            .run_io(async move {
+                expired_polled_for_io.store(true, Ordering::SeqCst);
+                Ok::<_, std::io::Error>(9_u8)
+            })
+            .await
+            .expect("an expired diagnostic budget should not become an IO error");
+        assert_eq!(expired, None);
+        assert!(
+            !expired_polled.load(Ordering::SeqCst),
+            "the deadline must remain latched after the first scan IO"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bucket_delete_diagnostic_budget_times_out_its_first_pending_io() {
+        let mut budget = BucketDeleteDiagnosticBudget::with_limits(8, Duration::from_millis(100));
+        let io_polled = Arc::new(AtomicBool::new(false));
+        let io_polled_for_future = io_polled.clone();
+
+        let result = budget
+            .run_io(std::future::poll_fn(move |_cx| {
+                io_polled_for_future.store(true, Ordering::SeqCst);
+                std::task::Poll::<std::io::Result<()>>::Pending
+            }))
+            .await
+            .expect("a diagnostic timeout should fail closed without an IO error");
+
+        assert_eq!(result, None);
+        assert!(
+            io_polled.load(Ordering::SeqCst),
+            "the first diagnostic IO must be polled before its timeout"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_metadata_less_scans_still_detect_orphans_and_xlmeta() {
+        let root = tempfile::tempdir().expect("temporary delayed-scan roots should be created");
+        let orphan_root = root.path().join("orphan-root");
+        let xlmeta_root = root.path().join("xlmeta-root");
+        std::fs::create_dir_all(&orphan_root).expect("orphan root should be created");
+        std::fs::create_dir_all(&xlmeta_root).expect("xlmeta root should be created");
+        std::fs::write(orphan_root.join("orphan-part"), b"orphan").expect("orphan fixture should be written");
+        std::fs::write(xlmeta_root.join(STORAGE_FORMAT_FILE), b"invalid-xlmeta").expect("xl.meta fixture should be written");
+
+        let mut orphan_budget = BucketDeleteDiagnosticBudget::with_limits(16, Duration::from_secs(5));
+        let mut xlmeta_budget = BucketDeleteDiagnosticBudget::with_limits(16, Duration::from_secs(5));
+        tokio::time::advance(Duration::from_secs(60)).await;
+
+        let orphan = scan_metadata_less_residue_with_budget(&orphan_root, &mut orphan_budget)
+            .await
+            .expect("delayed orphan scan should complete");
+        assert!(orphan.has_residue_without_xlmeta());
+        assert!(!orphan.diagnostic_truncated);
+
+        let xlmeta = scan_metadata_less_residue_with_budget(&xlmeta_root, &mut xlmeta_budget)
+            .await
+            .expect("delayed xl.meta scan should complete");
+        assert!(xlmeta.xlmeta_found);
+        assert!(!xlmeta.diagnostic_truncated);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn bucket_namespace_operation_fails_closed_after_lease_expiry() {
@@ -1057,16 +1498,23 @@ mod tests {
             .clone()
     }
 
-    async fn setup_multi_pool_scanner_listing_test_env() -> (tempfile::TempDir, Arc<ECStore>) {
-        let temp_dir = tempfile::tempdir().expect("multi-pool scanner test directory should be created");
+    async fn setup_multi_pool_bucket_test_env() -> (tempfile::TempDir, Arc<ECStore>) {
+        setup_bucket_quorum_test_env(&[4, 4], None).await
+    }
+
+    async fn setup_bucket_quorum_test_env(
+        drives_per_pool: &[usize],
+        standard_parity: Option<usize>,
+    ) -> (tempfile::TempDir, Arc<ECStore>) {
+        let temp_dir = tempfile::tempdir().expect("multi-pool bucket test directory should be created");
         let mut pools = Vec::new();
-        for pool_index in 0..2 {
+        for (pool_index, &drive_count) in drives_per_pool.iter().enumerate() {
             let mut endpoints = Vec::new();
-            for disk_index in 0..4 {
+            for disk_index in 0..drive_count {
                 let disk_path = temp_dir.path().join(format!("pool{pool_index}-disk{disk_index}"));
                 tokio::fs::create_dir_all(&disk_path)
                     .await
-                    .expect("multi-pool scanner test disk should be created");
+                    .expect("multi-pool bucket test disk should be created");
                 let mut endpoint =
                     Endpoint::try_from(disk_path.to_str().expect("disk path should be utf8")).expect("endpoint should parse");
                 endpoint.set_pool_index(pool_index);
@@ -1077,15 +1525,16 @@ mod tests {
             pools.push(PoolEndpoints {
                 legacy: false,
                 set_count: 1,
-                drives_per_set: 4,
+                drives_per_set: drive_count,
                 endpoints: Endpoints::from(endpoints),
-                cmd_line: format!("scanner-listing-pool-{pool_index}"),
+                cmd_line: format!("bucket-test-pool-{pool_index}"),
                 platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
             });
         }
 
         let endpoint_pools = EndpointServerPools(pools);
         let instance_ctx = Arc::new(InstanceContext::new());
+        instance_ctx.set_endpoints(endpoint_pools.clone());
         init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
             .await
             .expect("multi-pool local disks should initialize");
@@ -1097,9 +1546,12 @@ mod tests {
         )
         .await
         .expect("multi-pool ECStore should initialize");
-        let storage_class =
-            crate::config::storageclass::lookup_config_for_pools_without_env(&rustfs_config::server_config::KVS::new(), &[4, 4])
-                .expect("multi-pool storage class should match both four-disk pools");
+        let mut storage_class_kvs = rustfs_config::server_config::KVS::new();
+        if let Some(parity) = standard_parity {
+            storage_class_kvs.insert(crate::config::storageclass::CLASS_STANDARD.to_string(), format!("EC:{parity}"));
+        }
+        let storage_class = crate::config::storageclass::lookup_config_for_pools_without_env(&storage_class_kvs, drives_per_pool)
+            .expect("storage class should match every test erasure set");
         for pool in &ecstore.pools {
             for set in &pool.disk_set {
                 set.set_test_storage_class_config(storage_class.clone());
@@ -1109,9 +1561,47 @@ mod tests {
         (temp_dir, ecstore)
     }
 
+    async fn take_set_disks_offline(
+        ecstore: &ECStore,
+        set: &Arc<crate::set_disk::SetDisks>,
+        disk_indexes: &[usize],
+    ) -> Vec<(usize, crate::disk::DiskStore)> {
+        let offline = {
+            let mut disks = set.disks.write().await;
+            disk_indexes
+                .iter()
+                .map(|index| (*index, disks[*index].take().expect("fault-injection disk should start online")))
+                .collect::<Vec<_>>()
+        };
+        let local_disk_map = ecstore.ctx.local_disk_map();
+        let mut local_disks = local_disk_map.write().await;
+        for (_, disk) in &offline {
+            local_disks.insert(disk.endpoint().to_string(), None);
+        }
+        offline
+    }
+
+    async fn restore_set_disks(
+        ecstore: &ECStore,
+        set: &Arc<crate::set_disk::SetDisks>,
+        offline: Vec<(usize, crate::disk::DiskStore)>,
+    ) {
+        {
+            let local_disk_map = ecstore.ctx.local_disk_map();
+            let mut local_disks = local_disk_map.write().await;
+            for (_, disk) in &offline {
+                local_disks.insert(disk.endpoint().to_string(), Some(Arc::clone(disk)));
+            }
+        }
+        let mut disks = set.disks.write().await;
+        for (index, disk) in offline {
+            assert!(disks[index].replace(disk).is_none(), "fault-injection disk slot should remain empty");
+        }
+    }
+
     #[tokio::test]
     async fn request_metadata_methods_fail_closed_before_instance_initialization() {
-        let (_temp_dir, store) = setup_multi_pool_scanner_listing_test_env().await;
+        let (_temp_dir, store) = setup_multi_pool_bucket_test_env().await;
 
         let expected = "bucket metadata sys not initialized for this instance";
         let errors = [
@@ -1147,10 +1637,19 @@ mod tests {
             .put_object(bucket, object, &mut reader, &ObjectOptions::default())
             .await
             .expect("object should be written");
+        let lock = ecstore.pools[0].disk_set[0]
+            .new_ns_lock(bucket, object)
+            .await
+            .expect("fixture namespace lock should be created");
+        drop(
+            lock.get_write_lock(Duration::from_secs(30))
+                .await
+                .expect("fixture rename tail should finish before checking its generation"),
+        );
         assert_eq!(
             ecstore.scanner_namespace_mutation_generation(),
-            generation_before_put.saturating_add(1),
-            "successful object creation should advance scanner namespace activity"
+            generation_before_put.saturating_add(3),
+            "successful object creation must observe the logical mutation and both fanout boundaries"
         );
         ecstore
             .get_object_info(bucket, object, &ObjectOptions::default())
@@ -1180,6 +1679,19 @@ mod tests {
             }
         }
         false
+    }
+
+    async fn write_metadata_less_part_on_all_disks(disk_paths: &[PathBuf], bucket: &str, object: &str) {
+        for disk_path in disk_paths {
+            let data_dir = Uuid::new_v4();
+            let part_path = disk_path.join(bucket).join(object).join(data_dir.to_string()).join("part.1");
+            tokio::fs::create_dir_all(part_path.parent().expect("part path should have a parent"))
+                .await
+                .expect("metadata-less data dir should be created");
+            tokio::fs::write(part_path, b"orphan shard")
+                .await
+                .expect("metadata-less part should be written");
+        }
     }
 
     async fn write_bucket_metadata_marker(disk_paths: &[PathBuf], metadata_prefix: &str) {
@@ -1232,16 +1744,833 @@ mod tests {
     }
 
     #[test]
-    fn scanner_bucket_listing_bounds_set_fanout() {
-        assert_eq!(scanner_bucket_list_set_concurrency(0), 1);
-        assert_eq!(scanner_bucket_list_set_concurrency(2), 2);
-        assert_eq!(scanner_bucket_list_set_concurrency(100), SCANNER_BUCKET_LIST_SET_CONCURRENCY);
+    fn bucket_listing_selects_request_and_scanner_fanout() {
+        assert_eq!(bucket_list_set_concurrency(0, SCANNER_BUCKET_LIST_SET_CONCURRENCY), 1);
+        assert_eq!(bucket_list_set_concurrency(2, SCANNER_BUCKET_LIST_SET_CONCURRENCY), 2);
+        assert_eq!(
+            bucket_list_set_concurrency(100, SCANNER_BUCKET_LIST_SET_CONCURRENCY),
+            SCANNER_BUCKET_LIST_SET_CONCURRENCY
+        );
+        assert_eq!(bucket_list_set_concurrency(100, usize::MAX), 100);
+    }
+
+    #[tokio::test]
+    async fn metadata_less_residue_scan_ignores_empty_dirs_and_reports_uuid_data() {
+        let root = tempfile::tempdir().expect("temporary bucket root should be created");
+        let bucket_path = root.path().join("bucket");
+        tokio::fs::create_dir_all(bucket_path.join("empty/child"))
+            .await
+            .expect("empty directory residue should be created");
+
+        let empty = scan_metadata_less_residue(&bucket_path)
+            .await
+            .expect("empty residue scan should succeed");
+        assert!(!empty.has_residue_without_xlmeta());
+
+        let data_dir = Uuid::new_v4();
+        let part_path = bucket_path.join("object").join(data_dir.to_string()).join("part.1");
+        tokio::fs::create_dir_all(part_path.parent().expect("part path should have a parent"))
+            .await
+            .expect("data dir should be created");
+        tokio::fs::write(&part_path, b"orphan shard")
+            .await
+            .expect("part file should be written");
+
+        let residue = scan_metadata_less_residue(&bucket_path)
+            .await
+            .expect("metadata-less residue scan should succeed");
+        assert!(residue.has_residue_without_xlmeta());
+        assert_eq!(residue.files, 1);
+        assert_eq!(residue.uuid_data_dirs, 1);
+        let sample = residue.sample.as_deref().expect("part sample should be recorded");
+        assert!(sample.starts_with("object/"));
+        assert!(sample.ends_with("/part.1"));
+    }
+
+    #[tokio::test]
+    async fn metadata_less_residue_scan_shares_one_entry_budget_across_roots() {
+        let root = tempfile::tempdir().expect("temporary diagnostic roots should be created");
+        let first_root = root.path().join("disk-a");
+        let second_root = root.path().join("disk-b");
+        tokio::fs::create_dir_all(&first_root)
+            .await
+            .expect("first diagnostic root should be created");
+        tokio::fs::create_dir_all(&second_root)
+            .await
+            .expect("second diagnostic root should be created");
+        for index in 0..3 {
+            std::fs::write(first_root.join(format!("first-{index}")), b"").expect("first-root fixture should be written");
+            std::fs::write(second_root.join(format!("second-{index}")), b"").expect("second-root fixture should be written");
+        }
+
+        let mut budget = BucketDeleteDiagnosticBudget::with_limits(4, Duration::from_secs(5));
+        let first = scan_metadata_less_residue_with_budget(&first_root, &mut budget)
+            .await
+            .expect("first root should fit the shared budget");
+        assert!(!first.diagnostic_truncated);
+        let second = scan_metadata_less_residue_with_budget(&second_root, &mut budget)
+            .await
+            .expect("second root should stop at the remaining shared budget");
+        assert!(second.diagnostic_truncated);
+        assert!(first.entries_scanned + second.entries_scanned <= 4);
+    }
+
+    #[tokio::test]
+    async fn metadata_less_residue_scan_honors_an_expired_request_deadline() {
+        let root = tempfile::tempdir().expect("temporary diagnostic root should be created");
+        std::fs::write(root.path().join("orphan"), b"").expect("deadline fixture should be written");
+        let mut budget = BucketDeleteDiagnosticBudget::with_limits(8, Duration::ZERO);
+
+        let scan = scan_metadata_less_residue_with_budget(root.path(), &mut budget)
+            .await
+            .expect("an expired diagnostic budget should fail closed without an IO error");
+
+        assert!(scan.diagnostic_truncated);
+        assert_eq!(scan.entries_scanned, 0);
+        assert_eq!(scan.diagnostic_bytes_read, 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_less_residue_scan_stops_at_diagnostic_budget() {
+        let root = tempfile::tempdir().expect("temporary bucket root should be created");
+        let bucket_path = root.path().join("bucket");
+        tokio::fs::create_dir_all(&bucket_path)
+            .await
+            .expect("budget fixture directory should be created");
+        for index in 0..(BUCKET_DELETE_DIAGNOSTIC_MAX_ENTRIES + 32) {
+            std::fs::write(bucket_path.join(format!("orphan-{index:05}")), b"").expect("budget fixture file should be created");
+        }
+
+        let residue = scan_metadata_less_residue(&bucket_path)
+            .await
+            .expect("budgeted residue scan should fail closed without an IO error");
+        assert!(residue.diagnostic_truncated);
+        assert!(residue.has_residue_without_xlmeta());
+        assert!(!residue.xlmeta_found);
+        assert!(residue.entries_scanned <= BUCKET_DELETE_DIAGNOSTIC_MAX_ENTRIES);
+        assert!(residue.files <= BUCKET_DELETE_DIAGNOSTIC_MAX_ENTRIES);
+        assert_eq!(residue.diagnostic_bytes_read, 0);
+    }
+
+    #[tokio::test]
+    async fn bucket_residue_scan_distinguishes_visible_and_tier_free_xlmeta() {
+        let root = tempfile::tempdir().expect("temporary bucket root should be created");
+        let bucket_path = root.path().join("bucket");
+        let visible_path = bucket_path.join("visible").join(STORAGE_FORMAT_FILE);
+        tokio::fs::create_dir_all(visible_path.parent().expect("visible xl.meta should have a parent"))
+            .await
+            .expect("visible object directory should be created");
+        let mut visible = FileMeta::new();
+        visible
+            .add_version(FileInfo {
+                version_id: Some(Uuid::new_v4()),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("visible version should encode");
+        tokio::fs::write(&visible_path, visible.marshal_msg().expect("visible xl.meta should marshal"))
+            .await
+            .expect("visible xl.meta should be written");
+
+        let visible_scan = scan_metadata_less_residue(&bucket_path)
+            .await
+            .expect("visible xl.meta scan should succeed");
+        assert_eq!(visible_scan.xlmeta_blocker, Some(BucketDeleteBlockerKind::VisibleVersion));
+
+        tokio::fs::remove_dir_all(bucket_path.join("visible"))
+            .await
+            .expect("visible fixture should be removed");
+        let free_path = bucket_path.join("free").join(STORAGE_FORMAT_FILE);
+        tokio::fs::create_dir_all(free_path.parent().expect("free xl.meta should have a parent"))
+            .await
+            .expect("free-version object directory should be created");
+        let source_version_id = Uuid::new_v4();
+        let mut free = FileMeta::new();
+        free.add_version(FileInfo {
+            version_id: Some(source_version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_id: Some(Uuid::new_v4()),
+            transition_tier: "WARM".to_string(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        })
+        .expect("transitioned source should encode");
+        let mut delete = FileInfo {
+            version_id: Some(source_version_id),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        delete.set_tier_free_version_id(&Uuid::new_v4().to_string());
+        free.delete_version(&delete)
+            .expect("transitioned source delete should create a free-version");
+        tokio::fs::write(&free_path, free.marshal_msg().expect("free-version xl.meta should marshal"))
+            .await
+            .expect("free-version xl.meta should be written");
+
+        let free_scan = scan_metadata_less_residue(&bucket_path)
+            .await
+            .expect("free-version xl.meta scan should succeed");
+        assert_eq!(free_scan.xlmeta_blocker, Some(BucketDeleteBlockerKind::TierFreeVersion));
+
+        tokio::fs::remove_dir_all(bucket_path.join("free"))
+            .await
+            .expect("free-version fixture should be removed");
+
+        let exact_limit_path = bucket_path.join("exact-limit").join(STORAGE_FORMAT_FILE);
+        tokio::fs::create_dir_all(exact_limit_path.parent().expect("exact-limit xl.meta should have a parent"))
+            .await
+            .expect("exact-limit object directory should be created");
+        let exact_limit = tokio::fs::File::create(&exact_limit_path)
+            .await
+            .expect("exact-limit xl.meta should be created");
+        exact_limit
+            .set_len(BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES)
+            .await
+            .expect("exact-limit xl.meta should be extended without allocating its contents");
+        let exact_limit_scan = scan_metadata_less_residue(&bucket_path)
+            .await
+            .expect("exact-limit xl.meta scan should remain fail closed");
+        assert_eq!(exact_limit_scan.xlmeta_blocker, Some(BucketDeleteBlockerKind::UnknownXlMeta));
+        assert_eq!(exact_limit_scan.diagnostic_bytes_read, BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES);
+        tokio::fs::remove_dir_all(bucket_path.join("exact-limit"))
+            .await
+            .expect("exact-limit fixture should be removed");
+
+        let oversized_path = bucket_path.join("oversized").join(STORAGE_FORMAT_FILE);
+        tokio::fs::create_dir_all(oversized_path.parent().expect("oversized xl.meta should have a parent"))
+            .await
+            .expect("oversized object directory should be created");
+        let oversized = tokio::fs::File::create(&oversized_path)
+            .await
+            .expect("oversized xl.meta should be created");
+        oversized
+            .set_len(BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES + 1)
+            .await
+            .expect("oversized xl.meta should be extended without allocating its contents");
+        let oversized_scan = scan_metadata_less_residue(&bucket_path)
+            .await
+            .expect("oversized xl.meta scan should remain fail closed");
+        assert_eq!(oversized_scan.xlmeta_blocker, Some(BucketDeleteBlockerKind::UnknownXlMeta));
+        assert_eq!(oversized_scan.diagnostic_bytes_read, 0);
+        assert!(oversized_scan.diagnostic_bytes_read <= BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_namespace_reads_keep_pre_expansion_bucket_visible() {
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        let bucket = format!("pre-expansion-{}", Uuid::new_v4().simple());
+        let object = "existing-object";
+        ecstore.pools[0].disk_set[0]
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created in the original pool only");
+        let mut reader = PutObjReader::from_vec(b"object written before pool expansion".to_vec());
+        ecstore.pools[0]
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("object should be written in the original pool only");
+
+        let buckets = ecstore
+            .list_bucket(&BucketOptions::default())
+            .await
+            .expect("S3 bucket listing should remain available after adding an empty pool");
+        assert!(buckets.iter().any(|entry| entry.name == bucket));
+
+        let info = ecstore
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .expect("bucket validation should accept a bucket present in the original pool");
+        assert_eq!(info.name, bucket);
+
+        metadata_sys::init_bucket_metadata_sys(ecstore.clone(), vec![bucket.clone()]).await;
+        let listed = ecstore
+            .clone()
+            .list_objects_v2(&bucket, "", None, None, 1000, false, None, false)
+            .await
+            .expect("ListObjectsV2 should remain available after adding an empty pool");
+        assert!(listed.objects.iter().any(|entry| entry.name == object));
+        ecstore.pools[1].disk_set[0]
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .expect("metadata initialization should heal the bucket volume into the expansion pool");
+
+        let object_info = ecstore
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("an object in the original pool should remain readable after expansion");
+        assert_eq!(object_info.name, object);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_creation_accepts_exact_quorum_in_every_set() {
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        let bucket = format!("exact-set-quorum-{}", Uuid::new_v4().simple());
+        let original_set = Arc::clone(&ecstore.pools[0].disk_set[0]);
+        let offline = take_set_disks_offline(&ecstore, &original_set, &[0]).await;
+
+        ecstore
+            .make_bucket_on_sets(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("three of four disks should satisfy the original set quorum");
+
+        restore_set_disks(&ecstore, &original_set, offline).await;
+        for pool in &ecstore.pools {
+            pool.disk_set[0]
+                .get_bucket_info(&bucket, &BucketOptions::default())
+                .await
+                .expect("every set should expose a bucket created at its exact quorum");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_creation_rejects_cross_pool_quorum_subsidy() {
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        metadata_sys::init_bucket_metadata_sys(ecstore.clone(), Vec::new()).await;
+        let bucket = format!("create-set-quorum-minus-one-{}", Uuid::new_v4().simple());
+        let original_set = Arc::clone(&ecstore.pools[0].disk_set[0]);
+        let offline = take_set_disks_offline(&ecstore, &original_set, &[0, 1]).await;
+
+        let err = ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect_err("a healthy expansion pool must not subsidize a failed original set");
+        restore_set_disks(&ecstore, &original_set, offline).await;
+        assert!(
+            matches!(&err, StorageError::InsufficientWriteQuorum(name, object) if name == &bucket && object.is_empty()),
+            "unexpected error: {err}"
+        );
+        for pool in &ecstore.pools {
+            assert_eq!(
+                pool.disk_set[0]
+                    .get_bucket_info(&bucket, &BucketOptions::default())
+                    .await
+                    .expect_err("failed creation must not leave an authoritative bucket"),
+                StorageError::VolumeNotFound
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_creation_prioritizes_hard_set_error_over_existing_bucket() {
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        metadata_sys::init_bucket_metadata_sys(ecstore.clone(), Vec::new()).await;
+        let bucket = format!("create-hard-error-{}", Uuid::new_v4().simple());
+        ecstore.pools[0].disk_set[0]
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("the original pool should contain the bucket");
+        let expansion_set = Arc::clone(&ecstore.pools[1].disk_set[0]);
+        let offline = take_set_disks_offline(&ecstore, &expansion_set, &[0, 1]).await;
+
+        let err = ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect_err("a hard set failure must outrank BucketExists from another set");
+        restore_set_disks(&ecstore, &expansion_set, offline).await;
+        assert!(
+            matches!(&err, StorageError::InsufficientWriteQuorum(name, object) if name == &bucket && object.is_empty()),
+            "unexpected error: {err}"
+        );
+        ecstore.pools[0].disk_set[0]
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .expect("failure in another set must not roll back a pre-existing bucket");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_delete_rejects_cross_pool_quorum_subsidy_before_mutation() {
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        metadata_sys::init_bucket_metadata_sys(ecstore.clone(), Vec::new()).await;
+        let bucket = format!("delete-set-quorum-minus-one-{}", Uuid::new_v4().simple());
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created in every set before deletion");
+        let original_set = Arc::clone(&ecstore.pools[0].disk_set[0]);
+        let offline = take_set_disks_offline(&ecstore, &original_set, &[0, 1, 2]).await;
+
+        let err = ecstore
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a healthy expansion pool must not subsidize a failed original set deletion");
+        restore_set_disks(&ecstore, &original_set, offline).await;
+        assert!(
+            matches!(&err, StorageError::InsufficientWriteQuorum(name, object) if name == &bucket && object.is_empty()),
+            "unexpected error: {err}"
+        );
+        for pool in &ecstore.pools {
+            pool.disk_set[0]
+                .get_bucket_info(&bucket, &BucketOptions::default())
+                .await
+                .expect("failed deletion preflight must preserve every bucket volume");
+        }
+        let (_, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&ecstore.ctx, &bucket)
+            .await
+            .expect("failed deletion must preserve bucket metadata");
+        assert!(persisted);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_delete_rolls_back_sets_after_partial_failure() {
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        let bucket = format!("delete-set-rollback-{}", Uuid::new_v4().simple());
+        ecstore
+            .make_bucket_on_sets(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created in every set before deletion");
+        let original_set = Arc::clone(&ecstore.pools[0].disk_set[0]);
+        let offline = take_set_disks_offline(&ecstore, &original_set, &[0, 1]).await;
+
+        let err = ecstore
+            .delete_bucket_on_sets(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect_err("a failed set must fail the complete bucket deletion");
+        restore_set_disks(&ecstore, &original_set, offline).await;
+        assert_eq!(err, StorageError::ErasureWriteQuorum);
+        for pool in &ecstore.pools {
+            pool.disk_set[0]
+                .get_bucket_info(&bucket, &BucketOptions::default())
+                .await
+                .expect("delete rollback should restore the bucket namespace in every set");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_config_update_accepts_pre_expansion_bucket() {
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        metadata_sys::init_bucket_metadata_sys(ecstore.clone(), Vec::new()).await;
+        let bucket = format!("config-pre-expansion-{}", Uuid::new_v4().simple());
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created with authoritative metadata");
+        ecstore.pools[1].disk_set[0]
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("the expansion pool bucket volume should be removed for the regression state");
+
+        let policy = br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec();
+        ecstore
+            .update_bucket_metadata_config(&bucket, crate::bucket::metadata::BUCKET_POLICY_CONFIG, policy.clone())
+            .await
+            .expect("config mutation should validate existence per erasure set");
+        let (stored, _) = ecstore
+            .get_bucket_policy_raw(&bucket)
+            .await
+            .expect("updated bucket policy should remain readable");
+        assert_eq!(stored.as_bytes(), policy);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_metadata_init_recreates_pre_expansion_bucket_in_new_pool() {
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        let bucket = format!("metadata-expansion-{}", Uuid::new_v4().simple());
+        ecstore.pools[0].disk_set[0]
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created in the original pool only");
+        assert_eq!(
+            ecstore.pools[1].disk_set[0]
+                .get_bucket_info(&bucket, &BucketOptions::default())
+                .await
+                .expect_err("new pool should initially have no bucket volume"),
+            StorageError::VolumeNotFound
+        );
+
+        metadata_sys::init_bucket_metadata_sys(ecstore.clone(), vec![bucket.clone()]).await;
+
+        ecstore.pools[1].disk_set[0]
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .expect("metadata initialization should recreate the bucket volume in the new pool");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_metadata_init_repairs_half_created_expansion_pool() {
+        // Check both pool orders: an incomplete set must not hide a later
+        // complete set, and a complete set must not weaken request validation.
+        for complete_pool in 0..2 {
+            let (temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+            let bucket = format!("partial-expansion-{}", Uuid::new_v4().simple());
+            for pool_index in 0..2 {
+                let present_disks = if pool_index == complete_pool { 4 } else { 2 };
+                for disk_index in 0..present_disks {
+                    tokio::fs::create_dir(
+                        temp_dir
+                            .path()
+                            .join(format!("pool{pool_index}-disk{disk_index}"))
+                            .join(&bucket),
+                    )
+                    .await
+                    .expect("fixture bucket volume should be created");
+                }
+            }
+            assert_eq!(
+                ecstore
+                    .get_bucket_info_from_sets(&bucket, &BucketOptions::default())
+                    .await
+                    .expect_err("request validation must reject a half-created expansion set"),
+                StorageError::ErasureWriteQuorum
+            );
+
+            metadata_sys::init_bucket_metadata_sys(ecstore.clone(), vec![bucket.clone()]).await;
+
+            for pool_index in 0..2 {
+                for disk_index in 0..4 {
+                    assert!(
+                        temp_dir
+                            .path()
+                            .join(format!("pool{pool_index}-disk{disk_index}"))
+                            .join(&bucket)
+                            .is_dir(),
+                        "metadata initialization must heal every missing expansion volume"
+                    );
+                }
+            }
+            ecstore
+                .get_bucket_info_from_sets(&bucket, &BucketOptions::default())
+                .await
+                .expect("strict request validation should succeed after volume repair");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_metadata_init_does_not_combine_partial_set_evidence() {
+        let (temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        let bucket = format!("no-quorum-expansion-{}", Uuid::new_v4().simple());
+        for pool_index in 0..2 {
+            for disk_index in 0..2 {
+                tokio::fs::create_dir(
+                    temp_dir
+                        .path()
+                        .join(format!("pool{pool_index}-disk{disk_index}"))
+                        .join(&bucket),
+                )
+                .await
+                .expect("fixture bucket volume should be created");
+            }
+        }
+        assert_eq!(
+            ecstore
+                .bucket_exists_for_heal(&bucket)
+                .await
+                .expect_err("repair must require a complete quorum within one set"),
+            StorageError::ErasureWriteQuorum
+        );
+
+        metadata_sys::init_bucket_metadata_sys(ecstore.clone(), vec![bucket.clone()]).await;
+
+        for pool_index in 0..2 {
+            for disk_index in 0..4 {
+                assert_eq!(
+                    temp_dir
+                        .path()
+                        .join(format!("pool{pool_index}-disk{disk_index}"))
+                        .join(&bucket)
+                        .is_dir(),
+                    disk_index < 2,
+                    "unproven bucket generations must not recreate missing volumes"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_metadata_init_does_not_recreate_stale_bucket_name() {
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        let bucket = format!("stale-expansion-{}", Uuid::new_v4().simple());
+
+        metadata_sys::init_bucket_metadata_sys(ecstore.clone(), vec![bucket.clone()]).await;
+
+        for pool in &ecstore.pools {
+            let err = pool.disk_set[0]
+                .get_bucket_info(&bucket, &BucketOptions::default())
+                .await
+                .expect_err("a stale startup listing must not recreate a deleted bucket");
+            assert_eq!(err, StorageError::VolumeNotFound);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_info_read_quorum_tracks_erasure_layout() {
+        for (drive_count, parity) in [(2, 1), (3, 1), (4, 2), (5, 2), (6, 3), (8, 4), (6, 2), (12, 6)] {
+            let (_temp_dir, store) = setup_bucket_quorum_test_env(&[drive_count], Some(parity)).await;
+            metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+            let bucket = format!("read-quorum-{drive_count}-{parity}");
+            let object = "uncached-object";
+            let body = b"erasure read quorum must follow the persisted layout".repeat(32_768);
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("healthy namespace should accept bucket creation");
+            store
+                .put_object(&bucket, object, &mut PutObjReader::from_vec(body.clone()), &ObjectOptions::default())
+                .await
+                .expect("healthy erasure set should accept the seed object");
+            let set = &store.pools[0].disk_set[0];
+            let lock = set
+                .new_ns_lock(&bucket, object)
+                .await
+                .expect("seed namespace lock should resolve");
+            drop(
+                lock.get_write_lock(Duration::from_secs(30))
+                    .await
+                    .expect("seed physical fanout must finish before taking disks offline"),
+            );
+            if (drive_count, parity) == (6, 3) {
+                let mut kvs = rustfs_config::server_config::KVS::new();
+                kvs.insert(crate::config::storageclass::CLASS_STANDARD.to_string(), "EC:2".to_string());
+                set.set_test_storage_class_config(
+                    crate::config::storageclass::lookup_config_for_pools_without_env(&kvs, &[drive_count])
+                        .expect("a later storage-class change must not raise old objects' read quorum"),
+                );
+            }
+
+            let offline_indexes = (0..parity).collect::<Vec<_>>();
+            let offline = take_set_disks_offline(&store, set, &offline_indexes).await;
+            let info = store
+                .get_bucket_info(&bucket, &BucketOptions::default())
+                .await
+                .expect("bucket validation must admit the object's exact read quorum");
+            assert_eq!(info.name, bucket);
+
+            let mut reader = store
+                .get_object_reader(&bucket, object, None, Default::default(), &ObjectOptions::default())
+                .await
+                .expect("the persisted layout should remain readable at its exact data-shard quorum");
+            let mut restored = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut restored)
+                .await
+                .expect("quorum read should reconstruct the body");
+            assert_eq!(restored, body, "layout {drive_count}/{parity} must retain exact object contents");
+            drop(reader);
+
+            if drive_count - parity == drive_count / 2 {
+                let error = store
+                    .get_bucket_info_from_sets(&bucket, &BucketOptions::default())
+                    .await
+                    .expect_err("bucket mutations must retain their majority namespace check");
+                assert_eq!(error, StorageError::ErasureWriteQuorum);
+            }
+
+            let below_quorum = take_set_disks_offline(&store, set, &[parity]).await;
+            let read = store
+                .get_object_reader(&bucket, object, None, Default::default(), &ObjectOptions::default())
+                .await;
+            match read {
+                Ok(mut reader) => assert!(
+                    reader.stream.read_to_end(&mut Vec::new()).await.is_err(),
+                    "layout {drive_count}/{parity} must reject fewer than its data-shard quorum"
+                ),
+                Err(error) => assert!(
+                    matches!(error, StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _)),
+                    "a missing shard must report read quorum loss, got {error}"
+                ),
+            }
+            restore_set_disks(&store, set, below_quorum).await;
+            restore_set_disks(&store, set, offline).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_info_read_quorum_is_scoped_to_each_erasure_set() {
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4, 6], None).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "read-quorum-mixed-pools";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("healthy pools should accept bucket creation");
+
+        let first_set = &store.pools[0].disk_set[0];
+        let second_set = &store.pools[1].disk_set[0];
+        let first_offline = take_set_disks_offline(&store, first_set, &[0, 1]).await;
+        let second_offline = take_set_disks_offline(&store, second_set, &[0, 1, 2]).await;
+        store
+            .get_bucket_info(bucket, &BucketOptions::default())
+            .await
+            .expect("each set independently satisfies its namespace read quorum");
+
+        for (set, extra_disk) in [(first_set, 2), (second_set, 3)] {
+            let extra_offline = take_set_disks_offline(&store, set, &[extra_disk]).await;
+            assert_eq!(
+                store
+                    .get_bucket_info(bucket, &BucketOptions::default())
+                    .await
+                    .expect_err("another pool must not subsidize a set below its read quorum"),
+                StorageError::ErasureReadQuorum
+            );
+            restore_set_disks(&store, set, extra_offline).await;
+        }
+        restore_set_disks(&store, first_set, first_offline).await;
+        restore_set_disks(&store, second_set, second_offline).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_info_read_quorum_requires_authoritative_metadata() {
+        for state in ["missing", "corrupt", "foreign", "incarnation"] {
+            let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], None).await;
+            metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+            let bucket = format!("read-quorum-{state}-metadata");
+            let mut metadata = if state == "missing" {
+                store
+                    .make_bucket_on_sets(&bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("simulate directories left before bucket metadata is published");
+                BucketMetadata::new(&bucket)
+            } else {
+                store
+                    .make_bucket(&bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("healthy bucket should publish metadata");
+                metadata_sys::get_in(&store.ctx, &bucket)
+                    .await
+                    .expect("seed metadata should be cached")
+                    .as_ref()
+                    .clone()
+            };
+            let path = metadata.save_file_path();
+            match state {
+                "corrupt" => crate::config::com::save_config(store.clone(), &path, b"corrupt".to_vec())
+                    .await
+                    .expect("persist corrupt metadata while the cached copy remains valid"),
+                "foreign" => {
+                    metadata.name = "different-bucket".to_string();
+                    let mut encoded = vec![1, 0, 1, 0];
+                    encoded.extend(metadata.marshal_msg().expect("foreign metadata should encode"));
+                    crate::config::com::save_config(store.clone(), &path, encoded)
+                        .await
+                        .expect("persist metadata for a different bucket at the requested path");
+                }
+                "incarnation" => crate::bucket::metadata::save_bucket_incarnation(store.clone(), &bucket, Uuid::new_v4())
+                    .await
+                    .expect("persist a different bucket generation"),
+                _ => {}
+            }
+
+            let set = &store.pools[0].disk_set[0];
+            let offline = take_set_disks_offline(&store, set, &[0, 1]).await;
+            let error = store
+                .get_bucket_info(&bucket, &BucketOptions::default())
+                .await
+                .expect_err("read admission must not trust residual directories or cached metadata");
+            match state {
+                "missing" => assert_eq!(error, StorageError::ErasureReadQuorum),
+                "foreign" => assert_eq!(error, StorageError::FileCorrupt),
+                "incarnation" => assert!(error.to_string().contains("sidecar does not match bucket metadata")),
+                "corrupt" => assert!(error.to_string().contains("format invalid"), "unexpected corruption error: {error}"),
+                _ => unreachable!(),
+            }
+            restore_set_disks(&store, set, offline).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_info_read_quorum_accepts_persisted_legacy_metadata() {
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], None).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "interop";
+        store
+            .make_bucket_on_sets(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("legacy bucket directories should exist");
+        let hex = include_str!("../../tests/fixtures/minio/bucket_metadata.blob.hex")
+            .split_whitespace()
+            .collect::<String>();
+        let body = (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("pinned MinIO metadata fixture"))
+            .collect();
+        crate::config::com::save_config(store.clone(), &BucketMetadata::new(bucket).save_file_path(), body)
+            .await
+            .expect("legacy metadata should be persisted without an incarnation sidecar");
+
+        let set = &store.pools[0].disk_set[0];
+        let offline = take_set_disks_offline(&store, set, &[0, 1]).await;
+        let info = store
+            .get_bucket_info(bucket, &BucketOptions::default())
+            .await
+            .expect("persisted MinIO metadata should authorize reads at the namespace read quorum");
+        assert_eq!(info.name, bucket);
+        assert!(info.versioning);
+        assert!(info.object_locking);
+        restore_set_disks(&store, set, offline).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_namespace_reads_report_missing_when_every_set_is_absent() {
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        let bucket = format!("absent-{}", Uuid::new_v4().simple());
+
+        let buckets = ecstore
+            .list_bucket(&BucketOptions::default())
+            .await
+            .expect("an empty healthy namespace should remain listable");
+        assert!(buckets.iter().all(|entry| entry.name != bucket));
+
+        let err = ecstore
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .expect_err("a bucket absent from every set must remain missing");
+        assert_eq!(err, StorageError::VolumeNotFound);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_namespace_reads_fail_closed_when_any_set_loses_quorum() {
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        metadata_sys::init_bucket_metadata_sys(ecstore.clone(), Vec::new()).await;
+        let bucket = format!("degraded-expansion-{}", Uuid::new_v4().simple());
+        ecstore.pools[0].disk_set[0]
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created in the original pool only");
+        ecstore.pools[1].disk_set[0].disks.write().await[0] = None;
+        ecstore.pools[1].disk_set[0].disks.write().await[1] = None;
+        ecstore.pools[1].disk_set[0].disks.write().await[2] = None;
+
+        let list_err = ecstore
+            .list_bucket(&BucketOptions::default())
+            .await
+            .expect_err("listing must not hide an unavailable expansion pool");
+        assert_eq!(list_err, StorageError::ErasureWriteQuorum);
+
+        let info_err = ecstore
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .expect_err("bucket validation must fail when an expansion pool is unavailable");
+        assert_eq!(info_err, StorageError::ErasureReadQuorum);
     }
 
     #[tokio::test]
     #[serial]
     async fn scanner_bucket_listing_unions_every_erasure_set() {
-        let (_temp_dir, ecstore) = setup_multi_pool_scanner_listing_test_env().await;
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
         let bucket = format!("second-pool-only-{}", Uuid::new_v4().simple());
         ecstore.pools[1].disk_set[0]
             .make_bucket(&bucket, &MakeBucketOptions::default())
@@ -1277,7 +2606,7 @@ mod tests {
 
     #[tokio::test]
     async fn scanner_bucket_listing_marks_degraded_set_incomplete() {
-        let (_temp_dir, ecstore) = setup_multi_pool_scanner_listing_test_env().await;
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
         let bucket = format!("degraded-set-{}", Uuid::new_v4().simple());
         let set = &ecstore.pools[0].disk_set[0];
         set.make_bucket(&bucket, &MakeBucketOptions::default())
@@ -1299,7 +2628,7 @@ mod tests {
 
     #[tokio::test]
     async fn scanner_bucket_listing_marks_divergent_disk_views_incomplete() {
-        let (temp_dir, ecstore) = setup_multi_pool_scanner_listing_test_env().await;
+        let (temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
         let bucket = format!("divergent-set-{}", Uuid::new_v4().simple());
         ecstore.pools[0].disk_set[0]
             .make_bucket(&bucket, &MakeBucketOptions::default())
@@ -1563,6 +2892,57 @@ mod tests {
         );
     }
 
+    /// rustfs/rustfs#8003: a force-create (site replication replay, admin
+    /// import) against a bucket whose legacy migration stopped after the
+    /// sidecar write must persist `.metadata.bin` under the stored incarnation
+    /// rather than fail closed or replace the published identity.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn issue_8003_force_create_adopts_existing_incarnation_sidecar() {
+        let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-8003-sidecar-{}", Uuid::new_v4().simple());
+
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let stored = metadata_sys::get_in(&ecstore.ctx, &bucket)
+            .await
+            .expect("metadata should load")
+            .bucket_incarnation_id;
+        assert!(!stored.is_nil());
+
+        let metadata_path = format!("{BUCKET_META_PREFIX}/{bucket}/{}", crate::bucket::metadata::BUCKET_METADATA_FILE);
+        crate::config::com::delete_config(ecstore.clone(), &metadata_path)
+            .await
+            .expect("simulate the interrupted migration by removing only .metadata.bin");
+        assert!(!any_disk_path_exists(&disk_paths, format!("{RUSTFS_META_BUCKET}/{metadata_path}")).await);
+        metadata_sys::remove_bucket_metadata_in(&ecstore.ctx, &bucket)
+            .await
+            .expect("drop the cached copy so the next read hits disk");
+
+        ecstore
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    force_create: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("force create must repair the sidecar-only bucket");
+
+        let (repaired, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&ecstore.ctx, &bucket)
+            .await
+            .expect("repaired metadata should load");
+        assert!(persisted, "force create must persist .metadata.bin again");
+        assert!(repaired.bucket_incarnation_sidecar);
+        assert_eq!(
+            repaired.bucket_incarnation_id, stored,
+            "the repair must keep the incarnation the sidecar already published"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn make_bucket_seeds_new_bucket_durability_override() {
@@ -1664,6 +3044,150 @@ mod tests {
             .expect("DeleteBucket must succeed once the client has drained the bucket");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn bucket_delete_defers_zero_evidence_diagnostic_timeout_to_physical_empty_check() {
+        let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-del-diag-{}", Uuid::new_v4().simple());
+
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("empty bucket should be created");
+        let first_io_started = Arc::new(AtomicBool::new(false));
+        let diagnostic_budget = BucketDeleteDiagnosticBudget::new().with_first_io_delay(
+            BUCKET_DELETE_DIAGNOSTIC_MAX_ELAPSED + Duration::from_millis(100),
+            first_io_started.clone(),
+        );
+
+        ecstore
+            .handle_delete_bucket_with_diagnostic_budget(&bucket, &DeleteBucketOptions::default(), diagnostic_budget)
+            .await
+            .expect("a zero-evidence diagnostic timeout must defer to the physical empty check");
+
+        assert!(
+            first_io_started.load(Ordering::SeqCst),
+            "the regression must delay the first diagnostic read_dir"
+        );
+        assert!(
+            !any_disk_path_exists(&disk_paths, &bucket).await,
+            "the physical empty check should allow deletion of the actually empty bucket"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn bucket_delete_preserves_unobserved_residue_after_diagnostic_timeout() {
+        let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-del-residue-{}", Uuid::new_v4().simple());
+        let object = "object.txt";
+
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        write_metadata_less_part_on_all_disks(&disk_paths, &bucket, object).await;
+        let first_io_started = Arc::new(AtomicBool::new(false));
+        let diagnostic_budget = BucketDeleteDiagnosticBudget::new().with_first_io_delay(
+            BUCKET_DELETE_DIAGNOSTIC_MAX_ELAPSED + Duration::from_millis(100),
+            first_io_started.clone(),
+        );
+
+        let err = ecstore
+            .handle_delete_bucket_with_diagnostic_budget(&bucket, &DeleteBucketOptions::default(), diagnostic_budget)
+            .await
+            .expect_err("physical empty-bucket enforcement must reject unobserved residue");
+        assert!(
+            first_io_started.load(Ordering::SeqCst),
+            "the regression must time out before observing the residue"
+        );
+        match &err {
+            StorageError::BucketNotEmpty(err_bucket) | StorageError::BucketNotEmptyWithDetails { bucket: err_bucket, .. } => {
+                assert_eq!(err_bucket, &bucket)
+            }
+            other => panic!("expected an S3-compatible BucketNotEmpty error, got {other:?}"),
+        }
+        assert!(
+            any_disk_path_exists(&disk_paths, Path::new(&bucket).join(object)).await,
+            "physical empty-bucket enforcement must preserve unobserved residue"
+        );
+
+        ecstore
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("explicit force should clean up the test-owned residue");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn bucket_delete_succeeds_after_listing_and_deleting_an_unversioned_overwrite() {
+        let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-delete-after-overwrite-{}", Uuid::new_v4().simple());
+        let object = "object.txt";
+
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("unversioned bucket should be created");
+
+        let mut first_reader = PutObjReader::from_vec(b"version A".to_vec());
+        let first = ecstore
+            .put_object(&bucket, object, &mut first_reader, &ObjectOptions::default())
+            .await
+            .expect("version A should be written");
+        let mut second_reader = PutObjReader::from_vec(b"version B".to_vec());
+        let second = ecstore
+            .put_object(&bucket, object, &mut second_reader, &ObjectOptions::default())
+            .await
+            .expect("version B should overwrite version A");
+        assert_ne!(first.data_dir, second.data_dir, "the overwrite must publish a new body generation");
+
+        let listing = ecstore
+            .clone()
+            .list_object_versions(&bucket, "", None, None, None, 1000)
+            .await
+            .expect("the overwritten object should remain listable for teardown");
+        assert_eq!(listing.objects.len(), 1, "an unversioned overwrite should expose one current version");
+        let current = &listing.objects[0];
+        assert_eq!(current.name, object);
+        assert!(current.is_latest, "the listed null version must be current");
+        assert_eq!(current.version_id, None, "an unversioned object must be exposed as the null version");
+        assert_eq!(
+            current.data_dir, second.data_dir,
+            "listing must expose version B, not the overwritten body"
+        );
+
+        for version in listing.objects {
+            let version_id = version.version_id.map(|version_id| version_id.to_string());
+            ecstore
+                .delete_object(
+                    &bucket,
+                    &version.name,
+                    ObjectOptions {
+                        version_id,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("each version returned by teardown listing should be deletable");
+        }
+
+        assert!(
+            !any_disk_has_object_metadata(&disk_paths, &bucket).await,
+            "deleting the listed null version must remove every xl.meta"
+        );
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("DeleteBucket should succeed after the listed overwrite is deleted");
+    }
+
     #[tokio::test]
     #[serial]
     async fn bucket_delete_default_s3_delete_still_rejects_non_empty_bucket() {
@@ -1692,6 +3216,49 @@ mod tests {
         assert!(
             metadata_sys::get_in(&ecstore.ctx, &bucket).await.is_ok(),
             "failed default S3 DeleteBucket must keep metadata cache"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn bucket_delete_reports_metadata_less_residue_without_removing_it() {
+        let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-delete-orphan-datadir-{}", Uuid::new_v4().simple());
+        let object = "object.txt";
+
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        write_metadata_less_part_on_all_disks(&disk_paths, &bucket, object).await;
+        assert!(
+            !any_disk_has_object_metadata(&disk_paths, &bucket).await,
+            "test setup must reproduce a bucket with data dirs but no xl.meta"
+        );
+
+        let err = ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect_err("metadata-less data dirs must block ordinary DeleteBucket");
+
+        match err {
+            StorageError::BucketNotEmptyWithDetails {
+                bucket: err_bucket,
+                details,
+            } => {
+                assert_eq!(err_bucket, bucket);
+                assert!(
+                    details.contains("metadata-less on-disk residue"),
+                    "diagnostic should identify metadata-less residue, got: {details}"
+                );
+                assert!(details.contains("files="), "diagnostic should include a bounded count");
+                assert!(details.contains("uuid_data_dirs="), "diagnostic should include data-dir count");
+            }
+            other => panic!("expected detailed BucketNotEmpty, got {other:?}"),
+        }
+        assert!(
+            any_disk_path_exists(&disk_paths, Path::new(&bucket).join(object)).await,
+            "ordinary DeleteBucket must preserve metadata-less data until an explicit operator action"
         );
     }
 
@@ -1958,5 +3525,122 @@ mod tests {
         crate::config::com::save_config(ecstore, &usage_path, restored)
             .await
             .expect("usage fixture should be restored after the failure-path test");
+    }
+
+    /// Capture this module's log the way a stock deployment filters it.
+    fn bucket_logs_at_default_level(emit: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::EnvFilter;
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct CapturedLogs {
+            buffer: Arc<Mutex<Vec<u8>>>,
+        }
+        struct CapturedLogWriter {
+            buffer: Arc<Mutex<Vec<u8>>>,
+        }
+        impl std::io::Write for CapturedLogWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.buffer
+                    .lock()
+                    .expect("captured logs mutex should not be poisoned")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for CapturedLogs {
+            type Writer = CapturedLogWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CapturedLogWriter {
+                    buffer: Arc::clone(&self.buffer),
+                }
+            }
+        }
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new(rustfs_config::DEFAULT_LOG_LEVEL))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .without_time(),
+            );
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let _callsite_pin = crate::test_tracing::pin_callsite_interest_for_test();
+
+        emit();
+
+        let buffer = logs
+            .buffer
+            .lock()
+            .expect("captured logs mutex should not be poisoned")
+            .clone();
+        String::from_utf8(buffer).expect("captured logs should be valid UTF-8")
+    }
+
+    fn residue_sample(sample: &str) -> BucketMetadataLessResidue {
+        BucketMetadataLessResidue {
+            files: 1,
+            entries_scanned: 3,
+            sample: Some(sample.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// `DeleteBucket` answers from a raw per-disk residue scan, so it can refuse
+    /// for a reason no S3 request can observe. When that happens the server's
+    /// own record of which residue blocked it must survive the default log
+    /// filter — otherwise a client that drained the bucket sees `BucketNotEmpty`
+    /// and the server log holds no trace of the refusal at all.
+    #[test]
+    fn unreachable_residue_is_reported_at_the_default_log_level() {
+        for kind in [
+            BucketDeleteBlockerKind::UnknownXlMeta,
+            BucketDeleteBlockerKind::OrphanDirectory,
+            BucketDeleteBlockerKind::DiagnosticBudgetExceeded,
+        ] {
+            let logs = bucket_logs_at_default_level(|| {
+                record_bucket_delete_blocker("drained-bucket", kind, &residue_sample("obj/8f2c/xl.meta"));
+            });
+
+            assert!(logs.contains("drained-bucket"), "the bucket must be named for {kind:?}: {logs}");
+            assert!(logs.contains(kind.as_str()), "the blocker kind must be named for {kind:?}: {logs}");
+            assert!(
+                logs.contains("obj/8f2c/xl.meta"),
+                "the residue sample is the only pointer to the leftover state for {kind:?}: {logs}"
+            );
+        }
+    }
+
+    /// A bucket that genuinely still holds a version is an ordinary 409: the
+    /// client can list and delete what is left, so this must not be reported as
+    /// a server-side fault.
+    #[test]
+    fn client_visible_blockers_stay_below_the_default_log_level() {
+        for kind in [
+            BucketDeleteBlockerKind::VisibleVersion,
+            BucketDeleteBlockerKind::TierFreeVersion,
+        ] {
+            let logs = bucket_logs_at_default_level(|| {
+                record_bucket_delete_blocker("still-full-bucket", kind, &residue_sample("obj/xl.meta"));
+            });
+
+            assert!(logs.is_empty(), "an ordinary non-empty bucket must not log an error for {kind:?}: {logs}");
+        }
+    }
+
+    #[test]
+    fn blocker_kinds_split_by_whether_the_client_can_reach_the_residue() {
+        assert!(BucketDeleteBlockerKind::VisibleVersion.is_client_visible());
+        assert!(BucketDeleteBlockerKind::TierFreeVersion.is_client_visible());
+        assert!(!BucketDeleteBlockerKind::UnknownXlMeta.is_client_visible());
+        assert!(!BucketDeleteBlockerKind::OrphanDirectory.is_client_visible());
+        assert!(!BucketDeleteBlockerKind::DiagnosticBudgetExceeded.is_client_visible());
     }
 }

@@ -37,6 +37,8 @@ pub(crate) use rustfs_ecstore::api::runtime::{
 pub(crate) use rustfs_ecstore::api::storage::ECStore as ObsStore;
 use rustfs_storage_api as storage_contracts;
 
+use crate::metrics::collectors::{OdmBackfillBucketStats, OdmBackfillRuntimeStats, OnDemandMigrationBucketStats};
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ObsBucketReplicationTargetStatsSnapshot {
     pub(crate) target_arn: String,
@@ -454,6 +456,41 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
     buckets
 }
 
+struct OnDemandMigrationMetricsSource {
+    snapshot: fn() -> Vec<OnDemandMigrationBucketStats>,
+    backfill_snapshot: fn() -> Vec<OdmBackfillBucketStats>,
+}
+
+static ON_DEMAND_MIGRATION_METRICS_SOURCE: std::sync::OnceLock<OnDemandMigrationMetricsSource> = std::sync::OnceLock::new();
+
+/// Register the application-owned ODM snapshots before starting the collector.
+pub fn register_on_demand_migration_metrics_source(
+    snapshot: fn() -> Vec<OnDemandMigrationBucketStats>,
+    backfill_snapshot: fn() -> Vec<OdmBackfillBucketStats>,
+) -> bool {
+    ON_DEMAND_MIGRATION_METRICS_SOURCE
+        .set(OnDemandMigrationMetricsSource {
+            snapshot,
+            backfill_snapshot,
+        })
+        .is_ok()
+}
+
+pub(crate) fn obs_on_demand_migration_snapshot() -> Vec<OnDemandMigrationBucketStats> {
+    ON_DEMAND_MIGRATION_METRICS_SOURCE
+        .get()
+        .map(|source| (source.snapshot)())
+        .unwrap_or_default()
+}
+
+pub(crate) fn obs_on_demand_migration_backfill_snapshot(server: String) -> OdmBackfillRuntimeStats {
+    let buckets = ON_DEMAND_MIGRATION_METRICS_SOURCE
+        .get()
+        .map(|source| (source.backfill_snapshot)())
+        .unwrap_or_default();
+    OdmBackfillRuntimeStats { server, buckets }
+}
+
 pub(crate) async fn obs_replication_site_stats_snapshot(current_data_transfer_rate: f64) -> ObsReplicationSiteStatsSnapshot {
     let Some(stats) = get_global_replication_stats() else {
         return ObsReplicationSiteStatsSnapshot::default();
@@ -500,6 +537,31 @@ pub(crate) async fn obs_replication_site_stats_snapshot(current_data_transfer_ra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn on_demand_migration_callbacks_supply_runtime_snapshots() {
+        assert!(register_on_demand_migration_metrics_source(
+            || vec![OnDemandMigrationBucketStats {
+                bucket: "configured".into(),
+                pulled_bytes_total: 4096,
+                ..Default::default()
+            }],
+            || vec![OdmBackfillBucketStats {
+                bucket: "backfill".into(),
+                pulled: 3,
+                ..Default::default()
+            }],
+        ));
+        let snapshot = obs_on_demand_migration_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].bucket, "configured");
+        assert_eq!(snapshot[0].pulled_bytes_total, 4096);
+        let backfill = obs_on_demand_migration_backfill_snapshot("node-a".into());
+        assert_eq!(backfill.server, "node-a");
+        assert_eq!(backfill.buckets.len(), 1);
+        assert_eq!(backfill.buckets[0].bucket, "backfill");
+        assert_eq!(backfill.buckets[0].pulled, 3);
+    }
 
     #[test]
     fn obs_replication_numeric_conversions_floor_negative_values() {
@@ -721,7 +783,8 @@ pub(crate) mod metrics {
         ObsBucketBandwidthMonitor, ObsBucketReplicationStatsSnapshot, ObsEcstoreResult, ObsStore,
         obs_bucket_replication_stats_snapshot, obs_expiry_state_handle, obs_get_global_bucket_monitor, obs_get_quota_config,
         obs_get_total_usable_capacity, obs_get_total_usable_capacity_free, obs_is_disk_compression_enabled,
-        obs_load_compression_total_from_memory, obs_load_data_usage_from_backend, obs_replication_site_stats_snapshot,
-        obs_resolve_object_store_handle, obs_transition_state_handle,
+        obs_load_compression_total_from_memory, obs_load_data_usage_from_backend, obs_on_demand_migration_backfill_snapshot,
+        obs_on_demand_migration_snapshot, obs_replication_site_stats_snapshot, obs_resolve_object_store_handle,
+        obs_transition_state_handle,
     };
 }

@@ -25,6 +25,8 @@ use time::OffsetDateTime;
 use url::Url;
 
 const REDACTED_CREDENTIAL: &str = "<redacted>";
+const GO_YEAR_ONE_START_UNIX_SECONDS: i64 = -62_135_596_800;
+const GO_YEAR_TWO_START_UNIX_SECONDS: i64 = -62_104_060_800;
 
 #[derive(Deserialize, Serialize, Default, Clone)]
 pub struct Credentials {
@@ -32,11 +34,35 @@ pub struct Credentials {
     pub access_key: String,
     #[serde(rename = "secretKey")]
     pub secret_key: String,
+    // The aliases accept madmin's JSON tags (MinIO-written bucket-targets
+    // metadata and mc request bodies) without changing the snake_case
+    // persisted/peer wire format this struct serializes to.
+    #[serde(alias = "sessionToken")]
     pub session_token: Option<String>,
     pub expiration: Option<Timestamp>,
 }
 
 impl Credentials {
+    /// Returns the session token used for request signing.
+    ///
+    /// MinIO-compatible payloads may carry an empty token. Treat whitespace-only
+    /// values as absent without rewriting a real token, whose bytes are opaque.
+    pub fn effective_session_token(&self) -> Option<&str> {
+        self.session_token.as_deref().filter(|token| !token.trim().is_empty())
+    }
+
+    /// Returns the credential expiry after normalizing Go's zero `time.Time`.
+    ///
+    /// Go JSON encoders emit year 1 for an unset `time.Time`; persisted MinIO
+    /// target metadata can therefore contain that sentinel even for static
+    /// credentials.
+    pub fn effective_expiration(&self) -> Option<Timestamp> {
+        self.expiration.filter(|expiration| {
+            let unix_seconds = expiration.as_second();
+            !(GO_YEAR_ONE_START_UNIX_SECONDS..GO_YEAR_TWO_START_UNIX_SECONDS).contains(&unix_seconds)
+        })
+    }
+
     pub fn redacted(&self) -> Self {
         Self {
             access_key: self.access_key.clone(),
@@ -202,12 +228,14 @@ pub struct BucketTarget {
     #[serde(default)]
     pub region: String,
 
-    #[serde(alias = "bandwidth", default)]
+    // madmin-go v3.0.109 tags this `bandwidthlimit`; `bandwidth` is a legacy
+    // alias kept for inputs written before the madmin tag was verified.
+    #[serde(alias = "bandwidthlimit", alias = "bandwidth", default)]
     pub bandwidth_limit: i64,
 
     #[serde(rename = "replicationSync", default)]
     pub replication_sync: bool,
-    #[serde(default)]
+    #[serde(alias = "storageclass", default)]
     pub storage_class: String,
     #[serde(rename = "skipTlsVerify", default)]
     pub skip_tls_verify: bool,
@@ -220,7 +248,7 @@ pub struct BucketTarget {
 
     #[serde(rename = "resetBeforeDate", with = "time::serde::rfc3339::option", default)]
     pub reset_before_date: Option<OffsetDateTime>,
-    #[serde(default)]
+    #[serde(alias = "resetID", default)]
     pub reset_id: String,
     #[serde(rename = "totalDowntime", with = "duration_seconds", default)]
     pub total_downtime: Duration,
@@ -233,7 +261,7 @@ pub struct BucketTarget {
     #[serde(default)]
     pub latency: LatencyStat,
 
-    #[serde(default)]
+    #[serde(alias = "deploymentID", default)]
     pub deployment_id: String,
 
     #[serde(default)]
@@ -348,6 +376,24 @@ mod tests {
     use serde_json;
     use std::time::Duration;
     use time::OffsetDateTime;
+
+    #[test]
+    fn credential_effective_values_normalize_only_compatibility_sentinels() {
+        let mut credentials = Credentials {
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: Some("  ".to_string()),
+            expiration: Some("0001-01-01T08:00:00+08:00".parse().expect("Go zero time should parse")),
+        };
+
+        assert!(credentials.effective_session_token().is_none());
+        assert!(credentials.effective_expiration().is_none());
+
+        credentials.session_token = Some(" opaque token ".to_string());
+        credentials.expiration = Some("2099-01-01T00:00:00Z".parse().expect("future timestamp should parse"));
+        assert_eq!(credentials.effective_session_token(), Some(" opaque token "));
+        assert_eq!(credentials.effective_expiration(), credentials.expiration);
+    }
 
     #[test]
     fn test_bucket_target_json_deserialize() {
@@ -529,6 +575,85 @@ mod tests {
         let value = serde_json::to_value(&target).expect("target should serialize");
         assert_eq!(value["healthCheckDuration"], 60);
         assert_eq!(value["totalDowntime"], 90);
+    }
+
+    #[test]
+    fn bucket_target_persisted_wire_keys_stay_snake_case() {
+        // bucket-targets.json (persisted via `serde_json::to_vec(&BucketTargets)`
+        // in the admin set/remove handlers) and the msgpack struct-map form
+        // (`BucketTargets::marshal_msg`) both come straight from this struct's
+        // serde field names. madmin naming is applied only in the admin
+        // response layer (`remote_target_admin_json`); renaming here would
+        // silently break every existing deployment's persisted metadata.
+        let targets = BucketTargets {
+            targets: vec![BucketTarget {
+                credentials: Some(Credentials {
+                    access_key: "ak".to_string(),
+                    secret_key: "sk".to_string(),
+                    session_token: Some("token".to_string()),
+                    expiration: None,
+                }),
+                bandwidth_limit: 5,
+                storage_class: "STANDARD".to_string(),
+                reset_id: "reset-1".to_string(),
+                deployment_id: "deploy-1".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let json = serde_json::to_value(&targets).expect("targets should serialize to JSON");
+        let msgpack: serde_json::Value =
+            rmp_serde::from_slice(&targets.marshal_msg().expect("targets should marshal to msgpack"))
+                .expect("msgpack struct map should decode into a JSON value");
+
+        for (wire, entry) in [("JSON", &json["targets"][0]), ("msgpack", &msgpack["targets"][0])] {
+            assert_eq!(entry["bandwidth_limit"], 5, "{wire} key `bandwidth_limit` must stay");
+            assert_eq!(entry["storage_class"], "STANDARD", "{wire} key `storage_class` must stay");
+            assert_eq!(entry["reset_id"], "reset-1", "{wire} key `reset_id` must stay");
+            assert_eq!(entry["deployment_id"], "deploy-1", "{wire} key `deployment_id` must stay");
+            assert_eq!(entry["credentials"]["session_token"], "token", "{wire} key `session_token` must stay");
+        }
+    }
+
+    #[test]
+    fn minio_written_bucket_targets_json_populates_madmin_named_fields() {
+        // A MinIO-written bucket-targets.json carries madmin's JSON tags
+        // (`bandwidthlimit`, `storageclass`, `resetID`, `deploymentID`,
+        // `credentials.sessionToken` — madmin-go v3.0.109 bucket-targets.go).
+        // On migration these must land in the matching fields instead of
+        // silently defaulting (backlog#1951).
+        let targets: BucketTargets = serde_json::from_value(serde_json::json!({
+            "targets": [{
+                "sourcebucket": "src",
+                "endpoint": "minio.example:9000",
+                "credentials": {
+                    "accessKey": "ak",
+                    "secretKey": "sk",
+                    "sessionToken": "minio-session-token"
+                },
+                "targetbucket": "dst",
+                "type": "replication",
+                "replicationSync": true,
+                "bandwidthlimit": 107374182400i64,
+                "storageclass": "STANDARD",
+                "resetID": "reset-789",
+                "deploymentID": "deploy-123"
+            }]
+        }))
+        .expect("MinIO-written bucket-targets.json must deserialize");
+
+        let target = &targets.targets[0];
+        assert_eq!(target.bandwidth_limit, 107374182400);
+        assert_eq!(target.storage_class, "STANDARD");
+        assert_eq!(target.reset_id, "reset-789");
+        assert_eq!(target.deployment_id, "deploy-123");
+        assert_eq!(
+            target
+                .credentials
+                .as_ref()
+                .and_then(|credentials| credentials.session_token.as_deref()),
+            Some("minio-session-token")
+        );
     }
 
     #[test]

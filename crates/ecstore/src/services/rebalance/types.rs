@@ -51,6 +51,18 @@ pub(super) enum RebalanceEntryOutcome {
     Deferred { last_error: String },
 }
 
+/// Why a rebalance bucket was put back at the end of the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RebalanceDeferKind {
+    /// A transient object-migration failure. Persisting it as `lastError` keeps the pool
+    /// from being completed at the free-space goal while the entry is still retried.
+    Entry,
+    /// A retryable source-cleanup conflict. The bucket stays queued and is retried, so a
+    /// transient lock conflict must not be recorded as a permanent warning that would block
+    /// pool completion for the rest of the run.
+    SourceCleanup,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum RebalStatus {
     #[default]
@@ -143,6 +155,12 @@ pub struct DiskStat {
 pub struct RebalanceMeta {
     #[serde(skip)]
     pub cancel: Option<CancellationToken>, // To be invoked on rebalance-stop
+    /// Local operator intent, scoped to this run ID; a worker failure also cancels
+    /// `cancel`, so the token alone cannot identify an administrative stop.
+    #[serde(skip)]
+    pub stop_requested: bool,
+    #[serde(skip)]
+    pub activation_gate: std::sync::Arc<tokio::sync::RwLock<()>>,
     #[serde(skip)]
     pub last_refreshed_at: Option<OffsetDateTime>,
     #[serde(rename = "stopTs")]

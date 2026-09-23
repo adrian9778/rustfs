@@ -29,6 +29,33 @@ use tokio::sync::Mutex;
 
 const TEST_PLAN_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([3; 32]);
 
+mod cache_cost;
+
+#[test]
+fn scoped_scan_coverage_metadata_preserves_map_compatibility() {
+    #[derive(serde::Deserialize)]
+    struct LegacyInfo {
+        name: String,
+        next_cycle: u64,
+    }
+    let mut info = DataUsageCacheInfo {
+        name: DATA_USAGE_ROOT.to_string(),
+        next_cycle: 7,
+        ..Default::default()
+    };
+    let old = serde_json::to_value(&info).expect("legacy metadata should encode");
+    assert!(old.get("scan_coverage_digest").is_none());
+    let old: DataUsageCacheInfo = serde_json::from_value(old).expect("missing coverage must remain readable");
+    assert!(old.scan_coverage_digest.is_none());
+    info.scan_coverage_digest = Some(TEST_PLAN_DIGEST);
+    let encoded = rmp_serde::to_vec(&info).expect("coverage metadata should remain map encoded");
+    let legacy: LegacyInfo = rmp_serde::from_slice(&encoded).expect("old map readers should ignore additive proof fields");
+    assert_eq!(legacy.name, DATA_USAGE_ROOT);
+    assert_eq!(legacy.next_cycle, 7);
+    let decoded: DataUsageCacheInfo = rmp_serde::from_slice(&encoded).expect("new reader should restore the coverage proof");
+    assert_eq!(decoded.scan_coverage_digest, Some(TEST_PLAN_DIGEST));
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct CachePutRecord {
     object: String,
@@ -621,7 +648,6 @@ fn size_summary_add_saturates_all_usage_counters() {
             failed_count: usize::MAX,
         },
     );
-
     let mut increment = SizeSummary {
         total_size: 1,
         versions: 1,
@@ -636,6 +662,24 @@ fn size_summary_add_saturates_all_usage_counters() {
         failed_count: 1,
         ..Default::default()
     };
+    summary.tier_stats.insert(
+        UNKNOWN_TIER.to_string(),
+        TierStats {
+            total_size: u64::MAX,
+            num_versions: u64::MAX,
+            num_objects: u64::MAX,
+        },
+    );
+    increment.tier_stats.insert(
+        UNKNOWN_TIER.to_string(),
+        TierStats {
+            total_size: 1,
+            num_versions: 1,
+            num_objects: 1,
+        },
+    );
+    increment.unknown_tier_stats.unknown_bytes = 1;
+    increment.unknown_tier_stats.unknown_physical_bytes = 1;
     increment.repl_target_stats.insert(
         target.clone(),
         ReplTargetSizeSummary {
@@ -672,6 +716,8 @@ fn size_summary_add_saturates_all_usage_counters() {
     assert_eq!(target_summary.failed_size, i64::MAX);
     assert_eq!(target_summary.pending_count, usize::MAX);
     assert_eq!(target_summary.failed_count, usize::MAX);
+    assert_eq!(summary.tier_stats[UNKNOWN_TIER].total_size, u64::MAX);
+    assert_eq!(summary.unknown_tier_stats.unknown_bytes, 1);
 }
 
 #[test]
@@ -718,6 +764,249 @@ fn size_summary_actions_accounting_accumulates_tier_stats() {
             num_versions: 2,
             num_objects: 2,
         }
+    );
+}
+
+#[test]
+fn unknown_tier_is_bounded_and_accounted() {
+    let mut summary = SizeSummary::new();
+    summary.tier_stats.insert("WARM".to_string(), TierStats::default());
+    let object = ObjectInfo {
+        storage_class: Some("retired-tier".to_string()),
+        size: 11,
+        is_latest: true,
+        ..Default::default()
+    };
+
+    summary.actions_accounting(&object, 11, 11);
+
+    assert_eq!(summary.tier_stats.len(), 2);
+    assert_eq!(summary.tier_stats.get(UNKNOWN_TIER).map(|stats| stats.total_size), Some(11));
+    assert_eq!(summary.unknown_tier_stats.unknown_bytes, 11);
+    assert_eq!(summary.unknown_tier_stats.unknown_physical_bytes, 11);
+    assert_eq!(summary.unknown_tier_stats.unknown_objects, 1);
+    assert_eq!(summary.tier_accounting_proof.logical_total, 11);
+    assert_eq!(summary.tier_accounting_proof.logical_known, 0);
+    assert_eq!(summary.tier_accounting_proof.physical_total, 11);
+    assert_eq!(summary.tier_accounting_proof.physical_known, 0);
+    assert!(summary.unknown_tier_stats.diagnostics.len() <= UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP);
+    assert!(summary.unknown_tier_stats.diagnostics.iter().map(String::len).sum::<usize>() <= UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP);
+    assert!(
+        summary
+            .unknown_tier_stats
+            .diagnostics
+            .iter()
+            .all(|entry| !entry.contains("retired"))
+    );
+}
+
+#[test]
+fn unknown_tier_is_accounted_when_no_remote_tier_is_configured() {
+    let mut summary = SizeSummary::new();
+    let object = ObjectInfo {
+        storage_class: Some("retired-tier".to_string()),
+        size: 3,
+        is_latest: true,
+        ..Default::default()
+    };
+
+    summary.actions_accounting(&object, 9, 9);
+
+    assert_eq!(summary.tier_stats.len(), 1);
+    assert_eq!(summary.tier_stats[UNKNOWN_TIER].total_size, 3);
+    assert_eq!(summary.unknown_tier_stats.unknown_bytes, 9);
+    assert_eq!(summary.unknown_tier_stats.unknown_physical_bytes, 3);
+
+    let standard = ObjectInfo {
+        storage_class: Some(storageclass::STANDARD.to_string()),
+        size: 4,
+        is_latest: true,
+        ..Default::default()
+    };
+    summary.actions_accounting(&standard, 4, 4);
+    assert_eq!(summary.tier_accounting_proof.logical_total, 13);
+    assert_eq!(summary.tier_accounting_proof.logical_known, 4);
+    assert_eq!(summary.tier_accounting_proof.physical_total, 3 + 4);
+    assert_eq!(summary.tier_accounting_proof.physical_known, 4);
+    assert_eq!(summary.tier_stats.len(), 1, "built-ins preserve the no-tier map shape");
+}
+
+#[test]
+fn million_unique_tier_keys_do_not_grow_stats_map() {
+    let mut summary = SizeSummary::new();
+    summary.tier_stats.insert("WARM".to_string(), TierStats::default());
+    for index in 0..1_000_000_u64 {
+        let object = ObjectInfo {
+            storage_class: Some(format!("untrusted-tier-{index}")),
+            size: 1,
+            ..Default::default()
+        };
+        summary.actions_accounting(&object, 1, 1);
+    }
+
+    assert_eq!(summary.tier_stats.len(), 2);
+    assert_eq!(summary.tier_stats[UNKNOWN_TIER].total_size, 1_000_000);
+    assert_eq!(summary.unknown_tier_stats.unknown_bytes, 1_000_000);
+    assert!(summary.unknown_tier_stats.diagnostics.len() <= UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP);
+    assert!(summary.unknown_tier_stats.diagnostics.iter().map(String::len).sum::<usize>() <= UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP);
+}
+
+#[test]
+fn unknown_tier_never_triggers_transition() {
+    let mut summary = SizeSummary::new();
+    summary.tier_stats.insert("WARM".to_string(), TierStats::default());
+    let mut object = ObjectInfo {
+        storage_class: Some("removed-tier".to_string()),
+        size: 7,
+        ..Default::default()
+    };
+    object.transitioned_object.status = TRANSITION_COMPLETE.to_string();
+    object.transitioned_object.tier = "removed-tier".to_string();
+
+    summary.actions_accounting(&object, 7, 7);
+
+    assert_eq!(summary.tier_stats.get("removed-tier"), None);
+    assert_eq!(summary.tier_stats[UNKNOWN_TIER].total_size, 7);
+}
+
+#[test]
+fn removed_tier_survives_restart_as_unknown() {
+    let mut summary = SizeSummary::new();
+    summary.tier_stats.insert("COLD".to_string(), TierStats::default());
+    summary.tier_stats.insert(
+        "RETIRED".to_string(),
+        TierStats {
+            total_size: 5,
+            num_versions: 1,
+            num_objects: 1,
+        },
+    );
+    let object = ObjectInfo {
+        storage_class: Some("COLD".to_string()),
+        size: 5,
+        ..Default::default()
+    };
+    summary.actions_accounting(&object, 5, 5);
+    let mut entry = DataUsageEntry::default();
+    entry.add_tier_sizes(&summary.tier_stats);
+    entry.add_unknown_tier_stats(&UnknownTierStats {
+        unknown_bytes: 2,
+        unknown_physical_bytes: 2,
+        unknown_objects: 1,
+        unknown_versions: 1,
+        ..Default::default()
+    });
+    let encoded = rmp_serde::to_vec(&entry).expect("entry should encode");
+    let restored: DataUsageEntry = rmp_serde::from_slice(&encoded).expect("entry should decode");
+    assert_eq!(restored.unknown_tier_stats.as_ref().map(|stats| stats.unknown_bytes), Some(2));
+    assert_eq!(
+        restored.all_tier_stats.as_ref().expect("tier stats persisted").tiers["RETIRED"].total_size,
+        5
+    );
+
+    let mut cache = DataUsageCache::default();
+    cache.replace("bucket", "", restored);
+    cache.fold_retired_tiers(&["COLD".to_string()]);
+    let folded = cache.cache.get(&hash_path("bucket").key()).expect("folded cache entry");
+    assert_eq!(
+        folded.all_tier_stats.as_ref().expect("tier stats persisted").tiers[UNKNOWN_TIER].total_size,
+        5
+    );
+    assert_eq!(folded.unknown_tier_stats.as_ref().map(|stats| stats.unknown_bytes), Some(2));
+}
+
+#[test]
+fn retired_tier_fold_is_idempotent_and_rejects_mixed_companion_provenance() {
+    let mut cache = DataUsageCache::default();
+    let mut entry = DataUsageEntry {
+        all_tier_stats: Some(AllTierStats {
+            tiers: HashMap::from([(
+                "RETIRED".to_string(),
+                TierStats {
+                    total_size: 5,
+                    num_versions: 1,
+                    num_objects: 1,
+                },
+            )]),
+        }),
+        ..Default::default()
+    };
+    entry.unknown_tier_stats = Some(UnknownTierStats {
+        unknown_physical_bytes: 5,
+        ..Default::default()
+    });
+    entry.tier_accounting_proof = Some(TierAccountingProof {
+        physical_total: 5,
+        physical_known: 5,
+        ..Default::default()
+    });
+    cache.replace("bucket", "", entry);
+
+    cache.fold_retired_tiers(&["COLD".to_string()]);
+    let first = cache.cache.get(&hash_path("bucket").key()).expect("entry").clone();
+    assert_eq!(first.all_tier_stats.as_ref().expect("tiers").tiers[UNKNOWN_TIER].total_size, 5);
+    assert_eq!(first.unknown_tier_stats.as_ref().expect("companion").unknown_physical_bytes, 5);
+    assert!(first.tier_accounting_proof.is_none(), "mixed provenance must not publish");
+
+    cache.fold_retired_tiers(&["COLD".to_string()]);
+    let second = cache.cache.get(&hash_path("bucket").key()).expect("entry");
+    assert_eq!(second.all_tier_stats.as_ref().expect("tiers").tiers[UNKNOWN_TIER].total_size, 5);
+    assert_eq!(second.unknown_tier_stats.as_ref().expect("companion").unknown_physical_bytes, 5);
+}
+
+#[test]
+fn tier_registry_refresh_does_not_mix_cycle_generations() {
+    let first = crate::TierRegistrySnapshot {
+        generation: 1,
+        names: Arc::from(["WARM".to_string()]),
+        refresh_failed: false,
+    };
+    let second = crate::TierRegistrySnapshot {
+        generation: 2,
+        names: Arc::from(["COLD".to_string()]),
+        refresh_failed: false,
+    };
+    assert_ne!(first.generation, second.generation);
+    assert_eq!(first.names.as_ref(), ["WARM".to_string()]);
+    assert_eq!(second.names.as_ref(), ["COLD".to_string()]);
+    assert!(first.refreshed(Err(())).refresh_failed);
+    assert!(!second.refreshed(Ok(Arc::from(["HOT".to_string()]))).refresh_failed);
+    assert_eq!(first.refreshed(Err(())).generation, first.generation);
+    assert_eq!(first.refreshed(Err(())).names, first.names);
+}
+
+#[test]
+fn unknown_tier_counter_uses_checked_arithmetic() {
+    let max = TierStats {
+        total_size: u64::MAX,
+        num_versions: u64::MAX,
+        num_objects: u64::MAX,
+    };
+    assert!(max.checked_add(&TierStats::default()).is_some());
+    assert!(
+        max.checked_add(&TierStats {
+            total_size: 1,
+            ..Default::default()
+        })
+        .is_none()
+    );
+
+    let mut unknown = UnknownTierStats {
+        unknown_bytes: u64::MAX,
+        ..Default::default()
+    };
+    unknown.record("overflow", 1, 1, 1);
+    assert_eq!(unknown.unknown_bytes, u64::MAX);
+    assert_eq!(unknown.unknown_objects, 1);
+    assert!(unknown.counter_overflowed);
+    assert!(unknown.checked_add(&UnknownTierStats::default()).is_none());
+    assert!(
+        unknown
+            .checked_add(&UnknownTierStats {
+                unknown_bytes: 1,
+                ..Default::default()
+            })
+            .is_none()
     );
 }
 
@@ -805,6 +1094,8 @@ fn test_data_usage_cache_info_deserialize_defaults_scan_resume_after() {
     assert!(decoded.source.is_none());
     assert!(!decoded.snapshot_complete);
     assert!(decoded.scan_plan_digest.is_none());
+    assert!(decoded.scan_execution_digest.is_none());
+    assert!(decoded.segment_invalidation_proof.is_none());
     assert_eq!(decoded.cache_key_format, 0);
 }
 
@@ -843,10 +1134,12 @@ fn test_data_usage_cache_info_unmarshal_old_msgpack_defaults_scan_resume_after()
     assert_eq!(decoded.failed_objects.get("bad-object"), Some(&11));
     assert!(decoded.scan_resume_after.is_none());
     assert!(decoded.scan_checkpoint.is_none());
+    assert!(decoded.scan_raw_enumeration_cursor.is_none());
     assert!(decoded.pending_heals.is_empty());
     assert!(decoded.source.is_none());
     assert!(!decoded.snapshot_complete);
     assert!(decoded.scan_plan_digest.is_none());
+    assert!(decoded.scan_execution_digest.is_none());
     assert_eq!(decoded.cache_key_format, 0);
 }
 
@@ -881,8 +1174,23 @@ fn test_new_data_usage_cache_msgpack_round_trips_and_supports_old_reader() {
             skip_healing: true,
             failed_objects: HashMap::from([("bad-object".to_string(), 11)]),
             source: Some(DataUsageCacheSource::new(1, 2)),
+            scan_raw_enumeration_cursor: Some(DataUsageRawEnumerationCursor::new(
+                "bucket/prefix".to_string(),
+                Some("last-object".to_string()),
+                7,
+                [7; 32],
+            )),
+            scan_raw_enumeration_page_index: Some(raw_page_index_fixture("bucket/prefix", &["entry-a"], false)),
             snapshot_complete: true,
             scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            scan_execution_digest: Some(DataUsageScanPlanDigest([42; 32])),
+            segment_invalidation_proof: Some(DataUsageSegmentInvalidationProof {
+                process_epoch: "scanner-process".to_string(),
+                generation_start: 7,
+                generation_end: 9,
+                producer_identity_coverage_complete: true,
+                cold_zero_walk_oracle: true,
+            }),
             cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
             ..Default::default()
         },
@@ -900,8 +1208,28 @@ fn test_new_data_usage_cache_msgpack_round_trips_and_supports_old_reader() {
     let current = DataUsageCache::unmarshal(&buf).expect("Current reader failed to deserialize new cache");
     assert_eq!(current.info.leader_epoch, 9);
     assert_eq!(current.info.source, Some(DataUsageCacheSource::new(1, 2)));
+    assert_eq!(
+        current
+            .info
+            .scan_raw_enumeration_cursor
+            .as_ref()
+            .map(|cursor| cursor.last_entry.as_deref()),
+        Some(Some("last-object"))
+    );
+    assert!(current.info.scan_raw_enumeration_page_index.is_some());
     assert!(current.info.snapshot_complete);
     assert_eq!(current.info.scan_plan_digest, Some(TEST_PLAN_DIGEST));
+    assert_eq!(current.info.scan_execution_digest, Some(DataUsageScanPlanDigest([42; 32])));
+    assert_eq!(
+        current.info.segment_invalidation_proof,
+        Some(DataUsageSegmentInvalidationProof {
+            process_epoch: "scanner-process".to_string(),
+            generation_start: 7,
+            generation_end: 9,
+            producer_identity_coverage_complete: true,
+            cold_zero_walk_oracle: true,
+        })
+    );
     assert_eq!(current.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
     assert_eq!(current.find("bucket").map(|entry| entry.objects), Some(3));
 
@@ -919,6 +1247,179 @@ fn test_new_data_usage_cache_msgpack_round_trips_and_supports_old_reader() {
     assert!(decoded.info.pending_heals.is_empty());
     assert!(decoded.info.object_lock.is_none());
     assert_eq!(decoded.cache.get("bucket").map(|entry| entry.objects), Some(3));
+}
+
+fn valid_scan_identity() -> DataUsageScanIdentity {
+    DataUsageScanIdentity {
+        version: 1,
+        bucket_incarnation: uuid::Uuid::new_v4(),
+        set_layout: TEST_PLAN_DIGEST,
+        publication_epoch: 5,
+        tier_registry_generation: 9,
+        scan_mode: HealScanMode::Normal,
+    }
+}
+
+fn cache_with_raw_cursor(cursor: DataUsageRawEnumerationCursor) -> DataUsageCache {
+    DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            leader_epoch: 1,
+            source: Some(DataUsageCacheSource::new(1, 2)),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            scan_identity: Some(valid_scan_identity()),
+            tier_registry_generation: Some(9),
+            scan_progress: Some(DataUsageScanProgress {
+                started_plan: TEST_PLAN_DIGEST,
+                requested_plan: TEST_PLAN_DIGEST,
+            }),
+            scan_raw_enumeration_cursor: Some(cursor),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn raw_page_index_fixture(parent: &str, entries: &[&str], complete: bool) -> RawEnumerationPageIndex {
+    let mut index = RawEnumerationPageIndex::new(parent, 2).expect("raw page index should initialize");
+    let generation = index.generation().expect("raw page index should expose generation");
+    let outcome = if complete {
+        index.ingest_owner_entries(entries.iter().map(|entry| (*entry).to_string()), entries.len().max(1), generation)
+    } else {
+        index.ingest_partial_owner_entries(entries.iter().map(|entry| (*entry).to_string()), entries.len().max(1), generation)
+    }
+    .expect("raw page index fixture should ingest entries");
+    if outcome.ready_to_commit {
+        let generation = index.generation().expect("raw page index should expose commit generation");
+        index
+            .commit_building_page(generation)
+            .expect("raw page index fixture should commit ready page");
+    }
+    index
+}
+
+#[test]
+fn raw_enumeration_cursor_validation_requires_bucket_identity_and_bounded_marker() {
+    let valid = DataUsageRawEnumerationCursor::new("bucket/raw".to_string(), Some("entry-001".to_string()), 1, [8; 32]);
+    let cache = cache_with_raw_cursor(valid.clone());
+    assert_eq!(cache.validated_raw_enumeration_cursor(), Some(&valid));
+
+    let page_begin = DataUsageRawEnumerationCursor::new("bucket/raw".to_string(), None, 0, [8; 32]);
+    let cache = cache_with_raw_cursor(page_begin.clone());
+    assert_eq!(cache.validated_raw_enumeration_cursor(), Some(&page_begin));
+
+    let seen_without_marker = DataUsageRawEnumerationCursor::new("bucket/raw".to_string(), None, 1, [8; 32]);
+    assert!(
+        cache_with_raw_cursor(seen_without_marker)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+
+    let mut missing_identity = cache_with_raw_cursor(valid.clone());
+    missing_identity.info.scan_identity = None;
+    assert!(missing_identity.validated_raw_enumeration_cursor().is_none());
+
+    let mut outside_bucket = valid.clone();
+    outside_bucket.parent = "other/raw".to_string();
+    assert!(
+        cache_with_raw_cursor(outside_bucket)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+
+    let mut future_version = valid.clone();
+    future_version.version = DATA_USAGE_RAW_ENUMERATION_CURSOR_VERSION + 1;
+    assert!(
+        cache_with_raw_cursor(future_version)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+
+    let mut zero_digest = valid.clone();
+    zero_digest.page_digest = [0; 32];
+    assert!(
+        cache_with_raw_cursor(zero_digest)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+
+    let mut nested_marker = valid;
+    nested_marker.last_entry = Some("child/object".to_string());
+    assert!(
+        cache_with_raw_cursor(nested_marker)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+
+    let oversized_marker =
+        DataUsageRawEnumerationCursor::new("bucket/raw".to_string(), Some("x".repeat(16 * 1024 + 1)), 1, [8; 32]);
+    assert!(
+        cache_with_raw_cursor(oversized_marker)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+}
+
+#[test]
+fn prepare_bucket_checkpoint_preserves_only_valid_raw_enumeration_cursor() {
+    let identity = valid_scan_identity();
+    let source = DataUsageCacheSource::new(1, 2);
+    let cursor = DataUsageRawEnumerationCursor::new("bucket/raw".to_string(), Some("entry-001".to_string()), 1, [9; 32]);
+    let mut cache = cache_with_raw_cursor(cursor.clone());
+    cache.info.scan_identity = Some(identity);
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
+    assert_eq!(cache.info.scan_raw_enumeration_cursor, Some(cursor));
+
+    let invalid = DataUsageRawEnumerationCursor::new("other/raw".to_string(), Some("entry-001".to_string()), 1, [9; 32]);
+    let mut cache = cache_with_raw_cursor(invalid);
+    cache.info.scan_identity = Some(identity);
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
+    assert!(cache.info.scan_raw_enumeration_cursor.is_none());
+    assert!(cache.info.scan_progress.is_some());
+}
+
+#[test]
+fn prepare_bucket_checkpoint_preserves_only_valid_raw_page_index() {
+    let identity = valid_scan_identity();
+    let source = DataUsageCacheSource::new(1, 2);
+    let page_index = raw_page_index_fixture("bucket/raw", &["entry-001"], false);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            leader_epoch: 1,
+            source: Some(source),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            scan_identity: Some(identity),
+            tier_registry_generation: Some(9),
+            scan_progress: Some(DataUsageScanProgress {
+                started_plan: TEST_PLAN_DIGEST,
+                requested_plan: TEST_PLAN_DIGEST,
+            }),
+            scan_raw_enumeration_page_index: Some(page_index.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
+    assert_eq!(cache.info.scan_raw_enumeration_page_index, Some(page_index));
+
+    let invalid = raw_page_index_fixture("other/raw", &["entry-001"], false);
+    cache.info.scan_raw_enumeration_page_index = Some(invalid);
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
+    assert!(cache.info.scan_raw_enumeration_page_index.is_none());
+    assert!(cache.info.scan_progress.is_some());
 }
 
 /// Deterministic, fully populated cache used to pin the persisted
@@ -1062,6 +1563,24 @@ fn usage_cache_wire_format_is_pinned() {
             num_objects: 1,
         })
     );
+}
+
+#[test]
+fn usage_cache_lkg_fields_round_trip_when_present() {
+    let mut cache = wire_fixture_cache();
+    cache.info.lkg_snapshot_complete = true;
+    cache.info.lkg_next_cycle = Some(6);
+    cache.info.lkg_last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_699_999_999));
+    cache.info.lkg_leader_epoch = Some(8);
+    cache.info.lkg_scan_plan_digest = Some(DataUsageScanPlanDigest([2; 32]));
+
+    let encoded = cache.marshal_msg().expect("marshal cache with LKG metadata");
+    let decoded = DataUsageCache::unmarshal(&encoded).expect("decode cache with LKG metadata");
+    assert!(decoded.info.lkg_snapshot_complete);
+    assert_eq!(decoded.info.lkg_next_cycle, Some(6));
+    assert_eq!(decoded.info.lkg_last_update, cache.info.lkg_last_update);
+    assert_eq!(decoded.info.lkg_leader_epoch, Some(8));
+    assert_eq!(decoded.info.lkg_scan_plan_digest, Some(DataUsageScanPlanDigest([2; 32])));
 }
 
 #[test]
@@ -1515,6 +2034,59 @@ fn data_usage_cache_prepare_for_scan_fences_leader_epochs() {
 }
 
 #[test]
+fn prepare_bucket_checkpoint_migrates_legacy_epoch_bound_receipt() {
+    let identity = valid_scan_identity();
+    let source = DataUsageCacheSource::new(1, 2);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 8,
+            leader_epoch: 1,
+            source: Some(source),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            scan_identity: Some(identity),
+            tier_registry_generation: Some(identity.tier_registry_generation),
+            scan_progress: Some(DataUsageScanProgress {
+                started_plan: TEST_PLAN_DIGEST,
+                requested_plan: TEST_PLAN_DIGEST,
+            }),
+            scan_resume_after: Some("bucket/a".to_string()),
+            scan_checkpoint: Some(DataUsageScanCheckpoint::new(
+                "bucket/a".to_string(),
+                DataUsageScanCheckpointReason::Objects,
+            )),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace("bucket", "", DataUsageEntry::default());
+    cache.replace(
+        "bucket/a",
+        "bucket",
+        DataUsageEntry {
+            objects: 1,
+            ..Default::default()
+        },
+    );
+    let legacy_digest = cache
+        .legacy_coverage_prefix_digest("bucket/a")
+        .expect("legacy receipt digest");
+    cache.info.scan_coverage_receipt = Some(DataUsageScanCoverageReceipt {
+        through: "bucket/a".to_string(),
+        digest: legacy_digest,
+    });
+    assert_eq!(cache.validated_scan_frontier(), Some("bucket/a"));
+
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 8, 2, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
+    assert_eq!(cache.info.leader_epoch, 2);
+    assert_eq!(cache.validated_scan_frontier(), Some("bucket/a"));
+    assert_ne!(cache.info.scan_coverage_receipt.expect("migrated receipt").digest, legacy_digest);
+}
+
+#[test]
 fn test_data_usage_cache_mutations_update_in_place() {
     let mut cache = DataUsageCache {
         info: DataUsageCacheInfo {
@@ -1961,6 +2533,7 @@ fn test_cache_save_timeout_uses_default_when_env_missing() {
             DataUsageCache::cache_save_timeout(),
             Duration::from_secs(rustfs_config::DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS)
         );
+        assert_eq!(DataUsageCache::persistence_timeout(), Duration::from_millis(52_350));
     });
     crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }

@@ -34,10 +34,12 @@
 //! rejected header-SigV4 requests.
 
 use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
-use rustfs_signer::constants::UNSIGNED_PAYLOAD;
+use rustfs_signer::constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER};
 use rustfs_signer::request_signature_v4::{SIGN_V4_ALGORITHM, get_scope, get_signature, get_signing_key};
 use std::fmt::Write as _;
+use std::io::Cursor;
 use time::macros::format_description;
 use time::{Duration, OffsetDateTime};
 use tracing::info;
@@ -97,15 +99,37 @@ impl SigV4 {
     /// header AND folded into the canonical request — pass the hash of the
     /// body you *claim* to send, which may differ from what you actually send.
     fn sign(&self, method: &str, path: &str, canonical_query: &str, content_sha256: &str) -> SignedHeaders {
-        let amz_date = amz_datetime(self.time);
-        let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+        self.sign_with_extra_headers(method, path, canonical_query, content_sha256, &[])
+    }
 
-        let canonical_headers = format!(
-            "host:{host}\nx-amz-content-sha256:{sha}\nx-amz-date:{date}\n",
-            host = self.host,
-            sha = content_sha256,
-            date = amz_date,
-        );
+    /// Sign additional request headers while preserving SigV4's lowercase,
+    /// lexicographically sorted canonical-header representation.
+    fn sign_with_extra_headers(
+        &self,
+        method: &str,
+        path: &str,
+        canonical_query: &str,
+        content_sha256: &str,
+        extra_signed_headers: &[(&str, &str)],
+    ) -> SignedHeaders {
+        let amz_date = amz_datetime(self.time);
+        let mut canonical_header_values = vec![
+            ("host", self.host.as_str()),
+            ("x-amz-content-sha256", content_sha256),
+            ("x-amz-date", amz_date.as_str()),
+        ];
+        canonical_header_values.extend(extra_signed_headers.iter().copied());
+        canonical_header_values.sort_unstable_by(|left, right| left.0.cmp(right.0));
+
+        let signed_headers = canonical_header_values
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(";");
+        let mut canonical_headers = String::new();
+        for (name, value) in canonical_header_values {
+            let _ = writeln!(canonical_headers, "{name}:{value}");
+        }
         let canonical_request =
             format!("{method}\n{path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{content_sha256}");
 
@@ -178,6 +202,34 @@ async fn setup(env: &mut RustFSTestEnvironment) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+async fn build_single_member_archive(
+    member_key: &str,
+    member_body: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut builder = tokio_tar::Builder::new(Cursor::new(Vec::new()));
+    let mut header = tokio_tar::Header::new_gnu();
+    header.set_size(member_body.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder.append_data(&mut header, member_key, Cursor::new(member_body)).await?;
+    Ok(builder.into_inner().await?.into_inner())
+}
+
+fn sha256_base64(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    base64_simd::STANDARD.encode_to_string(Sha256::digest(data))
+}
+
+fn encode_unsigned_aws_chunked_with_sha256_trailer(decoded: &[u8]) -> Vec<u8> {
+    let checksum = sha256_base64(decoded);
+    let mut encoded = format!("{:x}\r\n", decoded.len()).into_bytes();
+    encoded.extend_from_slice(decoded);
+    encoded.extend_from_slice(b"\r\n0\r\n");
+    encoded.extend_from_slice(format!("x-amz-checksum-sha256:{checksum}\r\n\r\n").as_bytes());
+    encoded
+}
+
 /// Positive control: a correctly hand-signed request must succeed. Without
 /// this, every negative assertion below could pass for the wrong reason (a
 /// broken signer that never produces a valid signature).
@@ -206,6 +258,118 @@ async fn valid_header_sigv4_request_succeeds() -> Result<(), Box<dyn std::error:
     let bytes = resp.bytes().await?;
     assert_eq!(bytes.as_ref(), expected, "GET body must match stored object");
     info!("valid header SigV4 control passed");
+    Ok(())
+}
+
+const XM99_SOURCE_BUCKET: &str = "xm99-private-source";
+const XM99_SOURCE_BODY: &[u8] = b"private source object";
+const XM99_TARGET_BODY: &[u8] = b"original target object";
+
+/// Seed a private source object and upload the target with a plain
+/// header-signed PutObject, returning the target path and the copy source.
+async fn xm99_seed_target(
+    env: &RustFSTestEnvironment,
+    signer: &SigV4,
+) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+    env.create_test_bucket(XM99_SOURCE_BUCKET).await?;
+    env.create_s3_client()
+        .put_object()
+        .bucket(XM99_SOURCE_BUCKET)
+        .key("secret")
+        .body(ByteStream::from_static(XM99_SOURCE_BODY))
+        .send()
+        .await?;
+
+    let path = format!("/{BUCKET}/xm99-target");
+    let signed = signer.sign("PUT", &path, "", UNSIGNED_PAYLOAD);
+    let resp = send_signed(env, reqwest::Method::PUT, &path, &signed, Some(XM99_TARGET_BODY.to_vec())).await?;
+    assert_eq!(resp.status().as_u16(), 200, "plain header-signed upload must succeed");
+    Ok((path, format!("/{XM99_SOURCE_BUCKET}/secret")))
+}
+
+async fn xm99_target_body(env: &RustFSTestEnvironment) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let object = env
+        .create_s3_client()
+        .get_object()
+        .bucket(BUCKET)
+        .key("xm99-target")
+        .send()
+        .await?;
+    Ok(object.body.collect().await?.into_bytes().to_vec())
+}
+
+/// GHSA-xm99-m3gq-83g8: replaying a header-signed PutObject with an unsigned
+/// `x-amz-copy-source` must not become a CopyObject that reads another bucket
+/// with the signer's permissions, and swapping the algorithm token must not
+/// route the request around the check.
+#[tokio::test]
+async fn ghsa_xm99_header_sigv4_rejects_unsigned_copy_source() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+    let signer = SigV4::new(&env);
+    let (path, copy_source) = xm99_seed_target(&env, &signer).await?;
+
+    // The PutObject signature covers host, payload hash and date only.
+    let signed = signer.sign("PUT", &path, "", UNSIGNED_PAYLOAD);
+    let variants = [
+        (
+            signed.authorization.clone(),
+            "There were headers present in the request which were not signed",
+        ),
+        (
+            signed.authorization.replacen(SIGN_V4_ALGORITHM, "OTHER", 1),
+            "Unsupported SigV4 authorization algorithm",
+        ),
+    ];
+    for (authorization, message) in variants {
+        let resp = local_http_client()
+            .put(format!("{}{path}", env.url))
+            .header("authorization", &authorization)
+            .header("x-amz-date", &signed.amz_date)
+            .header("x-amz-content-sha256", &signed.content_sha256)
+            .header("x-amz-copy-source", &copy_source)
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        let body = resp.text().await?;
+        assert_eq!(status, 403, "unsigned x-amz-copy-source must be denied, got body:\n{body}");
+        assert_error_code(&body, "AccessDenied");
+        assert!(body.contains(message), "expected {message:?} in response body, got:\n{body}");
+    }
+
+    assert_eq!(
+        xm99_target_body(&env).await?,
+        XM99_TARGET_BODY,
+        "a rejected copy must leave the destination object unchanged"
+    );
+    Ok(())
+}
+
+/// Positive control for GHSA-xm99-m3gq-83g8: the same CopyObject succeeds when
+/// the credential holder signs `x-amz-copy-source`.
+#[tokio::test]
+async fn ghsa_xm99_header_sigv4_accepts_signed_copy_source() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+    let signer = SigV4::new(&env);
+    let (path, copy_source) = xm99_seed_target(&env, &signer).await?;
+
+    let signed = signer.sign_with_extra_headers("PUT", &path, "", UNSIGNED_PAYLOAD, &[("x-amz-copy-source", &copy_source)]);
+    let resp = local_http_client()
+        .put(format!("{}{path}", env.url))
+        .header("authorization", &signed.authorization)
+        .header("x-amz-date", &signed.amz_date)
+        .header("x-amz-content-sha256", &signed.content_sha256)
+        .header("x-amz-copy-source", &copy_source)
+        .send()
+        .await?;
+    let status = resp.status().as_u16();
+    let body = resp.text().await?;
+    assert_eq!(status, 200, "signed copy must succeed, got body:\n{body}");
+    assert!(body.contains("CopyObjectResult"), "expected CopyObjectResult, got:\n{body}");
+    assert_eq!(xm99_target_body(&env).await?, XM99_SOURCE_BODY, "signed copy must replace the target");
     Ok(())
 }
 
@@ -248,6 +412,128 @@ async fn tampered_signature_returns_signature_does_not_match() -> Result<(), Box
     Ok(())
 }
 
+/// `STREAMING-UNSIGNED-PAYLOAD-TRAILER` disables per-chunk signatures, not the
+/// seed/header SigV4 signature. A forged request must be rejected before the
+/// Snowball handler can publish any archive member.
+#[tokio::test]
+async fn snowball_streaming_unsigned_trailer_rejects_forged_signature() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+
+    let archive_key = "forged-streaming-snowball.tar";
+    let member_key = "must-not-be-published.txt";
+    let archive = build_single_member_archive(member_key, b"forged request payload").await?;
+    let decoded_content_length = archive.len().to_string();
+    let encoded_body = encode_unsigned_aws_chunked_with_sha256_trailer(&archive);
+    let path = format!("/{BUCKET}/{archive_key}");
+
+    let mut signer = SigV4::new(&env);
+    signer.secret_key = "wrong-secret-for-forged-streaming-request".to_string();
+    let extra_signed_headers = [
+        ("content-encoding", "aws-chunked"),
+        ("x-amz-decoded-content-length", decoded_content_length.as_str()),
+        ("x-amz-meta-snowball-auto-extract", "true"),
+        ("x-amz-trailer", "x-amz-checksum-sha256"),
+    ];
+    let headers = signer.sign_with_extra_headers("PUT", &path, "", UNSIGNED_PAYLOAD_TRAILER, &extra_signed_headers);
+
+    let response = local_http_client()
+        .put(format!("{}{}", env.url, path))
+        .header("authorization", &headers.authorization)
+        .header("content-encoding", "aws-chunked")
+        .header("x-amz-content-sha256", &headers.content_sha256)
+        .header("x-amz-date", &headers.amz_date)
+        .header("x-amz-decoded-content-length", &decoded_content_length)
+        .header("x-amz-meta-snowball-auto-extract", "true")
+        .header("x-amz-trailer", "x-amz-checksum-sha256")
+        .body(encoded_body)
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    assert_eq!(status.as_u16(), 403, "forged streaming signature must be 403, body:\n{body}");
+    assert_error_code(&body, "SignatureDoesNotMatch");
+
+    let absent = env
+        .create_s3_client()
+        .get_object()
+        .bucket(BUCKET)
+        .key(member_key)
+        .send()
+        .await
+        .expect_err("a forged streaming request must not publish a Snowball member");
+    assert_eq!(absent.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(absent.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
+
+    env.stop_server();
+    Ok(())
+}
+
+/// Snowball must consume the complete aws-chunked body before reading the
+/// trailing checksum exported by s3s into the PutObject response.
+#[tokio::test]
+async fn snowball_streaming_unsigned_trailer_returns_sha256_checksum() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+
+    let archive_key = "valid-streaming-snowball.tar";
+    let member_key = "streaming-checksum-member.txt";
+    let member_body = b"valid streaming Snowball payload";
+    let archive = build_single_member_archive(member_key, member_body).await?;
+    let expected_checksum = sha256_base64(&archive);
+    let decoded_content_length = archive.len().to_string();
+    let encoded_body = encode_unsigned_aws_chunked_with_sha256_trailer(&archive);
+    let path = format!("/{BUCKET}/{archive_key}");
+
+    let signer = SigV4::new(&env);
+    let extra_signed_headers = [
+        ("content-encoding", "aws-chunked"),
+        ("x-amz-decoded-content-length", decoded_content_length.as_str()),
+        ("x-amz-meta-snowball-auto-extract", "true"),
+        ("x-amz-sdk-checksum-algorithm", "SHA256"),
+        ("x-amz-trailer", "x-amz-checksum-sha256"),
+    ];
+    let headers = signer.sign_with_extra_headers("PUT", &path, "", UNSIGNED_PAYLOAD_TRAILER, &extra_signed_headers);
+
+    let response = local_http_client()
+        .put(format!("{}{}", env.url, path))
+        .header("authorization", &headers.authorization)
+        .header("content-encoding", "aws-chunked")
+        .header("x-amz-content-sha256", &headers.content_sha256)
+        .header("x-amz-date", &headers.amz_date)
+        .header("x-amz-decoded-content-length", &decoded_content_length)
+        .header("x-amz-meta-snowball-auto-extract", "true")
+        .header("x-amz-sdk-checksum-algorithm", "SHA256")
+        .header("x-amz-trailer", "x-amz-checksum-sha256")
+        .body(encoded_body)
+        .send()
+        .await?;
+    let status = response.status();
+    let response_checksum = response
+        .headers()
+        .get("x-amz-checksum-sha256")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let response_body = response.text().await?;
+    assert_eq!(status.as_u16(), 200, "valid streaming Snowball PUT failed, body:\n{response_body}");
+    assert_eq!(response_checksum.as_deref(), Some(expected_checksum.as_str()));
+
+    let member = env
+        .create_s3_client()
+        .get_object()
+        .bucket(BUCKET)
+        .key(member_key)
+        .send()
+        .await?;
+    let stored = member.body.collect().await?.into_bytes();
+    assert_eq!(stored.as_ref(), member_body);
+
+    env.stop_server();
+    Ok(())
+}
+
 /// (b) A valid AccessKeyId paired with the wrong secret key must be rejected
 /// with SignatureDoesNotMatch / 403.
 #[tokio::test]
@@ -280,7 +566,8 @@ async fn tampered_payload_is_rejected() -> Result<(), Box<dyn std::error::Error 
     let mut env = RustFSTestEnvironment::new().await?;
     setup(&mut env).await?;
 
-    let path = format!("/{BUCKET}/tampered-payload.txt");
+    let key = "tampered-payload.txt";
+    let path = format!("/{BUCKET}/{key}");
     let claimed_body = b"the-body-i-claim-to-send";
     let actual_body = b"the-body-i-really-send!!";
     assert_eq!(claimed_body.len(), actual_body.len(), "keep content-length stable for the mismatch");
@@ -295,17 +582,144 @@ async fn tampered_payload_is_rejected() -> Result<(), Box<dyn std::error::Error 
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            assert_ne!(status.as_u16(), 200, "payload mismatch must not succeed, body:\n{body}");
             assert!(
-                status.is_client_error() || status.is_server_error(),
-                "payload mismatch must be an error status, got {status}, body:\n{body}"
+                status.is_client_error(),
+                "payload mismatch must be rejected with a client error, got {status}, body:\n{body}"
             );
             info!(%status, "tampered payload rejected with error status");
         }
         // A mid-stream hash-mismatch abort surfacing as a transport error is
         // also a valid rejection (definitely not a 200 success).
-        Err(err) => info!(%err, "tampered payload rejected via transport error"),
+        Err(err) => {
+            assert!(!err.is_connect(), "connection failure is not proof of payload rejection: {err}");
+            assert!(!err.is_timeout(), "request timeout is not proof of payload rejection: {err}");
+            info!(%err, "tampered payload rejected via mid-stream transport error");
+        }
     }
+
+    let absent = env
+        .create_s3_client()
+        .get_object()
+        .bucket(BUCKET)
+        .key(key)
+        .send()
+        .await
+        .expect_err("a tampered payload must not publish an object");
+    assert_eq!(absent.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(absent.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
+    Ok(())
+}
+
+/// A signed UploadPart body must pass the same payload-hash gate as PutObject.
+/// Rejection must happen before the part is published into the multipart upload.
+#[tokio::test]
+async fn tampered_upload_part_payload_is_rejected() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+
+    let key = "tampered-upload-part.bin";
+    let client = env.create_s3_client();
+    let upload = client.create_multipart_upload().bucket(BUCKET).key(key).send().await?;
+    let upload_id = upload.upload_id().ok_or("create multipart upload omitted upload_id")?;
+
+    let path = format!("/{BUCKET}/{key}");
+    let canonical_query = format!("partNumber=1&uploadId={}", urlencoding::encode(upload_id));
+    let request_target = format!("{path}?{canonical_query}");
+    let claimed_body = b"the-part-i-claim-to-send";
+    let actual_body = b"the-part-i-really-send!!";
+    assert_eq!(claimed_body.len(), actual_body.len(), "keep content-length stable for the mismatch");
+
+    let signer = SigV4::new(&env);
+    let headers = signer.sign("PUT", &path, &canonical_query, &sha256_hex(claimed_body));
+    let resp = send_signed(&env, reqwest::Method::PUT, &request_target, &headers, Some(actual_body.to_vec())).await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "multipart payload mismatch must be rejected as BadDigest, body:\n{body}"
+    );
+    assert_error_code(&body, "BadDigest");
+
+    let parts = client
+        .list_parts()
+        .bucket(BUCKET)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await?;
+    assert!(parts.parts().is_empty(), "a tampered UploadPart must not publish a part");
+
+    client
+        .abort_multipart_upload()
+        .bucket(BUCKET)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await?;
+    Ok(())
+}
+
+/// s3s v0.16 validates the aws-chunked decoded length while RustFS consumes the
+/// body stream. Mismatches are client body errors and must not leak as 500s.
+#[tokio::test]
+async fn aws_chunked_decoded_length_mismatch_returns_incomplete_body() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+
+    for (key, declared_len) in [
+        ("decoded-length-overrun.bin", 3_usize),
+        ("decoded-length-shortfall.bin", 9_usize),
+    ] {
+        let decoded = b"decoded";
+        assert_ne!(declared_len, decoded.len(), "test case must exercise a mismatch");
+        let encoded_body = encode_unsigned_aws_chunked_with_sha256_trailer(decoded);
+        let decoded_content_length = declared_len.to_string();
+        let path = format!("/{BUCKET}/{key}");
+        let signer = SigV4::new(&env);
+        let extra_signed_headers = [
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-decoded-content-length", decoded_content_length.as_str()),
+            ("x-amz-trailer", "x-amz-checksum-sha256"),
+        ];
+        let headers = signer.sign_with_extra_headers("PUT", &path, "", UNSIGNED_PAYLOAD_TRAILER, &extra_signed_headers);
+
+        let response = local_http_client()
+            .put(format!("{}{}", env.url, path))
+            .header("authorization", &headers.authorization)
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-content-sha256", &headers.content_sha256)
+            .header("x-amz-date", &headers.amz_date)
+            .header("x-amz-decoded-content-length", &decoded_content_length)
+            .header("x-amz-trailer", "x-amz-checksum-sha256")
+            .body(encoded_body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "decoded length mismatch must be a client error, body:\n{body}"
+        );
+        assert_error_code(&body, "IncompleteBody");
+
+        let absent = env
+            .create_s3_client()
+            .get_object()
+            .bucket(BUCKET)
+            .key(key)
+            .send()
+            .await
+            .expect_err("decoded length mismatch must not publish an object");
+        assert_eq!(absent.raw_response().map(|response| response.status().as_u16()), Some(404));
+        assert_eq!(absent.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
+    }
+
+    env.stop_server();
     Ok(())
 }
 

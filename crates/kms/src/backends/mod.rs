@@ -32,6 +32,35 @@ pub mod vault;
 pub(crate) mod vault_credentials;
 pub mod vault_transit;
 
+/// Refuse a key identifier that cannot be used as a single path segment.
+///
+/// Every path-addressed backend derives its storage location by joining the key
+/// identifier onto a configured prefix: the Local backend joins it onto `key_dir`,
+/// the Vault KV2 backend onto `key_path_prefix`, the Vault Transit backend onto
+/// both `transit/keys/` and the metadata prefix. A separator, a dot segment or a
+/// NUL byte in the identifier moves that join somewhere else — `../evil` reads and
+/// deletes a record outside the prefix, `a/b` addresses a nested path the listing
+/// reports as a directory rather than a key. The rule is containment, not a
+/// character allowlist, so identifiers already in use keep resolving.
+///
+/// Applied by each backend at the point where the identifier becomes a path or a
+/// Vault key name, never at the manager: the AWS backend addresses keys by ARN and
+/// alias, both of which legitimately contain `/`.
+pub(crate) fn validate_key_id_segment(key_id: &str) -> Result<()> {
+    if key_id.is_empty() {
+        return Err(KmsError::invalid_key("key identifier must not be empty"));
+    }
+    if key_id.contains('/') || key_id.contains('\\') || key_id.contains('\0') {
+        return Err(KmsError::invalid_key(format!(
+            "key identifier must not contain path separators or NUL: {key_id:?}"
+        )));
+    }
+    if key_id == "." || key_id == ".." {
+        return Err(KmsError::invalid_key(format!("key identifier must not be a dot segment: {key_id:?}")));
+    }
+    Ok(())
+}
+
 /// Operations whose availability depends on the key's lifecycle state.
 ///
 /// Decryption is deliberately absent: RustFS allows decryption with
@@ -615,6 +644,14 @@ pub struct BackendCapabilities {
     pub update_key_metadata: bool,
     /// Re-wrapping an existing data key envelope onto the key's current version
     pub rewrap: bool,
+    /// Whether this backend is positioned for production use.
+    ///
+    /// Backends that keep their cryptographic root on the local host (Local,
+    /// Static) are for development, testing and demos only; this flag is how
+    /// that positioning reaches logs, the status API and the console without
+    /// each consumer matching on backend names.
+    #[serde(default)]
+    pub production_supported: bool,
 }
 
 impl BackendCapabilities {
@@ -633,6 +670,7 @@ impl BackendCapabilities {
             physical_delete: false,
             update_key_metadata: false,
             rewrap: false,
+            production_supported: false,
         }
     }
 
@@ -695,6 +733,12 @@ impl BackendCapabilities {
         self.rewrap = rewrap;
         self
     }
+
+    /// Set whether the backend is positioned for production use
+    pub const fn with_production_supported(mut self, production_supported: bool) -> Self {
+        self.production_supported = production_supported;
+        self
+    }
 }
 
 impl Default for BackendCapabilities {
@@ -707,8 +751,28 @@ impl Default for BackendCapabilities {
 mod tests {
     use super::*;
     use crate::config::KmsConfig;
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64_simd::STANDARD as BASE64;
+
+    #[test]
+    fn key_id_segment_rule_refuses_every_form_that_leaves_the_prefix() {
+        for refused in [
+            "",
+            "bad/name",
+            "../escape",
+            "..",
+            ".",
+            "/absolute",
+            "back\\slash",
+            "nul\0byte",
+            "a/../b",
+        ] {
+            let err = validate_key_id_segment(refused).expect_err("must be refused");
+            assert!(matches!(err, KmsError::InvalidKey { .. }), "{refused:?}: {err:?}");
+        }
+        for accepted in ["k213", "a.b_c-1", "..leading-dots", "3f2504e0-4f89-11d3-9a0c-0305e82c3301"] {
+            validate_key_id_segment(accepted).unwrap_or_else(|e| panic!("{accepted:?} must be accepted: {e:?}"));
+        }
+    }
 
     /// Backend that implements only the trait-mandated operations and relies
     /// on the default `capabilities` implementation.
@@ -775,6 +839,30 @@ mod tests {
         assert!(!capabilities.physical_delete);
         assert!(!capabilities.update_key_metadata);
         assert!(!capabilities.rewrap);
+        // Production positioning is an explicit claim, never inherited.
+        assert!(!capabilities.production_supported);
+    }
+
+    /// Older peers and consoles serialize capabilities without the
+    /// positioning flag; deserializing their payloads must not fail and must
+    /// default to the conservative claim.
+    #[test]
+    fn capabilities_without_positioning_field_deserialize_as_non_production() {
+        let legacy = serde_json::json!({
+            "encrypt": true,
+            "decrypt": true,
+            "generate_data_key": true,
+            "rotate": true,
+            "enable_disable": true,
+            "schedule_deletion": true,
+            "versioning": true,
+            "physical_delete": true,
+            "update_key_metadata": true,
+            "rewrap": true,
+        });
+        let capabilities: BackendCapabilities =
+            serde_json::from_value(legacy).expect("legacy capability payloads must stay deserializable");
+        assert!(!capabilities.production_supported);
     }
 
     #[tokio::test]
@@ -919,7 +1007,7 @@ mod tests {
 
     #[tokio::test]
     async fn static_backend_capabilities_golden() {
-        let config = KmsConfig::static_kms("static-key".to_string(), BASE64.encode([0u8; 32]));
+        let config = KmsConfig::static_kms("static-key".to_string(), BASE64.encode_to_string([0u8; 32]));
         let backend = static_kms::StaticKmsBackend::new(config)
             .await
             .expect("static backend should build");

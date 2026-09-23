@@ -40,6 +40,9 @@ mod kms_edge_cases_test;
 mod kms_fault_recovery_test;
 
 #[cfg(test)]
+mod kms_service_stop_test;
+
+#[cfg(test)]
 mod bucket_default_encryption_test;
 
 #[cfg(test)]
@@ -49,13 +52,25 @@ mod encryption_metadata_test;
 mod copy_object_self_copy_sse_test;
 
 #[cfg(test)]
+mod encrypted_range_get_test;
+
+#[cfg(test)]
 mod copy_object_version_restore_sse_test;
 
 #[cfg(test)]
 mod configured_roundtrip_test;
 
 #[cfg(test)]
+mod select_sse_response_test;
+
+#[cfg(test)]
+mod kms_anonymous_enforcement_test;
+
+#[cfg(test)]
 mod kms_authorization_negative_matrix_test;
 
 #[cfg(test)]
 mod kms_ilm_sse_kms_test;
+
+#[cfg(test)]
+mod kms_rekey_sweep_test;

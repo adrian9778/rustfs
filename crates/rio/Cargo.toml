@@ -79,16 +79,26 @@ rustfs-tls-runtime.workspace = true
 rustfs-utils = { workspace = true, features = ["io", "hash", "compress"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 md-5 = { workspace = true }
+minlz.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-base64.workspace = true
+base64-simd.workspace = true
 sha1.workspace = true
 sha2.workspace = true
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
-s3s = { workspace = true, features = ["minio"] }
 hex-simd.workspace = true
 
 [dev-dependencies]
+temp-env = { workspace = true, features = ["async_closure"] }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-test = { workspace = true }
+criterion = { workspace = true, features = ["html_reports"] }
+proptest = { workspace = true }
 axum = { workspace = true }
+hyper = { workspace = true, features = ["http2", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 http-body-util = { workspace = true }
+
+[[bench]]
+name = "tee_reader"
+harness = false

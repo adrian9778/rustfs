@@ -31,9 +31,9 @@ use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
 use serde_json;
-use std::ffi::OsStr;
 use std::fs as stdfs;
 use std::io::ErrorKind;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Once;
@@ -43,7 +43,6 @@ use tokio::net::TcpStream;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use walkdir::WalkDir;
 
 // Common constants for all E2E tests
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
@@ -56,6 +55,8 @@ const RUSTFS_FULL_FEATURE: &str = "full";
 const TEST_PORT_MIN: u16 = 20_000;
 // Keep allocator ports below the ephemeral range used by bind(..., 0) test helpers.
 const TEST_PORT_RANGE: u16 = 10_000;
+const TEST_PORT_MIN_ENV: &str = "RUSTFS_E2E_TEST_PORT_MIN";
+const TEST_PORT_RANGE_ENV: &str = "RUSTFS_E2E_TEST_PORT_RANGE";
 const TEST_PORT_COUNTER_PATH: &str = "/tmp/rustfs_e2e_next_port";
 const TEST_PORT_LOCK_DIR: &str = "/tmp/rustfs_e2e_port_allocator.lock";
 const TEST_PORT_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
@@ -98,22 +99,74 @@ impl Drop for PortAllocatorGuard {
     }
 }
 
-fn advance_test_port(port: u16) -> u16 {
-    let offset = (port - TEST_PORT_MIN + 1) % TEST_PORT_RANGE;
-    TEST_PORT_MIN + offset
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TestPortAllocatorConfig {
+    min: u16,
+    range: u16,
 }
 
-fn seeded_test_port() -> u16 {
-    let offset = (Uuid::new_v4().as_u128() % u128::from(TEST_PORT_RANGE)) as u16;
-    TEST_PORT_MIN + offset
+impl TestPortAllocatorConfig {
+    fn max_exclusive(self) -> u32 {
+        u32::from(self.min) + u32::from(self.range)
+    }
+
+    fn contains(self, port: &u16) -> bool {
+        (u32::from(self.min)..self.max_exclusive()).contains(&u32::from(*port))
+    }
 }
 
-fn read_next_test_port() -> u16 {
+fn parse_test_port_allocator_config(
+    min_override: Option<&str>,
+    range_override: Option<&str>,
+) -> Result<TestPortAllocatorConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let min = match min_override {
+        Some(value) => value
+            .parse::<u16>()
+            .map_err(|err| format!("{TEST_PORT_MIN_ENV} must be a valid u16: {err}"))?,
+        None => TEST_PORT_MIN,
+    };
+    let range = match range_override {
+        Some(value) => value
+            .parse::<u16>()
+            .map_err(|err| format!("{TEST_PORT_RANGE_ENV} must be a valid u16: {err}"))?,
+        None => TEST_PORT_RANGE,
+    };
+    if range == 0 {
+        return Err(format!("{TEST_PORT_RANGE_ENV} must be greater than zero").into());
+    }
+    if min < 1024 {
+        return Err(format!("{TEST_PORT_MIN_ENV} must be at least 1024").into());
+    }
+    let max_exclusive = u32::from(min) + u32::from(range);
+    if max_exclusive > u32::from(u16::MAX) + 1 {
+        return Err(format!("{TEST_PORT_MIN_ENV} + {TEST_PORT_RANGE_ENV} exceeds u16 port space").into());
+    }
+    Ok(TestPortAllocatorConfig { min, range })
+}
+
+fn test_port_allocator_config() -> Result<TestPortAllocatorConfig, Box<dyn std::error::Error + Send + Sync>> {
+    parse_test_port_allocator_config(
+        std::env::var(TEST_PORT_MIN_ENV).ok().as_deref(),
+        std::env::var(TEST_PORT_RANGE_ENV).ok().as_deref(),
+    )
+}
+
+fn advance_test_port(port: u16, config: TestPortAllocatorConfig) -> u16 {
+    let offset = (port - config.min + 1) % config.range;
+    config.min + offset
+}
+
+fn seeded_test_port(config: TestPortAllocatorConfig) -> u16 {
+    let offset = (Uuid::new_v4().as_u128() % u128::from(config.range)) as u16;
+    config.min + offset
+}
+
+fn read_next_test_port(config: TestPortAllocatorConfig) -> u16 {
     stdfs::read_to_string(TEST_PORT_COUNTER_PATH)
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())
-        .filter(|port| (TEST_PORT_MIN..TEST_PORT_MIN + TEST_PORT_RANGE).contains(port))
-        .unwrap_or_else(seeded_test_port)
+        .filter(|port| config.contains(port))
+        .unwrap_or_else(|| seeded_test_port(config))
 }
 
 fn remove_stale_port_allocator_lock() {
@@ -131,6 +184,15 @@ fn remove_stale_port_allocator_lock() {
 fn write_next_test_port(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     stdfs::write(TEST_PORT_COUNTER_PATH, port.to_string())?;
     Ok(())
+}
+
+fn no_available_test_port_error(config: TestPortAllocatorConfig, attempts: u16, last_error: Option<&std::io::Error>) -> String {
+    let max_inclusive = config.max_exclusive() - 1;
+    let detail = last_error.map(|err| format!("; last bind error: {err}")).unwrap_or_default();
+    format!(
+        "no available E2E test port found in {}..={} after {} attempts{}",
+        config.min, max_inclusive, attempts, detail
+    )
 }
 
 pub(crate) fn capture_command_logs(
@@ -209,6 +271,15 @@ pub fn local_http_client() -> HttpClient {
         .expect("failed to build local reqwest client")
 }
 
+pub(crate) fn signal_process(pid: u32, signal: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let output = Command::new("kill").arg(format!("-{signal}")).arg(pid.to_string()).output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(format!("kill -{signal} {pid} failed: {}", String::from_utf8_lossy(&output.stderr)).into())
+}
+
 pub(crate) async fn signed_s3_request(
     method: http::Method,
     url: &str,
@@ -217,7 +288,37 @@ pub(crate) async fn signed_s3_request(
     access_key: &str,
     secret_key: &str,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
-    signed_s3_request_with_session_token(method, url, body, content_type, access_key, secret_key, None).await
+    signed_s3_request_with_headers(method, url, body, content_type, access_key, secret_key, &http::HeaderMap::new()).await
+}
+
+pub(crate) async fn signed_s3_request_with_headers(
+    method: http::Method,
+    url: &str,
+    body: Option<String>,
+    content_type: Option<&str>,
+    access_key: &str,
+    secret_key: &str,
+    extra_headers: &http::HeaderMap,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    signed_s3_request_with_session_token(
+        method,
+        url,
+        body,
+        content_type,
+        SigningCredentials {
+            access_key,
+            secret_key,
+            session_token: None,
+        },
+        extra_headers,
+    )
+    .await
+}
+
+struct SigningCredentials<'a> {
+    access_key: &'a str,
+    secret_key: &'a str,
+    session_token: Option<&'a str>,
 }
 
 async fn signed_s3_request_with_session_token(
@@ -225,9 +326,8 @@ async fn signed_s3_request_with_session_token(
     url: &str,
     body: Option<String>,
     content_type: Option<&str>,
-    access_key: &str,
-    secret_key: &str,
-    session_token: Option<&str>,
+    credentials: SigningCredentials<'_>,
+    extra_headers: &http::HeaderMap,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
     let uri = url.parse::<http::Uri>()?;
     let authority = uri.authority().ok_or("S3 URL missing authority")?.to_string();
@@ -239,14 +339,17 @@ async fn signed_s3_request_with_session_token(
     if let Some(content_type) = content_type {
         request = request.header(CONTENT_TYPE, content_type);
     }
+    for (name, value) in extra_headers {
+        request = request.header(name, value);
+    }
 
     let content_length = i64::try_from(body.as_ref().map_or(0, String::len)).map_err(|_| "S3 request body is too large")?;
     let signed = sign_v4(
         request.body(Body::empty())?,
         content_length,
-        access_key,
-        secret_key,
-        session_token.unwrap_or_default(),
+        credentials.access_key,
+        credentials.secret_key,
+        credentials.session_token.unwrap_or_default(),
         "us-east-1",
     );
 
@@ -283,8 +386,19 @@ pub(crate) async fn admin_request_with_session_token(
 ) -> Result<(StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{base_url}{path_and_query}");
     let content_type = body.as_ref().map(|_| "application/json");
-    let response =
-        signed_s3_request_with_session_token(method, &url, body, content_type, access_key, secret_key, session_token).await?;
+    let response = signed_s3_request_with_session_token(
+        method,
+        &url,
+        body,
+        content_type,
+        SigningCredentials {
+            access_key,
+            secret_key,
+            session_token,
+        },
+        &http::HeaderMap::new(),
+    )
+    .await?;
     let status = response.status();
     let body = response.text().await?;
     Ok((status, body))
@@ -310,61 +424,86 @@ pub fn rustfs_binary_path() -> PathBuf {
     rustfs_binary_path_with_features(requested_rustfs_build_features().as_deref())
 }
 
-/// Resolve the RustFS binary relative to the workspace, optionally requesting build features.
+fn resolve_rustfs_binary_path(workspace: &Path, configured_target_dir: Option<&Path>) -> PathBuf {
+    let mut path = match configured_target_dir {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => workspace.join(path),
+        None => workspace.join("target"),
+    };
+    path.push(if cfg!(debug_assertions) { "debug" } else { "release" });
+    path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
+    path
+}
+
+/// Resolve the server verified by `scripts/e2e_binary.py run` for this test invocation.
+/// Requested features are a required subset of the server's resolved Cargo features.
 pub fn rustfs_binary_path_with_features(requested_features: Option<&str>) -> PathBuf {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_rustfs") {
-        return PathBuf::from(path);
-    }
-    let requested_features = requested_features.and_then(normalize_rustfs_build_features);
-
-    let mut binary_path = workspace_root();
-    binary_path.push("target");
-    let profile_dir = if cfg!(debug_assertions) { "debug" } else { "release" };
-    binary_path.push(profile_dir);
-    binary_path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
-
-    let features_match = binary_features_match(&binary_path, requested_features.as_deref());
-    let source_is_newer = workspace_sources_newer_than_binary(&binary_path);
-    let can_reuse_inside_e2e = running_inside_e2e_test_binary() && requested_features.is_none() && features_match;
-    if binary_path.is_file() && features_match && (!source_is_newer || can_reuse_inside_e2e) {
-        if source_is_newer {
-            warn!(
-                "RustFS binary at {:?} appears older than workspace sources; reusing it inside cargo test to avoid nested builds",
-                binary_path
-            );
-        }
-        info!("Using existing RustFS binary at {:?}", binary_path);
-        return binary_path;
-    }
-
-    info!("Building RustFS binary to ensure it's up to date...");
-    build_rustfs_binary(requested_features.as_deref());
-
-    info!("Using RustFS binary at {:?}", binary_path);
-    binary_path
-}
-
-fn workspace_sources_newer_than_binary(binary_path: &PathBuf) -> bool {
-    let Ok(binary_meta) = std::fs::metadata(binary_path) else {
-        return true;
-    };
-    let Ok(binary_modified) = binary_meta.modified() else {
-        return true;
-    };
-
     let workspace = workspace_root();
-    let watch_roots = [
-        workspace.join("Cargo.toml"),
-        workspace.join("Cargo.lock"),
-        workspace.join("rustfs"),
-        workspace.join("crates"),
-    ];
-
-    watch_roots.iter().any(|path| path_is_newer_than(binary_modified, path))
+    let configured_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+    let binary_path = std::env::var_os("CARGO_BIN_EXE_rustfs")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| resolve_rustfs_binary_path(&workspace, configured_target_dir.as_deref()));
+    let receipt_path = std::env::var_os("RUSTFS_E2E_BINARY_RECEIPT").map(PathBuf::from);
+    receipt_path
+        .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "missing E2E run receipt"))
+        .and_then(|receipt| verify_e2e_binary_receipt(&receipt, &workspace, &binary_path, requested_features))
+        .unwrap_or_else(|error| {
+            panic!(
+                "E2E server prerequisite failed: {error}. Build with `python3 scripts/e2e_binary.py build --features <features>` and run tests with `python3 scripts/e2e_binary.py run --features <features> -- cargo nextest run ...`"
+            )
+        })
 }
 
-fn running_inside_e2e_test_binary() -> bool {
-    std::env::var("CARGO_PKG_NAME").is_ok_and(|value| value == "e2e_test")
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct E2eBinaryReceipt {
+    schema: u32,
+    workspace: PathBuf,
+    binary: PathBuf,
+    size: u64,
+    modified_ns: u128,
+    features: Vec<String>,
+}
+
+fn verify_e2e_binary_receipt(
+    receipt_path: &Path,
+    workspace: &Path,
+    binary_path: &Path,
+    requested_features: Option<&str>,
+) -> std::io::Result<PathBuf> {
+    let receipt: E2eBinaryReceipt = serde_json::from_slice(&stdfs::read(receipt_path)?)?;
+    let binary = binary_path.canonicalize()?;
+    let metadata = binary.metadata()?;
+    let modified_ns = metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(std::io::Error::other)?
+        .as_nanos();
+    // The runner hashes source and binary before/after the entire suite. Each
+    // nextest process checks only this invocation's path, features, and file stat.
+    if receipt.schema != 1
+        || receipt.workspace != workspace.canonicalize()?
+        || receipt.binary != binary
+        || !metadata.is_file()
+        || receipt.size != metadata.len()
+        || receipt.modified_ns != modified_ns
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "E2E server differs from this run's verified binary",
+        ));
+    }
+    if let Some(requested) = requested_features.and_then(normalize_rustfs_build_features)
+        && requested
+            .split(',')
+            .any(|feature| !receipt.features.iter().any(|actual| actual == feature))
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "E2E server is missing a requested build feature",
+        ));
+    }
+    Ok(binary)
 }
 
 pub fn requested_rustfs_build_features() -> Option<String> {
@@ -394,115 +533,26 @@ pub fn rustfs_build_feature_enabled(requested_features: Option<&str>, required_f
         .any(|feature| feature.eq_ignore_ascii_case(RUSTFS_FULL_FEATURE) || feature.eq_ignore_ascii_case(required_feature))
 }
 
-fn rustfs_binary_features_stamp_path(binary_path: &Path) -> PathBuf {
-    binary_path.with_extension("features")
-}
-
-fn binary_features_match(binary_path: &Path, requested_features: Option<&str>) -> bool {
-    let stamp_path = rustfs_binary_features_stamp_path(binary_path);
-    let recorded = stdfs::read_to_string(stamp_path)
-        .ok()
-        .and_then(|value| normalize_rustfs_build_features(&value));
-    let requested = requested_features.and_then(normalize_rustfs_build_features);
-
-    match requested.as_deref() {
-        Some(features) => recorded.as_deref() == Some(features),
-        None => recorded.is_none(),
-    }
-}
-
-fn path_is_newer_than(binary_modified: std::time::SystemTime, path: &Path) -> bool {
-    if path.is_file() {
-        return std::fs::metadata(path)
-            .and_then(|meta| meta.modified())
-            .map(|modified| modified > binary_modified)
-            .unwrap_or(false);
-    }
-
-    if !path.is_dir() {
-        return false;
-    }
-
-    WalkDir::new(path)
-        .into_iter()
-        .filter_entry(|entry| {
-            let name = entry.file_name();
-            name != OsStr::new("target") && name != OsStr::new(".git")
-        })
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .any(|entry| {
-            std::fs::metadata(entry.path())
-                .and_then(|meta| meta.modified())
-                .map(|modified| modified > binary_modified)
-                .unwrap_or(false)
-        })
-}
-
-/// Build the RustFS binary using cargo
-fn build_rustfs_binary(requested_features: Option<&str>) {
-    let workspace = workspace_root();
-    info!("Building RustFS binary from workspace: {:?}", workspace);
-
-    let _profile = if cfg!(debug_assertions) {
-        info!("Building in debug mode");
-        "dev"
-    } else {
-        info!("Building in release mode");
-        "release"
-    };
-
-    let mut cmd = Command::new("cargo");
-    cmd.current_dir(&workspace).args(["build", "--bin", "rustfs"]);
-
-    if let Some(features) = requested_features {
-        cmd.arg("--features").arg(features);
-        info!("Building with features: {}", features);
-    }
-
-    if !cfg!(debug_assertions) {
-        cmd.arg("--release");
-    }
-
-    info!(
-        "Executing: cargo build --bin rustfs {}",
-        if cfg!(debug_assertions) { "" } else { "--release" }
-    );
-
-    let output = cmd.output().expect("Failed to execute cargo build command");
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        panic!("Failed to build RustFS binary. Error: {stderr}");
-    }
-
-    let mut binary_path = workspace;
-    binary_path.push("target");
-    binary_path.push(if cfg!(debug_assertions) { "debug" } else { "release" });
-    binary_path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
-    let stamp_path = rustfs_binary_features_stamp_path(&binary_path);
-    if let Err(err) = stdfs::write(&stamp_path, requested_features.unwrap_or_default()) {
-        warn!("Failed to write RustFS feature stamp {:?}: {}", stamp_path, err);
-    }
-
-    info!("✅ RustFS binary built successfully");
-}
-
 fn awscurl_binary_path() -> PathBuf {
     std::env::var_os("AWSCURL_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("awscurl"))
 }
 
-pub fn awscurl_available() -> bool {
-    let path = awscurl_binary_path();
-    if path.components().count() > 1 || path.is_absolute() {
-        return path.is_file();
+fn verify_awscurl_path(path: &Path) -> std::io::Result<()> {
+    let output = Command::new(path).arg("--help").output()?;
+    if output.status.success() {
+        return Ok(());
     }
 
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(&path).is_file()))
-        .unwrap_or(false)
+    Err(std::io::Error::other(format!(
+        "awscurl prerequisite check failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+pub fn require_awscurl() -> std::io::Result<()> {
+    verify_awscurl_path(&awscurl_binary_path())
 }
 
 // Global initialization
@@ -575,20 +625,25 @@ impl RustFSTestEnvironment {
     pub async fn find_available_port() -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
         use std::net::TcpListener;
         let _guard = PortAllocatorGuard::acquire().await?;
-        let mut next_port = read_next_test_port();
+        let config = test_port_allocator_config()?;
+        let mut next_port = read_next_test_port(config);
+        let mut last_error = None;
 
-        for _ in 0..TEST_PORT_RANGE {
+        for _ in 0..config.range {
             let port = next_port;
-            next_port = advance_test_port(next_port);
+            next_port = advance_test_port(next_port, config);
             write_next_test_port(next_port)?;
 
-            if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
-                drop(listener);
-                return Ok(port);
+            match TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => {
+                    drop(listener);
+                    return Ok(port);
+                }
+                Err(err) => last_error = Some(err),
             }
         }
 
-        Err("no available E2E test port found".into())
+        Err(no_available_test_port_error(config, config.range, last_error.as_ref()).into())
     }
 
     /// Kill any existing RustFS processes
@@ -629,6 +684,18 @@ impl RustFSTestEnvironment {
         extra_env: &[(&str, &str)],
         cleanup_existing: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let binary_path = rustfs_binary_path();
+        self.start_rustfs_server_inner_with_binary(&binary_path, extra_args, extra_env, cleanup_existing)
+            .await
+    }
+
+    async fn start_rustfs_server_inner_with_binary(
+        &mut self,
+        binary_path: &Path,
+        extra_args: Vec<&str>,
+        extra_env: &[(&str, &str)],
+        cleanup_existing: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if cleanup_existing {
             self.cleanup_existing_processes().await?;
         }
@@ -637,8 +704,7 @@ impl RustFSTestEnvironment {
 
         info!("Starting RustFS server with args: {:?}", args);
 
-        let binary_path = rustfs_binary_path();
-        let mut command = Command::new(&binary_path);
+        let mut command = Command::new(binary_path);
         command.env("RUST_LOG", "rustfs=info,rustfs_notify=debug");
         // The embedded console would bind the fixed default port :9001, which
         // collides with unrelated local services (e.g. Docker Desktop). Tests
@@ -656,6 +722,19 @@ impl RustFSTestEnvironment {
         self.wait_for_server_ready().await?;
 
         Ok(())
+    }
+
+    /// Start a specific RustFS binary against this environment's isolated
+    /// data directory. Upgrade tests use this to seed an old on-disk format
+    /// before restarting the same environment with the workspace binary.
+    pub async fn start_rustfs_server_from_binary(
+        &mut self,
+        binary_path: &Path,
+        extra_args: Vec<&str>,
+        extra_env: &[(&str, &str)],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.start_rustfs_server_inner_with_binary(binary_path, extra_args, extra_env, true)
+            .await
     }
 
     /// Start RustFS server with basic configuration
@@ -1137,6 +1216,9 @@ pub struct RustFSTestClusterEnvironment {
     pub node_extra_env: Vec<Vec<(String, String)>>,
     pub node_capture_log_paths: Vec<Option<String>>,
     pub topology: ClusterTopology,
+    /// Optional socket proxies used for the corresponding node's volume
+    /// endpoints. Proxies must be installed before [`Self::start`].
+    volume_proxy_addresses: Vec<Option<SocketAddr>>,
 }
 
 impl RustFSTestClusterEnvironment {
@@ -1228,6 +1310,7 @@ impl RustFSTestClusterEnvironment {
             extra_env.push(("RUSTFS_UNSAFE_BYPASS_DISK_CHECK".to_string(), "true".to_string()));
         }
 
+        let node_count = topology.node_count;
         Ok(Self {
             nodes,
             temp_dir,
@@ -1237,6 +1320,7 @@ impl RustFSTestClusterEnvironment {
             node_extra_env: vec![Vec::new(); topology.node_count],
             node_capture_log_paths: vec![None; topology.node_count],
             topology,
+            volume_proxy_addresses: vec![None; node_count],
         })
     }
 
@@ -1304,6 +1388,34 @@ impl RustFSTestClusterEnvironment {
         self.build_volumes_arg()
     }
 
+    /// Start a socket proxy for one node's volume endpoints and route all
+    /// subsequent `RUSTFS_VOLUMES` references for that node through it.
+    ///
+    /// Call this before [`Self::start`], then use the returned proxy's
+    /// [`crate::fault_proxy::FaultProxy::set_mode`] to inject latency,
+    /// blackhole, or one-way partition faults. The node's own listen address
+    /// remains direct, so S3 clients can still reach it while peer disk/RPC
+    /// traffic is steered through the proxy.
+    pub async fn start_volume_proxy_for_node(
+        &mut self,
+        node_idx: usize,
+    ) -> Result<crate::fault_proxy::FaultProxy, Box<dyn std::error::Error + Send + Sync>> {
+        self.ensure_node_index(node_idx)?;
+        if self.volume_proxy_addresses[node_idx].is_some() {
+            return Err(format!("a volume proxy is already configured for node {node_idx}").into());
+        }
+        let target = self.nodes[node_idx].address.parse::<SocketAddr>()?;
+        let proxy = crate::fault_proxy::FaultProxy::start(target).await?;
+        self.volume_proxy_addresses[node_idx] = Some(proxy.local_addr());
+        Ok(proxy)
+    }
+
+    fn volume_address(&self, node_idx: usize) -> String {
+        self.volume_proxy_addresses[node_idx]
+            .map(|address| address.to_string())
+            .unwrap_or_else(|| self.nodes[node_idx].address.clone())
+    }
+
     fn build_volumes_arg(&self) -> String {
         let pools = self.topology.normalized_pools();
 
@@ -1312,7 +1424,11 @@ impl RustFSTestClusterEnvironment {
             return self
                 .nodes
                 .iter()
-                .flat_map(|n| n.data_dirs.iter().map(move |dir| format!("http://{}{}", n.address, dir)))
+                .enumerate()
+                .flat_map(|(node_idx, n)| {
+                    let address = self.volume_address(node_idx);
+                    n.data_dirs.iter().map(move |dir| format!("http://{}{}", address, dir))
+                })
                 .collect::<Vec<_>>()
                 .join(" ");
         }
@@ -1323,13 +1439,19 @@ impl RustFSTestClusterEnvironment {
         pools
             .iter()
             .map(|nodes| {
-                let node = &self.nodes[nodes[0]];
+                let node_idx = nodes[0];
+                let node = &self.nodes[node_idx];
                 let base = node
                     .data_dirs
                     .first()
                     .and_then(|d| d.rsplit_once('/').map(|(parent, _)| parent))
                     .unwrap_or(&node.data_dir);
-                format!("http://{}{}/drive{{0...{}}}", node.address, base, self.topology.drives_per_node - 1)
+                format!(
+                    "http://{}{}/drive{{0...{}}}",
+                    self.volume_address(node_idx),
+                    base,
+                    self.topology.drives_per_node - 1
+                )
             })
             .collect::<Vec<_>>()
             .join(" ")
@@ -1348,31 +1470,18 @@ impl RustFSTestClusterEnvironment {
     ///   times out, or cluster service readiness times out.
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let binary_path = rustfs_binary_path();
+        self.start_with_binary(&binary_path).await
+    }
+
+    /// Start every cluster node with a specific RustFS binary.
+    ///
+    /// Upgrade compatibility tests use this to initialize a cluster with a
+    /// pinned previous release before replacing nodes with the workspace build.
+    pub async fn start_with_binary(&mut self, binary_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let volumes_arg = self.build_volumes_arg();
 
-        for (i, node) in self.nodes.iter_mut().enumerate() {
-            info!("Starting cluster node {} on {}", i, node.address);
-
-            let mut command = Command::new(&binary_path);
-            command
-                .env("RUSTFS_VOLUMES", &volumes_arg)
-                .env("RUSTFS_ADDRESS", &node.address)
-                .env("RUSTFS_ACCESS_KEY", &self.access_key)
-                .env("RUSTFS_SECRET_KEY", &self.secret_key)
-                .env("RUSTFS_CONSOLE_ENABLE", "false")
-                .env("RUST_LOG", "rustfs=info,rustfs_notify=debug");
-
-            for (key, value) in &self.extra_env {
-                command.env(key, value);
-            }
-            for (key, value) in &self.node_extra_env[i] {
-                command.env(key, value);
-            }
-            capture_command_logs(&mut command, self.node_capture_log_paths[i].as_deref())?;
-
-            let process = command.current_dir(&node.data_dir).spawn()?;
-
-            node.process = Some(process);
+        for node_idx in 0..self.nodes.len() {
+            self.spawn_node(node_idx, binary_path, &volumes_arg)?;
         }
 
         for (i, node) in self.nodes.iter().enumerate() {
@@ -1388,20 +1497,46 @@ impl RustFSTestClusterEnvironment {
 
     /// Start one node process using the cluster's existing volume layout.
     pub async fn start_node(&mut self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let binary_path = rustfs_binary_path();
+        self.start_node_from_binary(node_idx, &binary_path).await
+    }
+
+    /// Start one stopped cluster node with a specific RustFS binary while
+    /// preserving the cluster's volume layout and that node's data directory.
+    pub async fn start_node_from_binary(
+        &mut self,
+        node_idx: usize,
+        binary_path: &Path,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let volumes_arg = self.build_volumes_arg();
+        self.spawn_node(node_idx, binary_path, &volumes_arg)?;
+
+        self.wait_for_node_ready(&self.nodes[node_idx].address, node_idx).await?;
+        self.wait_for_node_service_ready(node_idx).await?;
+        Ok(())
+    }
+
+    fn spawn_node(
+        &mut self,
+        node_idx: usize,
+        binary_path: &Path,
+        volumes_arg: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.ensure_node_index(node_idx)?;
         if self.nodes[node_idx].process.is_some() {
             return Err(format!("cluster node {node_idx} is already running").into());
         }
+        if !binary_path.is_file() {
+            return Err(format!("RustFS binary does not exist: {}", binary_path.display()).into());
+        }
 
-        let binary_path = rustfs_binary_path();
-        let volumes_arg = self.build_volumes_arg();
         let log_path = self.node_capture_log_paths[node_idx].clone();
         let node = &mut self.nodes[node_idx];
-        info!("Starting cluster node {} on {}", node_idx, node.address);
+        info!("Starting cluster node {} on {} with {}", node_idx, node.address, binary_path.display());
 
-        let mut command = Command::new(&binary_path);
+        let mut command = Command::new(binary_path);
         command
-            .env("RUSTFS_VOLUMES", &volumes_arg)
+            .env("RUSTFS_VOLUMES", volumes_arg)
             .env("RUSTFS_ADDRESS", &node.address)
             .env("RUSTFS_ACCESS_KEY", &self.access_key)
             .env("RUSTFS_SECRET_KEY", &self.secret_key)
@@ -1418,9 +1553,6 @@ impl RustFSTestClusterEnvironment {
 
         let process = command.current_dir(&node.data_dir).spawn()?;
         node.process = Some(process);
-
-        self.wait_for_node_ready(&self.nodes[node_idx].address, node_idx).await?;
-        self.wait_for_node_service_ready(node_idx).await?;
         Ok(())
     }
 
@@ -1568,6 +1700,114 @@ impl RustFSTestClusterEnvironment {
         process.wait()?;
         Ok(())
     }
+
+    /// Append a new single-node erasure pool to a stopped multi-pool cluster.
+    ///
+    /// Used to simulate pool expansion on localhost: every pool already owns
+    /// exactly one node with `drives_per_node >= 2` (the only multi-pool layout
+    /// the single-host `RUSTFS_VOLUMES` syntax can express). The new node is
+    /// allocated a fresh port and empty drive directories; callers must
+    /// [`Self::start`] afterwards so every process picks up the extended
+    /// volumes argument. Existing data directories are left untouched.
+    pub async fn append_single_node_pool(&mut self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        if self.nodes.iter().any(|node| node.process.is_some()) {
+            return Err("stop the cluster before appending a pool".into());
+        }
+        if self.topology.drives_per_node < 2 {
+            return Err(
+                "append_single_node_pool requires drives_per_node >= 2 (the server parser rejects a single-drive ellipses pool)"
+                    .into(),
+            );
+        }
+
+        let mut pools = self.topology.normalized_pools();
+        for (pool_idx, nodes) in pools.iter().enumerate() {
+            if nodes.len() != 1 {
+                return Err(format!(
+                    "pool {pool_idx} spans {} nodes; append_single_node_pool requires one node per pool",
+                    nodes.len()
+                )
+                .into());
+            }
+        }
+
+        let new_idx = self.nodes.len();
+        let port = RustFSTestEnvironment::find_available_port().await?;
+        let address = format!("127.0.0.1:{port}");
+        let data_dirs: Vec<String> = (0..self.topology.drives_per_node)
+            .map(|drive| format!("{}/node{}/drive{}", self.temp_dir, new_idx, drive))
+            .collect();
+        for dir in &data_dirs {
+            fs::create_dir_all(dir).await?;
+        }
+
+        self.nodes.push(ClusterNode {
+            url: format!("http://{address}"),
+            address,
+            data_dir: data_dirs[0].clone(),
+            data_dirs,
+            pool_idx: pools.len(),
+            process: None,
+        });
+        pools.push(vec![new_idx]);
+        self.topology.node_count = self.nodes.len();
+        self.topology.pools = pools;
+        self.node_extra_env.push(Vec::new());
+        self.node_capture_log_paths.push(None);
+        self.volume_proxy_addresses.push(None);
+
+        if !self.extra_env.iter().any(|(key, _)| key == "RUSTFS_UNSAFE_BYPASS_DISK_CHECK") {
+            self.extra_env
+                .push(("RUSTFS_UNSAFE_BYPASS_DISK_CHECK".to_string(), "true".to_string()));
+        }
+
+        Ok(new_idx)
+    }
+
+    /// Gracefully stop one cluster node and wait for its process to exit.
+    ///
+    /// This is intentionally separate from [`Self::stop_node`]: the latter is
+    /// a hard kill used by crash-recovery tests, while this path lets RustFS
+    /// complete its normal shutdown hooks before a test restarts the node.
+    pub async fn stop_node_gracefully(&mut self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.ensure_node_index(node_idx)?;
+
+        #[cfg(unix)]
+        {
+            let Some(process) = self.nodes[node_idx].process.as_ref() else {
+                return Ok(());
+            };
+            let pid = process.id().to_string();
+            let signal_status = Command::new("kill").args(["-TERM", &pid]).status()?;
+            if !signal_status.success() {
+                return Err(format!("failed to send SIGTERM to cluster node {node_idx} (pid {pid})").into());
+            }
+
+            let mut process = self.nodes[node_idx]
+                .process
+                .take()
+                .ok_or_else(|| format!("cluster node {node_idx} process disappeared while stopping"))?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(45);
+            loop {
+                if let Some(status) = process.try_wait()? {
+                    info!("Cluster node {} stopped gracefully with {}", node_idx, status);
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = process.kill();
+                    let _ = process.wait();
+                    return Err(format!("cluster node {node_idx} did not stop gracefully within 45 seconds").into());
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = node_idx;
+            Err("graceful cluster-node stop is only supported on Unix E2E hosts".into())
+        }
+    }
 }
 
 impl Drop for RustFSTestClusterEnvironment {
@@ -1710,28 +1950,126 @@ pub(crate) async fn admin_create_user(
     username: &str,
     secret_key: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", env.url, username);
-    let body = serde_json::json!({
-        "secretKey": secret_key,
-        "status": "enabled"
-    });
-    let response = signed_request(
-        http::Method::PUT,
-        &url,
-        &env.access_key,
-        &env.secret_key,
-        Some(body.to_string().into_bytes()),
-        Some("application/json"),
-    )
-    .await?;
+    admin_create_user_via(AdminTransport::Signed, &env.url, &env.access_key, &env.secret_key, username, secret_key).await
+}
 
-    if response.status() != reqwest::StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("create user failed: {status} {body}").into());
+/// Transport used by the shared admin-API helpers: in-process SigV4 signing
+/// via [`signed_request`], or the external `awscurl` binary (an independent
+/// SigV4 implementation exercised by the awscurl-gated suites).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdminTransport {
+    Signed,
+    Awscurl,
+}
+
+/// Execute an admin-API request against `base_url` with admin credentials over
+/// the chosen transport, failing on any non-success response.
+pub(crate) async fn admin_execute_at(
+    transport: AdminTransport,
+    method: http::Method,
+    base_url: &str,
+    admin_access_key: &str,
+    admin_secret_key: &str,
+    path_and_query: &str,
+    body: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!("{base_url}{path_and_query}");
+    match transport {
+        AdminTransport::Signed => {
+            let content_type = match body {
+                Some(body) if !body.is_empty() => Some("application/json"),
+                _ => None,
+            };
+            let response = signed_request(
+                method.clone(),
+                &url,
+                admin_access_key,
+                admin_secret_key,
+                body.map(|body| body.as_bytes().to_vec()),
+                content_type,
+            )
+            .await?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                return Err(format!("{method} {path_and_query} failed: {status} {text}").into());
+            }
+        }
+        AdminTransport::Awscurl => {
+            execute_awscurl(&url, method.as_str(), body, admin_access_key, admin_secret_key).await?;
+        }
     }
-
     Ok(())
+}
+
+/// Create a new IAM user via the admin API over the chosen transport.
+pub(crate) async fn admin_create_user_via(
+    transport: AdminTransport,
+    base_url: &str,
+    admin_access_key: &str,
+    admin_secret_key: &str,
+    username: &str,
+    secret_key: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let path = format!("/rustfs/admin/v3/add-user?accessKey={username}");
+    let body = serde_json::json!({"secretKey": secret_key, "status": "enabled"}).to_string();
+    admin_execute_at(
+        transport,
+        http::Method::PUT,
+        base_url,
+        admin_access_key,
+        admin_secret_key,
+        &path,
+        Some(&body),
+    )
+    .await
+}
+
+/// Install a canned policy via the admin API over the chosen transport.
+pub(crate) async fn admin_add_canned_policy_via(
+    transport: AdminTransport,
+    base_url: &str,
+    admin_access_key: &str,
+    admin_secret_key: &str,
+    policy_name: &str,
+    policy_json: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let path = format!("/rustfs/admin/v3/add-canned-policy?name={policy_name}");
+    admin_execute_at(
+        transport,
+        http::Method::PUT,
+        base_url,
+        admin_access_key,
+        admin_secret_key,
+        &path,
+        Some(policy_json),
+    )
+    .await
+}
+
+/// Attach a canned policy to a user via the admin API over the chosen transport.
+pub(crate) async fn admin_attach_user_policy_via(
+    transport: AdminTransport,
+    base_url: &str,
+    admin_access_key: &str,
+    admin_secret_key: &str,
+    policy_name: &str,
+    username: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let path = format!("/rustfs/admin/v3/set-user-or-group-policy?policyName={policy_name}&userOrGroup={username}&isGroup=false");
+    // `Some("")` preserves the historical wire shape on both transports: awscurl
+    // keeps sending `-d ''` and the signed path attaches an empty body with no
+    // content type.
+    admin_execute_at(
+        transport,
+        http::Method::PUT,
+        base_url,
+        admin_access_key,
+        admin_secret_key,
+        &path,
+        Some(""),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1748,10 +2086,89 @@ mod tests {
     }
 
     #[test]
+    fn missing_awscurl_is_a_prerequisite_failure() {
+        let missing = std::env::temp_dir().join(format!("missing-awscurl-{}", Uuid::new_v4()));
+
+        let error = verify_awscurl_path(&missing).expect_err("a missing awscurl binary must fail the test prerequisite");
+
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn available_awscurl_client_passes_prerequisite_check() {
+        let executable = std::env::current_exe().expect("the test executable should have a path");
+
+        verify_awscurl_path(&executable).expect("an available client with a working help command should pass");
+    }
+
+    #[test]
     fn capture_log_path_uses_temp_directory_basename() {
         assert_eq!(
             capture_log_path(Path::new("/tmp/e2e-logs"), "/tmp/rustfs_e2e_test_abc"),
             Some(PathBuf::from("/tmp/e2e-logs/rustfs_e2e_test_abc.log"))
+        );
+    }
+
+    #[test]
+    fn e2e_port_allocator_uses_default_range() {
+        assert_eq!(
+            parse_test_port_allocator_config(None, None).expect("default port allocator config"),
+            TestPortAllocatorConfig {
+                min: TEST_PORT_MIN,
+                range: TEST_PORT_RANGE
+            }
+        );
+    }
+
+    #[test]
+    fn e2e_port_allocator_accepts_explicit_test_range() {
+        let config = parse_test_port_allocator_config(Some("31000"), Some("128")).expect("explicit port range");
+
+        assert_eq!(advance_test_port(31127, config), 31000);
+        assert!(config.contains(&31000));
+        assert!(config.contains(&31127));
+        assert!(!config.contains(&31128));
+    }
+
+    #[test]
+    fn e2e_port_allocator_rejects_invalid_override() {
+        assert!(parse_test_port_allocator_config(Some("1023"), Some("1")).is_err());
+        assert!(parse_test_port_allocator_config(Some("65000"), Some("1000")).is_err());
+        assert!(parse_test_port_allocator_config(Some("31000"), Some("0")).is_err());
+        assert!(parse_test_port_allocator_config(Some("not-a-port"), Some("128")).is_err());
+    }
+
+    #[test]
+    fn e2e_port_allocator_reports_attempt_window_and_last_bind_error() {
+        let config = TestPortAllocatorConfig { min: 41000, range: 3 };
+        let error = std::io::Error::from(ErrorKind::PermissionDenied);
+
+        let message = no_available_test_port_error(config, config.range, Some(&error));
+
+        assert!(message.contains("41000..=41002"));
+        assert!(message.contains("after 3 attempts"));
+        assert!(message.contains("last bind error"));
+        assert!(message.contains("permission denied"));
+    }
+
+    #[test]
+    fn resolves_rustfs_binary_in_configured_cargo_target_directory() {
+        let workspace = Path::new("workspace");
+        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let binary = format!("rustfs{}", std::env::consts::EXE_SUFFIX);
+        assert_eq!(
+            resolve_rustfs_binary_path(workspace, None),
+            workspace.join("target").join(profile).join(&binary)
+        );
+        assert_eq!(
+            resolve_rustfs_binary_path(workspace, Some(Path::new("custom-target"))),
+            workspace.join("custom-target").join(profile).join(&binary)
+        );
+
+        let absolute = std::env::temp_dir().join("rustfs-e2e-custom-target");
+        assert_eq!(
+            resolve_rustfs_binary_path(workspace, Some(&absolute)),
+            absolute.join(profile).join(binary)
         );
     }
 
@@ -1762,16 +2179,66 @@ mod tests {
     }
 
     #[test]
-    fn binary_feature_stamp_matching_uses_normalized_features() {
-        let binary_path = std::env::temp_dir().join(format!("rustfs-feature-stamp-test-{}", Uuid::new_v4()));
-        let stamp_path = rustfs_binary_features_stamp_path(&binary_path);
+    fn explicit_binary_without_run_receipt_is_rejected() {
+        const CHILD_ENV: &str = "RUSTFS_E2E_RECEIPT_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            rustfs_binary_path_with_features(None);
+            return;
+        }
+        let executable = std::env::current_exe().expect("locate isolated test process");
+        let output = Command::new(&executable)
+            .args([
+                "--exact",
+                "common::tests::explicit_binary_without_run_receipt_is_rejected",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("CARGO_BIN_EXE_rustfs", &executable)
+            .env_remove("RUSTFS_E2E_BINARY_RECEIPT")
+            .output()
+            .expect("run the missing-receipt scenario with isolated environment variables");
+        assert!(!output.status.success(), "an explicit binary must not bypass run verification");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("missing E2E run receipt"));
+    }
 
-        stdfs::write(&stamp_path, " SFTP, ftps ").expect("write feature stamp");
-        assert!(binary_features_match(&binary_path, Some("sftp,ftps")));
-        assert!(binary_features_match(&binary_path, Some(" SFTP, FTPS ")));
-        assert!(!binary_features_match(&binary_path, Some("sftp")));
-
-        stdfs::remove_file(stamp_path).ok();
+    #[test]
+    fn e2e_run_receipt_rejects_replaced_binary_and_missing_features() {
+        let directory = std::env::temp_dir().join(format!("rustfs-e2e-receipt-test-{}", Uuid::new_v4()));
+        stdfs::create_dir(&directory).expect("create receipt fixture");
+        let binary = directory.join("rustfs");
+        let receipt = directory.join("receipt.json");
+        stdfs::write(&binary, "server").expect("write fixture binary");
+        let metadata = binary.metadata().expect("stat fixture binary");
+        let record = serde_json::json!({
+            "schema": 1,
+            "workspace": directory.canonicalize().expect("canonical workspace"),
+            "binary": binary.canonicalize().expect("canonical binary"),
+            "size": metadata.len(),
+            "modified_ns": metadata.modified().expect("modified time").duration_since(std::time::UNIX_EPOCH).expect("positive timestamp").as_nanos(),
+            "features": ["default", "full", "ftps", "webdav", "sftp"]
+        });
+        stdfs::write(&receipt, serde_json::to_vec(&record).expect("serialize receipt")).expect("write receipt");
+        verify_e2e_binary_receipt(&receipt, &directory, &binary, Some("sftp,webdav")).expect("resolved feature subset");
+        verify_e2e_binary_receipt(&receipt, &directory, &binary, Some("full")).expect("full was actually requested");
+        assert_eq!(
+            verify_e2e_binary_receipt(&receipt, &directory, &binary, Some("rio-v2"))
+                .expect_err("full does not enable rio-v2")
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        let other = directory.join("old-server");
+        stdfs::write(&other, "server").expect("write alternate binary");
+        assert!(verify_e2e_binary_receipt(&receipt, &directory, &other, None).is_err());
+        stdfs::write(&binary, "different server").expect("replace fixture binary");
+        assert!(verify_e2e_binary_receipt(&receipt, &directory, &binary, None).is_err());
+        stdfs::remove_file(&receipt).expect("remove expired receipt");
+        assert_eq!(
+            verify_e2e_binary_receipt(&receipt, &directory, &binary, None)
+                .expect_err("expired receipt")
+                .kind(),
+            ErrorKind::NotFound
+        );
+        stdfs::remove_dir_all(directory).expect("remove receipt fixture");
     }
 
     /// Build a cluster environment struct in-memory (no ports, no processes) so
@@ -1788,7 +2255,7 @@ mod tests {
         }
         let multidrive = topology.drives_per_node > 1;
 
-        let nodes = (0..topology.node_count)
+        let nodes: Vec<ClusterNode> = (0..topology.node_count)
             .map(|i| {
                 let address = format!("127.0.0.1:{}", 9000 + i);
                 let data_dirs: Vec<String> = if multidrive {
@@ -1809,6 +2276,7 @@ mod tests {
             })
             .collect();
 
+        let node_count = nodes.len();
         RustFSTestClusterEnvironment {
             nodes,
             temp_dir,
@@ -1818,6 +2286,7 @@ mod tests {
             node_extra_env: vec![Vec::new(); topology.node_count],
             node_capture_log_paths: vec![None; topology.node_count],
             topology,
+            volume_proxy_addresses: vec![None; node_count],
         }
     }
 
@@ -1900,6 +2369,25 @@ mod tests {
         assert!(ClusterTopology::single_pool(4).validate().is_ok());
         assert!(ClusterTopology::single_pool_multidrive(4, 4).validate().is_ok());
         assert!(ClusterTopology::single_pool_multidrive(1, 1).validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn volume_proxy_rewrites_cluster_volume_endpoint() {
+        let mut env = RustFSTestClusterEnvironment::new(1)
+            .await
+            .expect("cluster environment should allocate a node");
+        let direct = env.nodes[0].address.clone();
+        let proxy = env
+            .start_volume_proxy_for_node(0)
+            .await
+            .expect("volume proxy should bind before the target server starts");
+        let proxied = proxy.local_addr().to_string();
+        let volumes = env.rustfs_volumes_arg();
+
+        assert!(volumes.contains(&proxied), "volumes must use the proxy address: {volumes}");
+        assert!(!volumes.contains(&direct), "volumes must not retain the direct address: {volumes}");
+
+        proxy.shutdown().await;
     }
 
     #[test]

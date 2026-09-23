@@ -39,7 +39,7 @@ pub const ENV_RUNTIME_DIAL9_S3_BUCKET: &str = "RUSTFS_RUNTIME_DIAL9_S3_BUCKET";
 /// Accepted but not honoured; see [`ENV_RUNTIME_DIAL9_S3_BUCKET`].
 pub const ENV_RUNTIME_DIAL9_S3_PREFIX: &str = "RUSTFS_RUNTIME_DIAL9_S3_PREFIX";
 // Note: there are deliberately no task-dump knobs. dial9 only captures task
-// dumps for futures spawned through `dial9_tokio_telemetry::spawn`, and RustFS
+// dumps for futures spawned through `dial9::spawn`, and RustFS
 // spawns with `tokio::spawn` throughout, so the switch could never do anything.
 // Measured: 0 dumps via tokio::spawn vs 14709 via dial9::spawn on an identical
 // workload. See rustfs/backlog#1157 (D9-16).
@@ -103,7 +103,7 @@ pub const ENV_ALLOCATOR_RECLAIM_ENABLED: &str = "RUSTFS_ALLOCATOR_RECLAIM_ENABLE
 pub const ENV_ALLOCATOR_RECLAIM_INTERVAL_SECS: &str = "RUSTFS_ALLOCATOR_RECLAIM_INTERVAL_SECS";
 pub const ENV_ALLOCATOR_RECLAIM_FORCE: &str = "RUSTFS_ALLOCATOR_RECLAIM_FORCE";
 pub const ENV_ALLOCATOR_RECLAIM_IDLE_INTERVALS: &str = "RUSTFS_ALLOCATOR_RECLAIM_IDLE_INTERVALS";
-pub const DEFAULT_ALLOCATOR_RECLAIM_ENABLED: bool = false;
+pub const DEFAULT_ALLOCATOR_RECLAIM_ENABLED: bool = true;
 pub const DEFAULT_ALLOCATOR_RECLAIM_INTERVAL_SECS: u64 = 30;
 pub const DEFAULT_ALLOCATOR_RECLAIM_FORCE: bool = true;
 pub const DEFAULT_ALLOCATOR_RECLAIM_IDLE_INTERVALS: u64 = 3;

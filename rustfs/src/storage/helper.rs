@@ -22,7 +22,8 @@ use hashbrown::HashMap;
 use http::StatusCode;
 use metrics::counter;
 use rustfs_audit::{
-    entity::{ApiDetails, ApiDetailsBuilder, AuditEntryBuilder},
+    ObjectVersion,
+    entity::{ApiDetailsBuilder, AuditEntryBuilder},
     global::AuditLogger,
 };
 use rustfs_io_metrics::record_s3_op;
@@ -135,7 +136,7 @@ impl OperationHelper {
 
         record_s3_op(op);
 
-        // Fast path: when both chains are disabled, avoid all request parsing/builder work.
+        // Fast path: when both chains are disabled, avoid audit/notify builder work.
         if !audit_enabled && !notify_enabled {
             return Self::Disabled;
         }
@@ -179,7 +180,7 @@ impl OperationHelper {
 
         let audit_builder = if audit_enabled {
             Some(
-                AuditEntryBuilder::new("1.0", event, trigger, ApiDetails::default())
+                AuditEntryBuilder::new("1.0", event, trigger, api_builder.clone().build())
                     .remote_host(remote_host)
                     .user_agent(get_request_user_agent(&req.headers))
                     .req_host(get_request_host(&req.headers))
@@ -246,6 +247,11 @@ impl OperationHelper {
         matches!(self, Self::Enabled(state) if state.event_builder.is_some())
     }
 
+    /// True when the audit entry can include object details.
+    pub fn wants_audit_object_info(&self) -> bool {
+        matches!(self, Self::Enabled(state) if state.audit_builder.is_some())
+    }
+
     #[cfg(test)]
     pub(crate) fn event_args(&self) -> Option<rustfs_notify::EventArgs> {
         match self {
@@ -260,6 +266,17 @@ impl OperationHelper {
             && let Some(builder) = state.event_builder.take()
         {
             state.event_builder = Some(builder.object(convert_ecstore_object_info(object_info)));
+        }
+        self
+    }
+
+    /// Sets nonempty object details on the audit entry.
+    pub fn audit_objects(mut self, objects: Vec<ObjectVersion>) -> Self {
+        if !objects.is_empty()
+            && let Self::Enabled(state) = &mut self
+            && state.audit_builder.is_some()
+        {
+            state.api_builder = state.api_builder.clone().objects(objects);
         }
         self
     }
@@ -429,15 +446,15 @@ mod tests {
     use crate::server::{refresh_audit_module_enabled, refresh_notify_module_enabled};
     use crate::storage::access::ReqInfo;
     use crate::storage::request_context::RequestContext;
-    use base64::Engine as _;
     use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
     use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, SharedString, Unit};
+    use rustfs_audit::ObjectVersion;
     use rustfs_credentials::Credentials;
     use rustfs_s3_ops::S3Operation;
     use rustfs_s3_types::EventName;
     use rustfs_utils::http::headers::{AMZ_REQUEST_ID, REQUEST_ID_HEADER};
-    use s3s::dto::{DeleteObjectTaggingInput, DeleteObjectTaggingOutput};
-    use s3s::{S3Request, S3Response};
+    use s3s::dto::{DeleteObjectTaggingInput, DeleteObjectTaggingOutput, GetObjectInput, GetObjectOutput};
+    use s3s::{S3Error, S3ErrorCode, S3Request, S3Response};
     use std::sync::{Arc, Mutex};
     use temp_env::{async_with_vars, with_vars};
 
@@ -551,6 +568,114 @@ mod tests {
                 assert_eq!(event_args.object.name, "prefix/issue-2292.txt");
                 assert_eq!(event_args.version_id, "version-123");
                 assert_eq!(event_args.req_params.get("principalId").map(String::as_str), Some("notifyTag"));
+            },
+        );
+    }
+
+    #[test]
+    fn operation_helper_adds_objects_to_audit_details() {
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                let input = DeleteObjectTaggingInput::builder()
+                    .bucket("test-bucket".to_string())
+                    .key("test-key".to_string())
+                    .build()
+                    .expect("delete object tagging input should build");
+                let req = build_request(input, Method::DELETE, Uri::from_static("/test-bucket"));
+                let objects = vec![
+                    ObjectVersion::new("first-key".to_string(), None),
+                    ObjectVersion::new("second-key".to_string(), Some("version-123".to_string())),
+                ];
+                let mut empty_helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObjects)
+                    .audit_objects(Vec::new());
+                let OperationHelper::Enabled(empty_state) = &mut empty_helper else {
+                    panic!("helper should be enabled when the audit switch is on");
+                };
+                assert!(empty_state.api_builder.0.objects.is_none());
+                empty_state.audit_builder.take();
+
+                let result = Ok(S3Response::new(DeleteObjectTaggingOutput::default()));
+                let mut helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObjects)
+                    .audit_objects(objects.clone())
+                    .complete(&result);
+
+                let OperationHelper::Enabled(state) = &mut helper else {
+                    panic!("helper should be enabled when the audit switch is on");
+                };
+                let audit_entry = state.audit_builder.take().expect("audit builder should exist").build();
+                assert_eq!(audit_entry.api.objects, Some(objects));
+            },
+        );
+    }
+
+    #[test]
+    fn operation_helper_initializes_audit_api_details_before_completion() {
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                let input = GetObjectInput::builder()
+                    .bucket("audit-bucket".to_string())
+                    .key("missing/object.txt".to_string())
+                    .build()
+                    .expect("get object input should build");
+                let req = build_request(input, Method::GET, Uri::from_static("/audit-bucket/missing/object.txt"));
+                let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
+
+                let OperationHelper::Enabled(state) = &mut helper else {
+                    panic!("helper should be enabled when the audit switch is on");
+                };
+                let audit_entry = state.audit_builder.take().expect("audit builder should exist").build();
+
+                assert_eq!(audit_entry.api.name.as_deref(), Some("s3:GetObject"));
+                assert_eq!(audit_entry.api.bucket.as_deref(), Some("audit-bucket"));
+                assert_eq!(audit_entry.api.object.as_deref(), Some("missing/object.txt"));
+                assert!(audit_entry.api.status_code.is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn operation_helper_complete_records_failed_status_code() {
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                let input = GetObjectInput::builder()
+                    .bucket("audit-bucket".to_string())
+                    .key("missing/object.txt".to_string())
+                    .build()
+                    .expect("get object input should build");
+                let req = build_request(input, Method::GET, Uri::from_static("/audit-bucket/missing/object.txt"));
+                let result: Result<S3Response<GetObjectOutput>, S3Error> = Err(S3Error::new(S3ErrorCode::NoSuchKey));
+                let mut helper =
+                    OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).complete(&result);
+
+                let OperationHelper::Enabled(state) = &mut helper else {
+                    panic!("helper should be enabled when the audit switch is on");
+                };
+                let audit_entry = state.audit_builder.take().expect("audit builder should exist").build();
+
+                assert_eq!(audit_entry.api.name.as_deref(), Some("s3:GetObject"));
+                assert_eq!(audit_entry.api.status.as_deref(), Some("failure"));
+                assert_eq!(audit_entry.api.status_code, Some(404));
             },
         );
     }
@@ -704,10 +829,7 @@ mod tests {
         std::collections::HashMap::from([
             ("x-amz-server-side-encryption".to_string(), "aws:kms".to_string()),
             ("x-rustfs-encryption-key-id".to_string(), "finance-key".to_string()),
-            (
-                "x-rustfs-encryption-key".to_string(),
-                base64::engine::general_purpose::STANDARD.encode([7u8; 48]),
-            ),
+            ("x-rustfs-encryption-key".to_string(), base64_simd::STANDARD.encode_to_string([7u8; 48])),
             ("x-rustfs-encryption-algorithm".to_string(), "aws:kms".to_string()),
         ])
     }
@@ -779,7 +901,7 @@ mod tests {
 
                 let rendered = serde_json::to_string(&tags).expect("audit tags serialize");
                 assert!(
-                    !rendered.contains(&base64::engine::general_purpose::STANDARD.encode([7u8; 48])),
+                    !rendered.contains(&base64_simd::STANDARD.encode_to_string([7u8; 48])),
                     "the audit entry must not carry the wrapped data key: {rendered}"
                 );
             },

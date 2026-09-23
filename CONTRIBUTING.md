@@ -62,11 +62,19 @@ make test
 # Fast pre-commit gate — see below for exactly what it runs
 make pre-commit
 
-# Full pre-PR gate (pre-commit gates + clippy + tests)
+# Optional full gate for broad cross-module changes (pre-commit + clippy + tests)
 make pre-pr
 ```
 
 > `make test` requires [cargo-nextest](https://nexte.st) (CI runs it and only nextest honours `.config/nextest.toml` test-groups). Install it with `cargo install cargo-nextest --locked` or a prebuilt binary (see https://nexte.st/docs/installation/). To run the plain `cargo test` fallback anyway (results not authoritative — serialization semantics differ from CI), set `RUSTFS_ALLOW_CARGO_TEST_FALLBACK=1`.
+
+> Some guard checks are Python (`test-wiring-check` in `make pre-commit`, plus the
+> security-coverage and scheduled-validation self-tests in `make test`) and import
+> `tomllib`, so they need **Python 3.11+**. Make resolves the interpreter through
+> `scripts/python_bin.sh`, which prefers a `python3.11`+ on `PATH` and otherwise falls
+> back to `uv run --python 3.12`. macOS ships `/usr/bin/python3` at 3.9, so install a
+> newer one (`brew install python@3.12`) or [uv](https://docs.astral.sh/uv/); pin a
+> specific interpreter with `RUSTFS_PYTHON=/path/to/python3.12`.
 
 > For the full test-layer taxonomy (unit / ecstore black-box / e2e / s3s-e2e / S3 compatibility / chaos / fuzz / bench), each layer's entry command, the naming conventions the migration gate depends on, and the serial/nextest rules, see [docs/testing/README.md](docs/testing/README.md).
 
@@ -88,34 +96,30 @@ make pre-pr
 8. `quick-check` — `cargo check --workspace --exclude e2e_test`
 
 **`make pre-commit` does NOT run clippy and does NOT run any tests.**
-A green `make pre-commit` is not enough to open a pull request.
+It does not replace the scoped Clippy and test checks applicable to a change.
 
 `make pre-pr` is the **full** gate: it runs all of the guard checks above,
 then `clippy-check` (`cargo clippy --all-targets --all-features -- -D warnings`)
 and `test` (shell script tests, workspace tests excluding `e2e_test`, and doc
 tests). Complete the applicable multi-role adversarial review described in
-`AGENTS.md` before running `make pre-pr`; then run the gate before opening or
-updating a pull request. This is what CI enforces.
+`AGENTS.md` first. Do not run `make pre-pr` locally by default before opening or
+updating a pull request. Consider it only for a broad change that spans multiple
+modules and whose impact cannot be bounded by targeted checks; decide from the
+affected boundaries and risks. CI still runs its configured repository gates.
 
 ### 🔒 Git Pre-commit Hooks (optional)
 
-Git hooks are **not** versioned in this repository, so a fresh clone has no
-active pre-commit hook. If you add your own `.git/hooks/pre-commit` (a good
-choice is a one-liner that runs `make pre-commit`), you can mark it executable
-with:
+The optional hook uses the checked-in `.pre-commit-config.yaml`. Install [pre-commit](https://pre-commit.com/#installation), then run this from the checkout or a linked worktree:
 
 ```bash
 make setup-hooks
 ```
 
-Or manually:
+The hook runs `cargo fmt --all --check` when staged files include Rust source. It does not compile the workspace or run tests. Fix formatting with `cargo fmt --all`, inspect and stage the result, then commit again.
 
-```bash
-chmod +x .git/hooks/pre-commit
-```
+`pre-commit install` resolves Git's hook directory for linked worktrees and preserves an existing hook in migration mode. If you use `core.hooksPath`, keep that hook manager and integrate `pre-commit run` there; the installer refuses to silently replace that configuration.
 
-With or without a hook, the expectation is the same: run `make pre-commit`
-before committing and `make pre-pr` before opening a pull request.
+A local hook provides early formatting feedback. With or without it, follow the verification tiers in `AGENTS.md`, run relevant behavioral tests, and satisfy the CI merge gates. `make pre-commit` and `make dev-check` remain explicit broader commands.
 
 ### 📝 Formatting Configuration
 
@@ -127,34 +131,16 @@ fn_call_width = 90
 single_line_let_else_max_width = 100
 ```
 
-### 🚫 Commit Prevention
-
-If you set up a pre-commit hook and your code doesn't meet the formatting requirements, the hook will:
-
-1. **Block the commit** and show clear error messages
-2. **Provide exact commands** to fix the issues
-3. **Guide you through** the resolution process
-
-Example output when formatting fails:
-
-```
-❌ Code formatting check failed!
-💡 Please run 'cargo fmt --all' to format your code before committing.
-
-🔧 Quick fix:
-   cargo fmt --all
-   git add .
-   git commit
-```
-
 ### 🔄 Development Workflow
 
 1. **Make your changes**
 2. **Format your code**: `make fmt` or `cargo fmt --all`
-3. **Run the fast gate**: `make pre-commit` (no clippy, no tests)
+3. **Select relevant checks** using the validation tier in `AGENTS.md`; use `make pre-commit` when its broader fast gate adds useful coverage
 4. **Commit your changes**: `git commit -m "your message"`
 5. **Complete the applicable multi-role adversarial review** for non-exempt changes (see `AGENTS.md`)
-6. **Run the full gate before opening/updating a PR**: `make pre-pr` (clippy + tests)
+6. **Run applicable scoped checks before opening/updating a PR**; consider
+   `make pre-pr` only for broad cross-module changes whose impact cannot be
+   bounded by targeted checks
 7. **Push to your branch**: `git push`
 
 ### 🛠️ IDE Integration
@@ -193,11 +179,12 @@ Configure your IDE to:
 #### Pre-commit hook not running?
 
 ```bash
-# Check if hook is executable
-ls -la .git/hooks/pre-commit
-
-# Make it executable if needed
-chmod +x .git/hooks/pre-commit
+pre-commit validate-config
+pre-commit run --all-files
+# Inspect any configured hook manager; do not overwrite it.
+git config --get core.hooksPath
+# Install if no separate hook manager is configured.
+make setup-hooks
 ```
 
 #### Formatting issues?

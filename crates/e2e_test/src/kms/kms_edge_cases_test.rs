@@ -21,20 +21,12 @@
 //! - Concurrent encryption operations
 //! - Security validation tests
 
-use super::common::{LocalKMSTestEnvironment, sse_customer_key_md5_base64};
+use super::common::{LocalKMSTestEnvironment, SSE_C_KEY_MISMATCH_MESSAGE, assert_s3_error, sse_customer_key_md5_base64};
 use crate::common::{TEST_BUCKET, init_logging};
 use aws_sdk_s3::types::ServerSideEncryption;
-use base64::Engine;
-use md5::{Digest as Md5Digest, Md5};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
-
-fn md5_hex(input: impl AsRef<[u8]>) -> String {
-    let mut hasher = Md5::new();
-    hasher.update(input.as_ref());
-    hex::encode(hasher.finalize())
-}
 
 /// Test encryption of zero-byte files (empty files)
 #[tokio::test]
@@ -75,7 +67,7 @@ async fn test_kms_zero_byte_file_encryption() -> Result<(), Box<dyn std::error::
     // Test SSE-C with zero-byte file
     info!("📤 Testing SSE-C with zero-byte file");
     let test_key = "01234567890123456789012345678901";
-    let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
+    let test_key_b64 = base64_simd::STANDARD.encode_to_string(test_key);
     let test_key_md5 = sse_customer_key_md5_base64(test_key);
     let object_key_c = "zero-byte-sse-c";
 
@@ -168,7 +160,7 @@ async fn test_kms_single_byte_file_encryption() -> Result<(), Box<dyn std::error
     // Test SSE-C with single byte
     info!("📤 Testing SSE-C with single-byte file");
     let test_key = "01234567890123456789012345678901";
-    let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
+    let test_key_b64 = base64_simd::STANDARD.encode_to_string(test_key);
     let test_key_md5 = sse_customer_key_md5_base64(test_key);
     let object_key_c = "single-byte-sse-c";
 
@@ -294,8 +286,8 @@ async fn test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Erro
     // Test 1: Invalid key length for SSE-C
     info!("🔍 Testing invalid SSE-C key length");
     let invalid_short_key = "short"; // Too short
-    let invalid_key_b64 = base64::engine::general_purpose::STANDARD.encode(invalid_short_key);
-    let invalid_key_md5 = md5_hex(invalid_short_key);
+    let invalid_key_b64 = base64_simd::STANDARD.encode_to_string(invalid_short_key);
+    let invalid_key_md5 = sse_customer_key_md5_base64(invalid_short_key);
 
     let invalid_key_result = s3_client
         .put_object()
@@ -308,14 +300,32 @@ async fn test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Erro
         .send()
         .await;
 
-    assert!(invalid_key_result.is_err(), "Should reject invalid key length");
+    assert_s3_error(
+        invalid_key_result,
+        400,
+        "InvalidRequest",
+        "SSE-C key must be 32 bytes (256 bits), got 5 bytes.",
+        "invalid SSE-C key length must be rejected",
+    );
+    assert_s3_error(
+        s3_client
+            .get_object()
+            .bucket(TEST_BUCKET)
+            .key("test-invalid-key-length")
+            .send()
+            .await,
+        404,
+        "NoSuchKey",
+        "The specified key does not exist.",
+        "rejected invalid-key PUT must not create an object",
+    );
     info!("✅ Correctly rejected invalid key length");
 
     // Test 2: Mismatched MD5 for SSE-C
     info!("🔍 Testing mismatched MD5 for SSE-C key");
     let valid_key = "01234567890123456789012345678901";
-    let valid_key_b64 = base64::engine::general_purpose::STANDARD.encode(valid_key);
-    let wrong_md5 = "wrongmd5hash12345678901234567890"; // Wrong MD5
+    let valid_key_b64 = base64_simd::STANDARD.encode_to_string(valid_key);
+    let wrong_md5 = sse_customer_key_md5_base64("98765432109876543210987654321098");
 
     let wrong_md5_result = s3_client
         .put_object()
@@ -324,11 +334,24 @@ async fn test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Erro
         .body(aws_sdk_s3::primitives::ByteStream::from(test_data.to_vec()))
         .sse_customer_algorithm("AES256")
         .sse_customer_key(&valid_key_b64)
-        .sse_customer_key_md5(wrong_md5)
+        .sse_customer_key_md5(&wrong_md5)
         .send()
         .await;
 
-    assert!(wrong_md5_result.is_err(), "Should reject mismatched MD5");
+    assert_s3_error(
+        wrong_md5_result,
+        400,
+        "InvalidRequest",
+        "The calculated MD5 hash of the key did not match the hash that was provided.",
+        "mismatched SSE-C key MD5 must be rejected",
+    );
+    assert_s3_error(
+        s3_client.get_object().bucket(TEST_BUCKET).key("test-wrong-md5").send().await,
+        404,
+        "NoSuchKey",
+        "The specified key does not exist.",
+        "rejected mismatched-MD5 PUT must not create an object",
+    );
     info!("✅ Correctly rejected mismatched MD5");
 
     // Test 3: Try to access SSE-C object without providing key
@@ -355,7 +378,28 @@ async fn test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Erro
         .send()
         .await;
 
-    assert!(no_key_result.is_err(), "Should require SSE-C key for access");
+    assert_s3_error(
+        no_key_result,
+        400,
+        "InvalidRequest",
+        "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object.",
+        "SSE-C object GET without a customer key must be rejected",
+    );
+
+    let recovered = s3_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("test-sse-c-no-key-access")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&valid_key_b64)
+        .sse_customer_key_md5(&valid_key_md5)
+        .send()
+        .await?
+        .body
+        .collect()
+        .await?
+        .into_bytes();
+    assert_eq!(recovered.as_ref(), test_data, "failed GET must not corrupt the SSE-C object");
     info!("✅ Correctly required SSE-C key for access");
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
@@ -420,7 +464,7 @@ async fn test_kms_concurrent_encryption() -> Result<(), Box<dyn std::error::Erro
                 2 => {
                     // SSE-C
                     let key = format!("testkey{i:026}"); // 32-byte key
-                    let key_b64 = base64::engine::general_purpose::STANDARD.encode(&key);
+                    let key_b64 = base64_simd::STANDARD.encode_to_string(&key);
                     let key_md5 = sse_customer_key_md5_base64(&key);
 
                     client
@@ -490,8 +534,8 @@ async fn test_kms_key_validation_security() -> Result<(), Box<dyn std::error::Er
     let key1 = "key1key1key1key1key1key1key1key1"; // 32 bytes
     let key2 = "key2key2key2key2key2key2key2key2"; // 32 bytes
 
-    let key1_b64 = base64::engine::general_purpose::STANDARD.encode(key1);
-    let key2_b64 = base64::engine::general_purpose::STANDARD.encode(key2);
+    let key1_b64 = base64_simd::STANDARD.encode_to_string(key1);
+    let key2_b64 = base64_simd::STANDARD.encode_to_string(key2);
     let key1_md5 = sse_customer_key_md5_base64(key1);
     let key2_md5 = sse_customer_key_md5_base64(key2);
 
@@ -563,7 +607,13 @@ async fn test_kms_key_validation_security() -> Result<(), Box<dyn std::error::Er
         .send()
         .await;
 
-    assert!(wrong_key_result.is_err(), "Should not be able to decrypt with wrong key");
+    assert_s3_error(
+        wrong_key_result,
+        400,
+        "InvalidRequest",
+        SSE_C_KEY_MISMATCH_MESSAGE,
+        "SSE-C object GET with the wrong customer key must be rejected",
+    );
     info!("✅ Key isolation verified - wrong key cannot decrypt data");
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;

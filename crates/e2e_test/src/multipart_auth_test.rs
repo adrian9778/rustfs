@@ -15,16 +15,19 @@
 //! Regression coverage for anonymous access on multipart control APIs.
 
 use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
-use async_compression::tokio::write::{BzEncoder, XzEncoder};
+use crate::kms::common::LocalKMSTestEnvironment;
+use async_compression::tokio::write::{BzEncoder, Lz4Encoder, XzEncoder};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
 };
-use base64::Engine;
 use chrono::{Duration as ChronoDuration, Utc};
-use flate2::{Compression, write::GzEncoder};
+use flate2::{
+    Compression,
+    write::{GzEncoder, ZlibEncoder},
+};
 use http::HeaderValue;
 use http::header::{CONTENT_TYPE, HOST};
 use md5::{Digest as Md5Digest, Md5};
@@ -47,19 +50,19 @@ fn encode_post_policy(conditions: Vec<serde_json::Value>) -> String {
         "conditions": conditions,
     });
 
-    base64::engine::general_purpose::STANDARD.encode(policy.to_string())
+    base64_simd::STANDARD.encode_to_string(policy.to_string())
 }
 
 fn sse_customer_key_md5_base64(key: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(key.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+    base64_simd::STANDARD.encode_to_string(hasher.finalize())
 }
 
 fn md5_hex(input: impl AsRef<[u8]>) -> String {
     let mut hasher = Md5::new();
     hasher.update(input.as_ref());
-    hex::encode(hasher.finalize())
+    hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower)
 }
 
 async fn create_restricted_user(
@@ -97,7 +100,7 @@ fn restricted_user_client(env: &RustFSTestEnvironment, username: &str, secret_ke
 const LOCAL_SSE_MASTER_KEY_ENV: &str = "RUSTFS_SSE_S3_MASTER_KEY";
 
 fn local_sse_master_key_value() -> String {
-    base64::engine::general_purpose::STANDARD.encode([0x42u8; 32])
+    base64_simd::STANDARD.encode_to_string([0x42u8; 32])
 }
 
 async fn make_tar(files: &[(&str, &[u8])], dirs: &[&str]) -> Vec<u8> {
@@ -188,6 +191,12 @@ fn gzip_bytes(data: &[u8]) -> Vec<u8> {
     encoder.finish().expect("gzip encoder should finish")
 }
 
+fn zlib_bytes(data: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).expect("zlib encoder should accept input");
+    encoder.finish().expect("zlib encoder should finish")
+}
+
 fn zstd_bytes(data: &[u8]) -> Vec<u8> {
     let mut encoder = zstd::Encoder::new(Vec::new(), 0).expect("zstd encoder should initialize");
     encoder.write_all(data).expect("zstd encoder should accept input");
@@ -208,6 +217,45 @@ async fn xz_bytes(data: &[u8]) -> Vec<u8> {
     encoder.write_all(data).await.expect("xz encoder should accept input");
     encoder.shutdown().await.expect("xz encoder should finish");
     encoder.into_inner().into_inner()
+}
+
+async fn lz4_bytes(data: &[u8]) -> Vec<u8> {
+    let cursor = Cursor::new(Vec::new());
+    let mut encoder = Lz4Encoder::new(cursor);
+    encoder.write_all(data).await.expect("LZ4 encoder should accept input");
+    encoder.shutdown().await.expect("LZ4 encoder should finish");
+    encoder.into_inner().into_inner()
+}
+
+/// Encode the S2 framed stream shape emitted by minio-go PutObjectsSnowball
+/// with `Compress: true`: 1 MiB independent blocks, better compression,
+/// masked CRC-32C, and the `S2sTwO` stream identifier.
+fn minio_go_snowball_s2_bytes(data: &[u8]) -> Vec<u8> {
+    const BLOCK_SIZE: usize = 1 << 20;
+    const CHECKSUM_SIZE: usize = 4;
+
+    let mut output = b"\xff\x06\x00\x00S2sTwO".to_vec();
+    let mut encoder = minlz::Encoder::new();
+    for block in data.chunks(BLOCK_SIZE) {
+        let compressed = encoder.encode_better(block);
+        let compressed_limit = block.len().saturating_sub(block.len() / 32).saturating_sub(5);
+        let (chunk_type, payload) = if compressed.len() <= compressed_limit {
+            (0x00, compressed.as_slice())
+        } else {
+            (0x01, block)
+        };
+        let chunk_len = payload.len() + CHECKSUM_SIZE;
+        assert!(chunk_len < 1 << 24, "S2 fixture chunk must fit the 24-bit frame length");
+        output.extend_from_slice(&[
+            chunk_type,
+            (chunk_len & 0xff) as u8,
+            ((chunk_len >> 8) & 0xff) as u8,
+            ((chunk_len >> 16) & 0xff) as u8,
+        ]);
+        output.extend_from_slice(&minlz::crc::crc(block).to_le_bytes());
+        output.extend_from_slice(payload);
+    }
+    output
 }
 
 fn assert_s3_error_code<T, E>(result: Result<T, SdkError<E>>, code: &str)
@@ -1418,10 +1466,10 @@ async fn test_anonymous_post_object_uses_bucket_default_sse_s3() -> Result<(), B
 async fn test_anonymous_post_object_uses_bucket_default_sse_kms() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
-    let mut env = RustFSTestEnvironment::new().await?;
-    let master_key = local_sse_master_key_value();
-    env.start_rustfs_server_with_env(vec![], &[(LOCAL_SSE_MASTER_KEY_ENV, master_key.as_str())])
-        .await?;
+    let mut kms_env = LocalKMSTestEnvironment::new().await?;
+    let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
+    kms_env.wait_for_kms_ready().await?;
+    let env = &kms_env.base_env;
 
     let bucket = "anon-post-default-sse-kms";
     let object_key = "post-default-sse-kms-object.txt";
@@ -1437,7 +1485,7 @@ async fn test_anonymous_post_object_uses_bucket_default_sse_kms() -> Result<(), 
                 .apply_server_side_encryption_by_default(
                     ServerSideEncryptionByDefault::builder()
                         .sse_algorithm(ServerSideEncryption::AwsKms)
-                        .kms_master_key_id("test-key")
+                        .kms_master_key_id(default_key_id)
                         .build()
                         .expect("default encryption rule should build"),
                 )
@@ -1887,7 +1935,7 @@ async fn test_anonymous_post_object_allows_sse_c_fields_outside_policy_condition
     let object_key = "sse-c-object.txt";
     let expected_body = b"anonymous-post-sse-c".to_vec();
     let customer_key = "01234567890123456789012345678901";
-    let customer_key_b64 = base64::engine::general_purpose::STANDARD.encode(customer_key);
+    let customer_key_b64 = base64_simd::STANDARD.encode_to_string(customer_key);
     let customer_key_md5 = sse_customer_key_md5_base64(customer_key);
 
     let admin_client = env.create_s3_client();
@@ -1941,7 +1989,7 @@ async fn test_anonymous_post_object_allows_sse_c_fields_outside_policy_condition
         .bucket(bucket)
         .key(object_key)
         .sse_customer_algorithm("AES256")
-        .sse_customer_key(base64::engine::general_purpose::STANDARD.encode(customer_key))
+        .sse_customer_key(base64_simd::STANDARD.encode_to_string(customer_key))
         .sse_customer_key_md5(customer_key_md5)
         .send()
         .await?;
@@ -1963,8 +2011,8 @@ async fn test_anonymous_post_object_rejects_sse_c_exact_policy_mismatch() -> Res
     let object_key = "sse-c-mismatch-object.txt";
     let policy_key = "01234567890123456789012345678901";
     let request_key = "abcdefghijklmnopqrstuvwxyzABCDEF";
-    let policy_key_b64 = base64::engine::general_purpose::STANDARD.encode(policy_key);
-    let request_key_b64 = base64::engine::general_purpose::STANDARD.encode(request_key);
+    let policy_key_b64 = base64_simd::STANDARD.encode_to_string(policy_key);
+    let request_key_b64 = base64_simd::STANDARD.encode_to_string(request_key);
 
     let admin_client = env.create_s3_client();
     admin_client.create_bucket().bucket(bucket).send().await?;
@@ -3458,6 +3506,62 @@ async fn test_signed_put_object_extract_expands_tar_entries_with_prefix_headers(
 }
 
 #[tokio::test]
+async fn test_signed_put_object_extract_ignore_dirs_skips_unauthorized_directory()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-ignore-dirs-auth";
+    let archive_key = "bundle.tar";
+    let allowed_member = "allowed/member.txt";
+    let denied_directory = "denied/";
+    let username = "snowball-ignore-dirs";
+    let secret_key = "snowball-ignore-dirs-secret";
+    let expected_body = b"allowed-body";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    create_restricted_user(&env, username, secret_key).await?;
+
+    let policy = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "AWS": [username] },
+            "Action": ["s3:PutObject"],
+            "Resource": [
+                format!("arn:aws:s3:::{bucket}/{archive_key}"),
+                format!("arn:aws:s3:::{bucket}/{allowed_member}")
+            ]
+        }]
+    })
+    .to_string();
+    admin_client.put_bucket_policy().bucket(bucket).policy(policy).send().await?;
+
+    let restricted_client = restricted_user_client(&env, username, secret_key);
+    let tar_bytes = make_tar(&[(allowed_member, expected_body)], &[denied_directory]).await;
+    restricted_client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .body(ByteStream::from(tar_bytes))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+            req.headers_mut().insert("x-amz-meta-snowball-ignore-dirs", "true");
+        })
+        .send()
+        .await?;
+
+    let stored = admin_client.get_object().bucket(bucket).key(allowed_member).send().await?;
+    assert_eq!(stored.body.collect().await?.into_bytes().as_ref(), expected_body);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_signed_put_object_extract_preserves_request_metadata_on_extracted_objects()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3526,7 +3630,7 @@ async fn test_signed_put_object_extract_preserves_sse_s3_and_redirect() -> Resul
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    let sse_master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+    let sse_master_key = base64_simd::STANDARD.encode_to_string([0x42u8; 32]);
     env.start_rustfs_server_with_env(vec![], &[("RUSTFS_SSE_S3_MASTER_KEY", sse_master_key.as_str())])
         .await?;
 
@@ -3799,7 +3903,7 @@ async fn test_signed_put_object_extract_uses_bucket_default_sse_s3() -> Result<(
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    let sse_master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+    let sse_master_key = base64_simd::STANDARD.encode_to_string([0x42u8; 32]);
     env.start_rustfs_server_with_env(vec![], &[("RUSTFS_SSE_S3_MASTER_KEY", sse_master_key.as_str())])
         .await?;
 
@@ -3925,7 +4029,7 @@ async fn test_signed_put_object_extract_preserves_sse_c() -> Result<(), Box<dyn 
     let extracted_key = "nested/file.txt";
     let expected_body = b"extract-sse-c-body".to_vec();
     let customer_key = "01234567890123456789012345678901";
-    let customer_key_b64 = base64::engine::general_purpose::STANDARD.encode(customer_key);
+    let customer_key_b64 = base64_simd::STANDARD.encode_to_string(customer_key);
     let customer_key_md5 = sse_customer_key_md5_base64(customer_key);
 
     let client = env.create_s3_client();
@@ -4187,6 +4291,60 @@ async fn test_signed_put_object_extract_returns_archive_etag() -> Result<(), Box
 }
 
 #[tokio::test]
+async fn test_signed_put_object_extract_expands_s2_and_lz4_by_magic_with_raw_etags()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-magic-codecs";
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+
+    let s2_tar = make_tar(&[("s2/object.txt", b"s2-body")], &[]).await;
+    let s2_archive = minio_go_snowball_s2_bytes(&s2_tar);
+    let expected_s2_etag = format!("\"{}\"", md5_hex(&s2_archive));
+    let s2_response = client
+        .put_object()
+        .bucket(bucket)
+        // minio-go intentionally uploads a compressed S2 stream with a .tar key.
+        .key("snowball-upload-0123456789abcdef.tar")
+        .body(ByteStream::from(s2_archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+    assert_eq!(s2_response.e_tag(), Some(expected_s2_etag.as_str()));
+
+    let s2_object = client.get_object().bucket(bucket).key("s2/object.txt").send().await?;
+    assert_eq!(s2_object.body.collect().await?.into_bytes().as_ref(), b"s2-body");
+
+    let lz4_tar = make_tar(&[("lz4/object.txt", b"lz4-body")], &[]).await;
+    let lz4_archive = lz4_bytes(&lz4_tar).await;
+    let expected_lz4_etag = format!("\"{}\"", md5_hex(&lz4_archive));
+    let lz4_response = client
+        .put_object()
+        .bucket(bucket)
+        .key("also-looks-like-a-plain.tar")
+        .body(ByteStream::from(lz4_archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+    assert_eq!(lz4_response.e_tag(), Some(expected_lz4_etag.as_str()));
+
+    let lz4_object = client.get_object().bucket(bucket).key("lz4/object.txt").send().await?;
+    assert_eq!(lz4_object.body.collect().await?.into_bytes().as_ref(), b"lz4-body");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_signed_put_object_extract_preserves_entry_mtime() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -4278,10 +4436,6 @@ async fn test_signed_put_object_extract_preserves_pax_metadata_and_version_id()
 async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retention_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if !crate::common::awscurl_available() {
-        return Ok(());
-    }
-
     let mut env = RustFSTestEnvironment::new().await?;
     env.start_rustfs_server(vec![]).await?;
 
@@ -4314,9 +4468,15 @@ async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retent
     let context_archive_resources = [
         format!("arn:aws:s3:::{bucket}/tag-context.tar"),
         format!("arn:aws:s3:::{bucket}/lock-context.tar"),
+        format!("arn:aws:s3:::{bucket}/legal-hold-context.tar"),
+        format!("arn:aws:s3:::{bucket}/user-agent-bypass.tar"),
+        format!("arn:aws:s3:::{bucket}/sse-bypass.tar"),
     ];
     let tag_entry_resource = format!("arn:aws:s3:::{bucket}/tag-context-entry.txt");
     let lock_entry_resource = format!("arn:aws:s3:::{bucket}/lock-context-entry.txt");
+    let legal_hold_entry_resource = format!("arn:aws:s3:::{bucket}/legal-hold-context-entry.txt");
+    let user_agent_entry_resource = format!("arn:aws:s3:::{bucket}/user-agent-bypass-entry.txt");
+    let sse_entry_resource = format!("arn:aws:s3:::{bucket}/sse-bypass-entry.txt");
     let policy = serde_json::json!({
         "Version": "2012-10-17",
         "Statement": [
@@ -4376,7 +4536,7 @@ async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retent
                 "Sid": "PaxContextArchives",
                 "Effect": "Allow",
                 "Principal": { "AWS": [pax_context_user] },
-                "Action": ["s3:PutObject", "s3:PutObjectRetention", "s3:PutObjectTagging"],
+                "Action": ["s3:PutObject", "s3:PutObjectRetention", "s3:PutObjectLegalHold", "s3:PutObjectTagging"],
                 "Resource": context_archive_resources
             },
             {
@@ -4416,6 +4576,49 @@ async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retent
                 "Principal": { "AWS": [pax_context_user] },
                 "Action": ["s3:PutObjectRetention"],
                 "Resource": [lock_entry_resource]
+            },
+            {
+                "Sid": "PaxLegalHoldContextPut",
+                "Effect": "Allow",
+                "Principal": { "AWS": [pax_context_user] },
+                "Action": ["s3:PutObject"],
+                "Resource": [legal_hold_entry_resource.clone()]
+            },
+            {
+                "Sid": "PaxLegalHoldContextAction",
+                "Effect": "Allow",
+                "Principal": { "AWS": [pax_context_user] },
+                "Action": ["s3:PutObjectLegalHold"],
+                "Resource": [legal_hold_entry_resource],
+                "Condition": {
+                    "StringEquals": {
+                        "s3:object-lock-legal-hold": "OFF"
+                    }
+                }
+            },
+            {
+                "Sid": "MemberUserAgentCondition",
+                "Effect": "Allow",
+                "Principal": { "AWS": [pax_context_user] },
+                "Action": ["s3:PutObject"],
+                "Resource": [user_agent_entry_resource],
+                "Condition": {
+                    "StringEquals": {
+                        "aws:UserAgent": "trusted"
+                    }
+                }
+            },
+            {
+                "Sid": "MemberSseCondition",
+                "Effect": "Allow",
+                "Principal": { "AWS": [pax_context_user] },
+                "Action": ["s3:PutObject"],
+                "Resource": [sse_entry_resource],
+                "Condition": {
+                    "StringEquals": {
+                        "s3:x-amz-server-side-encryption": "AES256"
+                    }
+                }
             }
         ]
     })
@@ -4428,8 +4631,13 @@ async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retent
     let cases = [
         (
             "legal-hold.tar",
-            put_only_client,
+            put_only_client.clone(),
             HashMap::from([("minio.metadata.x-amz-object-lock-legal-hold", "ON".to_string())]),
+        ),
+        (
+            "tagging.tar",
+            put_only_client,
+            HashMap::from([("minio.metadata.x-amz-tagging", "classification=restricted".to_string())]),
         ),
         (
             "retention-condition.tar",
@@ -4517,6 +4725,57 @@ async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retent
     assert_eq!(stored.body.collect().await?.into_bytes().as_ref(), b"condition-body");
 
     let pax_context_client = restricted_user_client(&env, pax_context_user, pax_context_secret);
+    for (archive_key, entry_key, pax_key, injected_value, outer_user_agent) in [
+        (
+            "user-agent-bypass.tar",
+            "user-agent-bypass-entry.txt",
+            "minio.metadata.user-agent",
+            "trusted",
+            Some("untrusted"),
+        ),
+        (
+            "sse-bypass.tar",
+            "sse-bypass-entry.txt",
+            "minio.metadata.x-amz-server-side-encryption",
+            "AES256",
+            None,
+        ),
+    ] {
+        let pax = HashMap::from([(pax_key, injected_value.to_string())]);
+        let archive = make_tar_with_pax_entry(entry_key, b"must-not-write", None, &pax).await;
+        let err = pax_context_client
+            .put_object()
+            .bucket(bucket)
+            .key(archive_key)
+            .body(ByteStream::from(archive))
+            .customize()
+            .mutate_request(move |req| {
+                req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+                if let Some(user_agent) = outer_user_agent {
+                    req.headers_mut().insert("user-agent", user_agent);
+                }
+            })
+            .send()
+            .await
+            .expect_err("PAX metadata must not satisfy unrelated IAM request conditions");
+        assert_eq!(
+            err.as_service_error().and_then(|error| error.meta().code()),
+            Some("AccessDenied"),
+            "{archive_key}"
+        );
+        let err = admin_client
+            .head_object()
+            .bucket(bucket)
+            .key(entry_key)
+            .send()
+            .await
+            .expect_err("a denied PAX member must not be written");
+        assert!(matches!(
+            err.as_service_error().and_then(|error| error.meta().code()),
+            Some("NoSuchKey" | "NotFound")
+        ));
+    }
+
     let tag_pax = HashMap::from([("minio.metadata.x-amz-tagging", "classification=public".to_string())]);
     let archive = make_tar_with_pax_entry("tag-context-entry.txt", b"tag-context-body", None, &tag_pax).await;
     pax_context_client
@@ -4579,6 +4838,34 @@ async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retent
             .fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime)?,
         pax_retain_until
     );
+
+    let legal_hold_pax = HashMap::from([("minio.metadata.x-amz-object-lock-legal-hold", "ON".to_string())]);
+    let archive = make_tar_with_pax_entry("legal-hold-context-entry.txt", b"must-not-write", None, &legal_hold_pax).await;
+    let err = pax_context_client
+        .put_object()
+        .bucket(bucket)
+        .key("legal-hold-context.tar")
+        .object_lock_legal_hold_status(aws_sdk_s3::types::ObjectLockLegalHoldStatus::Off)
+        .body(ByteStream::from(archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await
+        .expect_err("PAX legal hold must replace the outer value in the member IAM condition context");
+    assert_eq!(err.as_service_error().and_then(|error| error.meta().code()), Some("AccessDenied"));
+    let err = admin_client
+        .head_object()
+        .bucket(bucket)
+        .key("legal-hold-context-entry.txt")
+        .send()
+        .await
+        .expect_err("a denied PAX legal-hold member must not be written");
+    assert!(matches!(
+        err.as_service_error().and_then(|error| error.meta().code()),
+        Some("NoSuchKey" | "NotFound")
+    ));
 
     Ok(())
 }
@@ -5055,8 +5342,8 @@ async fn test_signed_put_object_extract_expands_tzst_archive() -> Result<(), Box
 }
 
 #[tokio::test]
-async fn test_signed_put_object_extract_rejects_missing_archive_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-{
+async fn test_signed_put_object_extract_uses_magic_without_requiring_or_trusting_extension()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -5069,8 +5356,7 @@ async fn test_signed_put_object_extract_rejects_missing_archive_extension() -> R
     admin_client.create_bucket().bucket(bucket).send().await?;
 
     let tar_bytes = make_tar(&[("plain.txt", b"plain-body")], &[]).await;
-
-    let result = admin_client
+    admin_client
         .put_object()
         .bucket(bucket)
         .key(archive_key)
@@ -5080,15 +5366,80 @@ async fn test_signed_put_object_extract_rejects_missing_archive_extension() -> R
             req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
         })
         .send()
-        .await;
+        .await?;
 
-    assert_s3_error_code(result, "InvalidArgument");
+    let plain = admin_client.get_object().bucket(bucket).key("plain.txt").send().await?;
+    assert_eq!(plain.body.collect().await?.into_bytes().as_ref(), b"plain-body");
+
+    let raw_with_gzip_suffix = make_tar(&[("raw-with-wrong-suffix.txt", b"raw-body")], &[]).await;
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key("raw-but-named.tar.gz")
+        .body(ByteStream::from(raw_with_gzip_suffix))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+
+    let raw = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key("raw-with-wrong-suffix.txt")
+        .send()
+        .await?;
+    assert_eq!(raw.body.collect().await?.into_bytes().as_ref(), b"raw-body");
+
+    let gzip_with_tar_suffix = gzip_bytes(&make_tar(&[("gzip-with-wrong-suffix.txt", b"gzip-body")], &[]).await);
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key("gzip-but-named.tar")
+        .body(ByteStream::from(gzip_with_tar_suffix))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+
+    let gzip = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key("gzip-with-wrong-suffix.txt")
+        .send()
+        .await?;
+    assert_eq!(gzip.body.collect().await?.into_bytes().as_ref(), b"gzip-body");
+
+    let zlib_archive = zlib_bytes(&make_tar(&[("zlib-extension.txt", b"zlib-body")], &[]).await);
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key("bundle.zlib")
+        .body(ByteStream::from(zlib_archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+
+    let zlib = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key("zlib-extension.txt")
+        .send()
+        .await?;
+    assert_eq!(zlib.body.collect().await?.into_bytes().as_ref(), b"zlib-body");
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_signed_put_object_extract_rejects_invalid_tar_gz_payload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_signed_put_object_extract_rejects_invalid_archive_payload() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;

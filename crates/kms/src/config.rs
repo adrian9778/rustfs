@@ -24,12 +24,20 @@ use std::time::Duration;
 use url::Url;
 
 pub const ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS: &str = "RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS";
+/// Write-side switch for binding the encryption context into DEK envelopes as
+/// AES-GCM additional data. Read-side support is unconditional; see
+/// [`crate::encryption::dek::envelope_aad_write_enabled`] for the rollout
+/// constraint that keeps this default-off for one release.
+pub const ENV_KMS_ENVELOPE_AAD: &str = "RUSTFS_KMS_ENVELOPE_AAD";
 pub const ENV_KMS_ALLOW_IMMEDIATE_DELETION: &str = "RUSTFS_KMS_ALLOW_IMMEDIATE_DELETION";
 pub const ENV_KMS_VAULT_ADDRESS: &str = "RUSTFS_KMS_VAULT_ADDRESS";
 pub const ENV_KMS_VAULT_TOKEN: &str = "RUSTFS_KMS_VAULT_TOKEN";
 pub const ENV_KMS_VAULT_NAMESPACE: &str = "RUSTFS_KMS_VAULT_NAMESPACE";
 pub const ENV_KMS_VAULT_MOUNT_PATH: &str = "RUSTFS_KMS_VAULT_MOUNT_PATH";
 pub const ENV_KMS_VAULT_SKIP_TLS_VERIFY: &str = "RUSTFS_KMS_VAULT_SKIP_TLS_VERIFY";
+pub const ENV_KMS_VAULT_CA_CERT: &str = "RUSTFS_KMS_VAULT_CA_CERT";
+pub const ENV_KMS_VAULT_CLIENT_CERT: &str = "RUSTFS_KMS_VAULT_CLIENT_CERT";
+pub const ENV_KMS_VAULT_CLIENT_KEY: &str = "RUSTFS_KMS_VAULT_CLIENT_KEY";
 pub const ENV_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "RUSTFS_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT";
 pub const ENV_KMS_VAULT_TRANSIT_METADATA_PREFIX: &str = "RUSTFS_KMS_VAULT_TRANSIT_METADATA_PREFIX";
 pub const ENV_KMS_STATIC_SECRET_KEY: &str = "RUSTFS_KMS_STATIC_SECRET_KEY";
@@ -359,9 +367,8 @@ impl StaticConfig {
     /// Decode the base64-encoded secret key into raw bytes.
     /// Returns an error if the key is not valid base64 or is not exactly 32 bytes.
     pub fn decode_key(&self) -> Result<[u8; 32]> {
-        use base64::Engine as _;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&self.secret_key)
+        let bytes = base64_simd::STANDARD
+            .decode_to_vec(&self.secret_key)
             .map_err(|e| KmsError::configuration_error(format!("Static KMS secret key is not valid base64: {e}")))?;
         if bytes.len() != 32 {
             return Err(KmsError::configuration_error(format!(
@@ -936,15 +943,18 @@ impl KmsConfig {
                     return Err(KmsError::configuration_error("Vault KV2 mount cannot be empty"));
                 }
 
+                if let Some(ref tls) = config.tls {
+                    validate_vault_tls_pairing(tls)?;
+                }
+
                 // Validate TLS configuration if using HTTPS
                 if config.address.starts_with("https://")
                     && let Some(ref tls) = config.tls
                     && !tls.skip_verify
+                    && tls.ca_cert_path.is_none()
+                    && tls.client_cert_path.is_none()
                 {
-                    // In production, we should have proper TLS configuration
-                    if tls.ca_cert_path.is_none() && tls.client_cert_path.is_none() {
-                        tracing::warn!("Using HTTPS without custom TLS configuration - relying on system CA");
-                    }
+                    tracing::warn!("Using HTTPS without custom TLS configuration - relying on system CA");
                 }
             }
             BackendConfig::VaultTransit(config) => {
@@ -973,6 +983,10 @@ impl KmsConfig {
 
                 if config.metadata_key_prefix.is_empty() {
                     return Err(KmsError::configuration_error("Vault Transit metadata key prefix cannot be empty"));
+                }
+
+                if let Some(ref tls) = config.tls {
+                    validate_vault_tls_pairing(tls)?;
                 }
 
                 if config.address.starts_with("https://")
@@ -1206,13 +1220,34 @@ pub fn kms_config_from_persisted_json(data: &[u8]) -> serde_json::Result<KmsConf
     Ok(config)
 }
 
-fn vault_tls_config(skip_tls_verify: bool) -> Option<TlsConfig> {
-    skip_tls_verify.then_some(TlsConfig {
-        ca_cert_path: None,
-        client_cert_path: None,
-        client_key_path: None,
-        skip_verify: true,
+/// Assemble the Vault TLS settings from the environment.
+///
+/// Returns `None` when nothing TLS-related is configured so the config
+/// serializes without an empty `tls` block, matching the previous behavior.
+fn vault_tls_config_from_env() -> Option<TlsConfig> {
+    let skip_verify = get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false);
+    let ca_cert_path = get_env_opt_str(ENV_KMS_VAULT_CA_CERT).map(PathBuf::from);
+    let client_cert_path = get_env_opt_str(ENV_KMS_VAULT_CLIENT_CERT).map(PathBuf::from);
+    let client_key_path = get_env_opt_str(ENV_KMS_VAULT_CLIENT_KEY).map(PathBuf::from);
+
+    (skip_verify || ca_cert_path.is_some() || client_cert_path.is_some() || client_key_path.is_some()).then_some(TlsConfig {
+        ca_cert_path,
+        client_cert_path,
+        client_key_path,
+        skip_verify,
     })
+}
+
+/// A client certificate without its key (or the reverse) cannot form an mTLS
+/// identity; rejecting it at validation names the missing setting instead of
+/// failing when the backend loads the files.
+fn validate_vault_tls_pairing(tls: &TlsConfig) -> Result<()> {
+    if tls.client_cert_path.is_some() != tls.client_key_path.is_some() {
+        return Err(KmsError::configuration_error(
+            "Vault client_cert_path and client_key_path must be configured together for mTLS",
+        ));
+    }
+    Ok(())
 }
 
 fn development_default_error(reason: &str) -> KmsError {
@@ -1266,7 +1301,7 @@ pub fn vault_kv2_config_from_env(overrides: VaultCliOverrides<'_>) -> Result<Vau
         mount_path,
         kv_mount: get_env_str("RUSTFS_KMS_VAULT_KV_MOUNT", "secret"),
         key_path_prefix: get_env_str("RUSTFS_KMS_VAULT_KEY_PREFIX", "rustfs/kms/keys"),
-        tls: vault_tls_config(get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false)),
+        tls: vault_tls_config_from_env(),
     })
 }
 
@@ -1285,7 +1320,7 @@ pub fn vault_transit_config_from_env(overrides: VaultCliOverrides<'_>) -> Result
             .unwrap_or_else(|| get_env_str(ENV_KMS_VAULT_MOUNT_PATH, "transit")),
         metadata_kv_mount: get_env_str(ENV_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT, DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT),
         metadata_key_prefix: get_env_str(ENV_KMS_VAULT_TRANSIT_METADATA_PREFIX, DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX),
-        tls: vault_tls_config(get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false)),
+        tls: vault_tls_config_from_env(),
     })
 }
 
@@ -1650,6 +1685,111 @@ mod tests {
     }
 
     #[test]
+    fn test_vault_tls_client_cert_and_key_must_be_paired() {
+        fn kv2_with_tls(tls: TlsConfig) -> KmsConfig {
+            KmsConfig {
+                backend: KmsBackend::VaultKv2,
+                backend_config: BackendConfig::VaultKv2(Box::new(VaultConfig {
+                    address: "https://vault.example.com:8200".to_string(),
+                    auth_method: VaultAuthMethod::Token {
+                        token: "vault-token".to_string(),
+                    },
+                    namespace: None,
+                    mount_path: "transit".to_string(),
+                    kv_mount: "secret".to_string(),
+                    key_path_prefix: "rustfs/kms/keys".to_string(),
+                    tls: Some(tls),
+                })),
+                ..Default::default()
+            }
+        }
+
+        let cert_only = kv2_with_tls(TlsConfig {
+            ca_cert_path: None,
+            client_cert_path: Some(PathBuf::from("/certs/client.pem")),
+            client_key_path: None,
+            skip_verify: false,
+        });
+        let error = cert_only
+            .with_insecure_development_defaults()
+            .validate()
+            .expect_err("a client certificate without its key cannot form an mTLS identity");
+        assert!(error.to_string().contains("must be configured together"), "{error}");
+
+        let key_only = kv2_with_tls(TlsConfig {
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: Some(PathBuf::from("/certs/client.key")),
+            skip_verify: false,
+        });
+        assert!(key_only.with_insecure_development_defaults().validate().is_err());
+
+        let paired = kv2_with_tls(TlsConfig {
+            ca_cert_path: Some(PathBuf::from("/certs/vault-ca.pem")),
+            client_cert_path: Some(PathBuf::from("/certs/client.pem")),
+            client_key_path: Some(PathBuf::from("/certs/client.key")),
+            skip_verify: false,
+        });
+        assert!(paired.with_insecure_development_defaults().validate().is_ok());
+
+        // The Transit branch shares the pairing guard.
+        let transit_cert_only = KmsConfig {
+            backend: KmsBackend::VaultTransit,
+            backend_config: BackendConfig::VaultTransit(Box::new(VaultTransitConfig {
+                address: "https://vault.example.com:8200".to_string(),
+                auth_method: VaultAuthMethod::Token {
+                    token: "vault-token".to_string(),
+                },
+                namespace: None,
+                mount_path: "transit".to_string(),
+                metadata_kv_mount: DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT.to_string(),
+                metadata_key_prefix: DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX.to_string(),
+                tls: Some(TlsConfig {
+                    ca_cert_path: None,
+                    client_cert_path: Some(PathBuf::from("/certs/client.pem")),
+                    client_key_path: None,
+                    skip_verify: false,
+                }),
+            })),
+            ..Default::default()
+        };
+        assert!(transit_cert_only.with_insecure_development_defaults().validate().is_err());
+    }
+
+    #[test]
+    fn test_vault_tls_config_from_env_reads_certificate_paths() {
+        temp_env::with_vars(
+            [
+                (ENV_KMS_VAULT_CA_CERT, Some("/certs/vault-ca.pem")),
+                (ENV_KMS_VAULT_CLIENT_CERT, Some("/certs/client.pem")),
+                (ENV_KMS_VAULT_CLIENT_KEY, Some("/certs/client.key")),
+            ],
+            || {
+                let tls = vault_tls_config_from_env().expect("certificate paths in the environment must produce TLS settings");
+                assert_eq!(tls.ca_cert_path.as_deref(), Some(Path::new("/certs/vault-ca.pem")));
+                assert_eq!(tls.client_cert_path.as_deref(), Some(Path::new("/certs/client.pem")));
+                assert_eq!(tls.client_key_path.as_deref(), Some(Path::new("/certs/client.key")));
+                assert!(!tls.skip_verify);
+            },
+        );
+
+        temp_env::with_vars_unset(
+            [
+                ENV_KMS_VAULT_CA_CERT,
+                ENV_KMS_VAULT_CLIENT_CERT,
+                ENV_KMS_VAULT_CLIENT_KEY,
+                ENV_KMS_VAULT_SKIP_TLS_VERIFY,
+            ],
+            || {
+                assert!(
+                    vault_tls_config_from_env().is_none(),
+                    "no TLS-related environment must keep the config free of a TLS block"
+                );
+            },
+        );
+    }
+
+    #[test]
     fn test_vault_kv2_backend_serialization_uses_pascal_case() {
         let serialized = serde_json::to_string(&KmsBackend::VaultKv2).expect("backend should serialize");
         assert_eq!(serialized, "\"VaultKV2\"");
@@ -1822,9 +1962,7 @@ mod tests {
 
     #[test]
     fn static_kms_config_serialization_does_not_expose_key_material() {
-        use base64::Engine as _;
-
-        let encoded_key = base64::engine::general_purpose::STANDARD.encode([0x5au8; 32]);
+        let encoded_key = base64_simd::STANDARD.encode_to_string([0x5au8; 32]);
         let config = KmsConfig::static_kms("static-key".to_string(), encoded_key.clone());
 
         let serialized = serde_json::to_string(&config).expect("static KMS config should serialize");
@@ -2428,14 +2566,12 @@ mod tests {
 
     #[test]
     fn test_from_env_reads_static_secret_file_and_sets_default_key() {
-        use base64::Engine as _;
-
         let temp_dir = TempDir::new().expect("create temp dir for static KMS secret");
         let secret_path = temp_dir.path().join("static-kms-secret");
         // Named `*_key_b64` (not `*_secret`) so the logging-guardrails check does not
         // flag these fixture interpolations as secrets leaking into log strings.
-        let file_key_b64 = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
-        let env_key_b64 = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        let file_key_b64 = base64_simd::STANDARD.encode_to_string([7u8; 32]);
+        let env_key_b64 = base64_simd::STANDARD.encode_to_string([9u8; 32]);
         std::fs::write(&secret_path, format!("file-key:{file_key_b64}\n")).expect("write static KMS secret file");
 
         with_vars(

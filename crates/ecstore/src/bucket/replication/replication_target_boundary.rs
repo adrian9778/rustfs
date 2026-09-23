@@ -15,7 +15,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::bucket::bucket_target_sys::{BucketTargetError, BucketTargetSys};
+pub(crate) use crate::bucket::bucket_target_sys::BucketTargetError;
+use crate::bucket::bucket_target_sys::BucketTargetSys;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::types::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode};
 use http::HeaderMap;
@@ -36,19 +37,22 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 pub(crate) use crate::bucket::bucket_target_sys::{
-    AdvancedPutOptions, HeadObjectSdkError, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
-    resolve_read_api_version_id,
+    AdvancedPutOptions, HeadObjectSdkError, PutObjectOptions, PutObjectPartOptions, RemotePutObjectResponse, RemoveObjectOptions,
+    ReplicaLocation, S3ClientError, TargetClient, resolve_read_api_version_id,
 };
 #[cfg(test)]
 pub(crate) use crate::bucket::target::BucketTarget;
 pub(crate) use crate::bucket::target::BucketTargets;
 pub use rustfs_replication::SsecPassthroughCapability;
+pub use rustfs_replication::{ObjectLockIntegrity, object_lock_put_integrity};
 pub(crate) use rustfs_replication::{
     SsecPassthroughGate, is_replication_target_offline_error, ssec_passthrough_gate, version_identity_drifted,
 };
+pub use rustfs_replication::{VersionIdentityCapability, version_identity_capability_from_put};
 
 use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::{Error, Result};
+use super::replication_filemeta_boundary::metadata_keys;
 use super::replication_filemeta_boundary::{ReplicationAction, ReplicationStatusType, ReplicationType};
 use super::replication_storage_boundary::ObjectInfo;
 use super::replication_tagging_boundary::ReplicationTagFilter;
@@ -91,7 +95,7 @@ fn metadata_value<'a>(metadata: &'a HashMap<String, String>, name: &str) -> Opti
 
 fn classify_replication_source_encryption(metadata: &HashMap<String, String>) -> ReplicationSourceEncryption {
     let is_ssec = replication_object_is_ssec_encrypted(metadata);
-    let sse = metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION);
+    let sse = metadata_value(metadata, metadata_keys::SERVER_SIDE_ENCRYPTION);
     let kms_key_id = metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID);
     let kms_context = metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT);
 
@@ -190,6 +194,14 @@ impl ReplicationTargetStore {
             .await
     }
 
+    pub(crate) fn version_identity_capability(arn: &str) -> VersionIdentityCapability {
+        BucketTargetSys::get().version_identity_capability(arn)
+    }
+
+    pub(crate) fn record_version_identity_capability(arn: &str, capability: VersionIdentityCapability) {
+        BucketTargetSys::get().record_version_identity_capability(arn, capability)
+    }
+
     #[cfg(test)]
     pub(crate) async fn register_test_target(target_client: &Arc<TargetClient>) {
         BucketTargetSys::get().arn_remotes_map.write().await.insert(
@@ -200,7 +212,7 @@ impl ReplicationTargetStore {
 }
 
 pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo) -> Result<(PutObjectOptions, bool)> {
-    use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use base64_simd::STANDARD as BASE64_STANDARD;
     use rustfs_utils::http::{AMZ_CHECKSUM_TYPE, AMZ_CHECKSUM_TYPE_FULL_OBJECT};
 
     let mut meta = HashMap::new();
@@ -236,6 +248,23 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
         meta.insert(key.to_string(), value.to_string());
     }
 
+    // A compressed SSE-C object passes through as its stored bytes. The target
+    // cannot infer the compression layout from ciphertext, so the scheme and
+    // the plaintext size travel as transport headers; each UploadPart carries
+    // its own plaintext length (backlog#2363).
+    if is_ssec && let Some(scheme) = get_str(&object_info.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION) {
+        insert_header_map(&mut meta, rustfs_utils::http::SUFFIX_REPLICATION_COMPRESSION, scheme);
+        if let Ok(actual_size) = object_info.get_actual_size()
+            && actual_size >= 0
+        {
+            insert_header_map(
+                &mut meta,
+                rustfs_utils::http::SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE,
+                actual_size.to_string(),
+            );
+        }
+    }
+
     // Managed SSE replicates as plaintext (the replication reader decrypts via
     // the object-encryption resolver) and re-encrypts on the target with the
     // target's own KMS. Send only the encryption intent — never the source
@@ -246,35 +275,65 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
         meta.insert(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string());
     }
 
-    let mut is_multipart = object_info.is_multipart();
+    // Older transformed objects can have physical parts without logical part
+    // lengths. Keep their existing whole-object transport: physical sizes are
+    // not plaintext boundaries for a multipart replication read.
+    let legacy_single_put = object_info.etag.as_deref().is_none_or(|etag| etag.len() == 32);
+    let base_is_multipart = object_info.is_multipart()
+        && !(legacy_single_put
+            && object_info.parts.len() > 1
+            && (object_info.is_compressed() || object_info.is_encrypted())
+            && object_info.parts.iter().any(|part| part.actual_size <= 0));
+    let mut is_multipart = base_is_multipart;
 
     if let Some(checksum_data) = &object_info.checksum
         && !checksum_data.is_empty()
     {
         if is_ssec {
-            let encoded = BASE64_STANDARD.encode(checksum_data);
+            let encoded = BASE64_STANDARD.encode_to_string(checksum_data);
             insert_header_map(&mut meta, SUFFIX_REPLICATION_SSEC_CRC, encoded);
         } else if object_info.is_encrypted() {
             // Encrypted checksums cannot be exposed as plaintext headers, and
             // decrypt_checksums reports is_multipart=false for them (a value
-            // the response path relies on). Keep the object's own multipart
-            // flag so encrypted objects stay on the multipart route.
+            // the response path relies on). Keep the transport selected from
+            // the object's layout and readable part boundaries.
         } else {
-            let (checksum_meta, is_mp) = object_info.decrypt_checksums(0, &HeaderMap::new())?;
-            is_multipart = is_mp;
+            let (checksum_meta, checksum_record_is_multipart) = object_info.decrypt_checksums(0, &HeaderMap::new())?;
+            // The checksum record describes how the *checksum* is composed,
+            // not how the object is stored. A full-object checksum carries no
+            // MULTIPART flag even on a multipart upload, so trusting it here
+            // routed a 768-part object through a single PutObject and the
+            // target rejected the 6 GiB body with EntityTooLarge
+            // (rustfs#6825). The usable part layout is the authority: the
+            // record may only add multipart-ness, never take it away.
+            is_multipart = base_is_multipart || checksum_record_is_multipart;
 
-            for (key, value) in checksum_meta.iter() {
-                if key != AMZ_CHECKSUM_TYPE {
-                    meta.insert(key.clone(), value.clone());
-                }
-            }
-
-            if !object_info.is_multipart()
+            if !base_is_multipart
                 && checksum_meta
                     .get(AMZ_CHECKSUM_TYPE)
                     .is_some_and(|value| value == AMZ_CHECKSUM_TYPE_FULL_OBJECT)
             {
                 is_multipart = false;
+            }
+
+            // The record keys each checksum by algorithm name ("CRC32"); the
+            // target only reads `x-amz-checksum-<algorithm>`. Inserting the bare
+            // name here made `PutObjectOptions::header()` send it as user
+            // metadata (`x-amz-meta-crc32`), so no replica ever carried the
+            // source checksum (rustfs/backlog#2340). The object-level record
+            // describes one PUT body: a multipart replica is rebuilt part by
+            // part, and its CreateMultipartUpload must not announce a checksum
+            // the parts do not carry, so the record is forwarded on the
+            // single-PUT route only (MinIO `getCRCMeta` parity).
+            if !is_multipart {
+                for (key, value) in checksum_meta.iter() {
+                    if key == AMZ_CHECKSUM_TYPE {
+                        continue;
+                    }
+                    if let Some(header) = rustfs_rio::ChecksumType::from_string(key).key() {
+                        meta.insert(header.to_string(), value.clone());
+                    }
+                }
             }
         }
     }
@@ -472,6 +531,7 @@ pub(crate) fn replication_complete_multipart_options(
     actual_size: String,
     source_etag: String,
     source_mtime: Option<OffsetDateTime>,
+    source_internal: &AdvancedPutOptions,
 ) -> PutObjectOptions {
     let mut user_metadata = HashMap::new();
     insert_header_map(&mut user_metadata, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, actual_size);
@@ -484,6 +544,14 @@ pub(crate) fn replication_complete_multipart_options(
             // mtime must degrade to epoch so header() suppresses the header
             // instead of asserting the replication time as the object's mtime.
             source_mtime: source_mtime.unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            // Carry the per-category LWW timestamps on the complete request as
+            // well: the receiver's CompleteMultipartUpload options builder
+            // parses the same headers, so the multipart transport gets the
+            // same receiver-side LWW as the single-PUT transport
+            // (rustfs/backlog#1953). Epoch values keep the headers suppressed.
+            tagging_timestamp: source_internal.tagging_timestamp,
+            retention_timestamp: source_internal.retention_timestamp,
+            legalhold_timestamp: source_internal.legalhold_timestamp,
             replication_status: ReplicationStatusType::Replica,
             replication_request: true,
             ..Default::default()
@@ -498,6 +566,7 @@ fn is_standard_header(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::replication_filemeta_boundary::ObjectPartInfo;
     use super::*;
     use aws_smithy_types::DateTime;
     use rustfs_replication::content_matches_by_etag;
@@ -508,6 +577,358 @@ mod tests {
     use std::sync::Arc;
     use time::Duration;
     use uuid::Uuid;
+
+    /// backlog#1735 A3b SSE key-case finding. Every RustFS writer persists the
+    /// SSE intent as lowercase `x-amz-server-side-encryption`
+    /// (`encryption_material_to_metadata`; header-derived keys come from a
+    /// lowercase `http::HeaderMap`). The mixed-case `X-Amz-Server-Side-Encryption`
+    /// spelling only appears in outbound replication user metadata, which the
+    /// S3 client re-lowercases on the wire. This reader has always matched
+    /// the key ASCII-case-insensitively; keep that, so the old lowercase bytes
+    /// and any title-case spelling both classify, while any non-case drift of
+    /// the key reads as "no SSE intent".
+    #[test]
+    fn replication_sse_classification_reads_pre_module_xlmeta_key() {
+        let metadata = super::super::replication_filemeta_boundary::pre_metadata_keys_fixture_metadata();
+        assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("AES256"));
+        assert_eq!(classify_replication_source_encryption(&metadata), ReplicationSourceEncryption::SseS3);
+
+        let sse_only = |key: String| HashMap::from([(key, "AES256".to_string())]);
+        let key = metadata_keys::SERVER_SIDE_ENCRYPTION;
+        for spelling in [
+            key.to_string(),
+            "X-Amz-Server-Side-Encryption".to_string(),
+            key.to_ascii_uppercase(),
+        ] {
+            assert_eq!(
+                classify_replication_source_encryption(&sse_only(spelling.clone())),
+                ReplicationSourceEncryption::SseS3,
+                "{spelling:?}"
+            );
+        }
+        for idx in 0..key.len() {
+            let mut bytes = key.as_bytes().to_vec();
+            bytes[idx] = if bytes[idx] == b'z' {
+                b'y'
+            } else if bytes[idx].is_ascii_alphabetic() {
+                b'z'
+            } else {
+                b'_'
+            };
+            let mutated = String::from_utf8(bytes).expect("ascii");
+            assert_eq!(
+                classify_replication_source_encryption(&sse_only(mutated.clone())),
+                ReplicationSourceEncryption::Plaintext,
+                "{mutated:?} must not read as the SSE key"
+            );
+        }
+    }
+
+    /// Serialize an object-level checksum record the way
+    /// `complete_multipart_upload` persists it for a **full-object** checksum:
+    /// the record carries the plain algorithm type, without the MULTIPART
+    /// flags that a composite record gets.
+    fn full_object_multipart_checksum_record() -> bytes::Bytes {
+        let checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type("crc32", "FULL_OBJECT");
+        assert!(checksum_type.is_set(), "crc32 FULL_OBJECT must be a valid checksum type");
+        assert!(checksum_type.full_object_requested());
+
+        let mut combined = Vec::new();
+        let mut checksum = rustfs_rio::Checksum {
+            checksum_type,
+            ..Default::default()
+        };
+        for part in [b"part-one".as_slice(), b"part-two".as_slice()] {
+            let part_checksum = rustfs_rio::Checksum::new_from_data(checksum_type, part).expect("part checksum");
+            combined.extend_from_slice(part_checksum.raw.as_slice());
+            checksum.add_part(&part_checksum, part.len() as i64).expect("add part");
+        }
+
+        checksum.to_bytes(&combined)
+    }
+
+    fn replication_route_metadata() -> [(&'static str, Arc<HashMap<String, String>>); 4] {
+        let mut compressed = HashMap::new();
+        rustfs_utils::http::insert_str(&mut compressed, rustfs_utils::http::SUFFIX_COMPRESSION, "zstd".to_string());
+        [
+            ("plain", Arc::new(HashMap::new())),
+            ("compressed", Arc::new(compressed)),
+            (
+                "encrypted",
+                Arc::new(HashMap::from([(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "AES256".to_string())])),
+            ),
+            (
+                "ssec",
+                Arc::new(HashMap::from([(SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string())])),
+            ),
+        ]
+    }
+
+    fn replication_route_object(
+        etag: Option<&str>,
+        actual_sizes: [i64; 3],
+        metadata: Arc<HashMap<String, String>>,
+    ) -> ObjectInfo {
+        ObjectInfo {
+            etag: etag.map(str::to_string),
+            size: 48,
+            actual_size: 12,
+            user_defined: metadata,
+            parts: Arc::new(
+                actual_sizes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, actual_size)| ObjectPartInfo {
+                        number: index + 1,
+                        size: 16,
+                        actual_size,
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn compressed_ssec_objects_declare_their_compression_layout_on_the_wire() {
+        use rustfs_utils::http::{
+            SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_REPLICATION_COMPRESSION, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE,
+            insert_str,
+        };
+
+        let mut ssec_compressed = HashMap::from([(SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string())]);
+        insert_str(&mut ssec_compressed, SUFFIX_COMPRESSION, "klauspost/compress/s2".to_string());
+        insert_str(&mut ssec_compressed, SUFFIX_ACTUAL_SIZE, "6295552".to_string());
+        let object_info = ObjectInfo {
+            etag: Some("0123456789abcdef0123456789abcdef-2".to_string()),
+            size: 4321,
+            actual_size: 6295552,
+            user_defined: Arc::new(ssec_compressed),
+            ..Default::default()
+        };
+
+        // SSE-C passthrough sends stored bytes: the scheme and the plaintext
+        // size travel as transport headers, never as the internal key
+        // (backlog#2363).
+        let (options, _) = replication_put_object_options("STANDARD", &object_info).expect("ssec put options");
+        assert_eq!(
+            get_header_map(&options.user_metadata, SUFFIX_REPLICATION_COMPRESSION).as_deref(),
+            Some("klauspost/compress/s2")
+        );
+        assert_eq!(
+            get_header_map(&options.user_metadata, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE).as_deref(),
+            Some("6295552")
+        );
+        assert!(
+            !options
+                .user_metadata
+                .keys()
+                .any(|key| rustfs_utils::http::is_internal_key(key)),
+            "internal metadata never leaves the source as plain metadata: {:?}",
+            options.user_metadata
+        );
+
+        // A compressed object that is not SSE-C is decompressed by the
+        // replication reader and travels as plaintext: no layout headers.
+        let mut plain_compressed = HashMap::new();
+        insert_str(&mut plain_compressed, SUFFIX_COMPRESSION, "klauspost/compress/s2".to_string());
+        insert_str(&mut plain_compressed, SUFFIX_ACTUAL_SIZE, "6295552".to_string());
+        let plain = ObjectInfo {
+            user_defined: Arc::new(plain_compressed),
+            ..object_info
+        };
+        let (options, _) = replication_put_object_options("STANDARD", &plain).expect("plain put options");
+        assert!(get_header_map(&options.user_metadata, SUFFIX_REPLICATION_COMPRESSION).is_none());
+        assert!(get_header_map(&options.user_metadata, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE).is_none());
+    }
+
+    #[test]
+    fn legacy_transformed_single_put_parts_keep_the_previous_replication_route() {
+        let [_, (_, compressed), (_, encrypted), (_, ssec)] = replication_route_metadata();
+        let cases = [
+            (
+                "compressed middle zero",
+                compressed.clone(),
+                Some("0123456789abcdef0123456789abcdef"),
+                [4, 0, 4],
+            ),
+            ("compressed tail unknown", compressed, None, [4, 4, -1]),
+            (
+                "encrypted middle unknown",
+                encrypted,
+                Some("gggggggggggggggggggggggggggggggg"),
+                [4, -1, 4],
+            ),
+            ("ssec tail zero", ssec.clone(), None, [4, 4, 0]),
+            ("ssec middle unknown", ssec, Some("gggggggggggggggggggggggggggggggg"), [4, -1, 4]),
+        ];
+        for (name, metadata, etag, actual_sizes) in cases {
+            for checksum in [None, Some(full_object_multipart_checksum_record())] {
+                let mut object_info = replication_route_object(etag, actual_sizes, metadata.clone());
+                object_info.checksum = checksum;
+                assert!(object_info.is_multipart(), "{name}: physical parts remain visible to metadata APIs");
+                assert!(object_info.is_compressed() || object_info.is_encrypted());
+
+                let (options, is_multipart) =
+                    replication_put_object_options("STANDARD", &object_info).expect("legacy transformed put options");
+                assert!(
+                    !is_multipart,
+                    "{name}: unknown logical part sizes must preserve the old whole-object route"
+                );
+                assert_eq!(options.internal.source_etag, etag.unwrap_or_default());
+                if metadata.contains_key(SSEC_ALGORITHM_HEADER) {
+                    assert_eq!(
+                        get_header_map(&options.user_metadata, SUFFIX_REPLICATION_SSEC_CRC).is_some(),
+                        object_info.checksum.is_some(),
+                        "SSE-C checksums retain their raw passthrough transport"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn positive_part_sizes_and_legacy_multipart_etags_keep_the_replication_route() {
+        for (name, metadata) in replication_route_metadata() {
+            for (etag, actual_sizes) in [
+                ("0123456789abcdef0123456789abcdef", [4, 4, 4]),
+                ("0123456789abcdef0123456789abcdef-3", [4, 0, -1]),
+            ] {
+                let mut object_info = replication_route_object(Some(etag), actual_sizes, metadata.clone());
+                object_info.checksum = Some(full_object_multipart_checksum_record());
+                let (_, is_multipart) = replication_put_object_options("STANDARD", &object_info).expect("multipart put options");
+                assert!(is_multipart, "{name}/{etag}: usable sizes and old multipart ETags must retain MPU");
+            }
+        }
+    }
+
+    #[test]
+    fn multipart_object_with_full_object_checksum_keeps_the_multipart_route() {
+        // rustfs#6825: a 768-part upload was replicated with a single
+        // PutObject and rejected by the target with EntityTooLarge. The
+        // object's storage shape says multipart; only the checksum record
+        // looked single-part, and the checksum record must not decide the
+        // transport.
+        let object_info = ObjectInfo {
+            etag: Some("0123456789abcdef0123456789abcdef-768".to_string()),
+            checksum: Some(full_object_multipart_checksum_record()),
+            size: 6 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+
+        assert!(object_info.is_multipart(), "the fixture must be a multipart object");
+        let (_, checksum_says_multipart) = object_info
+            .decrypt_checksums(0, &HeaderMap::new())
+            .expect("checksum record must decode");
+        assert!(
+            !checksum_says_multipart,
+            "fixture precondition: a full-object record carries no MULTIPART flag, which is what used to \
+             downgrade the transport"
+        );
+
+        let (_, is_multipart) = replication_put_object_options("STANDARD", &object_info).expect("build put options");
+
+        assert!(
+            is_multipart,
+            "a multipart object must replicate over multipart whatever its checksum record looks like"
+        );
+    }
+
+    #[test]
+    fn stored_multipart_parts_keep_the_replication_route_without_a_multipart_etag() {
+        for etag in [Some("0123456789abcdef0123456789abcdef"), None] {
+            for checksum in [None, Some(full_object_multipart_checksum_record())] {
+                let object_info = ObjectInfo {
+                    etag: etag.map(str::to_string),
+                    checksum,
+                    parts: Arc::new(
+                        (1..=2)
+                            .map(|number| ObjectPartInfo {
+                                number,
+                                ..Default::default()
+                            })
+                            .collect(),
+                    ),
+                    ..Default::default()
+                };
+                let (options, is_multipart) =
+                    replication_put_object_options("STANDARD", &object_info).expect("build put options");
+
+                assert!(
+                    is_multipart,
+                    "stored parts must retain multipart routing: etag={etag:?}, checksum={:?}",
+                    object_info.checksum
+                );
+                assert_eq!(options.internal.source_etag, etag.unwrap_or_default());
+            }
+        }
+    }
+
+    #[test]
+    fn checksum_record_never_changes_the_transport_a_single_part_object_needs() {
+        // The mirror of the rustfs#6825 guard: an object stored as one PUT
+        // must keep the single-PUT transport, or its replica's ETag would
+        // change shape and every ETag-based convergence check would re-copy it.
+        let checksum =
+            rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"whole-object").expect("checksum fixture");
+        let object_info = ObjectInfo {
+            etag: Some("0123456789abcdef0123456789abcdef".to_string()),
+            checksum: Some(checksum.to_bytes(&[])),
+            parts: Arc::new(vec![ObjectPartInfo {
+                number: 1,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        assert!(!object_info.is_multipart(), "the fixture must be a single-part object");
+
+        let (_, is_multipart) = replication_put_object_options("STANDARD", &object_info).expect("build put options");
+
+        assert!(!is_multipart, "a single-part object must not be promoted onto the multipart transport");
+    }
+
+    #[test]
+    fn composite_checksum_multipart_object_keeps_the_multipart_route() {
+        // The checksum shape that already worked before rustfs#6825, pinned so
+        // the fix cannot regress it.
+        let mut checksum_type = rustfs_rio::ChecksumType::from_string("crc32");
+        checksum_type
+            .merge(rustfs_rio::ChecksumType::MULTIPART)
+            .merge(rustfs_rio::ChecksumType::INCLUDES_MULTIPART);
+
+        let mut combined = Vec::new();
+        for part in [b"part-one".as_slice(), b"part-two".as_slice()] {
+            let part_checksum =
+                rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::from_string("crc32"), part).expect("part checksum");
+            combined.extend_from_slice(part_checksum.raw.as_slice());
+        }
+        let checksum = rustfs_rio::Checksum::new_from_data(checksum_type, &combined).expect("composite checksum");
+
+        let object_info = ObjectInfo {
+            etag: Some("0123456789abcdef0123456789abcdef-2".to_string()),
+            checksum: Some(checksum.to_bytes(&combined)),
+            ..Default::default()
+        };
+
+        let (_, is_multipart) = replication_put_object_options("STANDARD", &object_info).expect("build put options");
+
+        assert!(is_multipart, "a composite-checksum multipart object must stay on the multipart transport");
+
+        for (name, metadata) in replication_route_metadata() {
+            let mut legacy = replication_route_object(Some("0123456789abcdef0123456789abcdef"), [4, 0, 4], metadata);
+            legacy.checksum = Some(checksum.to_bytes(&combined));
+            let (_, record_is_multipart) = legacy.decrypt_checksums(0, &HeaderMap::new()).expect("decode checksum");
+            let (_, is_multipart) = replication_put_object_options("STANDARD", &legacy).expect("legacy checksum put options");
+            if legacy.is_encrypted() {
+                assert!(!is_multipart, "{name}: encrypted checksum records must not change the old transport");
+            } else {
+                assert!(record_is_multipart, "the composite checksum must carry its own multipart signal");
+                assert!(is_multipart, "{name}: a composite record can still promote the legacy route to MPU");
+            }
+        }
+    }
 
     #[test]
     fn replication_action_for_target_head_existing_object_source_newer_null_version_requires_replication() {
@@ -663,20 +1084,39 @@ mod tests {
     #[test]
     fn replication_complete_multipart_options_sets_actual_size() {
         let source_mtime = OffsetDateTime::from_unix_timestamp(1_716_170_000).expect("valid test timestamp");
+        let source_internal = AdvancedPutOptions {
+            tagging_timestamp: OffsetDateTime::from_unix_timestamp(1_716_170_100).expect("valid test timestamp"),
+            retention_timestamp: OffsetDateTime::from_unix_timestamp(1_716_170_200).expect("valid test timestamp"),
+            legalhold_timestamp: OffsetDateTime::from_unix_timestamp(1_716_170_300).expect("valid test timestamp"),
+            ..Default::default()
+        };
         let options = replication_complete_multipart_options(
             "1024".to_string(),
             "0123456789abcdef0123456789abcdef-3".to_string(),
             Some(source_mtime),
+            &source_internal,
         );
         assert_eq!(options.internal.source_etag, "0123456789abcdef0123456789abcdef-3");
         assert_eq!(options.internal.source_mtime, source_mtime);
 
+        // The complete request must carry the same per-category LWW timestamps
+        // as the initiate request; the receiver reads them from the complete
+        // headers (rustfs/backlog#1953).
+        assert_eq!(options.internal.tagging_timestamp, source_internal.tagging_timestamp);
+        assert_eq!(options.internal.retention_timestamp, source_internal.retention_timestamp);
+        assert_eq!(options.internal.legalhold_timestamp, source_internal.legalhold_timestamp);
+
         // Absent source mtime must degrade to epoch (header suppressed), not
         // the AdvancedPutOptions default of now_utc() — that default would
         // stamp the replication time as the replica's mtime and break the
-        // multipart HEAD convergence.
-        let options_no_mtime = replication_complete_multipart_options("1024".to_string(), String::new(), None);
+        // multipart HEAD convergence. Unset category timestamps stay epoch so
+        // header() keeps suppressing them.
+        let options_no_mtime =
+            replication_complete_multipart_options("1024".to_string(), String::new(), None, &AdvancedPutOptions::default());
         assert_eq!(options_no_mtime.internal.source_mtime.unix_timestamp(), 0);
+        assert_eq!(options_no_mtime.internal.tagging_timestamp.unix_timestamp(), 0);
+        assert_eq!(options_no_mtime.internal.retention_timestamp.unix_timestamp(), 0);
+        assert_eq!(options_no_mtime.internal.legalhold_timestamp.unix_timestamp(), 0);
 
         assert_eq!(
             get_header_map(&options.user_metadata, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE).as_deref(),
@@ -711,6 +1151,11 @@ mod tests {
         metadata.insert(MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(), "DAREv2-HMAC-SHA256".to_string());
         metadata.insert(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(), "sealed".to_string());
         metadata.insert(MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER.to_string(), "true".to_string());
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_REPLICATION_GENERATION,
+            Uuid::from_u128(1).to_string(),
+        );
 
         let object_info = ObjectInfo {
             user_defined: Arc::new(metadata),
@@ -756,6 +1201,13 @@ mod tests {
         assert!(!options.user_metadata.contains_key(AMZ_SERVER_SIDE_ENCRYPTION));
         assert!(!options.user_metadata.contains_key(SSEC_ALGORITHM_HEADER));
         assert!(!options.user_metadata.contains_key(INTERNAL_ENCRYPTION_IV_HEADER));
+        assert!(
+            options
+                .user_metadata
+                .keys()
+                .all(|key| !key.contains(rustfs_utils::http::SUFFIX_REPLICATION_GENERATION)),
+            "source-local mutation generation must never cross the replication wire"
+        );
         assert!(
             !options
                 .user_metadata
@@ -1156,12 +1608,63 @@ mod tests {
                 ..Default::default()
             };
 
-            let (opts, _is_multipart) = replication_put_object_options("", &object_info).expect("build replication put options");
+            let (opts, is_multipart) = replication_put_object_options("", &object_info).expect("build replication put options");
 
+            assert!(!is_multipart, "{name}: a single-part checksum record must keep the single-PUT route");
+            let header = ty.key().expect("every forwarded algorithm has an x-amz-checksum header");
             assert_eq!(
-                opts.user_metadata.get(name),
+                opts.user_metadata.get(header),
                 Some(&checksum.encoded),
-                "replication must forward the {name} checksum into user_metadata identically to the classic algorithms"
+                "replication must forward the {name} checksum as the {header} header"
+            );
+            assert!(
+                !opts.user_metadata.contains_key(name),
+                "{name}: the bare algorithm name would leave as x-amz-meta user metadata"
+            );
+        }
+    }
+
+    /// The object-level record of a multipart upload (composite or full-object)
+    /// must not become a PutObject checksum header: the replica is rebuilt
+    /// through CreateMultipartUpload/UploadPart, and a checksum announced there
+    /// that the parts do not carry would be rejected by the target.
+    #[test]
+    fn replication_put_object_options_keeps_multipart_checksum_records_off_the_wire() {
+        let mut composite_type = rustfs_rio::ChecksumType::from_string("crc32");
+        composite_type
+            .merge(rustfs_rio::ChecksumType::MULTIPART)
+            .merge(rustfs_rio::ChecksumType::INCLUDES_MULTIPART);
+        let mut combined = Vec::new();
+        for part in [b"part-one".as_slice(), b"part-two".as_slice()] {
+            let part_checksum =
+                rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::from_string("crc32"), part).expect("part checksum");
+            combined.extend_from_slice(part_checksum.raw.as_slice());
+        }
+        let composite = rustfs_rio::Checksum::new_from_data(composite_type, &combined)
+            .expect("composite checksum")
+            .to_bytes(&combined);
+
+        for (label, checksum, etag) in [
+            ("composite", composite, "0123456789abcdef0123456789abcdef-2"),
+            (
+                "full-object",
+                full_object_multipart_checksum_record(),
+                "0123456789abcdef0123456789abcdef-3",
+            ),
+        ] {
+            let object_info = ObjectInfo {
+                etag: Some(etag.to_string()),
+                checksum: Some(checksum),
+                ..Default::default()
+            };
+            let (opts, is_multipart) = replication_put_object_options("", &object_info).expect("build replication put options");
+            assert!(is_multipart, "{label}: a multipart object must keep the multipart route");
+            assert!(
+                opts.user_metadata
+                    .keys()
+                    .all(|key| !key.starts_with("x-amz-checksum-") && key != "CRC32"),
+                "{label}: no object-level checksum may reach the target's CreateMultipartUpload: {:?}",
+                opts.user_metadata
             );
         }
     }

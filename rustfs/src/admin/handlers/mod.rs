@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod account;
+pub(crate) mod account_audit;
 pub mod account_info;
 pub mod audit;
 mod audit_runtime_config;
@@ -23,6 +25,7 @@ pub mod diagnostics;
 pub mod durability;
 pub mod event;
 pub mod extensions;
+pub mod gateway_key_inventory;
 pub mod group;
 pub mod heal;
 pub mod health;
@@ -30,6 +33,7 @@ pub(crate) mod iam_error;
 pub mod idp_compat;
 pub mod ilm_transition;
 pub mod inspect_archive;
+pub mod integrity;
 pub mod is_admin;
 pub mod kms;
 pub mod kms_audit;
@@ -39,12 +43,14 @@ pub mod kms_key_lifecycle;
 pub mod kms_key_metadata;
 pub mod kms_keys;
 pub mod kms_management;
-pub mod metrics;
+pub mod kms_rekey;
+pub mod mfa;
 pub mod module_switch;
 mod notify_runtime_access;
 pub mod object_data_cache;
 pub mod object_zip_download;
 pub mod oidc;
+pub mod on_demand_migration;
 pub mod plugins_catalog;
 pub mod plugins_instances;
 pub mod policies;
@@ -52,6 +58,7 @@ pub mod pools;
 pub mod profile;
 pub mod profile_admin;
 pub mod quota;
+pub mod realtime;
 pub mod rebalance;
 pub mod replication;
 pub mod scanner;
@@ -69,6 +76,27 @@ pub mod user;
 pub mod user_iam;
 pub mod user_lifecycle;
 pub mod user_policy_binding;
+
+/// Serialize `payload` as the body of an admin JSON response.
+///
+/// Routes reached through the `/minio/admin` compat prefix carry an encrypted
+/// body; `encode_compatible_admin_payload` decides that from the path, so every
+/// handler must go through here rather than serializing directly, or a
+/// MinIO client gets plaintext where it expects ciphertext.
+pub(crate) fn admin_json_response<T: serde::Serialize>(
+    path: &str,
+    secret_key: &str,
+    status: http::StatusCode,
+    payload: &T,
+) -> s3s::S3Result<s3s::S3Response<(http::StatusCode, s3s::Body)>> {
+    let body = serde_json::to_vec(payload)
+        .map_err(|e| s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, format!("serialize error: {e}")))?;
+    let (body, content_type) = crate::admin::utils::encode_compatible_admin_payload(path, secret_key, body)?;
+
+    let mut header = hyper::HeaderMap::new();
+    header.insert(s3s::header::CONTENT_TYPE, content_type.parse().expect("valid header value"));
+    Ok(s3s::S3Response::with_headers((status, s3s::Body::from(body)), header))
+}
 
 pub(crate) async fn supervise_admin_mutation<T>(
     operation: &'static str,
@@ -104,6 +132,10 @@ mod tests {
         let _list_extension_instances = extensions::ListExtensionInstancesHandler {};
         let _get_plugin_catalog = plugins_catalog::GetPluginCatalogHandler {};
         let _create_object_zip_download = object_zip_download::CreateObjectZipDownloadHandler {};
+        let _set_on_demand_migration = on_demand_migration::SetBucketOnDemandMigrationHandler {};
+        let _get_on_demand_migration = on_demand_migration::GetBucketOnDemandMigrationHandler {};
+        let _delete_on_demand_migration = on_demand_migration::DeleteBucketOnDemandMigrationHandler {};
+        let _on_demand_migration_status = on_demand_migration::GetBucketOnDemandMigrationStatusHandler {};
         let _list_plugin_instances = plugins_instances::ListPluginInstancesHandler {};
         let _get_plugin_instance = plugins_instances::GetPluginInstanceHandler {};
         let _put_plugin_instance = plugins_instances::PutPluginInstanceHandler {};
@@ -114,7 +146,7 @@ mod tests {
         let _inspect_data_handler = system::InspectDataHandler {};
         let _storage_info_handler = system::StorageInfoHandler {};
         let _data_usage_handler = system::DataUsageInfoHandler {};
-        let _metrics_handler = metrics::MetricsHandler {};
+        let _metrics_handler = realtime::MetricsHandler {};
         let _profile_handler = profile_admin::ProfileHandler {};
         let _profile_status_handler = profile_admin::ProfileStatusHandler {};
         let _tls_status_handler = tls_debug::TlsStatusHandler {};
@@ -127,6 +159,7 @@ mod tests {
         let _remove_remote_target_handler = replication::RemoveRemoteTargetHandler {};
         let _scanner_status_handler = scanner::ScannerStatusHandler {};
         let _scanner_cycle_state_reset_handler = scanner::ScannerCycleStateResetHandler {};
+        let _scanner_usage_state_reset_handler = scanner::ScannerUsageStateResetHandler {};
         let _ilm_expiry_status_handler = scanner::IlmExpiryStatusHandler {};
         let _manual_transition_handler = ilm_transition::ManualTransitionRunHandler {};
         let _manual_transition_status_handler = ilm_transition::ManualTransitionJobStatusHandler {};

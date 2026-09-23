@@ -71,6 +71,73 @@ pub fn replication_etags_match(source: Option<&str>, target: Option<&str>) -> bo
     source_etag.is_some() && source_etag == target_etag
 }
 
+fn is_plain_single_part_md5(etag: &str) -> bool {
+    etag.len() == 32 && etag.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// How a replication PutObject that carries Object Lock parameters satisfies
+/// the target-side rule that such a request must also carry `Content-MD5` or
+/// an `x-amz-checksum-*` header (AWS S3, MinIO and most compatible stores
+/// enforce it; rustfs#7082).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectLockIntegrity {
+    /// No Object Lock parameters, or an integrity header is already present.
+    NotRequired,
+    /// Send `Content-MD5` computed from this hex MD5: the source ETag is the
+    /// MD5 of exactly the bytes going on the wire, so no body pass and no
+    /// change of payload framing is needed.
+    ContentMd5Hex(String),
+    /// The source ETag is not the MD5 of the wire bytes (multipart layout,
+    /// or an encrypted object whose ETag does not describe the plaintext);
+    /// let the SDK compute a checksum instead.
+    SdkChecksum,
+}
+
+/// Decide the integrity header for a locked replication PUT.
+///
+/// `plaintext_end_to_end` is false when the request announces any server-side
+/// encryption or carries SSE-C ciphertext passthrough headers: the source
+/// ETag then does not describe the bytes on the wire and must not be turned
+/// into a `Content-MD5` the target would reject with `BadDigest`.
+pub fn object_lock_put_integrity(
+    lock_params: bool,
+    has_integrity_header: bool,
+    plaintext_end_to_end: bool,
+    source_etag: Option<&str>,
+) -> ObjectLockIntegrity {
+    if !lock_params || has_integrity_header {
+        return ObjectLockIntegrity::NotRequired;
+    }
+    match source_etag.map(trim_etag) {
+        Some(etag) if plaintext_end_to_end && is_plain_single_part_md5(&etag) => {
+            ObjectLockIntegrity::ContentMd5Hex(etag.to_ascii_lowercase())
+        }
+        _ => ObjectLockIntegrity::SdkChecksum,
+    }
+}
+
+/// Whether the ETag the target returned for a single-part replica proves the
+/// stored bytes differ from what the source sent — e.g. a target that does not
+/// decode `aws-chunked` framing stores the frames verbatim and returns their
+/// ETag. Only a plain single-part MD5 ETag on both sides is decidable; a
+/// multipart or opaque (encrypted) ETag, or a withheld replica ETag, returns
+/// `false` because no corruption can be concluded from it.
+pub fn single_part_replica_etag_mismatch(source_etag: Option<&str>, replica_etag: Option<&str>) -> bool {
+    let Some(source) = source_etag.map(trim_etag) else {
+        return false;
+    };
+    if !is_plain_single_part_md5(&source) {
+        return false;
+    }
+    let Some(replica) = replica_etag.map(trim_etag) else {
+        return false;
+    };
+    if !is_plain_single_part_md5(&replica) {
+        return false;
+    }
+    !source.eq_ignore_ascii_case(&replica)
+}
+
 pub fn target_is_newer_than_source_null_version(
     source: &ReplicationSourceObject<'_>,
     target: &ReplicationTargetObject<'_>,
@@ -167,18 +234,62 @@ fn comparable_metadata(metadata: Option<&HashMap<String, String>>) -> HashMap<St
 /// real (non-nil) version uuid, and drift means the target answered with
 /// anything else — including nothing at all.
 pub fn version_identity_drifted(source_version_id: &str, assigned_version_id: Option<&str>) -> bool {
-    if source_version_id.is_empty() {
-        return false;
+    version_identity_capability_from_put(source_version_id, assigned_version_id) == Some(VersionIdentityCapability::MintsOwn)
+}
+
+/// Whether a replication target adopts the source version id it is handed on
+/// PutObject / CompleteMultipartUpload, or mints its own.
+///
+/// A target that mints its own ids (AWS S3, Wasabi, Impossible Cloud) still
+/// stores the bytes, but every later version-addressed request from the
+/// source names an id the target never had. Its HEAD then answers 404 —
+/// indistinguishable from a replica that is really missing — so a heal, MRF
+/// retry or existing-object resync re-drive would PUT the object again and
+/// mint yet another target version (rustfs/backlog#2340). The replication
+/// worker learns the verdict from each PUT response (and replication-check's
+/// VersionFidelity phase) and, once `MintsOwn` is known, locates a replica by
+/// exact key and ETag before concluding that it is missing. The verdict cache
+/// is owned by the runtime's bucket target system; this crate owns only the
+/// vocabulary and the judgment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VersionIdentityCapability {
+    #[default]
+    Unknown,
+    Adopts,
+    MintsOwn,
+}
+
+impl VersionIdentityCapability {
+    /// True when a 404 from a version-addressed HEAD on this target cannot be
+    /// read as "replica missing": the source-side id was never the target's.
+    pub fn version_addressing_unreliable(self) -> bool {
+        self == VersionIdentityCapability::MintsOwn
     }
-    // A nil source uuid travels as the literal "null" (unversioned-source
-    // semantics); no identity contract applies to it.
+}
+
+/// Judge the identity contract from one replication write: `None` when no
+/// contract applies (the source addressed no real version — an empty or nil
+/// uuid travels as the literal "null", unversioned-source semantics),
+/// otherwise whether the target echoed the source id or answered with
+/// anything else — including nothing at all.
+pub fn version_identity_capability_from_put(
+    source_version_id: &str,
+    assigned_version_id: Option<&str>,
+) -> Option<VersionIdentityCapability> {
+    if source_version_id.is_empty() {
+        return None;
+    }
     if uuid::Uuid::parse_str(source_version_id)
         .map(|uuid| uuid.is_nil())
         .unwrap_or(true)
     {
-        return false;
+        return None;
     }
-    assigned_version_id != Some(source_version_id)
+    Some(if assigned_version_id == Some(source_version_id) {
+        VersionIdentityCapability::Adopts
+    } else {
+        VersionIdentityCapability::MintsOwn
+    })
 }
 
 const REPLICATION_TARGET_OFFLINE_ERROR_MARKERS: &[&str] = &[
@@ -276,11 +387,43 @@ pub fn ssec_passthrough_evidence_present(sse_customer_algorithm: Option<&str>) -
 
 #[cfg(test)]
 mod tests {
+    use super::{ObjectLockIntegrity, object_lock_put_integrity};
+
+    const SOURCE_MD5: &str = "9a0364b9e99bb480dd25e1f0284c8555";
+    const FRAMED_MD5: &str = "0f343b0931126a20f133d67c2b018a3b";
+
+    #[test]
+    fn single_part_replica_mismatch_is_only_decided_on_plain_md5_pairs() {
+        // The #6853 shape: the target stored aws-chunked frames verbatim and
+        // returned the framed bytes' ETag.
+        assert!(single_part_replica_etag_mismatch(Some(SOURCE_MD5), Some(FRAMED_MD5)));
+        assert!(single_part_replica_etag_mismatch(
+            Some(&format!("\"{SOURCE_MD5}\"")),
+            Some(&format!("\"{FRAMED_MD5}\""))
+        ));
+
+        // A faithful replica, quoted or not, passes; hex case must not matter
+        // (a target may return the same MD5 uppercased).
+        assert!(!single_part_replica_etag_mismatch(Some(SOURCE_MD5), Some(SOURCE_MD5)));
+        assert!(!single_part_replica_etag_mismatch(Some(&format!("\"{SOURCE_MD5}\"")), Some(SOURCE_MD5)));
+        assert!(!single_part_replica_etag_mismatch(
+            Some(SOURCE_MD5),
+            Some(&SOURCE_MD5.to_ascii_uppercase())
+        ));
+
+        // Not decidable: multipart source, opaque replica ETag, or either side
+        // missing must never be reported as corruption.
+        assert!(!single_part_replica_etag_mismatch(Some(&format!("{SOURCE_MD5}-3")), Some(FRAMED_MD5)));
+        assert!(!single_part_replica_etag_mismatch(Some(SOURCE_MD5), Some(&format!("{FRAMED_MD5}-3"))));
+        assert!(!single_part_replica_etag_mismatch(Some(SOURCE_MD5), None));
+        assert!(!single_part_replica_etag_mismatch(None, Some(FRAMED_MD5)));
+    }
+
     use super::{
         ReplicationSourceObject, ReplicationTargetObject, SsecPassthroughCapability, SsecPassthroughGate,
-        content_matches_by_etag, is_replication_target_offline_error, replication_action_for_target, replication_etags_match,
-        ssec_passthrough_evidence_present, ssec_passthrough_gate, target_is_newer_than_source_null_version,
-        version_identity_drifted,
+        VersionIdentityCapability, content_matches_by_etag, is_replication_target_offline_error, replication_action_for_target,
+        replication_etags_match, single_part_replica_etag_mismatch, ssec_passthrough_evidence_present, ssec_passthrough_gate,
+        target_is_newer_than_source_null_version, version_identity_capability_from_put, version_identity_drifted,
     };
     use crate::filemeta::{ReplicationAction, ReplicationType};
     use crate::http::AMZ_OBJECT_LOCK_MODE;
@@ -410,6 +553,32 @@ mod tests {
     }
 
     #[test]
+    fn version_identity_capability_is_judged_only_for_real_source_versions() {
+        let source = "8e4d2f4c-2d5c-4f1b-9d0a-9c8b7a6f5e4d";
+        assert_eq!(
+            version_identity_capability_from_put(source, Some(source)),
+            Some(VersionIdentityCapability::Adopts)
+        );
+        // Wasabi / AWS shape: a minted id, or no id at all, both mean the
+        // source-side id is not addressable on the target.
+        assert_eq!(
+            version_identity_capability_from_put(source, Some("001788697733811332140-fR6j6uXKV-")),
+            Some(VersionIdentityCapability::MintsOwn)
+        );
+        assert_eq!(
+            version_identity_capability_from_put(source, None),
+            Some(VersionIdentityCapability::MintsOwn)
+        );
+        // No contract for an unversioned source write.
+        assert_eq!(version_identity_capability_from_put("", Some("anything")), None);
+        assert_eq!(version_identity_capability_from_put("00000000-0000-0000-0000-000000000000", None), None);
+        assert_eq!(version_identity_capability_from_put("null", Some("null")), None);
+        assert!(VersionIdentityCapability::MintsOwn.version_addressing_unreliable());
+        assert!(!VersionIdentityCapability::Adopts.version_addressing_unreliable());
+        assert!(!VersionIdentityCapability::Unknown.version_addressing_unreliable());
+    }
+
+    #[test]
     fn replication_target_offline_error_classifier_is_network_scoped() {
         assert!(is_replication_target_offline_error("put_object dispatch failure: connector error"));
         assert!(is_replication_target_offline_error("request TimeoutError after retry"));
@@ -498,6 +667,42 @@ mod tests {
         assert_eq!(
             replication_action_for_target(&source, &target, ReplicationType::Metadata),
             ReplicationAction::Metadata
+        );
+    }
+
+    #[test]
+    fn locked_put_uses_the_plain_source_md5_as_content_md5() {
+        assert_eq!(
+            object_lock_put_integrity(true, false, true, Some("\"9A0364B9E99BB480DD25E1F0284C8555\"")),
+            ObjectLockIntegrity::ContentMd5Hex("9a0364b9e99bb480dd25e1f0284c8555".to_string())
+        );
+    }
+
+    #[test]
+    fn locked_put_without_a_usable_etag_falls_back_to_the_sdk_checksum() {
+        // Multipart layout: the ETag is not the MD5 of the body.
+        assert_eq!(
+            object_lock_put_integrity(true, false, true, Some("9a0364b9e99bb480dd25e1f0284c8555-2")),
+            ObjectLockIntegrity::SdkChecksum
+        );
+        // Encrypted end to end: the ETag does not describe the wire bytes.
+        assert_eq!(
+            object_lock_put_integrity(true, false, false, Some("9a0364b9e99bb480dd25e1f0284c8555")),
+            ObjectLockIntegrity::SdkChecksum
+        );
+        assert_eq!(object_lock_put_integrity(true, false, true, None), ObjectLockIntegrity::SdkChecksum);
+        assert_eq!(object_lock_put_integrity(true, false, true, Some("")), ObjectLockIntegrity::SdkChecksum);
+    }
+
+    #[test]
+    fn integrity_is_not_added_without_lock_params_or_when_already_present() {
+        assert_eq!(
+            object_lock_put_integrity(false, false, true, Some("9a0364b9e99bb480dd25e1f0284c8555")),
+            ObjectLockIntegrity::NotRequired
+        );
+        assert_eq!(
+            object_lock_put_integrity(true, true, true, Some("9a0364b9e99bb480dd25e1f0284c8555")),
+            ObjectLockIntegrity::NotRequired
         );
     }
 }

@@ -15,15 +15,16 @@
 use crate::bucket::metadata::BucketMetadata;
 use crate::bucket::metadata_sys::get_bucket_targets_config;
 use crate::bucket::metadata_sys::get_replication_config;
+use crate::bucket::remote_s3_client::{
+    PathStyle, REPLICATION_TARGET_RETRY_POLICY, RemoteCredentials, RemoteS3EndpointSpec, build_remote_s3_client,
+};
+use crate::bucket::replication::{ObjectLockIntegrity, object_lock_put_integrity, replication_etags_match};
 use crate::bucket::replication::{ReplicationStatusType, ReplicationTargetConfigBridge};
 use crate::bucket::target::ARN;
 use crate::bucket::target::BucketTargetType;
 use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::runtime::sources as runtime_sources;
-use aws_credential_types::Credentials as SdkCredentials;
-use aws_sdk_s3::config::Region as SdkRegion;
-use aws_sdk_s3::config::SharedHttpClient;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
@@ -32,34 +33,27 @@ use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
 use aws_sdk_s3::operation::get_object_tagging::{GetObjectTaggingError, GetObjectTaggingOutput};
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
+use aws_sdk_s3::operation::put_object_legal_hold::{PutObjectLegalHoldError, PutObjectLegalHoldOutput};
+use aws_sdk_s3::operation::put_object_retention::{PutObjectRetentionError, PutObjectRetentionOutput};
 use aws_sdk_s3::operation::put_object_tagging::{PutObjectTaggingError, PutObjectTaggingOutput};
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::BucketVersioningStatus;
 use aws_sdk_s3::types::Tagging as SdkTagging;
 use aws_sdk_s3::types::{
-    ChecksumMode, CompletedMultipartUpload, CompletedPart, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
+    ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
+    ServerSideEncryption,
 };
-use aws_sdk_s3::{Client as S3Client, Config as S3Config, operation::head_object::HeadObjectOutput};
-use aws_sdk_s3::{config::SharedCredentialsProvider, types::BucketVersioningStatus};
-use aws_smithy_http_client::{Builder as SmithyHttpClientBuilder, tls as smithy_tls};
-use aws_smithy_runtime_api::box_error::BoxError;
-use aws_smithy_runtime_api::client::http::{
-    HttpConnector as SmithyHttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn,
-};
-use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
-use aws_smithy_runtime_api::client::result::ConnectorError;
-use aws_smithy_types::body::SdkBody;
+use aws_sdk_s3::types::{ObjectLockLegalHold, ObjectLockRetention};
+use aws_sdk_s3::{Client as S3Client, operation::head_object::HeadObjectOutput};
+use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
 use futures::{StreamExt, stream};
-use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
-use hyper_util::client::legacy::Client as HyperClient;
-use hyper_util::rt::{TokioExecutor, TokioTimer};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use reqwest::Client as HttpClient;
-use rustfs_config::{DEFAULT_TRUST_LEAF_CERT_AS_CA, ENV_TRUST_LEAF_CERT_AS_CA, RUSTFS_CA_CERT, RUSTFS_TLS_CERT};
-use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE,
-    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_STORAGE_CLASS, AMZ_WEBSITE_REDIRECT_LOCATION, is_amz_header, is_minio_header,
-    is_rustfs_header, is_standard_header, is_storageclass_header,
+    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_TAGGING_LOWER, AMZ_STORAGE_CLASS, AMZ_WEBSITE_REDIRECT_LOCATION, is_amz_header,
+    is_minio_header, is_rustfs_header, is_standard_header, is_storageclass_header,
 };
 use rustfs_utils::http::{
     SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_PROXY_REQUEST,
@@ -67,21 +61,18 @@ use rustfs_utils::http::{
     SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_SOURCE_VERSION_ID,
     insert_header,
 };
-use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
-use std::path::Path;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::Weak;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
-use tower::Service;
 use tracing::error;
 use tracing::warn;
 use url::Url;
@@ -90,7 +81,73 @@ use uuid::Uuid;
 const MAX_CONCURRENT_TARGET_HEALTH_CHECKS: usize = 16;
 const REDACTED_CREDENTIAL: &str = "<redacted>";
 
+fn remote_credentials(credentials: &Credentials, account_id: &str) -> RemoteCredentials {
+    RemoteCredentials {
+        access_key: credentials.access_key.clone(),
+        secret_key: credentials.secret_key.clone(),
+        session_token: credentials.effective_session_token().map(str::to_string),
+        expiration: credentials.effective_expiration().map(SystemTime::from),
+        account_id: account_id.to_string(),
+    }
+}
+
+fn target_path_style(path: &str) -> PathStyle {
+    match path.trim().to_ascii_lowercase().as_str() {
+        // Explicit DNS/virtual-hosted-style requested by user.
+        "dns" | "off" | "false" => PathStyle::VirtualHost,
+        // Explicit path-style or legacy boolean-like values.
+        "path" | "on" | "true" => PathStyle::Path,
+        // `auto` and empty are defaulted to path-style for custom S3-compatible endpoints.
+        "auto" | "" => PathStyle::Auto,
+        // Unknown values: prefer compatibility with S3-compatible services.
+        _ => PathStyle::Path,
+    }
+}
+
+impl From<&BucketTarget> for RemoteS3EndpointSpec {
+    fn from(target: &BucketTarget) -> Self {
+        RemoteS3EndpointSpec {
+            endpoint: target.endpoint.clone(),
+            secure: target.secure,
+            region: target.region.clone(),
+            path_style: target_path_style(&target.path),
+            credentials: target
+                .credentials
+                .as_ref()
+                .map(|credentials| remote_credentials(credentials, &target.reset_id)),
+            skip_tls_verify: target.skip_tls_verify,
+            ca_cert_pem: (!target.ca_cert_pem.trim().is_empty()).then(|| target.ca_cert_pem.clone()),
+            connect_timeout: None,
+            read_timeout: None,
+            // Replication has no retry budget of its own on the request path,
+            // so it keeps the SDK's standard three attempts; stating it here
+            // pins the behaviour to this line instead of an SDK default.
+            retry: REPLICATION_TARGET_RETRY_POLICY,
+            user_agent_suffix: "",
+        }
+    }
+}
+
 pub type HeadObjectSdkError = Box<SdkError<HeadObjectError>>;
+
+/// Whether an edited bucket target still addresses the same remote service
+/// (endpoint, bucket, path style, TLS and identity), so a verdict learned
+/// about that service stays valid across the edit.
+fn same_replication_service(edited: &BucketTarget, previous: &BucketTarget) -> bool {
+    let access_key = |target: &BucketTarget| target.credentials.as_ref().map(|credentials| credentials.access_key.clone());
+    edited.endpoint == previous.endpoint
+        && edited.target_bucket == previous.target_bucket
+        && edited.secure == previous.secure
+        && edited.path == previous.path
+        && access_key(edited) == access_key(previous)
+}
+
+/// Page size and page budget for [`TargetClient::locate_replica_by_etag`].
+const FIND_VERSION_BY_ETAG_PAGE_SIZE: i32 = 1000;
+const FIND_VERSION_BY_ETAG_MAX_PAGES: usize = 8;
+/// Candidate cap for [`TargetClient::replica_candidates_by_etag`]: more than
+/// this many same-content versions of one key is ambiguity by any measure.
+const FIND_VERSION_BY_ETAG_MAX_MATCHES: usize = 16;
 pub type GetObjectSdkError = Box<SdkError<GetObjectError>>;
 pub type GetObjectTaggingSdkError = Box<SdkError<GetObjectTaggingError>>;
 pub type PutObjectTaggingSdkError = Box<SdkError<PutObjectTaggingError>>;
@@ -314,6 +371,13 @@ struct TargetClientBuildProbe {
 /// their import path while the verdict vocabulary lives with the
 /// replication decision logic.
 pub use crate::bucket::replication::SsecPassthroughCapability;
+/// Version-identity verdicts (see the enum's own docs in
+/// `rustfs-replication`) are cached here per target ARN and follow the same
+/// `arn_remotes_map` lifecycle. They carry no TTL: the verdict is refreshed
+/// by every replication write's response, so it can only go stale on a
+/// target that receives no writes — and a stale `MintsOwn` costs one extra
+/// content-identity lookup before a PUT, never a lost replica.
+pub use crate::bucket::replication::VersionIdentityCapability;
 
 /// How long an audited SSE-C passthrough verdict stays authoritative.
 ///
@@ -340,7 +404,17 @@ pub struct BucketTargetSys {
     /// SSE-C passthrough capability verdicts keyed by target ARN. See
     /// [`SsecPassthroughCapability`]; reset alongside `arn_remotes_map`.
     ssec_passthrough_map: Arc<RwLock<HashMap<String, SsecPassthroughRecord>>>,
+    /// Version-identity verdicts keyed by target ARN. See
+    /// [`VersionIdentityCapability`]; reset alongside `arn_remotes_map`. A std
+    /// lock (never held across an await) so the replication worker can record
+    /// a verdict from inside its synchronous PUT-response audit.
+    version_identity_map: Arc<std::sync::RwLock<HashMap<String, VersionIdentityCapability>>>,
     pub targets_map: Arc<RwLock<HashMap<String, Vec<BucketTarget>>>>,
+    /// Buckets whose persisted `bucket-targets.json` exists but cannot be
+    /// decoded (rustfs/backlog#2282). Written under the bucket's update mutex
+    /// alongside `targets_map`, and read before it so an unreadable
+    /// configuration surfaces as a typed error instead of an empty target set.
+    unreadable_targets: Arc<RwLock<HashSet<String>>>,
     pub h_mutex: Arc<RwLock<HashMap<String, EpHealth>>>,
     target_h_mutex: Arc<RwLock<HashMap<String, EpHealth>>>,
     pub hc_client: Arc<HttpClient>,
@@ -352,6 +426,28 @@ pub struct BucketTargetSys {
     heartbeat_started: OnceLock<()>,
 }
 
+/// Build the bucket-target health-check HTTP client without panicking when
+/// the host has no system CA bundle (issue #6734).
+///
+/// `BucketTargetSys::get()` initializes lazily on the startup path (bucket
+/// metadata install calls it on the main thread), and `reqwest::Client::new()`
+/// panics when the TLS backend cannot load any system trust root — the state
+/// of a minimal container image. Fall back to a client with an explicit empty
+/// trust store: HTTP health checks keep working, and HTTPS targets fail closed
+/// at the TLS handshake with a clear certificate error instead of aborting
+/// the whole process at startup.
+fn build_health_check_client() -> HttpClient {
+    HttpClient::builder().build().unwrap_or_else(|error| {
+        warn!(
+            "bucket target health-check HTTP client could not load system TLS roots ({error}); continuing with an empty trust store — HTTPS target health checks will fail until a CA bundle is installed"
+        );
+        HttpClient::builder()
+            .tls_certs_only(std::iter::empty::<reqwest::Certificate>())
+            .build()
+            .expect("HTTP client construction must succeed with an explicit empty trust store")
+    })
+}
+
 impl BucketTargetSys {
     pub fn get() -> &'static Self {
         GLOBAL_BUCKET_TARGET_SYS.get_or_init(Self::new)
@@ -361,10 +457,12 @@ impl BucketTargetSys {
         Self {
             arn_remotes_map: Arc::new(RwLock::new(HashMap::new())),
             ssec_passthrough_map: Arc::new(RwLock::new(HashMap::new())),
+            version_identity_map: Arc::new(std::sync::RwLock::new(HashMap::new())),
             targets_map: Arc::new(RwLock::new(HashMap::new())),
+            unreadable_targets: Arc::new(RwLock::new(HashSet::new())),
             h_mutex: Arc::new(RwLock::new(HashMap::new())),
             target_h_mutex: Arc::new(RwLock::new(HashMap::new())),
-            hc_client: Arc::new(HttpClient::new()),
+            hc_client: Arc::new(build_health_check_client()),
             a_mutex: Arc::new(Mutex::new(HashMap::new())),
             arn_errs_map: Arc::new(RwLock::new(HashMap::new())),
             target_update_mutexes: Arc::new(Mutex::new(HashMap::new())),
@@ -393,6 +491,19 @@ impl BucketTargetSys {
         let mutex = Arc::new(Mutex::new(()));
         mutexes.insert(bucket.to_string(), Arc::downgrade(&mutex));
         mutex
+    }
+
+    /// Snapshot the heartbeat-tracked health of `url`'s endpoint.
+    ///
+    /// Returns `None` when the heartbeat has never seen the endpoint. Unlike
+    /// [`Self::is_offline`] this deliberately does not call `init_hc`: a caller
+    /// that only reports metrics must not create health entries as a side
+    /// effect, or merely rendering a status page would mark an unknown peer
+    /// online.
+    pub async fn endpoint_health(&self, url: &Url) -> Option<EpHealth> {
+        let key = endpoint_health_key(url);
+        let health_map = self.h_mutex.read().await;
+        health_map.get(&key).cloned()
     }
 
     pub async fn is_offline(&self, url: &Url) -> bool {
@@ -558,30 +669,40 @@ impl BucketTargetSys {
         health_map.clone()
     }
 
-    pub async fn list_targets(&self, bucket: &str, arn_type: &str) -> Vec<BucketTarget> {
+    /// Targets of one bucket, or of every bucket when `bucket` is empty.
+    ///
+    /// A bucket that simply has no targets yields an empty list; a bucket
+    /// whose persisted configuration cannot be decoded is an error, so an
+    /// admin listing reports the fault instead of an empty list that reads as
+    /// "replication is not configured" (rustfs/backlog#2282).
+    pub async fn list_targets(&self, bucket: &str, arn_type: &str) -> Result<Vec<BucketTarget>, BucketTargetError> {
         let health_stats = self.target_health_stats().await;
         let mut targets = Vec::new();
 
         if !bucket.is_empty() {
-            if let Ok(bucket_targets) = self.list_bucket_targets(bucket).await {
-                for mut target in bucket_targets.targets {
-                    if arn_type.is_empty() || target.target_type.to_string() == arn_type {
-                        if let Some(health) = health_stats.get(&target.arn) {
-                            target.total_downtime = health.offline_duration;
-                            target.online = health.online;
-                            target.last_online = health.last_online;
-                            target.latency = target::LatencyStat {
-                                curr: health.latency.curr,
-                                avg: health.latency.avg,
-                                max: health.latency.peak,
-                            };
-                            target.offline_count = health.offline_count;
+            match self.list_bucket_targets(bucket).await {
+                Ok(bucket_targets) => {
+                    for mut target in bucket_targets.targets {
+                        if arn_type.is_empty() || target.target_type.to_string() == arn_type {
+                            if let Some(health) = health_stats.get(&target.arn) {
+                                target.total_downtime = health.offline_duration;
+                                target.online = health.online;
+                                target.last_online = health.last_online;
+                                target.latency = target::LatencyStat {
+                                    curr: health.latency.curr,
+                                    avg: health.latency.avg,
+                                    max: health.latency.peak,
+                                };
+                                target.offline_count = health.offline_count;
+                            }
+                            targets.push(target);
                         }
-                        targets.push(target);
                     }
                 }
+                Err(BucketTargetError::BucketRemoteTargetNotFound { .. }) => {}
+                Err(err) => return Err(err),
             }
-            return targets;
+            return Ok(targets);
         }
 
         let targets_map = self.targets_map.read().await;
@@ -604,10 +725,16 @@ impl BucketTargetSys {
             }
         }
 
-        targets
+        Ok(targets)
     }
 
     pub async fn list_bucket_targets(&self, bucket: &str) -> Result<BucketTargets, BucketTargetError> {
+        if self.unreadable_targets.read().await.contains(bucket) {
+            return Err(BucketTargetError::BucketRemoteTargetsUnreadable {
+                bucket: bucket.to_string(),
+            });
+        }
+
         let targets_map = self.targets_map.read().await;
         if let Some(targets) = targets_map.get(bucket) {
             Ok(BucketTargets {
@@ -620,13 +747,30 @@ impl BucketTargetSys {
         }
     }
 
+    /// Record that this bucket's persisted targets configuration exists but
+    /// cannot be decoded (rustfs/backlog#2282).
+    ///
+    /// Any snapshot published from an earlier readable load is deliberately
+    /// left in place: withdrawing it would produce exactly the silent "no
+    /// targets configured" state this marker exists to prevent. The marker is
+    /// cleared by the next successful publish, which is what makes a repaired
+    /// configuration take effect without a restart.
+    pub async fn mark_targets_unreadable(&self, bucket: &str) {
+        let update_mutex = self.target_update_mutex(bucket).await;
+        let _update_guard = update_mutex.lock().await;
+
+        self.unreadable_targets.write().await.insert(bucket.to_string());
+    }
+
     pub async fn delete(&self, bucket: &str) {
         let update_mutex = self.target_update_mutex(bucket).await;
         let _update_guard = update_mutex.lock().await;
 
-        // Lock order: targets_map, then arn_remotes_map, then target_h_mutex,
-        // then ssec_passthrough_map (always last; also taken standalone by the
-        // capability accessors).
+        // Lock order: unreadable_targets, then targets_map, then
+        // arn_remotes_map, then target_h_mutex, then ssec_passthrough_map
+        // (always last; also taken standalone by the capability accessors).
+        self.unreadable_targets.write().await.remove(bucket);
+
         let mut targets_map = self.targets_map.write().await;
         let mut arn_remotes_map = self.arn_remotes_map.write().await;
         let mut health_map = self.target_h_mutex.write().await;
@@ -637,8 +781,38 @@ impl BucketTargetSys {
                 arn_remotes_map.remove(&target.arn);
                 health_map.remove(&target.arn);
                 ssec_map.remove(&target.arn);
+                self.forget_version_identity_capability(&target.arn);
             }
         }
+    }
+
+    /// Cached version-identity verdict for a target ARN; `Unknown` until a
+    /// replication write or a replication-check VersionFidelity probe judged
+    /// it since the target was built.
+    pub fn version_identity_capability(&self, arn: &str) -> VersionIdentityCapability {
+        self.version_identity_map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(arn)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Record a version-identity verdict for a target ARN. Written by the
+    /// replication worker after every PutObject / CompleteMultipartUpload
+    /// response and by the replication-check VersionFidelity phase.
+    pub fn record_version_identity_capability(&self, arn: &str, capability: VersionIdentityCapability) {
+        self.version_identity_map
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(arn.to_string(), capability);
+    }
+
+    fn forget_version_identity_capability(&self, arn: &str) {
+        self.version_identity_map
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(arn);
     }
 
     /// Cached SSE-C passthrough capability for a target ARN, plus whether the
@@ -685,15 +859,22 @@ impl BucketTargetSys {
     ) -> Result<BucketTargets, BucketTargetError> {
         self.validate_target(bucket, target).await?;
 
-        let mut bucket_targets = match self.list_bucket_targets(bucket).await {
-            Ok(targets) => targets,
-            Err(BucketTargetError::BucketRemoteTargetNotFound { .. }) => BucketTargets::default(),
-            Err(err) => return Err(err),
-        };
+        let mut bucket_targets = self.targets_base_for_write(bucket).await?;
 
         Self::upsert_target_entry(&mut bucket_targets.targets, target, update)?;
 
         Ok(bucket_targets)
+    }
+
+    /// Ordinary writes must not turn an unreadable cached snapshot into an
+    /// empty configuration. Explicit repair belongs to the metadata transaction
+    /// that can inspect the current persisted state.
+    async fn targets_base_for_write(&self, bucket: &str) -> Result<BucketTargets, BucketTargetError> {
+        match self.list_bucket_targets(bucket).await {
+            Ok(targets) => Ok(targets),
+            Err(BucketTargetError::BucketRemoteTargetNotFound { .. }) => Ok(BucketTargets::default()),
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn validate_target(&self, bucket: &str, target: &BucketTarget) -> Result<(), BucketTargetError> {
@@ -754,7 +935,9 @@ impl BucketTargetSys {
         Ok(())
     }
 
-    fn upsert_target_entry(
+    /// Merge a validated target into a caller-owned snapshot. The caller must
+    /// protect that snapshot through persistence.
+    pub fn upsert_target_entry(
         bucket_targets: &mut Vec<BucketTarget>,
         target: &BucketTarget,
         update: bool,
@@ -823,13 +1006,26 @@ impl BucketTargetSys {
         Ok(BucketTargets { targets: new_targets })
     }
 
+    async fn mark_refresh_attempt(&self, arn: &str) {
+        // Rate-limit a failed config fetch as well as a failed client build.
+        // A successful rebuild replaces this timestamp during publication.
+        self.arn_remotes_map
+            .write()
+            .await
+            .entry(arn.to_string())
+            .or_default()
+            .last_refresh = OffsetDateTime::now_utc();
+    }
+
     pub async fn mark_refresh_in_progress(&self, bucket: &str, arn: &str) {
         let mut arn_errs = self.arn_errs_map.write().await;
-        arn_errs.entry(arn.to_string()).or_insert_with(|| ArnErrs {
-            bucket: bucket.to_string(),
-            update_in_progress: true,
+        let err = arn_errs.entry(arn.to_string()).or_insert_with(|| ArnErrs {
             count: 1,
+            bucket: bucket.to_string(),
+            ..Default::default()
         });
+        err.update_in_progress = true;
+        err.bucket = bucket.to_string();
     }
 
     pub async fn mark_refresh_done(&self, bucket: &str, arn: &str) {
@@ -841,15 +1037,21 @@ impl BucketTargetSys {
     }
 
     pub async fn is_reloading_target(&self, _bucket: &str, arn: &str) -> bool {
-        let arn_errs = self.arn_errs_map.read().await;
-        arn_errs.get(arn).map(|err| err.update_in_progress).unwrap_or(false)
+        self.arn_errs_map
+            .read()
+            .await
+            .get(arn)
+            .is_some_and(|err| err.update_in_progress)
     }
 
-    pub async fn inc_arn_errs(&self, _bucket: &str, arn: &str) {
+    pub async fn inc_arn_errs(&self, bucket: &str, arn: &str) {
         let mut arn_errs = self.arn_errs_map.write().await;
-        if let Some(err) = arn_errs.get_mut(arn) {
-            err.count += 1;
-        }
+        let err = arn_errs.entry(arn.to_string()).or_insert_with(|| ArnErrs {
+            bucket: bucket.to_string(),
+            ..Default::default()
+        });
+        err.count += 1;
+        err.bucket = bucket.to_string();
     }
 
     pub async fn get_remote_target_client(&self, bucket: &str, arn: &str) -> Option<Arc<TargetClient>> {
@@ -862,13 +1064,13 @@ impl BucketTargetSys {
                 .unwrap_or((None, None))
         };
 
-        if let Some(cli) = cli {
+        let credentials_expired = cli
+            .as_ref()
+            .is_some_and(|client| client.credentials_expired_at(jiff::Timestamp::now()));
+        if let Some(cli) = cli
+            && !credentials_expired
+        {
             return Some(cli);
-        }
-
-        // TODO(backlog): spawn an async task to proactively reload the replication target
-        if self.is_reloading_target(bucket, arn).await {
-            return None;
         }
 
         if let Some(last_refresh) = last_refresh {
@@ -878,16 +1080,24 @@ impl BucketTargetSys {
             }
         }
 
+        // The existing per-bucket publication lock is also the reload claim:
+        // try-locking keeps the request path non-blocking, is cancellation-safe,
+        // and prevents a stale reload from publishing after a credential update.
+        let update_mutex = self.target_update_mutex(bucket).await;
+        let Ok(update_guard) = update_mutex.try_lock() else {
+            return None;
+        };
+        self.mark_refresh_attempt(arn).await;
+
         match get_bucket_targets_config(bucket).await {
             Ok(bucket_targets) => {
-                self.mark_refresh_in_progress(bucket, arn).await;
-                self.update_all_targets(bucket, Some(&bucket_targets)).await;
-                self.mark_refresh_done(bucket, arn).await;
+                self.update_all_targets_locked(bucket, Some(&bucket_targets)).await;
             }
             Err(e) => {
                 error!("get bucket targets config error:{}", e);
             }
         };
+        drop(update_guard);
 
         let cli = self
             .arn_remotes_map
@@ -895,8 +1105,10 @@ impl BucketTargetSys {
             .await
             .get(arn)
             .and_then(|target| target.client.clone());
-        if cli.is_some() {
-            return cli;
+        if let Some(cli) = cli
+            && !cli.credentials_expired_at(jiff::Timestamp::now())
+        {
+            return Some(cli);
         }
 
         self.inc_arn_errs(bucket, arn).await;
@@ -926,55 +1138,17 @@ impl BucketTargetSys {
             });
         };
 
-        let creds = SdkCredentials::builder()
-            .access_key_id(credentials.access_key.clone())
-            .secret_access_key(credentials.secret_key.clone())
-            .account_id(target.reset_id.clone())
-            .provider_name("bucket_target_sys")
-            .build();
-
-        let endpoint = if target.secure {
-            format!("https://{}", target.endpoint)
-        } else {
-            format!("http://{}", target.endpoint)
-        };
-        let parsed_endpoint = Url::parse(&endpoint).map_err(|err| BucketTargetError::RemoteTargetConnectionErr {
-            bucket: target.target_bucket.clone(),
-            access_key: credentials.access_key.clone(),
-            error: format!("invalid target endpoint: {err}"),
-        })?;
-        validate_replication_target_endpoint(&parsed_endpoint).map_err(|err| BucketTargetError::RemoteTargetConnectionErr {
-            bucket: target.target_bucket.clone(),
-            access_key: credentials.access_key.clone(),
-            error: format!("target endpoint is not allowed: {err}"),
-        })?;
-
-        let mut config_builder = S3Config::builder()
-            .endpoint_url(endpoint.clone())
-            .credentials_provider(SharedCredentialsProvider::new(creds))
-            .region(SdkRegion::new(target.region.clone()))
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest());
-
-        if should_force_path_style(target) {
-            config_builder = config_builder.force_path_style(true);
-        }
-
-        if let Some(http_client) =
-            build_aws_s3_http_client_for_target(target)
-                .await
-                .map_err(|err| BucketTargetError::RemoteTargetConnectionErr {
-                    bucket: target.target_bucket.clone(),
-                    access_key: credentials.access_key.clone(),
-                    error: err.to_string(),
-                })?
-        {
-            config_builder = config_builder.http_client(http_client);
-        }
-
-        let config = config_builder.build();
+        let spec = RemoteS3EndpointSpec::from(target);
+        let client = build_remote_s3_client(&spec)
+            .await
+            .map_err(|err| BucketTargetError::RemoteTargetConnectionErr {
+                bucket: target.target_bucket.clone(),
+                access_key: credentials.access_key.clone(),
+                error: err.to_string(),
+            })?;
 
         Ok(TargetClient {
-            endpoint,
+            endpoint: spec.endpoint_url(),
             credentials: target.credentials.clone(),
             bucket: target.target_bucket.clone(),
             storage_class: target.storage_class.clone(),
@@ -984,7 +1158,7 @@ impl BucketTargetSys {
             secure: target.secure,
             health_check_duration: target.health_check_duration,
             replicate_sync: target.replication_sync,
-            client: Arc::new(S3Client::from_conf(config)),
+            client: Arc::new(client),
         })
     }
 
@@ -1025,6 +1199,18 @@ impl BucketTargetSys {
         let update_mutex = self.target_update_mutex(bucket).await;
         let _update_guard = update_mutex.lock().await;
 
+        self.update_all_targets_locked(bucket, targets).await;
+    }
+
+    /// Builds and publishes one bucket snapshot while its update mutex is held.
+    /// Keeping persisted-config reads under the same mutex prevents a stale
+    /// reload from overwriting a concurrent credential rotation.
+    async fn update_all_targets_locked(&self, bucket: &str, targets: Option<&BucketTargets>) {
+        // Reaching here means the persisted configuration decoded, so the
+        // unreadable marker (if any) is stale. Cleared before the maps below
+        // so `unreadable_targets` stays the outermost of this module's locks.
+        self.unreadable_targets.write().await.remove(bucket);
+
         let mut clients = Vec::new();
         if let Some(new_targets) = targets {
             for target in &new_targets.targets {
@@ -1032,21 +1218,41 @@ impl BucketTargetSys {
             }
         }
 
-        // Lock order: targets_map, then arn_remotes_map, then target_h_mutex,
-        // then ssec_passthrough_map (always last; also taken standalone by the
-        // capability accessors).
+        // Lock order: unreadable_targets (above), then targets_map, then
+        // arn_remotes_map, then target_h_mutex, then ssec_passthrough_map
+        // (always last; also taken standalone by the capability accessors).
         let mut targets_map = self.targets_map.write().await;
         let mut arn_remotes_map = self.arn_remotes_map.write().await;
         let mut health_map = self.target_h_mutex.write().await;
         // Remove existing targets
         if let Some(existing_targets) = targets_map.remove(bucket) {
             let mut ssec_map = self.ssec_passthrough_map.write().await;
+            let unchanged_service: HashMap<&str, &BucketTarget> = targets
+                .map(|new_targets| {
+                    new_targets
+                        .targets
+                        .iter()
+                        .map(|target| (target.arn.as_str(), target))
+                        .collect()
+                })
+                .unwrap_or_default();
             for target in existing_targets {
                 arn_remotes_map.remove(&target.arn);
                 health_map.remove(&target.arn);
                 // A rebuilt/edited target may point at a different service:
                 // the SSE-C passthrough verdict must be re-audited from Unknown.
                 ssec_map.remove(&target.arn);
+                // The version-identity verdict survives an edit that keeps the
+                // same remote service (a resync start or a bandwidth change
+                // rewrites the entry in place): forgetting it there would make
+                // the very resync that follows re-drive every object as a
+                // duplicate on a target that mints its own version ids.
+                if unchanged_service
+                    .get(target.arn.as_str())
+                    .is_none_or(|edited| !same_replication_service(edited, &target))
+                {
+                    self.forget_version_identity_capability(&target.arn);
+                }
                 self.update_bandwidth_limit(bucket, &target.arn, 0);
             }
         }
@@ -1056,6 +1262,17 @@ impl BucketTargetSys {
             && !new_targets.is_empty()
         {
             for (target, client) in clients {
+                // Keep a timestamped placeholder for configured targets whose
+                // client cannot be built. Replication records these attempts as
+                // failed, while the placeholder prevents every object from
+                // triggering another metadata reload/client build for five minutes.
+                arn_remotes_map.insert(
+                    target.arn.clone(),
+                    ArnTarget {
+                        client: None,
+                        last_refresh: OffsetDateTime::now_utc(),
+                    },
+                );
                 match client {
                     Ok(client) => {
                         arn_remotes_map.insert(
@@ -1068,11 +1285,6 @@ impl BucketTargetSys {
                         health_map.insert(client.arn.clone(), target_health(&client));
                         self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
                     }
-                    // The target stays in `targets_map`, so it keeps showing up in
-                    // `bucket remote ls` while no client exists to replicate through it —
-                    // replication then drops every object for this ARN. Without this the
-                    // rejection (loopback endpoint, bad CA, unparseable URL) left no trace
-                    // anywhere.
                     Err(err) => warn!(
                         bucket = %bucket,
                         arn = %target.arn,
@@ -1087,6 +1299,11 @@ impl BucketTargetSys {
     }
 
     pub async fn set(&self, bucket: &str, meta: &BucketMetadata) {
+        if meta.bucket_targets_unreadable() {
+            self.mark_targets_unreadable(bucket).await;
+            return;
+        }
+
         let Some(config) = &meta.bucket_target_config else {
             return;
         };
@@ -1104,25 +1321,27 @@ impl BucketTargetSys {
             return (String::new(), false);
         };
 
-        {
-            let targets_map = self.targets_map.read().await;
-            if let Some(targets) = targets_map.get(bucket) {
-                for tgt in targets {
-                    if tgt.target_type == target.target_type
-                        && tgt.target_bucket == target.target_bucket
-                        && target.endpoint == tgt.endpoint
-                        && tgt
-                            .credentials
-                            .as_ref()
-                            .map(|c| {
-                                let default_creds = Credentials::default();
-                                c.access_key == target.credentials.as_ref().unwrap_or(&default_creds).access_key
-                            })
-                            .unwrap_or(false)
-                    {
-                        return (tgt.arn.clone(), true);
-                    }
-                }
+        let targets_map = self.targets_map.read().await;
+        let targets = targets_map.get(bucket).map(Vec::as_slice).unwrap_or_default();
+        Self::remote_arn_for_targets(targets, target, depl_id)
+    }
+
+    /// Resolve create idempotency against the snapshot the caller will persist.
+    pub fn remote_arn_for_targets(targets: &[BucketTarget], target: &BucketTarget, depl_id: &str) -> (String, bool) {
+        for tgt in targets {
+            if tgt.target_type == target.target_type
+                && tgt.target_bucket == target.target_bucket
+                && target.endpoint == tgt.endpoint
+                && tgt
+                    .credentials
+                    .as_ref()
+                    .map(|c| {
+                        let default_creds = Credentials::default();
+                        c.access_key == target.credentials.as_ref().unwrap_or(&default_creds).access_key
+                    })
+                    .unwrap_or(false)
+            {
+                return (tgt.arn.clone(), true);
             }
         }
 
@@ -1131,308 +1350,6 @@ impl BucketTargetSys {
         }
         let arn = generate_arn(target, depl_id);
         (arn, false)
-    }
-}
-
-#[derive(Debug)]
-struct AcceptAnyServerCertVerifier;
-
-impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCertVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls_pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
-        _server_name: &rustls_pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls_pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls_pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls_pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-#[derive(Clone)]
-struct TargetHyperHttpConnector<C> {
-    client: HyperClient<C, SdkBody>,
-}
-
-impl<C> fmt::Debug for TargetHyperHttpConnector<C> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TargetHyperHttpConnector")
-            .field("client", &"** hyper client **")
-            .finish()
-    }
-}
-
-impl<C> SmithyHttpConnector for TargetHyperHttpConnector<C>
-where
-    C: Clone + Send + Sync + 'static,
-    C: Service<Uri>,
-    C::Response:
-        hyper::rt::Read + hyper::rt::Write + hyper_util::client::legacy::connect::Connection + Send + Sync + Unpin + 'static,
-    C::Future: Unpin + Send + 'static,
-    C::Error: Into<BoxError>,
-{
-    fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-        let request = match request.try_into_http1x() {
-            Ok(request) => request,
-            Err(err) => return HttpConnectorFuture::ready(Err(ConnectorError::user(err.into()))),
-        };
-
-        let mut client = self.client.clone();
-        let fut = client.call(request);
-        HttpConnectorFuture::new(async move {
-            let response = fut
-                .await
-                .map_err(|err| ConnectorError::io(err.into()))?
-                .map(SdkBody::from_body_1_x);
-            HttpResponse::try_from(response).map_err(|err| ConnectorError::other(err.into(), None))
-        })
-    }
-}
-
-fn ensure_rustls_crypto_provider() {
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    }
-}
-
-fn has_custom_ca_pem(target: &BucketTarget) -> bool {
-    !target.ca_cert_pem.trim().is_empty()
-}
-
-/// Env opt-in that re-enables loopback replication targets. Loopback (`127.0.0.1`,
-/// `::1`, `localhost`) is a classic SSRF vector and stays rejected by default, but
-/// single-host multi-instance dev setups and the e2e harness legitimately replicate
-/// over loopback. Never set this in production.
-const ALLOW_LOOPBACK_REPLICATION_TARGET_ENV: &str = "RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET";
-
-fn loopback_replication_targets_allowed() -> bool {
-    std::env::var(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV)
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false)
-}
-
-fn validate_replication_target_endpoint(url: &Url) -> Result<(), OutboundUrlError> {
-    validate_replication_target_endpoint_inner(url, loopback_replication_targets_allowed())
-}
-
-fn validate_replication_target_endpoint_inner(url: &Url, allow_loopback: bool) -> Result<(), OutboundUrlError> {
-    match validate_outbound_url(url) {
-        Ok(()) => Ok(()),
-        // Replication targets are trusted infrastructure the operator configures, and
-        // legitimately live on private networks, so private addresses are always allowed.
-        Err(OutboundUrlError::ForbiddenHost {
-            reason: "private address",
-            ..
-        }) => Ok(()),
-        // Loopback is far higher SSRF risk, so it is allowed only under the explicit,
-        // off-by-default opt-in above (single-host multi-instance / the e2e harness).
-        Err(OutboundUrlError::ForbiddenHost {
-            reason: "loopback address" | "loopback host",
-            ..
-        }) if allow_loopback => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
-fn build_insecure_aws_s3_http_client() -> SharedHttpClient {
-    ensure_rustls_crypto_provider();
-
-    let tls_config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCertVerifier))
-        .with_no_client_auth();
-
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls_config)
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .build();
-    let mut client_builder = HyperClient::builder(TokioExecutor::new());
-    client_builder.pool_timer(TokioTimer::new());
-    let client = client_builder.build(https);
-    let connector = SharedHttpConnector::new(TargetHyperHttpConnector { client });
-
-    http_client_fn(move |_settings, _components| connector.clone())
-}
-
-fn validate_ca_pem_bundle(ca_cert_pem: &[u8]) -> Result<(), String> {
-    let certs = rustls_pki_types::CertificateDer::pem_slice_iter(ca_cert_pem)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| format!("invalid PEM encoding: {err}"))?;
-
-    if certs.is_empty() {
-        return Err("no certificates found".to_string());
-    }
-
-    // Smithy's rustls adapter defers parsing custom certificates and assumes
-    // they are valid when the HTTPS connector is built. Validate every DER
-    // certificate first so malformed configuration is reported rather than
-    // reaching an `expect` in the dependency.
-    let mut validation_store = rustls::RootCertStore::empty();
-    for cert in certs {
-        validation_store
-            .add(cert)
-            .map_err(|err| format!("invalid X.509 certificate: {err}"))?;
-    }
-
-    Ok(())
-}
-
-fn validate_target_ca_pem(ca_cert_pem: &str) -> Result<(), BucketTargetError> {
-    validate_ca_pem_bundle(ca_cert_pem.as_bytes())
-        .map_err(|err| BucketTargetError::Io(std::io::Error::other(format!("invalid target CA PEM: {err}"))))
-}
-
-fn compose_replication_trust_store(certificate_bundles: impl IntoIterator<Item = Vec<u8>>) -> (smithy_tls::TrustStore, usize) {
-    // `TrustStore::default()` keeps the platform-native roots enabled. Target
-    // and RUSTFS_TLS_PATH certificates extend that baseline instead of
-    // replacing it with a target-specific trust island.
-    let mut trust_store = smithy_tls::TrustStore::default();
-    let mut custom_bundle_count = 0;
-    for pem in certificate_bundles {
-        trust_store.add_pem_certificate(pem);
-        custom_bundle_count += 1;
-    }
-
-    (trust_store, custom_bundle_count)
-}
-
-fn build_aws_s3_http_client_with_trust_store(trust_store: smithy_tls::TrustStore) -> Result<SharedHttpClient, BucketTargetError> {
-    let tls_context = smithy_tls::TlsContext::builder()
-        .with_trust_store(trust_store)
-        .build()
-        .map_err(|err| BucketTargetError::Io(std::io::Error::other(format!("invalid target CA PEM: {err}"))))?;
-
-    Ok(SmithyHttpClientBuilder::new()
-        .tls_provider(smithy_tls::Provider::rustls(smithy_tls::rustls_provider::CryptoMode::AwsLc))
-        .tls_context(tls_context)
-        .build_https())
-}
-
-async fn load_tls_path_ca_bundles(tls_dir: &Path, trust_leaf_cert_as_ca: bool) -> Vec<Vec<u8>> {
-    let mut certificate_bundles = Vec::new();
-
-    let ca_path = tls_dir.join(RUSTFS_CA_CERT);
-    match tokio::fs::read(&ca_path).await {
-        Ok(pem) => match validate_ca_pem_bundle(&pem) {
-            Ok(()) => certificate_bundles.push(pem),
-            Err(err) => warn!("ignoring invalid custom CA bundle {:?} for replication client: {}", ca_path, err),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => warn!("failed to read custom CA bundle {:?} for replication client: {}", ca_path, e),
-    }
-
-    if trust_leaf_cert_as_ca {
-        let leaf_cert_path = tls_dir.join(RUSTFS_TLS_CERT);
-        match tokio::fs::read(&leaf_cert_path).await {
-            Ok(pem) => match validate_ca_pem_bundle(&pem) {
-                Ok(()) => certificate_bundles.push(pem),
-                Err(err) => warn!(
-                    "ignoring invalid leaf certificate {:?} for replication client trust store: {}",
-                    leaf_cert_path, err
-                ),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => warn!("failed to read leaf cert {:?} for replication client trust store: {}", leaf_cert_path, e),
-        }
-    }
-
-    certificate_bundles
-}
-
-async fn load_configured_tls_ca_bundles() -> Vec<Vec<u8>> {
-    let tls_path = rustfs_utils::get_env_str(rustfs_config::ENV_RUSTFS_TLS_PATH, rustfs_config::DEFAULT_RUSTFS_TLS_PATH);
-    if tls_path.is_empty() {
-        return Vec::new();
-    }
-
-    load_tls_path_ca_bundles(
-        Path::new(&tls_path),
-        rustfs_utils::get_env_bool(ENV_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_LEAF_CERT_AS_CA),
-    )
-    .await
-}
-
-async fn build_aws_s3_http_client_from_target_ca_pem(ca_cert_pem: &str) -> Result<SharedHttpClient, BucketTargetError> {
-    validate_target_ca_pem(ca_cert_pem)?;
-
-    let mut certificate_bundles = load_configured_tls_ca_bundles().await;
-    certificate_bundles.push(ca_cert_pem.as_bytes().to_vec());
-    let (trust_store, _) = compose_replication_trust_store(certificate_bundles);
-
-    build_aws_s3_http_client_with_trust_store(trust_store)
-}
-
-async fn build_aws_s3_http_client_for_target(target: &BucketTarget) -> Result<Option<SharedHttpClient>, BucketTargetError> {
-    if !target.secure {
-        return Ok(None);
-    }
-
-    if target.skip_tls_verify {
-        return Ok(Some(build_insecure_aws_s3_http_client()));
-    }
-
-    if has_custom_ca_pem(target) {
-        return build_aws_s3_http_client_from_target_ca_pem(&target.ca_cert_pem)
-            .await
-            .map(Some);
-    }
-
-    Ok(build_aws_s3_http_client_from_tls_path().await)
-}
-
-async fn build_aws_s3_http_client_from_tls_path() -> Option<aws_sdk_s3::config::SharedHttpClient> {
-    let certificate_bundles = load_configured_tls_ca_bundles().await;
-    if certificate_bundles.is_empty() {
-        return None;
-    }
-
-    let (trust_store, _) = compose_replication_trust_store(certificate_bundles);
-    match build_aws_s3_http_client_with_trust_store(trust_store) {
-        Ok(client) => Some(client),
-        Err(e) => {
-            warn!("failed to build AWS SDK TLS context for replication client: {}", e);
-            None
-        }
-    }
-}
-
-fn should_force_path_style(target: &BucketTarget) -> bool {
-    match target.path.trim().to_ascii_lowercase().as_str() {
-        // Explicit DNS/virtual-hosted-style requested by user.
-        "dns" | "off" | "false" => false,
-        // Explicit path-style or legacy boolean-like values.
-        "path" | "on" | "true" => true,
-        // `auto` and empty are defaulted to path-style for custom S3-compatible endpoints.
-        "auto" | "" => true,
-        // Unknown values: prefer compatibility with S3-compatible services.
-        _ => true,
     }
 }
 
@@ -1452,6 +1369,7 @@ fn generate_arn(t: &BucketTarget, depl_id: &str) -> String {
     arn.to_string()
 }
 
+#[derive(Debug, Clone)]
 pub struct RemoveObjectOptions {
     pub force_delete: bool,
     pub governance_bypass: bool,
@@ -1507,7 +1425,12 @@ fn build_remove_object_headers(version_id: Option<&str>, opts: &RemoveObjectOpti
 /// and silently creates a delete marker instead of removing the version, while
 /// the source stamps `VersionPurgeStatus=Complete` (backlog#799 B8 / #857).
 /// Non-replication callers always pass the version through unchanged.
-fn resolve_delete_api_version_id(version_id: Option<String>, opts: &RemoveObjectOptions) -> Option<String> {
+/// The `versionId` a replicated DELETE puts on the wire: none for a
+/// delete-marker creation (the target mints the marker; the source version
+/// travels in the internal headers for RustFS peers), the addressed version
+/// otherwise. A generic S3 target given the version id on a marker-creation
+/// DELETE would permanently delete that version instead.
+pub fn resolve_delete_api_version_id(version_id: Option<String>, opts: &RemoveObjectOptions) -> Option<String> {
     if opts.replication_request && opts.replication_delete_marker {
         None
     } else {
@@ -1613,6 +1536,36 @@ impl Default for AdvancedPutOptions {
             replication_validity_check: false,
         }
     }
+}
+
+/// Decide how a replication PUT satisfies the Object Lock integrity rule from
+/// the headers it is about to send (the pure decision lives in the replication crate, re-exported through the replication boundary).
+fn object_lock_put_integrity_for(headers: &HeaderMap, opts: &PutObjectOptions) -> ObjectLockIntegrity {
+    let lock_params = opts.mode.is_some() || opts.retain_until_date.unix_timestamp() != 0 || opts.legalhold.is_some();
+    let has_integrity_header = headers.keys().any(|name| {
+        let name = name.as_str();
+        name.starts_with("x-amz-checksum-") || name == "x-amz-sdk-checksum-algorithm" || name == "content-md5"
+    });
+    let plaintext_end_to_end = !headers.contains_key("x-amz-server-side-encryption")
+        && !headers.contains_key("x-amz-server-side-encryption-customer-algorithm")
+        && !rustfs_utils::http::has_ssec_transport_headers(headers);
+    object_lock_put_integrity(
+        lock_params,
+        has_integrity_header,
+        plaintext_end_to_end,
+        Some(opts.internal.source_etag.as_str()),
+    )
+}
+
+/// The subset of the target's PutObject response replication audits.
+#[derive(Debug, Clone)]
+pub struct RemotePutObjectResponse {
+    /// Version id the target assigned (`x-amz-version-id`).
+    pub version_id: Option<String>,
+    /// ETag of what the target stored; `None` when the target withheld it or
+    /// when its encryption mode (SSE-KMS / SSE-C) makes it incomparable to
+    /// the source ETag. `None` is therefore "not decidable", never evidence.
+    pub etag: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1774,6 +1727,22 @@ impl PutObjectOptions {
             Self::insert_checked(&mut header, AMZ_BUCKET_REPLICATION_STATUS, self.internal.replication_status.as_str());
         }
 
+        // MinIO PutObjectOptions.Header parity: object tags travel on the
+        // `x-amz-tagging` header (form-urlencoded). `replication_put_object_options`
+        // fills `user_tags` from the source version; without this header the
+        // whole-object transport delivered a tagless replica, so tag edits
+        // never reached the peer and the receiver-side LWW comparison
+        // (rustfs/backlog#1953) had nothing to judge.
+        if !self.user_tags.is_empty() {
+            let mut tags: Vec<(&String, &String)> = self.user_tags.iter().collect();
+            tags.sort();
+            let mut encoded = url::form_urlencoded::Serializer::new(String::new());
+            for (key, value) in tags {
+                encoded.append_pair(key, value);
+            }
+            Self::insert_checked(&mut header, AMZ_OBJECT_TAGGING_LOWER, &encoded.finish());
+        }
+
         for (k, v) in &self.user_metadata {
             let Ok(header_value) = HeaderValue::from_str(v) else {
                 warn!("skipping user metadata header with invalid value: {}", k);
@@ -1924,6 +1893,13 @@ pub struct TargetClient {
 }
 
 impl TargetClient {
+    fn credentials_expired_at(&self, now: jiff::Timestamp) -> bool {
+        self.credentials
+            .as_ref()
+            .and_then(Credentials::effective_expiration)
+            .is_some_and(|expiration| expiration <= now)
+    }
+
     pub fn to_url(&self) -> Url {
         Url::parse(&self.endpoint).unwrap()
     }
@@ -2002,6 +1978,125 @@ impl TargetClient {
                 }
                 Result::<_, std::convert::Infallible>::Ok(req)
             })
+            .send()
+            .await
+            .map_err(Box::new)
+    }
+
+    /// Candidate replicas by content identity on a target that mints its own
+    /// version ids: page `ListObjectVersions` under the exact key and report
+    /// the live versions whose ETag matches `source_etag`, newest first.
+    /// Delete markers and prefix siblings never match. Bounded to
+    /// [`FIND_VERSION_BY_ETAG_MAX_PAGES`] pages and
+    /// [`FIND_VERSION_BY_ETAG_MAX_MATCHES`] candidates so a key with a very
+    /// deep history cannot turn one convergence check into an unbounded scan;
+    /// a replica beyond that window reads as missing, which only costs a
+    /// re-PUT (today's behaviour), never a lost object.
+    ///
+    /// Content identity is not version identity: two source generations with
+    /// the same bytes have the same ETag. Callers drop the candidates other
+    /// source versions already claim through their ledgers and refuse an
+    /// [`ReplicaLocation::Ambiguous`] remainder before mutating or deleting.
+    pub async fn replica_candidates_by_etag(
+        &self,
+        bucket: &str,
+        object: &str,
+        source_etag: &str,
+    ) -> Result<Vec<String>, Box<SdkError<aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError>>> {
+        let mut key_marker: Option<String> = None;
+        let mut version_id_marker: Option<String> = None;
+        let mut matches: Vec<String> = Vec::new();
+        for _ in 0..FIND_VERSION_BY_ETAG_MAX_PAGES {
+            let page = self
+                .client
+                .list_object_versions()
+                .bucket(bucket)
+                .prefix(object)
+                .max_keys(FIND_VERSION_BY_ETAG_PAGE_SIZE)
+                .set_key_marker(key_marker.take())
+                .set_version_id_marker(version_id_marker.take())
+                .send()
+                .await
+                .map_err(Box::new)?;
+            matches.extend(
+                page.versions()
+                    .iter()
+                    .filter(|version| {
+                        version.key() == Some(object)
+                            && version.version_id().is_some_and(|id| !id.is_empty())
+                            && replication_etags_match(Some(source_etag), version.e_tag())
+                    })
+                    .filter_map(|version| version.version_id().map(str::to_string)),
+            );
+            // A listing that moved past the exact key (every listed key is >=
+            // the prefix), ended, or already filled the candidate cap decides.
+            if matches.len() >= FIND_VERSION_BY_ETAG_MAX_MATCHES
+                || page
+                    .versions()
+                    .iter()
+                    .any(|version| version.key().is_some_and(|key| key > object))
+                || !page.is_truncated().unwrap_or(false)
+            {
+                break;
+            }
+            key_marker = page.next_key_marker().map(str::to_string);
+            version_id_marker = page.next_version_id_marker().map(str::to_string);
+            if key_marker.is_none() {
+                break;
+            }
+        }
+        matches.truncate(FIND_VERSION_BY_ETAG_MAX_MATCHES);
+        Ok(matches)
+    }
+
+    /// PutObjectRetention against a replica version on a target that does not
+    /// take retention through the replication PUT's own headers (it mints its
+    /// own version ids, so a re-PUT would create another version instead of
+    /// updating this one). Anti-loop marker always added.
+    pub async fn put_object_retention(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        mode: ObjectLockRetentionMode,
+        retain_until: aws_sdk_s3::primitives::DateTime,
+    ) -> Result<PutObjectRetentionOutput, Box<SdkError<PutObjectRetentionError>>> {
+        let headers = proxy_outbound_headers(HeaderMap::new());
+        self.client
+            .put_object_retention()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(resolve_read_api_version_id(version_id))
+            .retention(
+                ObjectLockRetention::builder()
+                    .mode(mode)
+                    .retain_until_date(retain_until)
+                    .build(),
+            )
+            .customize()
+            .map_request(move |req| apply_extra_headers(req, &headers))
+            .send()
+            .await
+            .map_err(Box::new)
+    }
+
+    /// PutObjectLegalHold counterpart of [`Self::put_object_retention`].
+    pub async fn put_object_legal_hold(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        status: ObjectLockLegalHoldStatus,
+    ) -> Result<PutObjectLegalHoldOutput, Box<SdkError<PutObjectLegalHoldError>>> {
+        let headers = proxy_outbound_headers(HeaderMap::new());
+        self.client
+            .put_object_legal_hold()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(resolve_read_api_version_id(version_id))
+            .legal_hold(ObjectLockLegalHold::builder().status(status).build())
+            .customize()
+            .map_request(move |req| apply_extra_headers(req, &headers))
             .send()
             .await
             .map_err(Box::new)
@@ -2137,7 +2232,9 @@ impl TargetClient {
 
     /// On success returns the version id the target assigned (from
     /// `x-amz-version-id`), letting callers audit the version-identity
-    /// contract — a target that adopts the source version echoes it back.
+    /// contract — a target that adopts the source version echoes it back —
+    /// together with the ETag of what the target actually stored, so callers
+    /// can detect a target that persisted transformed bytes (#6853).
     pub async fn put_object(
         &self,
         bucket: &str,
@@ -2145,10 +2242,10 @@ impl TargetClient {
         size: i64,
         body: ByteStream,
         opts: &PutObjectOptions,
-    ) -> Result<Option<String>, S3ClientError> {
+    ) -> Result<RemotePutObjectResponse, S3ClientError> {
         let mut headers = opts.header();
 
-        let builder = self.client.put_object();
+        let mut builder = self.client.put_object();
 
         let version_id = opts.internal.source_version_id.clone();
         if !version_id.is_empty() {
@@ -2156,7 +2253,36 @@ impl TargetClient {
         }
         let api_version_id = resolve_put_api_version_id(&version_id).map(ToOwned::to_owned);
 
-        match builder
+        // A PUT carrying Object Lock parameters must also carry Content-MD5 or
+        // an x-amz-checksum-* header on AWS-compatible targets (rustfs#7082).
+        // The plain-payload default (rustfs#6853) sends neither, so supply one
+        // here: the source ETag when it is the MD5 of the wire bytes, else an
+        // SDK-computed checksum.
+        match object_lock_put_integrity_for(&headers, opts) {
+            ObjectLockIntegrity::NotRequired => {}
+            ObjectLockIntegrity::ContentMd5Hex(md5_hex) => {
+                let digest = hex_simd::decode_to_vec(md5_hex.as_bytes())
+                    .map_err(|err| S3ClientError::new(format!("source etag is not hex: {err}")))?;
+                let encoded = base64_simd::STANDARD.encode_to_string(digest);
+                headers.insert(
+                    http::header::HeaderName::from_static("content-md5"),
+                    HeaderValue::from_str(&encoded).map_err(|err| S3ClientError::new(format!("invalid Content-MD5: {err}")))?,
+                );
+            }
+            ObjectLockIntegrity::SdkChecksum => {
+                builder = builder.checksum_algorithm(ChecksumAlgorithm::Crc32);
+            }
+        }
+
+        // A forwarded source checksum is this PUT's integrity header. In
+        // streaming-checksum mode (`RUSTFS_REPLICATION_STREAMING_CHECKSUMS`)
+        // the SDK would still add its default CRC32 trailer, and a target that
+        // receives both keeps the trailer's algorithm: a forwarded SHA256
+        // vanished from the replica while the source reported COMPLETED. Pin
+        // this request to WhenRequired so nothing is sent beside the source's
+        // own checksum.
+        let forwards_source_checksum = headers.keys().any(|name| name.as_str().starts_with("x-amz-checksum-"));
+        let mut operation = builder
             .bucket(bucket)
             .key(object)
             .content_length(size)
@@ -2176,11 +2302,33 @@ impl TargetClient {
                 }
 
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
-            })
-            .send()
-            .await
-        {
-            Ok(output) => Ok(output.version_id().map(ToOwned::to_owned)),
+            });
+        if forwards_source_checksum {
+            operation = operation.config_override(
+                aws_sdk_s3::config::Builder::new()
+                    .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired),
+            );
+        }
+        match operation.send().await {
+            Ok(output) => {
+                // Under SSE-KMS/DSSE or SSE-C the target's ETag is not the MD5
+                // of the stored plaintext, so it cannot be compared against the
+                // source ETag; withhold it rather than let a caller conclude
+                // corruption from an opaque value.
+                let etag_comparable = output.sse_customer_algorithm().is_none()
+                    && !matches!(
+                        output.server_side_encryption(),
+                        Some(ServerSideEncryption::AwsKms) | Some(ServerSideEncryption::AwsKmsDsse)
+                    );
+                Ok(RemotePutObjectResponse {
+                    version_id: output.version_id().map(ToOwned::to_owned),
+                    etag: if etag_comparable {
+                        output.e_tag().map(ToOwned::to_owned)
+                    } else {
+                        None
+                    },
+                })
+            }
             Err(e) => match e {
                 SdkError::ServiceError(service_err) => {
                     let err = service_err.into_err();
@@ -2328,6 +2476,21 @@ impl TargetClient {
         }
     }
 
+    pub async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str) -> Result<(), S3ClientError> {
+        match self
+            .client
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(object)
+            .upload_id(upload_id)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub async fn remove_object(
         &self,
         bucket: &str,
@@ -2390,9 +2553,55 @@ impl TargetClient {
     }
 }
 
+/// Where a replica stands on a target that mints its own version ids, by
+/// content identity (exact key + ETag) after the candidates other source
+/// versions claim were removed. See
+/// [`TargetClient::replica_candidates_by_etag`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplicaLocation {
+    /// No live version under the key carries the source ETag.
+    Missing,
+    /// Exactly one live version carries it: safe to address.
+    Unique(String),
+    /// More than one live version carries it (same bytes replicated for
+    /// several source generations). `newest` is the most recently listed
+    /// one — good enough to prove the replica exists, never good enough to
+    /// pick which one to mutate or delete.
+    Ambiguous { newest: String },
+}
+
+impl ReplicaLocation {
+    /// `matches` newest first, as the target listed them.
+    pub fn from_matches(mut matches: Vec<String>) -> Self {
+        match matches.len() {
+            0 => Self::Missing,
+            1 => Self::Unique(matches.remove(0)),
+            _ => Self::Ambiguous {
+                newest: matches.remove(0),
+            },
+        }
+    }
+
+    /// The version to read for existence/ETag checks, where an ambiguous
+    /// match is still a located replica.
+    pub fn any_version_id(&self) -> Option<&str> {
+        match self {
+            Self::Missing => None,
+            Self::Unique(version_id) | Self::Ambiguous { newest: version_id } => Some(version_id),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum BucketTargetError {
     BucketRemoteTargetNotFound {
+        bucket: String,
+    },
+    /// The bucket's persisted targets configuration exists but cannot be
+    /// decoded. Distinct from `BucketRemoteTargetNotFound`, which means the
+    /// bucket genuinely has no targets: callers must not degrade this one to
+    /// an empty target set (rustfs/backlog#2282).
+    BucketRemoteTargetsUnreadable {
         bucket: String,
     },
     BucketRemoteArnTypeInvalid {
@@ -2427,6 +2636,9 @@ impl fmt::Display for BucketTargetError {
         match self {
             BucketTargetError::BucketRemoteTargetNotFound { bucket } => {
                 write!(f, "Remote target not found for bucket: {bucket}")
+            }
+            BucketTargetError::BucketRemoteTargetsUnreadable { bucket } => {
+                write!(f, "Persisted replication target configuration is unreadable for bucket: {bucket}")
             }
             BucketTargetError::BucketRemoteArnTypeInvalid { bucket } => {
                 write!(f, "Invalid ARN type for bucket: {bucket}")
@@ -2472,7 +2684,37 @@ impl Error for BucketTargetError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::remote_s3_client::{
+        EXPIRED_REMOTE_TARGET_CREDENTIALS, RemoteS3RetryPolicy, RemoteTargetCredentialsProvider,
+        build_aws_s3_http_client_for_spec, build_aws_s3_http_client_from_target_ca_pem,
+        build_aws_s3_http_client_with_trust_store, build_insecure_aws_s3_http_client, compose_replication_trust_store,
+        ensure_rustls_crypto_provider, load_tls_path_ca_bundles, remote_sdk_credentials,
+        replication_request_checksum_calculation, validate_remote_endpoint_inner, validate_target_ca_pem,
+    };
+    use aws_credential_types::Credentials as SdkCredentials;
+    use aws_sdk_s3::Config as S3Config;
+    use aws_sdk_s3::config::{Region as SdkRegion, RequestChecksumCalculation, SharedCredentialsProvider, SharedHttpClient};
+    use aws_smithy_runtime_api::client::http::{
+        HttpConnector as SmithyHttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn,
+    };
+    use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+    use aws_smithy_types::body::SdkBody;
     use rcgen::generate_simple_self_signed;
+    use rustfs_config::{RUSTFS_CA_CERT, RUSTFS_TLS_CERT};
+    use rustfs_utils::egress::OutboundUrlError;
+    use rustfs_utils::http::AMZ_SERVER_SIDE_ENCRYPTION;
+
+    // The startup panic fix for hosts without a CA bundle (issue #6734) rests
+    // on two properties: the health-check client constructor never panics, and
+    // its degraded fallback — an explicit empty trust store — always builds.
+    #[test]
+    fn health_check_client_construction_never_panics() {
+        let _ = build_health_check_client();
+        HttpClient::builder()
+            .tls_certs_only(std::iter::empty::<reqwest::Certificate>())
+            .build()
+            .expect("empty-trust-store client build must succeed without touching system roots");
+    }
 
     #[derive(Clone, Debug)]
     struct RecordingHttpConnector {
@@ -2487,6 +2729,361 @@ mod tests {
                 .push(request.uri().to_string());
             HttpConnectorFuture::ready(Ok(HttpResponse::new(
                 aws_smithy_runtime_api::http::StatusCode::try_from(204_u16).expect("204 should be a valid response status"),
+                SdkBody::empty(),
+            )))
+        }
+    }
+
+    type RecordedHeaders = Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>;
+
+    /// Records full request headers and answers with canned response headers,
+    /// for asserting wire framing and response parsing.
+    #[derive(Clone, Debug)]
+    struct RecordingHeaderConnector {
+        request_headers: RecordedHeaders,
+        response_headers: Vec<(String, String)>,
+    }
+
+    impl SmithyHttpConnector for RecordingHeaderConnector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            self.request_headers
+                .lock()
+                .expect("recorded header lock should not be poisoned")
+                .push(
+                    request
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                );
+            let mut response = HttpResponse::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(200_u16).expect("200 should be a valid response status"),
+                SdkBody::empty(),
+            );
+            for (name, value) in &self.response_headers {
+                response.headers_mut().insert(name.clone(), value.clone());
+            }
+            HttpConnectorFuture::ready(Ok(response))
+        }
+    }
+
+    fn header_recording_target_client(response_headers: Vec<(String, String)>) -> (TargetClient, RecordedHeaders) {
+        header_recording_target_client_with_checksums(response_headers, replication_request_checksum_calculation())
+    }
+
+    fn header_recording_target_client_with_checksums(
+        response_headers: Vec<(String, String)>,
+        checksums: RequestChecksumCalculation,
+    ) -> (TargetClient, RecordedHeaders) {
+        let request_headers: RecordedHeaders = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connector = SharedHttpConnector::new(RecordingHeaderConnector {
+            request_headers: Arc::clone(&request_headers),
+            response_headers,
+        });
+        let http_client = http_client_fn(move |_settings, _components| connector.clone());
+        let client =
+            s3_client_for_endpoint_test_with_checksums("https://localhost:443".to_string(), Some(http_client), checksums);
+        (
+            TargetClient {
+                endpoint: "https://localhost:443".to_string(),
+                credentials: None,
+                bucket: "target-bucket".to_string(),
+                storage_class: String::new(),
+                disable_proxy: false,
+                arn: "arn:rustfs:replication:us-east-1:target:bucket".to_string(),
+                reset_id: String::new(),
+                secure: true,
+                health_check_duration: Duration::from_secs(5),
+                replicate_sync: false,
+                client: Arc::new(client),
+            },
+            request_headers,
+        )
+    }
+
+    fn streaming_test_body(payload: &'static [u8]) -> ByteStream {
+        let stream = tokio_util::io::ReaderStream::new(std::io::Cursor::new(payload));
+        let body = http_body_util::StreamBody::new(futures::StreamExt::map(stream, |r| r.map(http_body::Frame::data)));
+        ByteStream::new(SdkBody::from_body_1_x(body))
+    }
+
+    #[test]
+    fn replication_checksums_default_to_plain_payloads() {
+        assert!(matches!(
+            replication_request_checksum_calculation(),
+            RequestChecksumCalculation::WhenRequired
+        ));
+    }
+
+    #[tokio::test]
+    async fn replication_put_object_sends_plain_signed_payloads_by_default() {
+        let (client, recorded) = header_recording_target_client(Vec::new());
+        client
+            .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &PutObjectOptions::default())
+            .await
+            .expect("recorded put_object should succeed");
+
+        let recorded = recorded.lock().expect("recorded header lock should not be poisoned");
+        let headers = &recorded[0];
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        };
+        // The #6853 regression shape: trailer checksums force aws-chunked
+        // framing, which a non-decoding target stores verbatim as the object.
+        assert_eq!(header("x-amz-trailer"), None, "streaming uploads must not carry a trailer checksum");
+        assert!(
+            header("content-encoding").is_none_or(|v| !v.contains("aws-chunked")),
+            "streaming uploads must not be aws-chunked framed"
+        );
+        assert_eq!(header("x-amz-decoded-content-length"), None);
+        assert_eq!(header("content-length"), Some("4"));
+    }
+
+    fn recorded_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn locked_put_options(source_etag: &str) -> PutObjectOptions {
+        PutObjectOptions {
+            mode: Some(ObjectLockRetentionMode::Governance),
+            retain_until_date: OffsetDateTime::from_unix_timestamp(4_102_444_800).expect("valid timestamp"),
+            internal: AdvancedPutOptions {
+                source_etag: source_etag.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// rustfs#7082: a locked PUT of a plaintext single-part object carries a
+    /// Content-MD5 derived from the source ETag, still as a plain payload.
+    #[tokio::test]
+    async fn locked_put_object_carries_content_md5_from_the_source_etag() {
+        let (client, recorded) = header_recording_target_client(Vec::new());
+        client
+            .put_object(
+                "target-bucket",
+                "object",
+                4,
+                streaming_test_body(b"data"),
+                &locked_put_options("\"8d777f385d3dfec8815d20f7496026dc\""),
+            )
+            .await
+            .expect("recorded put_object should succeed");
+
+        let recorded = recorded.lock().expect("recorded header lock should not be poisoned");
+        let headers = &recorded[0];
+        // base64 of the MD5 bytes of "data".
+        assert_eq!(recorded_header(headers, "content-md5"), Some("jXd/OF09/siBXSD3SWAm3A=="));
+        assert_eq!(recorded_header(headers, "x-amz-object-lock-mode"), Some("GOVERNANCE"));
+        assert_eq!(
+            recorded_header(headers, "x-amz-trailer"),
+            None,
+            "Content-MD5 must not change the payload framing"
+        );
+        assert!(
+            recorded_header(headers, "content-encoding").is_none_or(|v| !v.contains("aws-chunked")),
+            "locked uploads stay plain signed payloads"
+        );
+        assert_eq!(recorded_header(headers, "content-length"), Some("4"));
+    }
+
+    /// A legal hold is an Object Lock parameter too.
+    #[tokio::test]
+    async fn legal_hold_put_object_carries_content_md5() {
+        let (client, recorded) = header_recording_target_client(Vec::new());
+        let opts = PutObjectOptions {
+            legalhold: Some(ObjectLockLegalHoldStatus::On),
+            internal: AdvancedPutOptions {
+                source_etag: "8d777f385d3dfec8815d20f7496026dc".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        client
+            .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &opts)
+            .await
+            .expect("recorded put_object should succeed");
+        let recorded = recorded.lock().expect("recorded header lock should not be poisoned");
+        assert_eq!(recorded_header(&recorded[0], "content-md5"), Some("jXd/OF09/siBXSD3SWAm3A=="));
+        assert_eq!(recorded_header(&recorded[0], "x-amz-object-lock-legal-hold"), Some("ON"));
+    }
+
+    /// When the source ETag is not the MD5 of the wire bytes (multipart
+    /// layout, or an encrypted object) the SDK computes the checksum instead;
+    /// with a streaming body that is a CRC32 trailer.
+    #[tokio::test]
+    async fn locked_put_object_without_a_usable_etag_uses_an_sdk_checksum() {
+        for (label, opts) in [
+            ("multipart etag", locked_put_options("8d777f385d3dfec8815d20f7496026dc-3")),
+            ("managed sse", {
+                let mut opts = locked_put_options("8d777f385d3dfec8815d20f7496026dc");
+                opts.user_metadata
+                    .insert(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "AES256".to_string());
+                opts
+            }),
+        ] {
+            let (client, recorded) = header_recording_target_client(Vec::new());
+            client
+                .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &opts)
+                .await
+                .expect("recorded put_object should succeed");
+            let recorded = recorded.lock().expect("recorded header lock should not be poisoned");
+            let headers = &recorded[0];
+            assert_eq!(
+                recorded_header(headers, "content-md5"),
+                None,
+                "{label}: the source etag is not the wire MD5"
+            );
+            assert!(
+                recorded_header(headers, "x-amz-sdk-checksum-algorithm").is_some_and(|v| v.eq_ignore_ascii_case("CRC32"))
+                    || recorded_header(headers, "x-amz-checksum-crc32").is_some(),
+                "{label}: the SDK must announce a CRC32 checksum; headers: {headers:?}"
+            );
+        }
+    }
+
+    /// With streaming checksums enabled the SDK adds a CRC32 trailer to every
+    /// upload. A PUT that forwards the source's checksum must not get that
+    /// second algorithm: a target that receives both keeps the trailer's and
+    /// the forwarded SHA256 never reaches the replica (rustfs/backlog#2340).
+    #[tokio::test]
+    async fn streaming_put_object_with_forwarded_checksum_sends_no_sdk_checksum() {
+        let (client, recorded) =
+            header_recording_target_client_with_checksums(Vec::new(), RequestChecksumCalculation::WhenSupported);
+        let mut forwarded = PutObjectOptions::default();
+        forwarded.user_metadata.insert(
+            "x-amz-checksum-sha256".to_string(),
+            "OoJ3yNhRwv3wwtZoGqEIPrPX9xwTnfLl+ka0wStN1g0=".to_string(),
+        );
+        client
+            .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &forwarded)
+            .await
+            .expect("recorded put_object should succeed");
+        client
+            .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &PutObjectOptions::default())
+            .await
+            .expect("recorded put_object should succeed");
+        let recorded = recorded.lock().expect("recorded header lock should not be poisoned");
+        let with_forwarded = &recorded[0];
+        assert_eq!(
+            recorded_header(with_forwarded, "x-amz-checksum-sha256"),
+            Some("OoJ3yNhRwv3wwtZoGqEIPrPX9xwTnfLl+ka0wStN1g0=")
+        );
+        assert_eq!(
+            recorded_header(with_forwarded, "x-amz-trailer"),
+            None,
+            "the SDK must not add a trailer checksum"
+        );
+        assert_eq!(recorded_header(with_forwarded, "x-amz-sdk-checksum-algorithm"), None);
+        // Control: the same client still streams a trailer when nothing is forwarded.
+        let without_forwarded = &recorded[1];
+        assert!(
+            recorded_header(without_forwarded, "x-amz-trailer").is_some(),
+            "streaming mode must still apply to uploads without a forwarded checksum: {without_forwarded:?}"
+        );
+    }
+
+    /// A forwarded source checksum already satisfies the rule; nothing is added.
+    #[tokio::test]
+    async fn locked_put_object_keeps_a_forwarded_source_checksum() {
+        let (client, recorded) = header_recording_target_client(Vec::new());
+        let mut opts = locked_put_options("8d777f385d3dfec8815d20f7496026dc");
+        opts.user_metadata
+            .insert("x-amz-checksum-crc32".to_string(), "rfPzYw==".to_string());
+        client
+            .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &opts)
+            .await
+            .expect("recorded put_object should succeed");
+        let recorded = recorded.lock().expect("recorded header lock should not be poisoned");
+        let headers = &recorded[0];
+        assert_eq!(recorded_header(headers, "x-amz-checksum-crc32"), Some("rfPzYw=="));
+        assert_eq!(recorded_header(headers, "content-md5"), None);
+        assert_eq!(recorded_header(headers, "x-amz-trailer"), None);
+    }
+
+    /// Without Object Lock parameters the plain-payload default is untouched.
+    #[tokio::test]
+    async fn unlocked_put_object_adds_no_integrity_header() {
+        let (client, recorded) = header_recording_target_client(Vec::new());
+        let opts = PutObjectOptions {
+            internal: AdvancedPutOptions {
+                source_etag: "8d777f385d3dfec8815d20f7496026dc".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        client
+            .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &opts)
+            .await
+            .expect("recorded put_object should succeed");
+        let recorded = recorded.lock().expect("recorded header lock should not be poisoned");
+        let headers = &recorded[0];
+        assert_eq!(recorded_header(headers, "content-md5"), None);
+        assert_eq!(recorded_header(headers, "x-amz-trailer"), None);
+        assert_eq!(recorded_header(headers, "x-amz-sdk-checksum-algorithm"), None);
+    }
+
+    #[tokio::test]
+    async fn put_object_returns_the_etag_the_target_stored() {
+        let (client, _) =
+            header_recording_target_client(vec![("etag".to_string(), "\"9a0364b9e99bb480dd25e1f0284c8555\"".to_string())]);
+        let response = client
+            .put_object(
+                "target-bucket",
+                "object",
+                4,
+                ByteStream::from_static(b"data"),
+                &PutObjectOptions::default(),
+            )
+            .await
+            .expect("recorded put_object should succeed");
+        assert_eq!(response.etag.as_deref(), Some("\"9a0364b9e99bb480dd25e1f0284c8555\""));
+    }
+
+    #[tokio::test]
+    async fn put_object_withholds_the_etag_under_target_side_kms() {
+        let (client, _) = header_recording_target_client(vec![
+            ("etag".to_string(), "\"9a0364b9e99bb480dd25e1f0284c8555\"".to_string()),
+            ("x-amz-server-side-encryption".to_string(), "aws:kms".to_string()),
+        ]);
+        let response = client
+            .put_object(
+                "target-bucket",
+                "object",
+                4,
+                ByteStream::from_static(b"data"),
+                &PutObjectOptions::default(),
+            )
+            .await
+            .expect("recorded put_object should succeed");
+        assert!(
+            response.etag.is_none(),
+            "a KMS-encrypted replica's etag is not the content MD5 and must be withheld"
+        );
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordingAuthConnector {
+        signed_requests: Arc<std::sync::Mutex<Vec<(bool, bool)>>>,
+    }
+
+    impl SmithyHttpConnector for RecordingAuthConnector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let has_expected_token = request.headers().get("x-amz-security-token") == Some("temporary-session-token");
+            let has_authorization = request.headers().contains_key("authorization");
+            self.signed_requests
+                .lock()
+                .expect("recorded auth request lock should not be poisoned")
+                .push((has_expected_token, has_authorization));
+            HttpConnectorFuture::ready(Ok(HttpResponse::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(200_u16).expect("200 should be a valid response status"),
                 SdkBody::empty(),
             )))
         }
@@ -2515,6 +3112,150 @@ mod tests {
             },
             request_uris,
         )
+    }
+
+    #[test]
+    fn remote_target_sdk_credentials_preserve_temporary_credential_fields() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let expiration = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
+        let credentials = Credentials {
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: Some("temporary-session-token".to_string()),
+            expiration: Some(jiff::Timestamp::try_from(expiration).expect("test expiration should convert")),
+        };
+
+        let sdk_credentials = remote_sdk_credentials(&remote_credentials(&credentials, "account"), now)
+            .expect("unexpired temporary credentials should build");
+
+        assert_eq!(sdk_credentials.session_token(), Some("temporary-session-token"));
+        assert_eq!(sdk_credentials.expiry(), Some(expiration));
+        assert_eq!(sdk_credentials.account_id().map(|id| id.as_str()), Some("account"));
+    }
+
+    #[test]
+    fn remote_target_sdk_credentials_normalize_go_zero_expiration() {
+        let credentials = Credentials {
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: None,
+            expiration: Some("0001-01-01T00:00:00Z".parse().expect("Go zero time should parse")),
+        };
+
+        let sdk_credentials = remote_sdk_credentials(&remote_credentials(&credentials, ""), SystemTime::now())
+            .expect("Go zero expiration should remain compatible with static credentials");
+
+        assert!(sdk_credentials.session_token().is_none());
+        assert!(sdk_credentials.expiry().is_none());
+    }
+
+    #[test]
+    fn remote_target_sdk_credentials_reject_invalid_expiration_boundaries() {
+        let expiration = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
+        let mut credentials = Credentials {
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: None,
+            expiration: Some(jiff::Timestamp::try_from(expiration).expect("test expiration should convert")),
+        };
+
+        assert_eq!(
+            remote_sdk_credentials(&remote_credentials(&credentials, ""), SystemTime::UNIX_EPOCH + Duration::from_secs(1_000))
+                .expect_err("expiration without a session token must fail"),
+            "remote target credential expiration requires a session token"
+        );
+
+        credentials.session_token = Some("temporary-session-token".to_string());
+        assert_eq!(
+            remote_sdk_credentials(&remote_credentials(&credentials, ""), expiration)
+                .expect_err("credentials expire at the exact expiration boundary"),
+            EXPIRED_REMOTE_TARGET_CREDENTIALS
+        );
+    }
+
+    #[test]
+    fn remote_target_credentials_provider_fails_closed_after_expiration() {
+        let expiration = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
+        let provider = RemoteTargetCredentialsProvider {
+            credentials: SdkCredentials::new(
+                "access",
+                "secret",
+                Some("temporary-session-token".to_string()),
+                Some(expiration),
+                "test",
+            ),
+        };
+
+        assert!(provider.resolve_at(expiration - Duration::from_nanos(1)).is_ok());
+        let err = provider
+            .resolve_at(expiration)
+            .expect_err("expired credentials must not be returned");
+        assert_eq!(err.source().map(ToString::to_string).as_deref(), Some(EXPIRED_REMOTE_TARGET_CREDENTIALS));
+        assert!(!format!("{provider:?}").contains("temporary-session-token"));
+        assert!(!format!("{provider:?}").contains("secret"));
+    }
+
+    #[test]
+    fn target_client_detects_expiration_for_cache_refresh() {
+        let expiration: jiff::Timestamp = "2099-01-01T00:00:00Z".parse().expect("expiration should parse");
+        let (mut client, _) = recording_target_client();
+        client.credentials = Some(Credentials {
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: Some("temporary-session-token".to_string()),
+            expiration: Some(expiration),
+        });
+
+        assert!(!client.credentials_expired_at("2098-12-31T23:59:59Z".parse().expect("pre-expiration timestamp should parse")));
+        assert!(client.credentials_expired_at(expiration));
+
+        client.credentials.as_mut().expect("credentials should exist").expiration =
+            Some("0001-01-01T00:00:00Z".parse().expect("Go zero time should parse"));
+        assert!(!client.credentials_expired_at(jiff::Timestamp::now()));
+    }
+
+    #[tokio::test]
+    async fn temporary_credentials_add_security_token_to_sigv4_requests() {
+        let signed_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connector = SharedHttpConnector::new(RecordingAuthConnector {
+            signed_requests: Arc::clone(&signed_requests),
+        });
+        let http_client = http_client_fn(move |_settings, _components| connector.clone());
+        let credentials = Credentials {
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: Some("temporary-session-token".to_string()),
+            expiration: Some("2099-01-01T00:00:00Z".parse().expect("future expiration should parse")),
+        };
+        let sdk_credentials = remote_sdk_credentials(&remote_credentials(&credentials, ""), SystemTime::now())
+            .expect("unexpired temporary credentials should build");
+        let client = S3Client::from_conf(
+            S3Config::builder()
+                .endpoint_url("https://target.example")
+                .credentials_provider(SharedCredentialsProvider::new(RemoteTargetCredentialsProvider {
+                    credentials: sdk_credentials,
+                }))
+                .region(SdkRegion::new("us-east-1"))
+                .http_client(http_client)
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .build(),
+        );
+
+        client
+            .head_bucket()
+            .bucket("target-bucket")
+            .send()
+            .await
+            .expect("recording connector should accept the signed request");
+
+        assert_eq!(
+            signed_requests
+                .lock()
+                .expect("recorded auth request lock should not be poisoned")
+                .as_slice(),
+            &[(true, true)],
+            "SigV4 request must include both authorization and the session-token header"
+        );
     }
 
     fn spawn_https_server(cert: &rcgen::CertifiedKey<rcgen::KeyPair>, requests: usize) -> (u16, std::thread::JoinHandle<()>) {
@@ -2614,6 +3355,14 @@ mod tests {
     }
 
     fn s3_client_for_endpoint_test(endpoint: String, http_client: Option<SharedHttpClient>) -> S3Client {
+        s3_client_for_endpoint_test_with_checksums(endpoint, http_client, replication_request_checksum_calculation())
+    }
+
+    fn s3_client_for_endpoint_test_with_checksums(
+        endpoint: String,
+        http_client: Option<SharedHttpClient>,
+        checksums: RequestChecksumCalculation,
+    ) -> S3Client {
         let credentials = SdkCredentials::builder()
             .access_key_id("test-access")
             .secret_access_key("test-secret")
@@ -2624,7 +3373,10 @@ mod tests {
             .credentials_provider(SharedCredentialsProvider::new(credentials))
             .region(SdkRegion::new("us-east-1"))
             .force_path_style(true)
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest());
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            // Mirror the production remote-target builder so recorded requests
+            // exercise the same checksum/framing behavior (#6853).
+            .request_checksum_calculation(checksums);
         if let Some(http_client) = http_client {
             config = config.http_client(http_client);
         }
@@ -2658,6 +3410,51 @@ mod tests {
         assert!(!replication_target_versioning_enabled(None));
     }
 
+    #[test]
+    fn remote_endpoint_spec_from_target_keeps_legacy_path_style_and_trust_semantics() {
+        for (path, expected) in [
+            ("dns", PathStyle::VirtualHost),
+            ("OFF", PathStyle::VirtualHost),
+            ("false", PathStyle::VirtualHost),
+            ("path", PathStyle::Path),
+            ("on", PathStyle::Path),
+            ("true", PathStyle::Path),
+            (" auto ", PathStyle::Auto),
+            ("", PathStyle::Auto),
+            ("something-else", PathStyle::Path),
+        ] {
+            assert_eq!(target_path_style(path), expected, "path={path:?}");
+        }
+
+        let spec = RemoteS3EndpointSpec::from(&BucketTarget {
+            endpoint: "192.168.1.10:9000".to_string(),
+            secure: true,
+            region: "us-east-1".to_string(),
+            ca_cert_pem: "   ".to_string(),
+            reset_id: "reset-1".to_string(),
+            credentials: Some(Credentials {
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                session_token: Some("  ".to_string()),
+                expiration: Some("0001-01-01T00:00:00Z".parse().expect("Go zero time should parse")),
+            }),
+            ..Default::default()
+        });
+        assert_eq!(spec.endpoint_url(), "https://192.168.1.10:9000");
+        assert!(spec.ca_cert_pem.is_none(), "whitespace-only CA PEM means unset");
+        assert!(spec.connect_timeout.is_none() && spec.read_timeout.is_none());
+        assert_eq!(spec.user_agent_suffix, "");
+        assert_eq!(
+            spec.retry,
+            RemoteS3RetryPolicy::Standard { max_attempts: 3 },
+            "replication targets keep the SDK's historical three attempts"
+        );
+        let credentials = spec.credentials.expect("credentials carry over");
+        assert_eq!(credentials.account_id, "reset-1");
+        assert!(credentials.session_token.is_none(), "blank session token is absent");
+        assert!(credentials.expiration.is_none(), "Go zero expiration is absent");
+    }
+
     fn parse_url(raw: &str) -> Url {
         Url::parse(raw).expect("test URL should parse")
     }
@@ -2667,16 +3464,16 @@ mod tests {
         // Public hosts and private-network targets are allowed regardless of the
         // loopback opt-in — replication commonly runs across trusted private infra.
         for allow_loopback in [false, true] {
-            assert!(validate_replication_target_endpoint_inner(&parse_url("https://s3.example.com"), allow_loopback).is_ok());
-            assert!(validate_replication_target_endpoint_inner(&parse_url("http://10.0.0.5:9000"), allow_loopback).is_ok());
-            assert!(validate_replication_target_endpoint_inner(&parse_url("http://192.168.1.20"), allow_loopback).is_ok());
+            assert!(validate_remote_endpoint_inner(&parse_url("https://s3.example.com"), allow_loopback).is_ok());
+            assert!(validate_remote_endpoint_inner(&parse_url("http://10.0.0.5:9000"), allow_loopback).is_ok());
+            assert!(validate_remote_endpoint_inner(&parse_url("http://192.168.1.20"), allow_loopback).is_ok());
         }
     }
 
     #[test]
     fn replication_endpoint_rejects_loopback_without_opt_in() {
         // Default (production) behaviour: loopback IP and localhost host both rejected.
-        let err = validate_replication_target_endpoint_inner(&parse_url("http://127.0.0.1:9000"), false)
+        let err = validate_remote_endpoint_inner(&parse_url("http://127.0.0.1:9000"), false)
             .expect_err("loopback IP must be rejected by default");
         assert!(matches!(
             err,
@@ -2685,7 +3482,7 @@ mod tests {
                 ..
             }
         ));
-        let err = validate_replication_target_endpoint_inner(&parse_url("http://localhost:9000"), false)
+        let err = validate_remote_endpoint_inner(&parse_url("http://localhost:9000"), false)
             .expect_err("localhost must be rejected by default");
         assert!(matches!(
             err,
@@ -2700,15 +3497,15 @@ mod tests {
     fn replication_endpoint_allows_loopback_with_opt_in() {
         // e2e harness / single-host multi-instance: opt-in re-enables loopback in
         // both IP (127.0.0.1, ::1) and hostname (localhost) forms.
-        assert!(validate_replication_target_endpoint_inner(&parse_url("http://127.0.0.1:9000"), true).is_ok());
-        assert!(validate_replication_target_endpoint_inner(&parse_url("http://[::1]:9000"), true).is_ok());
-        assert!(validate_replication_target_endpoint_inner(&parse_url("http://localhost:9000"), true).is_ok());
+        assert!(validate_remote_endpoint_inner(&parse_url("http://127.0.0.1:9000"), true).is_ok());
+        assert!(validate_remote_endpoint_inner(&parse_url("http://[::1]:9000"), true).is_ok());
+        assert!(validate_remote_endpoint_inner(&parse_url("http://localhost:9000"), true).is_ok());
     }
 
     #[test]
     fn replication_endpoint_opt_in_does_not_open_other_ssrf_targets() {
         // The loopback opt-in must not widen into link-local / metadata endpoints.
-        let err = validate_replication_target_endpoint_inner(&parse_url("http://169.254.169.254/latest/meta-data"), true)
+        let err = validate_remote_endpoint_inner(&parse_url("http://169.254.169.254/latest/meta-data"), true)
             .expect_err("metadata endpoint must stay rejected even with loopback opt-in");
         assert!(matches!(
             err,
@@ -2717,7 +3514,7 @@ mod tests {
                 ..
             }
         ));
-        let err = validate_replication_target_endpoint_inner(&parse_url("http://[fe80::1]:9000"), true)
+        let err = validate_remote_endpoint_inner(&parse_url("http://[fe80::1]:9000"), true)
             .expect_err("link-local must stay rejected even with loopback opt-in");
         assert!(matches!(
             err,
@@ -2740,6 +3537,64 @@ mod tests {
         assert!(message.contains(REDACTED_CREDENTIAL));
         assert!(!message.contains("sensitive-access-key"));
         assert!(message.contains("connection refused"));
+    }
+
+    #[test]
+    fn same_replication_service_ignores_resync_and_bandwidth_edits() {
+        let base = BucketTarget {
+            endpoint: "target.example:9000".to_string(),
+            target_bucket: "replica".to_string(),
+            secure: true,
+            path: "on".to_string(),
+            arn: "arn:rustfs:replication:us-east-1:bucket:same".to_string(),
+            credentials: Some(Credentials {
+                access_key: "access".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resync_edit = BucketTarget {
+            reset_id: "reset-1".to_string(),
+            bandwidth_limit: 1024,
+            ..base.clone()
+        };
+        assert!(same_replication_service(&resync_edit, &base));
+        for moved in [
+            BucketTarget {
+                endpoint: "other.example:9000".to_string(),
+                ..base.clone()
+            },
+            BucketTarget {
+                target_bucket: "other".to_string(),
+                ..base.clone()
+            },
+            BucketTarget {
+                secure: false,
+                ..base.clone()
+            },
+            BucketTarget {
+                credentials: Some(Credentials {
+                    access_key: "rotated".to_string(),
+                    ..Default::default()
+                }),
+                ..base.clone()
+            },
+        ] {
+            assert!(!same_replication_service(&moved, &base));
+        }
+    }
+
+    #[test]
+    fn version_identity_verdict_is_per_arn_and_forgotten_with_the_target() {
+        let sys = BucketTargetSys::default();
+        let arn = "arn:rustfs:replication:us-east-1:bucket:identity";
+        assert_eq!(sys.version_identity_capability(arn), VersionIdentityCapability::Unknown);
+        sys.record_version_identity_capability(arn, VersionIdentityCapability::MintsOwn);
+        assert_eq!(sys.version_identity_capability(arn), VersionIdentityCapability::MintsOwn);
+        assert_eq!(sys.version_identity_capability("other"), VersionIdentityCapability::Unknown);
+        // A rebuilt target may point at a different service.
+        sys.forget_version_identity_capability(arn);
+        assert_eq!(sys.version_identity_capability(arn), VersionIdentityCapability::Unknown);
     }
 
     #[test]
@@ -2847,7 +3702,7 @@ mod tests {
             }],
         );
 
-        let targets = sys.list_targets("", "").await;
+        let targets = sys.list_targets("", "").await.expect("listing every bucket's targets");
 
         assert_eq!(targets.len(), 1);
         assert!(!targets[0].online);
@@ -3196,6 +4051,29 @@ mod tests {
     }
 
     #[test]
+    fn put_object_headers_carry_user_tags_on_x_amz_tagging() {
+        // rustfs/backlog#1953: tag edits replicate through the whole-object
+        // transport, so the source tags must travel on x-amz-tagging.
+        let mut opts = PutObjectOptions::default();
+        opts.user_tags.insert("owner".to_string(), "site a".to_string());
+        opts.user_tags.insert("env".to_string(), "prod".to_string());
+
+        let header = opts.header();
+        let tagging = header
+            .get(AMZ_OBJECT_TAGGING_LOWER)
+            .expect("user tags must be transported on x-amz-tagging")
+            .to_str()
+            .expect("tag header must be ASCII");
+        // Deterministic key order; values are form-urlencoded.
+        assert_eq!(tagging, "env=prod&owner=site+a");
+
+        assert!(
+            PutObjectOptions::default().header().get(AMZ_OBJECT_TAGGING_LOWER).is_none(),
+            "a tagless source must not send an empty x-amz-tagging header"
+        );
+    }
+
+    #[test]
     fn put_object_headers_omit_unset_replication_timestamps() {
         // UNIX_EPOCH means "never modified on the source"; sending it would
         // make the receiver treat an unset category as a fresh modification.
@@ -3426,6 +4304,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn target_refresh_attempt_updates_retry_timestamp_and_error_count() {
+        let sys = BucketTargetSys::default();
+
+        sys.mark_refresh_attempt("arn:reload").await;
+        let last_refresh = sys.arn_remotes_map.read().await["arn:reload"].last_refresh;
+        assert!(OffsetDateTime::now_utc() - last_refresh < Duration::from_secs(5));
+
+        sys.inc_arn_errs("bucket", "arn:reload").await;
+        sys.inc_arn_errs("bucket", "arn:reload").await;
+        let errors = sys.arn_errs_map.read().await;
+        assert_eq!(errors["arn:reload"].count, 2);
+        assert_eq!(errors["arn:reload"].bucket, "bucket");
+        drop(errors);
+
+        sys.mark_refresh_in_progress("bucket", "arn:reload").await;
+        assert!(sys.is_reloading_target("bucket", "arn:reload").await);
+        sys.mark_refresh_done("bucket", "arn:reload").await;
+        assert!(!sys.is_reloading_target("bucket", "arn:reload").await);
+        sys.mark_refresh_in_progress("bucket", "arn:reload").await;
+        assert!(sys.is_reloading_target("bucket", "arn:reload").await);
+    }
+
+    #[tokio::test]
     async fn update_all_targets_publishes_disable_proxy_on_target_client() {
         // The read-proxy selector (replication_proxy::get_proxy_targets) skips
         // targets whose TargetClient carries disable_proxy — the persisted
@@ -3461,6 +4362,88 @@ mod tests {
             .await
             .expect("client should be published");
         assert!(opted_out.disable_proxy, "disable_proxy must reach the published TargetClient");
+    }
+
+    #[tokio::test]
+    async fn update_all_targets_keeps_failed_client_placeholder() {
+        let sys = BucketTargetSys::default();
+        let target = BucketTarget {
+            arn: "arn:expired".to_string(),
+            endpoint: "192.168.1.10:9000".to_string(),
+            target_bucket: "target-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            credentials: Some(Credentials {
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                session_token: Some("temporary-session-token".to_string()),
+                expiration: Some("2000-01-01T00:00:00Z".parse().expect("expired timestamp should parse")),
+            }),
+            ..Default::default()
+        };
+        let targets = BucketTargets { targets: vec![target] };
+
+        sys.update_all_targets("bucket", Some(&targets)).await;
+
+        let remotes = sys.arn_remotes_map.read().await;
+        let placeholder = remotes
+            .get("arn:expired")
+            .expect("configured target should retain a cache entry");
+        assert!(placeholder.client.is_none());
+        assert!(OffsetDateTime::now_utc() - placeholder.last_refresh < Duration::from_secs(5));
+        drop(remotes);
+        assert!(sys.get_remote_target_client("bucket", "arn:expired").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn credential_rotation_atomically_replaces_published_client() {
+        let sys = BucketTargetSys::default();
+        let target = |session_token: &str| BucketTarget {
+            arn: "arn:rotating".to_string(),
+            endpoint: "192.168.1.10:9000".to_string(),
+            target_bucket: "target-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            credentials: Some(Credentials {
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                session_token: Some(session_token.to_string()),
+                expiration: None,
+            }),
+            ..Default::default()
+        };
+
+        sys.update_all_targets(
+            "bucket",
+            Some(&BucketTargets {
+                targets: vec![target("old-session-token")],
+            }),
+        )
+        .await;
+        let old_client = sys
+            .get_remote_target_client("bucket", "arn:rotating")
+            .await
+            .expect("initial client should be published");
+
+        sys.update_all_targets(
+            "bucket",
+            Some(&BucketTargets {
+                targets: vec![target("new-session-token")],
+            }),
+        )
+        .await;
+        let new_client = sys
+            .get_remote_target_client("bucket", "arn:rotating")
+            .await
+            .expect("rotated client should be published");
+
+        assert!(!Arc::ptr_eq(&old_client, &new_client));
+        assert_eq!(
+            old_client.credentials.as_ref().and_then(Credentials::effective_session_token),
+            Some("old-session-token")
+        );
+        assert_eq!(
+            new_client.credentials.as_ref().and_then(Credentials::effective_session_token),
+            Some("new-session-token")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3598,12 +4581,12 @@ mod tests {
 
     #[tokio::test]
     async fn skip_tls_verify_takes_priority_over_invalid_custom_ca_pem() {
-        let client = build_aws_s3_http_client_for_target(&BucketTarget {
+        let client = build_aws_s3_http_client_for_spec(&RemoteS3EndpointSpec::from(&BucketTarget {
             secure: true,
             skip_tls_verify: true,
             ca_cert_pem: "not a pem".to_string(),
             ..Default::default()
-        })
+        }))
         .await
         .expect("skip verification should bypass custom CA parsing");
 
@@ -3716,5 +4699,42 @@ mod tests {
     fn last_minute_latency_empty_window_is_zero() {
         let window = LastMinuteLatency::new();
         assert_eq!(window.get_total().avg, Duration::from_secs(0));
+    }
+
+    fn repair_target(bucket: &str, id: &str) -> BucketTarget {
+        BucketTarget {
+            source_bucket: bucket.to_string(),
+            endpoint: "remote.example.com".to_string(),
+            target_bucket: "remote".to_string(),
+            arn: format!("arn:rustfs:replication:us-east-1:{bucket}:{id}"),
+            target_type: BucketTargetType::ReplicationService,
+            region: "us-east-1".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_target_set_refuses_cached_writes() {
+        let sys = BucketTargetSys::default();
+        let bucket = "targets-repair-opt-in";
+        sys.mark_targets_unreadable(bucket).await;
+        assert!(matches!(
+            sys.targets_base_for_write(bucket).await,
+            Err(BucketTargetError::BucketRemoteTargetsUnreadable { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_readable_target_set_remains_the_write_base() {
+        let sys = BucketTargetSys::default();
+        let bucket = "targets-repair-readable";
+        let existing = repair_target(bucket, "keep");
+        sys.targets_map
+            .write()
+            .await
+            .insert(bucket.to_string(), vec![existing.clone()]);
+        let base = sys.targets_base_for_write(bucket).await.expect("read targets");
+        assert_eq!(base.targets.len(), 1);
+        assert_eq!(base.targets[0].arn, existing.arn);
     }
 }

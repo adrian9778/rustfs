@@ -31,8 +31,7 @@ use crate::storage_api_contracts::internode::{
     NS_SCANNER_PROTOCOL_VERSION, PUT_FILE_AUTH_TRAILER_DIGEST_LEN, PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_TRAILER_MAC_LEN,
     PUT_FILE_AUTH_TRAILER_MAGIC, PUT_FILE_CAPABILITY_VERSION,
 };
-use base64::Engine as _;
-use base64::engine::general_purpose;
+
 use hmac::{Hmac, KeyInit, Mac};
 use http::uri::Authority;
 use http::{HeaderMap, HeaderValue, Method, Uri};
@@ -40,11 +39,12 @@ use http::{HeaderMap, HeaderValue, Method, Uri};
 use rustfs_credentials::{DEFAULT_SECRET_KEY, RPC_SECRET_REQUIRED_MESSAGE};
 use rustfs_credentials::{RPC_SECRET_REQUIRED_OPERATOR_MESSAGE, try_get_rpc_token};
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_FORCE_UNLOCK, INTERNODE_OPERATION_GRPC_LOCK,
-    INTERNODE_OPERATION_GRPC_LOCK_BATCH, INTERNODE_OPERATION_GRPC_OTHER, INTERNODE_OPERATION_GRPC_READ_ALL,
-    INTERNODE_OPERATION_GRPC_READ_MULTIPLE, INTERNODE_OPERATION_GRPC_READ_VERSION, INTERNODE_OPERATION_GRPC_REFRESH,
-    INTERNODE_OPERATION_GRPC_UNLOCK, INTERNODE_OPERATION_GRPC_UNLOCK_BATCH, INTERNODE_OPERATION_GRPC_WRITE_ALL,
-    INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
+    INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
+    INTERNODE_OPERATION_GRPC_FORCE_UNLOCK, INTERNODE_OPERATION_GRPC_LOCK, INTERNODE_OPERATION_GRPC_LOCK_BATCH,
+    INTERNODE_OPERATION_GRPC_OTHER, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+    INTERNODE_OPERATION_GRPC_READ_VERSION, INTERNODE_OPERATION_GRPC_REFRESH, INTERNODE_OPERATION_GRPC_UNLOCK,
+    INTERNODE_OPERATION_GRPC_UNLOCK_BATCH, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
+    global_internode_metrics,
 };
 use rustfs_object_data_cache::{MemoryBasis, resolve_effective_memory};
 use rustfs_utils::get_env_bool;
@@ -94,6 +94,7 @@ const REPLAY_CACHE_AUTO_MEMORY_PERCENT: u64 = 13;
 const REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU: usize = 4096;
 const REPLAY_CACHE_AUTO_MAX_CAPACITY: usize = 33_554_432;
 const NS_SCANNER_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-capability-v3";
+const NS_SCANNER_TIER_REGISTRY_GENERATION_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-tier-registry-generation-v1";
 pub const TONIC_RPC_PREFIX: &str = "/node_service.NodeService";
 static INTERNODE_RPC_SIGNATURE_STRICT: LazyLock<bool> = LazyLock::new(|| {
     get_env_bool(
@@ -522,11 +523,11 @@ fn generate_signature(secret: &str, url: &str, method: &Method, timestamp: i64) 
     let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(data.as_bytes());
     let result = mac.finalize();
-    general_purpose::STANDARD.encode(result.into_bytes())
+    base64_simd::STANDARD.encode_to_string(result.into_bytes())
 }
 
 fn verify_signature(secret: &str, url: &str, method: &Method, timestamp: i64, signature: &str) -> bool {
-    let Ok(signature) = general_purpose::STANDARD.decode(signature) else {
+    let Ok(signature) = base64_simd::STANDARD.decode_to_vec(signature) else {
         return false;
     };
 
@@ -636,40 +637,79 @@ pub fn verify_put_file_capability(challenge: Uuid, server_epoch: Uuid, version: 
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid put_file capability proof"))
 }
 
-fn update_ns_scanner_capability_mac(mac: &mut HmacSha256, challenge: Uuid, server_epoch: Uuid) {
+fn update_ns_scanner_capability_mac(
+    mac: &mut HmacSha256,
+    challenge: Uuid,
+    server_epoch: Uuid,
+    supports_tier_registry_generation: bool,
+) {
     mac.update(NS_SCANNER_CAPABILITY_AUTH_DOMAIN);
     mac.update(&NS_SCANNER_PROTOCOL_VERSION.to_be_bytes());
     mac.update(challenge.as_bytes());
     mac.update(server_epoch.as_bytes());
+    if supports_tier_registry_generation {
+        // The optional response capability is part of the authenticated
+        // scope. A proxy cannot turn an old/unsupported peer into a worker
+        // that receives generation-fenced scanner work.
+        mac.update(NS_SCANNER_TIER_REGISTRY_GENERATION_AUTH_DOMAIN);
+    }
 }
 
-fn generate_ns_scanner_capability_proof(secret: &str, challenge: Uuid, server_epoch: Uuid) -> std::io::Result<Vec<u8>> {
+fn generate_ns_scanner_capability_proof(
+    secret: &str,
+    challenge: Uuid,
+    server_epoch: Uuid,
+    supports_tier_registry_generation: bool,
+) -> std::io::Result<Vec<u8>> {
     if challenge.is_nil() || server_epoch.is_nil() {
         return Err(std::io::Error::other("Invalid namespace scanner capability scope"));
     }
     let mut mac =
         <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
-    update_ns_scanner_capability_mac(&mut mac, challenge, server_epoch);
+    update_ns_scanner_capability_mac(&mut mac, challenge, server_epoch, supports_tier_registry_generation);
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
-fn verify_ns_scanner_capability_proof(secret: &str, challenge: Uuid, server_epoch: Uuid, proof: &[u8]) -> std::io::Result<()> {
+fn verify_ns_scanner_capability_proof(
+    secret: &str,
+    challenge: Uuid,
+    server_epoch: Uuid,
+    proof: &[u8],
+    supports_tier_registry_generation: bool,
+) -> std::io::Result<()> {
     if challenge.is_nil() || server_epoch.is_nil() {
         return Err(std::io::Error::other("Invalid namespace scanner capability scope"));
     }
     let mut mac =
         <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
-    update_ns_scanner_capability_mac(&mut mac, challenge, server_epoch);
+    update_ns_scanner_capability_mac(&mut mac, challenge, server_epoch, supports_tier_registry_generation);
     mac.verify_slice(proof)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid namespace scanner capability proof"))
 }
 
 pub fn sign_ns_scanner_capability(challenge: Uuid, server_epoch: Uuid) -> std::io::Result<Vec<u8>> {
-    generate_ns_scanner_capability_proof(&get_shared_secret()?, challenge, server_epoch)
+    sign_ns_scanner_capability_with_tier_registry_generation(challenge, server_epoch, false)
 }
 
 pub fn verify_ns_scanner_capability(challenge: Uuid, server_epoch: Uuid, proof: &[u8]) -> std::io::Result<()> {
-    verify_ns_scanner_capability_proof(&get_shared_secret()?, challenge, server_epoch, proof)
+    verify_ns_scanner_capability_with_tier_registry_generation(challenge, server_epoch, proof, false)
+}
+
+pub fn sign_ns_scanner_capability_with_tier_registry_generation(
+    challenge: Uuid,
+    server_epoch: Uuid,
+    supports_tier_registry_generation: bool,
+) -> std::io::Result<Vec<u8>> {
+    generate_ns_scanner_capability_proof(&get_shared_secret()?, challenge, server_epoch, supports_tier_registry_generation)
+}
+
+pub fn verify_ns_scanner_capability_with_tier_registry_generation(
+    challenge: Uuid,
+    server_epoch: Uuid,
+    proof: &[u8],
+    supports_tier_registry_generation: bool,
+) -> std::io::Result<()> {
+    verify_ns_scanner_capability_proof(&get_shared_secret()?, challenge, server_epoch, proof, supports_tier_registry_generation)
 }
 
 #[derive(Clone, Copy)]
@@ -705,11 +745,11 @@ fn generate_signature_v2(secret: &str, scope: SignatureV2Scope<'_>) -> std::io::
     let mut mac =
         <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
     update_signature_v2(&mut mac, scope);
-    Ok(general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+    Ok(base64_simd::STANDARD.encode_to_string(mac.finalize().into_bytes()))
 }
 
 fn verify_signature_v2(secret: &str, scope: SignatureV2Scope<'_>, signature: &str) -> bool {
-    let Ok(signature) = general_purpose::STANDARD.decode(signature) else {
+    let Ok(signature) = base64_simd::STANDARD.decode_to_vec(signature) else {
         return false;
     };
     let Ok(mut mac) = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()) else {
@@ -752,11 +792,11 @@ fn generate_replay_scope_signature(secret: &str, scope: ReplayScope<'_>) -> std:
     let mut mac =
         <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
     update_replay_scope(&mut mac, scope);
-    Ok(general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+    Ok(base64_simd::STANDARD.encode_to_string(mac.finalize().into_bytes()))
 }
 
 fn verify_replay_scope_signature(secret: &str, scope: ReplayScope<'_>, signature: &str) -> bool {
-    let Ok(signature) = general_purpose::STANDARD.decode(signature) else {
+    let Ok(signature) = base64_simd::STANDARD.decode_to_vec(signature) else {
         return false;
     };
     let Ok(mut mac) = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()) else {
@@ -781,15 +821,15 @@ fn generate_boot_epoch_proof(secret: &str, audience: &str, challenge: Uuid, boot
     let mut mac =
         <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
     update_boot_epoch_proof(&mut mac, audience, challenge, boot_epoch);
-    Ok(general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+    Ok(base64_simd::STANDARD.encode_to_string(mac.finalize().into_bytes()))
 }
 
 fn verify_boot_epoch_proof(secret: &str, audience: &str, challenge: Uuid, boot_epoch: Uuid, proof: &str) -> std::io::Result<()> {
     if audience.is_empty() || challenge.is_nil() || boot_epoch.is_nil() {
         return Err(std::io::Error::other("Invalid RPC boot epoch proof scope"));
     }
-    let proof = general_purpose::STANDARD
-        .decode(proof)
+    let proof = base64_simd::STANDARD
+        .decode_to_vec(proof)
         .map_err(|_| std::io::Error::other("Invalid RPC boot epoch proof"))?;
     let mut mac =
         <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
@@ -822,7 +862,7 @@ fn generate_replay_cache_capability_proof(
     let mut mac =
         <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
     update_replay_cache_capability_proof(&mut mac, audience, challenge, boot_epoch);
-    Ok(general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+    Ok(base64_simd::STANDARD.encode_to_string(mac.finalize().into_bytes()))
 }
 
 fn verify_replay_cache_capability_proof(
@@ -832,8 +872,8 @@ fn verify_replay_cache_capability_proof(
     boot_epoch: Uuid,
     proof: &str,
 ) -> std::io::Result<()> {
-    let proof = general_purpose::STANDARD
-        .decode(proof)
+    let proof = base64_simd::STANDARD
+        .decode_to_vec(proof)
         .map_err(|_| std::io::Error::other("Invalid RPC replay cache capability proof"))?;
     let mut mac =
         <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
@@ -1038,6 +1078,7 @@ fn tonic_rpc_metric_operation(path: &str) -> &'static str {
         Some("ReadVersion") => INTERNODE_OPERATION_GRPC_READ_VERSION,
         Some("BatchReadVersion") => INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
         Some("WriteAll") => INTERNODE_OPERATION_GRPC_WRITE_ALL,
+        Some("CompareAndUpdateFile") => INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
         Some("Lock") => INTERNODE_OPERATION_GRPC_LOCK,
         Some("UnLock") => INTERNODE_OPERATION_GRPC_UNLOCK,
         Some("LockBatch") => INTERNODE_OPERATION_GRPC_LOCK_BATCH,
@@ -1266,6 +1307,32 @@ pub fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>, canoni
 /// (<https://github.com/rustfs/backlog/issues/1327>).
 pub fn verify_tonic_mutation_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
     verify_tonic_mutation_body_digest_with_strictness(request, canonical_body, internode_rpc_body_digest_strict())
+}
+
+/// Verify a non-disk mutation without accepting a newly-generated unsigned v2 body.
+///
+/// The disk mutation lane has a rolling-upgrade exception for `UNSIGNED-PAYLOAD`
+/// while peer replay-cache capability is being discovered. Historical v2 peers
+/// used the fixed `unsigned` nonce before body-digest rollout; preserve that
+/// exact marker for mixed-version compatibility, but reject unsigned v2
+/// requests that omit it or present a different nonce.
+pub fn verify_tonic_mutation_body_digest_reject_unsigned<T>(
+    request: &tonic::Request<T>,
+    canonical_body: &[u8],
+) -> std::io::Result<()> {
+    let version = request
+        .metadata()
+        .get(RPC_AUTH_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let digest = request
+        .metadata()
+        .get(RPC_CONTENT_SHA256_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let nonce = request.metadata().get(RPC_NONCE_HEADER).and_then(|value| value.to_str().ok());
+    if version == Some(RPC_AUTH_VERSION_V2) && digest == Some(UNSIGNED_PAYLOAD) && nonce != Some("unsigned") {
+        return Err(std::io::Error::other("RPC mutation requires a body-bound v2 signature"));
+    }
+    verify_tonic_mutation_body_digest(request, canonical_body)
 }
 
 /// [`verify_tonic_mutation_body_digest`] with the strict gate injected as a parameter, so both
@@ -1709,13 +1776,28 @@ mod tests {
         let secret = "test-scanner-capability-secret";
         let challenge = Uuid::new_v4();
         let server_epoch = Uuid::new_v4();
-        let proof =
-            generate_ns_scanner_capability_proof(secret, challenge, server_epoch).expect("capability proof should be generated");
+        let proof = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, false)
+            .expect("capability proof should be generated");
 
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof).is_ok());
-        assert!(verify_ns_scanner_capability_proof(secret, Uuid::new_v4(), server_epoch, &proof).is_err());
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, Uuid::new_v4(), &proof).is_err());
-        assert!(verify_ns_scanner_capability_proof("different-secret", challenge, server_epoch, &proof).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, false).is_ok());
+        assert!(verify_ns_scanner_capability_proof(secret, Uuid::new_v4(), server_epoch, &proof, false).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, Uuid::new_v4(), &proof, false).is_err());
+        assert!(verify_ns_scanner_capability_proof("different-secret", challenge, server_epoch, &proof, false).is_err());
+    }
+
+    #[test]
+    fn namespace_scanner_capability_proof_binds_tier_registry_generation_support() {
+        let secret = "test-scanner-capability-secret";
+        let challenge = Uuid::new_v4();
+        let server_epoch = Uuid::new_v4();
+        let proof = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, true)
+            .expect("generation capability proof should be generated");
+
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, true).is_ok());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, false).is_err());
+        let legacy = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, false)
+            .expect("legacy capability proof should be generated");
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &legacy, true).is_err());
     }
 
     /// Security regression for GHSA-r5qv-rc46-hv8q (internode RPC fail-closed,
@@ -1933,9 +2015,9 @@ mod tests {
         let method = Method::GET;
         let timestamp = 1640995200;
         let signature = generate_signature(secret, url, &method, timestamp);
-        let mut tampered = general_purpose::STANDARD.decode(&signature).unwrap();
+        let mut tampered = base64_simd::STANDARD.decode_to_vec(&signature).unwrap();
         tampered[0] ^= 1;
-        let tampered_signature = general_purpose::STANDARD.encode(tampered);
+        let tampered_signature = base64_simd::STANDARD.encode_to_string(tampered);
 
         assert!(verify_signature(secret, url, &method, timestamp, &signature));
         assert!(!verify_signature(secret, url, &method, timestamp, &tampered_signature));
@@ -2634,6 +2716,10 @@ mod tests {
             INTERNODE_OPERATION_GRPC_WRITE_ALL
         );
         assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/CompareAndUpdateFile"),
+            INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE
+        );
+        assert_eq!(
             tonic_rpc_metric_operation("/node_service.NodeService/Lock"),
             INTERNODE_OPERATION_GRPC_LOCK
         );
@@ -2932,6 +3018,7 @@ mod tests {
     fn rename_data_mutation_contract_binds_method_nonce_and_body() {
         ensure_test_rpc_secret();
         let message = rustfs_protos::proto_gen::node_service::RenameDataRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "http://node-a:9000/data/rustfs0".to_string(),
             src_volume: ".rustfs.sys/multipart".to_string(),
             src_path: "uploads/object".to_string(),
@@ -2939,6 +3026,7 @@ mod tests {
             dst_volume: "bucket".to_string(),
             dst_path: "object".to_string(),
             file_info_bin: vec![0x81, 0xA1, 0x76, 0x01].into(),
+            scanner_publication_lease_token: Vec::new().into(),
         };
         let body = rustfs_protos::canonical_rename_data_request_body(&message).expect("small request should encode");
         let mut request = tonic::Request::new(());

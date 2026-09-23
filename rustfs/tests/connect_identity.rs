@@ -20,10 +20,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
+use base64_simd::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
 use rustfs::connect::identity::{DeviceIdentity, IdentityError, RegistrationTranscript};
 use rustfs::connect::identity_store::{IdentityStore, StoreError};
+use x509_parser::prelude::{FromDer as _, X509CertificationRequest};
 
 fn transcript_fixture() -> serde_json::Value {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../protocol/agent/v1/fixtures/registration/transcript.json");
@@ -33,6 +33,11 @@ fn transcript_fixture() -> serde_json::Value {
 fn accept_vectors() -> serde_json::Value {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../protocol/agent/v1/fixtures/registration/accept-vectors.json");
     serde_json::from_slice(&fs::read(path).expect("read accept-vectors.json")).expect("accept-vectors.json parses")
+}
+
+fn reject_vectors() -> serde_json::Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../protocol/agent/v1/fixtures/registration/reject-vectors.json");
+    serde_json::from_slice(&fs::read(path).expect("read reject-vectors.json")).expect("reject-vectors.json parses")
 }
 
 /// Extract the SubjectPublicKeyInfo from a PKCS#10 request.
@@ -66,8 +71,8 @@ fn transcript_reproduces_every_accept_vector() {
         let token = &vector["tokenRecord"];
         let request = &vector["request"];
 
-        let csr = base64::engine::general_purpose::STANDARD
-            .decode(
+        let csr = base64_simd::STANDARD
+            .decode_to_vec(
                 request["certificateRequest"]
                     .as_str()
                     .expect("vector carries a certificate request"),
@@ -118,8 +123,8 @@ fn published_proofs_verify_over_locally_rebuilt_transcripts() {
 
         let token = &vector["tokenRecord"];
         let request = &vector["request"];
-        let csr = base64::engine::general_purpose::STANDARD
-            .decode(request["certificateRequest"].as_str().unwrap())
+        let csr = base64_simd::STANDARD
+            .decode_to_vec(request["certificateRequest"].as_str().unwrap())
             .expect("certificate request is base64");
 
         let transcript = RegistrationTranscript::build(
@@ -134,11 +139,12 @@ fn published_proofs_verify_over_locally_rebuilt_transcripts() {
         .expect("transcript builds");
 
         let raw = BASE64_URL_NO_PAD
-            .decode(request["proof"]["value"].as_str().expect("vector carries a proof"))
+            .decode_to_vec(request["proof"]["value"].as_str().expect("vector carries a proof"))
             .expect("proof decodes");
         let signature = p256::ecdsa::Signature::from_slice(&raw).expect("signature parses");
-        assert!(
-            signature.normalize_s().is_none(),
+        assert_eq!(
+            signature.normalize_s(),
+            signature,
             "vector '{name}' publishes a proof that is already low-S"
         );
 
@@ -182,10 +188,10 @@ fn csr_octets_matching_golden_digest() -> Vec<u8> {
         let Some(encoded) = vector["request"]["certificateRequest"].as_str() else {
             continue;
         };
-        let der = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
+        let der = base64_simd::STANDARD
+            .decode_to_vec(encoded)
             .expect("certificate request is base64");
-        let digest = BASE64_URL_NO_PAD.encode(<sha2::Sha256 as sha2::Digest>::digest(&der));
+        let digest = BASE64_URL_NO_PAD.encode_to_string(<sha2::Sha256 as sha2::Digest>::digest(&der));
         if digest == want {
             return der;
         }
@@ -301,12 +307,13 @@ fn proof_is_a_canonical_low_s_signature_that_verifies() {
         "the proof must use the base64url alphabet with no padding"
     );
 
-    let raw = BASE64_URL_NO_PAD.decode(&proof.value).expect("proof decodes");
+    let raw = BASE64_URL_NO_PAD.decode_to_vec(&proof.value).expect("proof decodes");
     assert_eq!(raw.len(), 64, "the signature is a fixed-width r || s");
 
     let signature = p256::ecdsa::Signature::from_slice(&raw).expect("signature parses");
-    assert!(
-        signature.normalize_s().is_none(),
+    assert_eq!(
+        signature.normalize_s(),
+        signature,
         "s must already be in the lower half of the group order"
     );
 
@@ -332,7 +339,7 @@ fn proof_does_not_verify_over_a_different_transcript() {
     let other = transcript_from_fixture_inputs(b"a different certificate request").expect("transcript builds");
     assert_ne!(transcript.as_bytes(), other.as_bytes());
 
-    let raw = BASE64_URL_NO_PAD.decode(&proof.value).expect("proof decodes");
+    let raw = BASE64_URL_NO_PAD.decode_to_vec(&proof.value).expect("proof decodes");
     let signature = p256::ecdsa::Signature::from_slice(&raw).expect("signature parses");
     let verifying = <p256::ecdsa::VerifyingKey as p256::pkcs8::DecodePublicKey>::from_public_key_der(&identity.public_key_der())
         .expect("public key decodes");
@@ -356,6 +363,33 @@ fn certificate_request_presents_a_p256_key() {
         "the certificate request must present an ECDSA P-256 SubjectPublicKeyInfo"
     );
     assert_eq!(der[0], 0x30, "a PKCS#10 request is a DER SEQUENCE");
+}
+
+#[test]
+fn certificate_request_uses_the_frozen_no_san_authorization_profile() {
+    let profile = &transcript_fixture()["request"]["certificateRequestProfile"]["authorizationCompatibility"];
+    assert_eq!(profile["noSubjectAlternativeNameAccepted"].as_bool(), Some(true));
+    assert_eq!(profile["mismatchedTypeReason"].as_str(), Some("CERTIFICATE_REQUEST_PROFILE_UNSUPPORTED"));
+
+    let identity = DeviceIdentity::generate();
+    let der = identity.certificate_request_der().expect("certificate request builds");
+    let (remaining, request) = X509CertificationRequest::from_der(&der).expect("certificate request parses");
+    assert!(remaining.is_empty(), "the certificate request has no trailing octets");
+    assert!(
+        request
+            .requested_extensions()
+            .is_none_or(|mut extensions| extensions.next().is_none()),
+        "RustFS must not send a subject alternative name in its registration request"
+    );
+
+    let profile_vector = reject_vectors()["vectors"]
+        .as_array()
+        .expect("reject vectors are a list")
+        .iter()
+        .find(|vector| vector["expected"]["reason"] == "CERTIFICATE_REQUEST_PROFILE_UNSUPPORTED")
+        .expect("the frozen profile rejection vector exists")
+        .clone();
+    assert_eq!(profile_vector["stage"].as_str(), Some("certificateRequest"));
 }
 
 fn hex_to_bytes(hex: &str) -> Vec<u8> {

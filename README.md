@@ -12,12 +12,11 @@
 </p>
 
 <p align="center">
-<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://trendshift.io/api/badge/repositories/14181" alt="rustfs%2Frustfs | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a> 
-<a href="https://runacap.com/ross-index/q4-2025/" target="_blank" rel="noopener"><img style="width: 260px; height: 55px" src="https://runacap.com/wp-content/uploads/2026/01/ROSS_badge_white_Q4_2025.svg" alt="ROSS Index - Fastest Growing Open-Source Startups in Q4 2025 | Runa Capital" height="55" /></a>
+<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://trendshift.io/api/badge/repositories/14181" alt="rustfs%2Frustfs | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </p>
 
 <p align="center">
-  <a href="https://docs.rustfs.com/installation/">Getting Started</a>
+  <a href="https://docs.rustfs.com/en/installation">Getting Started</a>
   · <a href="https://docs.rustfs.com/">Docs</a>
   · <a href="https://github.com/rustfs/rustfs/issues">Bug reports</a>
   · <a href="https://github.com/rustfs/rustfs/discussions">Discussions</a>
@@ -49,16 +48,33 @@ Unlike other storage systems, RustFS is released under the permissible Apache 2.
 - **Open Source**: Licensed under Apache 2.0, encouraging unrestricted community contributions and commercial usage.
 - **User-Friendly**: Designed with simplicity in mind for easy deployment and management.
 
-| Feature                 | Status       | Feature                  | Status           |
-| :---------------------- | :----------- | :----------------------- | :--------------- |
-| **S3 Core Features**    | ✅ Available | **Bitrot Protection**    | ✅ Available     |
-| **Upload / Download**   | ✅ Available | **Single Node Mode**     | ✅ Available     |
-| **Versioning**          | ✅ Available | **Bucket Replication**   | ✅ Available     |
-| **Logging**             | ✅ Available | **Lifecycle Management** | 🚧 Under Testing |
-| **Event Notifications** | ✅ Available | **Distributed Mode**     | 🚧 Under Testing |
-| **K8s Helm Charts**     | ✅ Available | **RustFS KMS**           | 🚧 Under Testing |
-| **Keystone Auth**       | ✅ Available | **Multi-Tenancy**        | ✅ Available     |
-| **Swift API**           | ✅ Available | **Swift Metadata Ops**   | 🚧 Partial       |
+Status legend: ✅ Available — shipped and covered by CI gates; 🧪 Preview — shipped behind an opt-in flag or with a bounded compatibility claim.
+
+| Feature                          | Status       | Feature                            | Status       |
+| :------------------------------- | :----------- | :--------------------------------- | :----------- |
+| **S3 Core Features**             | ✅ Available | **Distributed Mode**               | ✅ Available |
+| **Upload / Download**            | ✅ Available | **Single Node Mode**               | ✅ Available |
+| **Versioning**                   | ✅ Available | **Bitrot Protection**              | ✅ Available |
+| **Object Lock (WORM)**           | ✅ Available | **Healing & Scanner**              | ✅ Available |
+| **Server-Side Encryption**       | ✅ Available | **Pool Expansion / Decommission**  | ✅ Available |
+| **RustFS KMS**                   | ✅ Available | **Bucket Replication**             | ✅ Available |
+| **Lifecycle Management (ILM)**   | ✅ Available | **Site Replication**               | ✅ Available |
+| **ILM Tiering (Remote S3)**      | ✅ Available | **Bucket Quota**                   | ✅ Available |
+| **S3 Select**                    | ✅ Available | **Event Notifications**            | ✅ Available |
+| **S3 Tables (Iceberg REST)**     | 🧪 Preview   | **Audit Logging**                  | ✅ Available |
+| **IAM / Policies**               | ✅ Available | **Logging & Observability**        | ✅ Available |
+| **OIDC / SSO**                   | ✅ Available | **Web Console**                    | ✅ Available |
+| **Keystone Auth**                | ✅ Available | **K8s Helm Charts**                | ✅ Available |
+| **Swift API**                    | ✅ Available | **FTPS / WebDAV**                  | ✅ Available |
+| **Multi-Tenancy**                | ✅ Available | **SFTP**                           | ✅ Available |
+| **MinIO On-Disk Compatibility**  | 🧪 Preview   |                                    |              |
+
+Notes:
+
+- **RustFS KMS**: Vault (KV2 / Transit) and AWS KMS backends are supported for production. The `Local` and `Static` backends are for development and testing only. See [KMS backend security properties](docs/operations/kms-backend-security.md).
+- **Swift API / SFTP**: opt-in cargo features (`--features swift`, `--features sftp`, or `full`). FTPS and WebDAV are enabled in the default build.
+- **S3 Tables**: ships as an Iceberg REST Catalog with automated PyIceberg and DuckDB coverage; other engines and vendor profiles carry bounded claims listed in the [S3 Tables support matrix](docs/architecture/s3-tables-support-matrix.md).
+- **MinIO On-Disk Compatibility**: gated behind the `rio-v2` feature and not part of the default build. Objects MinIO encrypted are not readable by RustFS. See [MinIO file-format interoperability](docs/architecture/minio-file-format-compat.md).
 
 ## RustFS vs MinIO Performance
 
@@ -93,6 +109,15 @@ Star RustFS on GitHub and be instantly notified of new releases.
 
 ## Quickstart
 
+> [!IMPORTANT]
+> **Pool expansion notice:**
+>
+> - A single-node single-drive (SNSD) deployment is supported only as a standalone local path. It cannot expand in place or be added as a Pool. To move to a multi-drive topology, create a new deployment and migrate data through S3.
+> - Keep an existing multi-drive Pool's endpoints and Erasure Set width unchanged; expand by appending a new Pool. With ellipsis-based expansion, every Pool argument must contain an ellipsis expression and expand to at least two drive endpoints.
+> - Single-node multi-drive Pools and multi-node Pools with one drive per node are allowed, subject to valid Erasure Set geometry and EC settings; acceptance does not guarantee host-failure tolerance.
+>
+> These topology rules follow MinIO, but automatic parity selection differs between the projects. See the [Pool layout compatibility and regression tests](docs/testing/pool-layout-compatibility.md) before expanding a deployment.
+
 To get started with RustFS, follow these steps:
 
 ### 1. One-click Installation (Option 1)
@@ -116,7 +141,7 @@ chown -R 10001:10001 data logs
 docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
 # Using specific version
-docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-rc.3
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.1
 ```
 
 If you use [podman](https://github.com/containers/podman) instead of docker, you can install the RustFS with the below command
@@ -186,7 +211,10 @@ For developers who want to build RustFS Docker images from source with multi-arc
 
 ```bash
 # Build multi-architecture images locally
-./docker-buildx.sh --build-arg RELEASE=latest
+./docker-buildx.sh
+
+# Build a single-platform image locally
+./docker-buildx.sh -p linux/amd64
 
 # Build and push to registry
 ./docker-buildx.sh --push
@@ -245,6 +273,26 @@ nix build github:rustfs/rustfs
 nix build
 nix run
 ```
+
+The flake also exports a NixOS module and the RustFS `rc` client. Add the
+module to your system and provide credentials through runtime files (for
+example, sops-nix or agenix) so secrets are never stored in the Nix store:
+
+```nix
+imports = [ inputs.rustfs.nixosModules.rustfs ];
+
+services.rustfs = {
+  enable = true;
+  accessKeyFile = "/run/secrets/rustfs-access-key";
+  secretKeyFile = "/run/secrets/rustfs-secret-key";
+  volumes = [ "/var/lib/rustfs" ];
+};
+```
+
+Install the S3-compatible client with
+`nix profile install github:rustfs/rustfs#rustfs-client` (the executable is named
+`rc`), or use `inputs.rustfs.packages.${pkgs.system}.rustfs-client` in a system
+configuration.
 
 ### 6\. X-CMD (Option 6)
 

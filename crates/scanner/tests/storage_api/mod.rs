@@ -12,13 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use rustfs_ecstore::api::bucket::lifecycle::tier_delete_journal::recover_tier_delete_journal_entries;
+pub(crate) use rustfs_ecstore::api::bucket::lifecycle::transition_transaction::{
+    recover_transition_transaction_records, recover_transition_transaction_records_at,
+};
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::{
     bucket_lifecycle_audit::LcEventSrc,
-    bucket_lifecycle_ops::{enqueue_transition_for_existing_objects, expire_transitioned_object, init_background_expiry},
+    bucket_lifecycle_ops::{
+        ExpiryState, enqueue_transition_for_existing_objects, expire_transitioned_object, init_background_expiry,
+    },
     lifecycle::{Event as LcEvent, IlmAction, TRANSITION_PENDING, TransitionOptions},
 };
-pub(crate) use rustfs_ecstore::api::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
+pub(crate) use rustfs_ecstore::api::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG};
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
     get as get_bucket_metadata, init_bucket_metadata_sys, update as update_bucket_metadata,
 };
@@ -27,6 +31,7 @@ pub(crate) use rustfs_ecstore::api::capacity::path2_bucket_object_with_base_path
 pub(crate) use rustfs_ecstore::api::disk::{DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, new_disk};
 pub(crate) use rustfs_ecstore::api::error::{Error as EcstoreError, is_err_object_not_found, is_err_version_not_found};
 pub(crate) use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
+pub(crate) use rustfs_ecstore::api::object::test_util::DeleteAfterObjectLockSnapshotBarrier;
 pub(crate) use rustfs_ecstore::api::runtime::global_tier_config_mgr as get_global_tier_config_mgr;
 pub(crate) use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
 // Shared lifecycle/tier test utilities (rustfs/backlog#1148 ilm-6). The mock
@@ -45,12 +50,13 @@ pub(crate) mod lifecycle {
     };
 
     pub(crate) use super::{
-        BUCKET_LIFECYCLE_CONFIG, BucketVersioningSys, DiskOption, ECStore, EcstoreError, Endpoint, EndpointServerPools,
-        Endpoints, IlmAction, LcEvent, LcEventSrc, MockWarmBackend, PoolEndpoints, STORAGE_FORMAT_FILE, TRANSITION_PENDING,
-        TransitionCleanupStoreBarrier, TransitionOptions, assert_transition_meta_consistent,
-        enqueue_transition_for_existing_objects, expire_transitioned_object, free_version_count, get_bucket_metadata,
-        get_global_tier_config_mgr, init_background_expiry, init_bucket_metadata_sys, init_local_disks, is_err_object_not_found,
-        is_err_version_not_found, new_disk, path2_bucket_object_with_base_path, recover_tier_delete_journal_entries,
+        BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG, BucketVersioningSys, DeleteAfterObjectLockSnapshotBarrier, DiskOption,
+        ECStore, EcstoreError, Endpoint, EndpointServerPools, Endpoints, ExpiryState, IlmAction, LcEvent, LcEventSrc,
+        MockWarmBackend, PoolEndpoints, STORAGE_FORMAT_FILE, TRANSITION_PENDING, TransitionCleanupStoreBarrier,
+        TransitionOptions, assert_transition_meta_consistent, enqueue_transition_for_existing_objects,
+        expire_transitioned_object, free_version_count, get_bucket_metadata, get_global_tier_config_mgr, init_background_expiry,
+        init_bucket_metadata_sys, init_local_disks, is_err_object_not_found, is_err_version_not_found, new_disk,
+        path2_bucket_object_with_base_path, recover_transition_transaction_records, recover_transition_transaction_records_at,
         register_mock_tier_util, update_bucket_metadata, wait_for_free_version_absence,
     };
 }

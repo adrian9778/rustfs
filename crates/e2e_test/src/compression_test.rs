@@ -4,7 +4,8 @@ use crate::common::{RustFSTestEnvironment, init_logging, rustfs_binary_path};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::info;
 
@@ -31,30 +32,58 @@ fn generate_high_ratio_binary_data(size: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-fn find_part_files(temp_dir: &str, bucket: &str, object_key: &str) -> Vec<PathBuf> {
+fn find_part_files(temp_dir: &str, bucket: &str, object_key: &str) -> io::Result<Vec<PathBuf>> {
     let bucket_path = PathBuf::from(temp_dir).join(bucket);
     let mut part_files = Vec::new();
 
-    fn scan_dir(dir: &PathBuf, target: &str, results: &mut Vec<PathBuf>) {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    scan_dir(&path, target, results);
-                } else if path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().starts_with("part."))
-                    .unwrap_or(false)
-                    && path.to_string_lossy().contains(target)
-                {
-                    results.push(path);
+    fn scan_dir(dir: &Path, target: &str, results: &mut Vec<PathBuf>) -> io::Result<()> {
+        let entries = fs::read_dir(dir)
+            .map_err(|error| io::Error::new(error.kind(), format!("failed to read {}: {error}", dir.display())))?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| io::Error::new(error.kind(), format!("failed to read entry in {}: {error}", dir.display())))?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|error| io::Error::new(error.kind(), format!("failed to inspect {}: {error}", path.display())))?;
+            if file_type.is_dir() {
+                scan_dir(&path, target, results)?;
+            } else if path
+                .file_name()
+                .map(|n| n.to_string_lossy().starts_with("part."))
+                .unwrap_or(false)
+                && path.to_string_lossy().contains(target)
+            {
+                if !file_type.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("expected regular part file at {}", path.display()),
+                    ));
                 }
+                results.push(path);
             }
         }
+        Ok(())
     }
 
-    scan_dir(&bucket_path, object_key, &mut part_files);
-    part_files
+    scan_dir(&bucket_path, object_key, &mut part_files)?;
+    Ok(part_files)
+}
+
+fn part_files_total_size(part_files: &[PathBuf]) -> io::Result<u64> {
+    part_files.iter().try_fold(0_u64, |total, path| {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| io::Error::new(error.kind(), format!("failed to stat {}: {error}", path.display())))?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected regular part file at {}", path.display()),
+            ));
+        }
+        total
+            .checked_add(metadata.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "on-disk part size overflow"))
+    })
 }
 
 async fn start_rustfs_with_compression(env: &mut RustFSTestEnvironment) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -123,8 +152,29 @@ async fn test_compression_roundtrip() -> Result<(), Box<dyn std::error::Error + 
     let content_length = head_response.content_length().unwrap_or(0);
     assert_eq!(content_length as usize, original_size, "Content-Length should be original size");
 
-    let part_files = find_part_files(&env.temp_dir, COMPRESSION_TEST_BUCKET, object_key);
-    let total_physical_size: u64 = part_files.iter().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum();
+    // A 5 KiB compressed object sits inside the inline budget, so its shard is
+    // embedded in xl.meta rather than written as a part file; the stored size
+    // recorded in the metadata is the compressed length.
+    let part_files = find_part_files(&env.temp_dir, COMPRESSION_TEST_BUCKET, object_key)?;
+    assert!(
+        part_files.is_empty(),
+        "small compressed object must be stored inline, found part files {part_files:?}"
+    );
+    let xl_meta_path = PathBuf::from(&env.temp_dir)
+        .join(COMPRESSION_TEST_BUCKET)
+        .join(object_key)
+        .join("xl.meta");
+    let file_info = rustfs_filemeta::FileMeta::load(&fs::read(&xl_meta_path)?)?.into_fileinfo(
+        COMPRESSION_TEST_BUCKET,
+        object_key,
+        "",
+        true,
+        false,
+        true,
+    )?;
+    assert!(file_info.inline_data(), "xl.meta must carry the inline marker for the compressed object");
+    assert!(file_info.is_compressed(), "xl.meta must carry the compression marker");
+    let total_physical_size = u64::try_from(file_info.size)?;
 
     assert!(
         total_physical_size < original_size as u64,
@@ -246,9 +296,9 @@ async fn test_compression_multipart_roundtrip() -> Result<(), Box<dyn std::error
         "Content-Length should be the logical object size"
     );
 
-    let part_files = find_part_files(&env.temp_dir, MULTIPART_COMPRESSION_BUCKET, object_key);
+    let part_files = find_part_files(&env.temp_dir, MULTIPART_COMPRESSION_BUCKET, object_key)?;
     assert!(!part_files.is_empty(), "expected on-disk part files for the multipart object");
-    let total_physical_size: u64 = part_files.iter().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum();
+    let total_physical_size = part_files_total_size(&part_files)?;
     assert!(
         total_physical_size < (total_size / 2) as u64,
         "Physical size {total_physical_size} should be well below original size {total_size} (multipart compression applied)"
@@ -366,9 +416,9 @@ async fn test_compression_multipart_high_ratio_binary_roundtrip() -> Result<(), 
 
     // This pattern compresses to roughly 1/50 of its logical size, so a comfortably loose 2x
     // margin still proves the parts were stored compressed rather than raw or double-encoded.
-    let part_files = find_part_files(&env.temp_dir, MPU_HIGH_RATIO_BUCKET, object_key);
+    let part_files = find_part_files(&env.temp_dir, MPU_HIGH_RATIO_BUCKET, object_key)?;
     assert!(!part_files.is_empty(), "expected on-disk part files for the multipart object");
-    let total_physical_size: u64 = part_files.iter().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum();
+    let total_physical_size = part_files_total_size(&part_files)?;
     assert!(
         total_physical_size < (total_size as u64) / 2,
         "Physical size {total_physical_size} should be far below the logical size {total_size} for high-ratio data"
@@ -522,9 +572,9 @@ async fn test_compression_multipart_upload_part_copy_roundtrip() -> Result<(), B
         "Content-Length should be the logical object size"
     );
 
-    let part_files = find_part_files(&env.temp_dir, MPU_COPY_COMPRESSION_BUCKET, target_key);
+    let part_files = find_part_files(&env.temp_dir, MPU_COPY_COMPRESSION_BUCKET, target_key)?;
     assert!(!part_files.is_empty(), "expected on-disk part files for the copied object");
-    let total_physical_size: u64 = part_files.iter().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum();
+    let total_physical_size = part_files_total_size(&part_files)?;
     assert!(
         total_physical_size < (total_size / 2) as u64,
         "Physical size {total_physical_size} should be well below original size {total_size} (copied part compression applied)"
@@ -585,9 +635,9 @@ async fn test_compression_multipart_three_parts_part_number_gets() -> Result<(),
         "Content-Length should be the logical object size"
     );
 
-    let part_files = find_part_files(&env.temp_dir, MPU_THREE_PARTS_BUCKET, object_key);
+    let part_files = find_part_files(&env.temp_dir, MPU_THREE_PARTS_BUCKET, object_key)?;
     assert!(!part_files.is_empty(), "expected on-disk part files for the multipart object");
-    let total_physical_size: u64 = part_files.iter().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum();
+    let total_physical_size = part_files_total_size(&part_files)?;
     assert!(
         total_physical_size < (total_size / 2) as u64,
         "Physical size {total_physical_size} should be well below original size {total_size} (multipart compression applied)"
@@ -622,11 +672,10 @@ const MPU_SSE_COMPRESSION_BUCKET: &str = "compression-mpu-sse-bucket";
 async fn start_rustfs_with_compression_and_sse(
     env: &mut RustFSTestEnvironment,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use base64::Engine;
     env.cleanup_existing_processes().await?;
 
     let binary_path = rustfs_binary_path();
-    let master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+    let master_key = base64_simd::STANDARD.encode_to_string([0x42u8; 32]);
     // Server output goes to a file inside the per-test temp dir so a failing
     // run can be diagnosed from the child's logs.
     let server_log = std::fs::File::create(format!("{}/server.log", env.temp_dir))?;
@@ -734,9 +783,9 @@ async fn test_compression_multipart_sse_s3_roundtrip() -> Result<(), Box<dyn std
         "HEAD must report SSE-S3"
     );
 
-    let part_files = find_part_files(&env.temp_dir, MPU_SSE_COMPRESSION_BUCKET, object_key);
+    let part_files = find_part_files(&env.temp_dir, MPU_SSE_COMPRESSION_BUCKET, object_key)?;
     assert!(!part_files.is_empty(), "expected on-disk part files for the multipart object");
-    let total_physical_size: u64 = part_files.iter().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum();
+    let total_physical_size = part_files_total_size(&part_files)?;
     assert!(
         total_physical_size < (total_size / 2) as u64,
         "Physical size {total_physical_size} should be well below original size {total_size} (compress-then-encrypt applied)"

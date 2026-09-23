@@ -12,7 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::*;
+use super::super::{
+    Cursor, DiskStore, EVENT_SET_DISK_WRITE, Error, FileInfo, HashAlgorithm, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK,
+    Result, join_all, warn,
+};
+use crate::disk::DiskAPI;
+#[cfg(test)]
+use crate::disk::RUSTFS_META_TMP_BUCKET;
+use crate::set_disk::coding;
+#[cfg(test)]
+use bytes::Bytes;
 
 /// Null out any disk whose shard writer failed (or was never created) so its
 /// truncated/absent shard is not committed by the final rename, and return the
@@ -132,7 +141,7 @@ pub(in crate::set_disk::ops) async fn verify_written_bitrot_shards(
 mod tests {
     use super::super::object::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity;
     use super::*;
-    use crate::disk::DiskAPI as _;
+    use crate::storage_api_contracts::object::ObjectIO as _;
 
     async fn encode_streaming_shard(data: &[u8], shard_size: usize) -> Bytes {
         let mut writer = coding::BitrotWriter::new(Cursor::new(Vec::new()), shard_size, HashAlgorithm::HighwayHash256S);
@@ -286,5 +295,20 @@ mod tests {
             .expect_err("inline shard with trailing bytes must not be committed");
             assert!(err.to_string().contains("trailing data"));
         }
+    }
+
+    #[tokio::test]
+    async fn no_parity_put_round_trip_large_stream() {
+        let (_temp_dirs, disks, set_disks) = hermetic_set_disks_for_pool_with_default_parity(1, 0, 0).await;
+        let bucket = "no-parity-put-round-trip";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let payload = vec![0x5a; 13 * 1024 * 1024 + 727_213];
+        let mut reader = crate::set_disk::PutObjReader::from_vec(payload);
+        set_disks
+            .put_object(bucket, "object", &mut reader, &crate::set_disk::ObjectOptions::default())
+            .await
+            .expect("single-disk no-parity PUT should pass self-verify");
     }
 }

@@ -41,8 +41,7 @@ use crate::types::{
     DescribeKeyRequest, EncryptRequest, GenerateDataKeyRequest, KeySpec, KeyState, KeyUsage, ObjectEncryptionContext,
     RewrapDataKeyRequest,
 };
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64_simd::STANDARD as BASE64;
 use rand::RngExt as _;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -285,7 +284,7 @@ async fn static_backend_stateless_contract() {
     let key_id = "static-contract-key";
     let mut raw_key = [0u8; 32];
     rand::rng().fill(&mut raw_key[..]);
-    let config = KmsConfig::static_kms(key_id.to_string(), BASE64.encode(raw_key));
+    let config = KmsConfig::static_kms(key_id.to_string(), BASE64.encode_to_string(raw_key));
     let static_backend = StaticKmsBackend::new(config).await.expect("static backend should build");
     let backend: &dyn KmsBackend = &static_backend;
 
@@ -300,14 +299,16 @@ async fn static_backend_stateless_contract() {
     assert_eq!(decrypted.plaintext, data_key.plaintext_key);
     assert_key_state(backend, key_id, KeyState::Enabled).await;
 
-    expect_invalid_key_state(backend.create_key(create_request("another-key".to_string())).await, "read-only");
-    expect_invalid_key_state(backend.delete_key(schedule_request(key_id)).await, "read-only");
-    expect_invalid_key_state(backend.cancel_key_deletion(cancel_request(key_id)).await, "read-only");
-    // Enable/disable, rotation and rewrap are capability gaps at the product
-    // surface, not state-machine rejections. A single fixed key has no second
-    // version to rewrap onto, so reporting the gap is the only honest answer —
-    // re-wrapping with the same material would look like progress while
-    // changing nothing.
+    // Every mutation of the key set is a capability gap at the product surface,
+    // not a state-machine rejection: the backend has exactly one externally
+    // supplied key and no way to add, remove or alter it, so the admin API
+    // reports 501 for all of them rather than 400 for some.
+    expect_unsupported(backend.create_key(create_request("another-key".to_string())).await);
+    expect_unsupported(backend.delete_key(schedule_request(key_id)).await);
+    expect_unsupported(backend.cancel_key_deletion(cancel_request(key_id)).await);
+    // A single fixed key has no second version to rewrap onto, so reporting the
+    // gap is the only honest answer: re-wrapping with the same material would
+    // look like progress while changing nothing.
     expect_unsupported(backend.enable_key(key_id).await);
     expect_unsupported(backend.disable_key(key_id).await);
     expect_unsupported(backend.rotate_key(key_id).await);

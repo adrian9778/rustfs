@@ -21,8 +21,9 @@
 //! - Corrupted key files
 //! - Recovery from transient failures
 
-use super::common::LocalKMSTestEnvironment;
+use super::common::{LocalKMSTestEnvironment, create_default_key, create_key_with_specific_id, kms_admin_request};
 use crate::common::{TEST_BUCKET, init_logging};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::ServerSideEncryption;
 use std::fs;
 use std::time::Duration;
@@ -58,6 +59,36 @@ async fn test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::
 
     assert_eq!(put_response.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
 
+    // A missing key in the healthy store is a client error, unlike a store outage.
+    let missing_key_object = "test-missing-kms-key";
+    let missing_key_error = s3_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key(missing_key_object)
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"must not be published"))
+        .server_side_encryption(ServerSideEncryption::AwsKms)
+        .ssekms_key_id("rustfs-e2e-test-missing-key")
+        .send()
+        .await
+        .expect_err("an unknown key in a healthy Local KMS store must reject the write");
+    assert_eq!(missing_key_error.raw_response().map(|response| response.status().as_u16()), Some(400));
+    assert_eq!(
+        missing_key_error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("KMS.NotFoundException")
+    );
+    let missing_key_absence = s3_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(missing_key_object)
+        .send()
+        .await
+        .expect_err("a write rejected by a missing KMS key must not publish an object");
+    assert_eq!(missing_key_absence.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(
+        missing_key_absence.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("NoSuchKey")
+    );
+
     // Temporarily rename the key directory to simulate unavailability
     info!("🔧 Simulating key directory unavailability");
     let backup_dir = format!("{}.backup", kms_env.kms_keys_dir);
@@ -77,12 +108,25 @@ async fn test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::
         .send()
         .await;
 
-    // This should fail, but the server should still be responsive
-    if put_result2.is_err() {
-        info!("✅ Upload correctly failed when key directory unavailable");
-    } else {
-        warn!("⚠️ Upload succeeded despite unavailable key directory (may be using cached keys)");
-    }
+    let unavailable_error = put_result2.expect_err("a missing Local KMS key directory must reject encrypted writes");
+    assert_eq!(unavailable_error.raw_response().map(|response| response.status().as_u16()), Some(503));
+    assert_eq!(
+        unavailable_error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("ServiceUnavailable")
+    );
+    let unavailable_absence = s3_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(object_key2)
+        .send()
+        .await
+        .expect_err("a write rejected by unavailable KMS must not publish an object");
+    assert_eq!(unavailable_absence.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(
+        unavailable_absence.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("NoSuchKey")
+    );
+    info!("✅ Upload correctly failed when key directory unavailable");
 
     // Restore the key directory
     info!("🔧 Restoring key directory");
@@ -106,6 +150,11 @@ async fn test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::
         .await?;
 
     assert_eq!(put_response3.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+
+    let get_response3 = s3_client.get_object().bucket(TEST_BUCKET).key(object_key3).send().await?;
+    assert_eq!(get_response3.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    let downloaded_data3 = get_response3.body.collect().await?.into_bytes();
+    assert_eq!(downloaded_data3.as_ref(), test_data3);
 
     // Verify we can still access the original file
     info!("📥 Verifying access to original encrypted file");
@@ -174,12 +223,22 @@ async fn test_kms_corrupted_key_files() -> Result<(), Box<dyn std::error::Error 
         .send()
         .await;
 
-    // This might succeed if KMS uses cached keys, but should eventually fail
-    if put_result2.is_err() {
-        info!("✅ Upload correctly failed with corrupted key");
-    } else {
-        warn!("⚠️ Upload succeeded despite corrupted key (likely using cached key)");
-    }
+    let corrupt_error = put_result2.expect_err("corrupt Local KMS key material must reject encrypted writes");
+    assert_eq!(corrupt_error.raw_response().map(|response| response.status().as_u16()), Some(500));
+    assert_eq!(
+        corrupt_error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("InternalError")
+    );
+    let corrupt_absence = s3_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(object_key2)
+        .send()
+        .await
+        .expect_err("a write rejected by corrupt KMS material must not publish an object");
+    assert_eq!(corrupt_absence.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(corrupt_absence.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
+    info!("✅ Upload correctly failed with corrupted key");
 
     // Restore the original key file
     info!("🔧 Restoring original key file");
@@ -204,6 +263,11 @@ async fn test_kms_corrupted_key_files() -> Result<(), Box<dyn std::error::Error 
         .await?;
 
     assert_eq!(put_response3.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+
+    let get_response3 = s3_client.get_object().bucket(TEST_BUCKET).key(object_key3).send().await?;
+    assert_eq!(get_response3.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    let downloaded_data3 = get_response3.body.collect().await?.into_bytes();
+    assert_eq!(downloaded_data3.as_ref(), test_data3);
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
     info!("✅ Corrupted key files test completed successfully");
@@ -280,18 +344,14 @@ async fn test_kms_multipart_upload_interruption() -> Result<(), Box<dyn std::err
     info!("🔧 Simulating upload interruption");
 
     // Abort the multipart upload
-    let abort_result = s3_client
+    s3_client
         .abort_multipart_upload()
         .bucket(TEST_BUCKET)
         .key(object_key)
         .upload_id(upload_id)
         .send()
-        .await;
-
-    match abort_result {
-        Ok(_) => info!("✅ Multipart upload aborted successfully"),
-        Err(e) => warn!("⚠️ Failed to abort multipart upload: {}", e),
-    }
+        .await?;
+    info!("✅ Multipart upload aborted successfully");
 
     // Try to complete the aborted upload - this should fail
     info!("🔍 Attempting to complete aborted upload");
@@ -310,17 +370,37 @@ async fn test_kms_multipart_upload_interruption() -> Result<(), Box<dyn std::err
         .set_parts(Some(completed_parts))
         .build();
 
-    let complete_result = s3_client
+    let complete_error = s3_client
         .complete_multipart_upload()
         .bucket(TEST_BUCKET)
         .key(object_key)
         .upload_id(upload_id)
         .multipart_upload(completed_multipart_upload)
         .send()
-        .await;
-
-    assert!(complete_result.is_err(), "Should not be able to complete aborted upload");
+        .await
+        .expect_err("an aborted multipart upload must not be completable");
+    assert_eq!(complete_error.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(
+        complete_error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("NoSuchUpload")
+    );
+    assert_eq!(
+        complete_error.as_service_error().and_then(ProvideErrorMetadata::message),
+        Some(
+            "The specified multipart upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed."
+        )
+    );
     info!("✅ Correctly failed to complete aborted upload");
+
+    let missing_object = s3_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(object_key)
+        .send()
+        .await
+        .expect_err("aborting a multipart upload must not publish an object");
+    assert_eq!(missing_object.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(missing_object.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
 
     // Start a new multipart upload and complete it successfully
     info!("📤 Starting new multipart upload");
@@ -393,11 +473,10 @@ async fn test_kms_multipart_upload_interruption() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// Test KMS resilience to temporary resource constraints
+/// Test concurrent KMS encryption requests
 #[tokio::test]
-async fn test_kms_resource_constraints() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_kms_concurrent_encryption_requests() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    info!("🧪 Testing KMS behavior under resource constraints");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
@@ -431,29 +510,153 @@ async fn test_kms_resource_constraints() -> Result<(), Box<dyn std::error::Error
     }
 
     // Wait for all uploads to complete
-    let mut successful_uploads = 0;
-    let mut failed_uploads = 0;
+    let mut failures = Vec::new();
 
     for task in upload_tasks {
-        let (object_key, result) = task.await.unwrap();
+        let (object_key, result) = task.await?;
         match result {
             Ok(_) => {
-                successful_uploads += 1;
                 info!("✅ Rapid upload {} succeeded", object_key);
             }
             Err(e) => {
-                failed_uploads += 1;
                 warn!("❌ Rapid upload {} failed: {}", object_key, e);
+                failures.push(format!("{object_key}: {e}"));
             }
         }
     }
 
-    info!("📊 Rapid upload results: {} succeeded, {} failed", successful_uploads, failed_uploads);
-
-    // We expect most uploads to succeed even under load
-    assert!(successful_uploads >= 7, "Expected at least 7/10 rapid uploads to succeed");
+    assert!(
+        failures.is_empty(),
+        "all 10 concurrent KMS uploads must succeed; failures: {}",
+        failures.join("; ")
+    );
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
-    info!("✅ Resource constraints test completed successfully");
+    Ok(())
+}
+
+/// Once the key an object was wrapped under is deleted, the object cannot be
+/// read until the key is restored. That is the same `400 KMS.NotFoundException`
+/// a write under a missing key returns, not a `500`; `HeadObject` never unwraps
+/// the data key and keeps answering `200`.
+#[tokio::test]
+async fn test_reads_under_a_deleted_kms_key_report_key_not_found() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut kms_env = LocalKMSTestEnvironment::new().await?;
+    let default_key_id = "rustfs-e2e-test-default-key";
+    create_key_with_specific_id(&kms_env.kms_keys_dir, default_key_id).await?;
+    let key_dir = kms_env.kms_keys_dir.clone();
+    kms_env
+        .base_env
+        .start_rustfs_server_with_env(
+            vec![
+                "--kms-enable",
+                "--kms-backend",
+                "local",
+                "--kms-key-dir",
+                &key_dir,
+                "--kms-default-key-id",
+                default_key_id,
+            ],
+            &[
+                ("RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS", "true"),
+                // Immediate deletion is refused on a default server; the test
+                // needs the key gone now rather than after the waiting window.
+                ("RUSTFS_KMS_ALLOW_IMMEDIATE_DELETION", "true"),
+            ],
+        )
+        .await?;
+    kms_env.wait_for_kms_ready().await?;
+    let base = &kms_env.base_env;
+    let s3_client = base.create_s3_client();
+    base.create_test_bucket(TEST_BUCKET).await?;
+
+    let doomed_key_id = create_default_key(&base.url, &base.access_key, &base.secret_key).await?;
+    let object_key = "wrapped-under-doomed-key";
+    let payload = b"readable only while the key exists".to_vec();
+    let put = s3_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key(object_key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(payload.clone()))
+        .server_side_encryption(ServerSideEncryption::AwsKms)
+        .ssekms_key_id(&doomed_key_id)
+        .send()
+        .await?;
+    assert_eq!(put.ssekms_key_id(), Some(doomed_key_id.as_str()));
+
+    info!("🗑️ deleting {doomed_key_id} immediately");
+    kms_admin_request(
+        &base.url,
+        http::Method::DELETE,
+        "/rustfs/admin/v3/kms/keys/delete",
+        Some(
+            &serde_json::json!({
+                "key_id": doomed_key_id,
+                "force_immediate": true,
+                "confirm_key_id": doomed_key_id,
+            })
+            .to_string(),
+        ),
+        &base.access_key,
+        &base.secret_key,
+    )
+    .await?;
+    kms_admin_request(
+        &base.url,
+        http::Method::POST,
+        "/rustfs/admin/v3/kms/clear-cache",
+        Some("{}"),
+        &base.access_key,
+        &base.secret_key,
+    )
+    .await?;
+
+    let head = s3_client.head_object().bucket(TEST_BUCKET).key(object_key).send().await?;
+    assert_eq!(head.ssekms_key_id(), Some(doomed_key_id.as_str()));
+
+    let get_error = s3_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(object_key)
+        .send()
+        .await
+        .expect_err("an object wrapped under a deleted key must not be readable");
+    assert_eq!(get_error.raw_response().map(|response| response.status().as_u16()), Some(400));
+    assert_eq!(
+        get_error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("KMS.NotFoundException"),
+        "GetObject error was {get_error:?}"
+    );
+
+    let copy_error = s3_client
+        .copy_object()
+        .bucket(TEST_BUCKET)
+        .key("copied-from-doomed-source")
+        .copy_source(format!("{TEST_BUCKET}/{object_key}"))
+        .server_side_encryption(ServerSideEncryption::AwsKms)
+        .send()
+        .await
+        .expect_err("copying from an object wrapped under a deleted key must fail the same way");
+    assert_eq!(copy_error.raw_response().map(|response| response.status().as_u16()), Some(400));
+    assert_eq!(
+        copy_error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("KMS.NotFoundException"),
+        "CopyObject error was {copy_error:?}"
+    );
+
+    // The default key is untouched, so the node keeps serving other objects.
+    let unaffected = s3_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key("wrapped-under-default-key")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"still fine"))
+        .server_side_encryption(ServerSideEncryption::AwsKms)
+        .send()
+        .await?;
+    assert_eq!(unaffected.ssekms_key_id(), Some(default_key_id));
+
+    base.delete_test_bucket(TEST_BUCKET).await?;
     Ok(())
 }

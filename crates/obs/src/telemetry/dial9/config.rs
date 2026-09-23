@@ -14,10 +14,10 @@
 
 //! Configuration for dial9 Tokio runtime telemetry.
 //!
-//! This module carries no dependency on the `dial9-tokio-telemetry` crate, so
-//! it compiles identically whether or not the `dial9` feature is enabled. That
-//! lets callers read the configured state (and export metrics about it) from a
-//! binary that was built without telemetry support.
+//! This module carries no dependency on the optional `dial9` crate, so it
+//! compiles identically whether or not the `dial9` feature is enabled. That lets
+//! callers read the configured state (and export metrics about it) from a binary
+//! that was built without telemetry support.
 
 use super::state::dial9_runtime_state;
 use rustfs_config::{
@@ -76,7 +76,7 @@ pub struct Dial9Config {
     /// Directory where trace files are written
     pub output_dir: String,
 
-    /// Prefix for trace file names
+    /// Trace family name under the output directory
     pub file_prefix: String,
 
     /// Maximum size of each trace file in bytes
@@ -158,7 +158,7 @@ impl Dial9Config {
         }
     }
 
-    /// Get the base path for trace files.
+    /// Get the trace family directory for rotating trace segments.
     pub fn base_path(&self) -> PathBuf {
         PathBuf::from(&self.output_dir).join(&self.file_prefix)
     }

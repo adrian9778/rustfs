@@ -24,7 +24,7 @@ use crate::heal::{
 use crate::{Error, Result};
 use futures::{StreamExt, stream::FuturesUnordered};
 use metrics::{counter, gauge};
-use rustfs_common::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
+use rustfs_heal_contracts::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::{
     Arc,
@@ -34,7 +34,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, error, warn};
 
-use super::{DiskStore, EcstoreError};
+use super::{DiskStore, EcstoreError, POOL_META_NAME, RUSTFS_META_BUCKET};
 
 /// Outcome of classifying an error returned by [`HealStorageAPI::heal_object`].
 enum HealObjectOutcome {
@@ -68,6 +68,13 @@ struct PageConcurrencyGuard {
     set_label: String,
 }
 
+struct ErasureSetPassCounters<'a> {
+    processed_objects: &'a mut u64,
+    successful_objects: &'a mut u64,
+    failed_objects: &'a mut u64,
+    skipped_objects: &'a mut u64,
+}
+
 impl PageConcurrencyGuard {
     fn new(in_flight: Arc<AtomicUsize>, set_label: String) -> Self {
         let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -98,7 +105,10 @@ const EVENT_HEAL_ERASURE_BUCKET_STATE: &str = "heal_erasure_bucket_state";
 const EVENT_HEAL_ERASURE_OBJECT_STATE: &str = "heal_erasure_object_state";
 
 /// Erasure Set Healer
+mod admin;
+
 pub struct ErasureSetHealer {
+    admin_task: Option<super::task::HealTask>,
     storage: Arc<dyn HealStorageAPI>,
     progress: Arc<RwLock<HealProgress>>,
     cancel_token: tokio_util::sync::CancellationToken,
@@ -106,8 +116,148 @@ pub struct ErasureSetHealer {
     heal_opts: HealOpts,
     source: HealRequestSource,
     target_endpoints: Arc<[String]>,
+    pool_metadata_target_endpoints: Arc<[String]>,
     replacement_task_id: Option<String>,
     replacement_target_identities: Option<Arc<[ReplacementTargetIdentity]>>,
+    replacement_execution: Option<Arc<super::storage::ReplacementExecution>>,
+    mainline_pacer: Option<Arc<super::pacing::MainlinePacer>>,
+}
+
+async fn acquire_page_permit(
+    semaphore: Arc<Semaphore>,
+    pacer: Option<&super::pacing::MainlinePacer>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    let acquire = || async {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(Error::TaskCancelled),
+            permit = semaphore.clone().acquire_owned() => permit.map_err(|err| Error::other(format!("Failed to acquire page concurrency permit: {err}"))),
+        }
+    };
+    let mut paid_pause = false;
+    loop {
+        let permit = acquire().await?;
+        if let Some(pacer) = pacer {
+            // Keep the real permit on the low-pressure path. Every acquisition
+            // gets a fresh decision, including a waiter that queued a second
+            // time. One completed pause is a bounded minimum-progress grant.
+            match pacer.admission_decision() {
+                super::pacing::PacingDecision::Wait(pressure) if !paid_pause => {
+                    drop(permit);
+                    paid_pause = pacer.wait_after_admission(cancel, pressure).await?;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        return Ok(permit);
+    }
+}
+
+#[cfg(test)]
+mod mainline_pacing_tests {
+    use super::*;
+    use crate::heal::pacing::{MainlinePacer, TestPressure};
+    use rustfs_concurrency::WorkloadClass;
+    use std::sync::atomic::Ordering;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test(start_paused = true)]
+    async fn running_mainline_page_waiters_resample_after_capacity_and_release_permits() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let occupied = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("existing object owns capacity");
+        let provider = Arc::new(TestPressure::new(WorkloadClass::ForegroundRead, 0));
+        let pacer = Arc::new(MainlinePacer::new(provider.clone(), 80, 80, Duration::from_millis(250)).expect("pacer"));
+        let cancel = CancellationToken::new();
+        let waiting = tokio::spawn({
+            let semaphore = semaphore.clone();
+            let pacer = pacer.clone();
+            let cancel = cancel.clone();
+            async move { acquire_page_permit(semaphore, Some(&pacer), &cancel).await }
+        });
+        tokio::task::yield_now().await;
+        provider.active.store(100, Ordering::SeqCst);
+        drop(occupied);
+        provider.sampled.notified().await;
+        assert_eq!(semaphore.available_permits(), 1, "running pressure wait cannot retain the page permit");
+        cancel.cancel();
+        assert!(matches!(waiting.await.expect("page waiter"), Err(Error::TaskCancelled)));
+        assert_eq!(semaphore.available_permits(), 1);
+        let deadline = tokio::time::timeout(
+            Duration::from_millis(10),
+            acquire_page_permit(semaphore.clone(), Some(&pacer), &CancellationToken::new()),
+        )
+        .await;
+        assert!(deadline.is_err());
+        assert_eq!(semaphore.available_permits(), 1, "deadline must release all permits");
+        let permit = acquire_page_permit(semaphore.clone(), None, &CancellationToken::new())
+            .await
+            .expect("unpaced admission");
+        assert_eq!(semaphore.available_permits(), 0, "disabling pacing cannot disable the hard cap");
+        drop(permit);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn running_mainline_two_page_waiters_check_pressure_at_final_admission() {
+        use std::task::Poll;
+        for raise_pressure in [false, true] {
+            let semaphore = Arc::new(Semaphore::new(1));
+            let occupied = semaphore.clone().acquire_owned().await.expect("queue both waiters");
+            let provider = Arc::new(TestPressure::new(WorkloadClass::ForegroundRead, 0));
+            let pause = Duration::from_millis(250);
+            let pacer = MainlinePacer::new(provider.clone(), 80, 80, pause).expect("pacer");
+            let cancel = CancellationToken::new();
+            let mut first = Box::pin(acquire_page_permit(semaphore.clone(), Some(&pacer), &cancel));
+            let mut second = Box::pin(acquire_page_permit(semaphore.clone(), Some(&pacer), &cancel));
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            drop(occupied);
+            let first_ready = match futures::poll!(first.as_mut()) {
+                Poll::Ready(result) => Some(result.expect("first admission")),
+                Poll::Pending => None,
+            };
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            let first_permit = match first_ready {
+                Some(permit) => permit,
+                None => tokio::time::timeout(Duration::from_millis(1), first)
+                    .await
+                    .expect("low-pressure waiters must not bounce capacity forever")
+                    .expect("first permit"),
+            };
+            // The first object owns real page capacity while its commit runs.
+            tokio::time::advance(Duration::from_millis(100)).await;
+            if raise_pressure {
+                provider.active.store(100, Ordering::SeqCst);
+            }
+            drop(first_permit);
+            let admitted = if raise_pressure {
+                assert!(
+                    futures::poll!(second.as_mut()).is_pending(),
+                    "a second acquisition cannot reuse the earlier low-pressure sample"
+                );
+                assert_eq!(semaphore.available_permits(), 1, "pressure wait must release page capacity");
+                tokio::time::advance(pause).await;
+                tokio::time::timeout(Duration::from_millis(1), second)
+                    .await
+                    .expect("sustained pressure must allow one unit after its bounded pause")
+                    .expect("second permit")
+            } else {
+                tokio::time::timeout(Duration::from_millis(1), second)
+                    .await
+                    .expect("low pressure must make progress")
+                    .expect("second permit")
+            };
+            assert_eq!(semaphore.available_permits(), 0);
+            drop(admitted);
+            assert_eq!(semaphore.available_permits(), 1);
+        }
+    }
 }
 
 pub(crate) fn target_outcomes_complete(result: &HealResultItem, target_endpoints: &[String]) -> bool {
@@ -159,9 +309,13 @@ impl ErasureSetHealer {
 
     /// Classify an error returned by [`HealStorageAPI::heal_object`].
     ///
-    /// Both the inner `Ok((_, Some(err)))` and the outer `Err(err)` produced by
-    /// `heal_object` wrap `Error::Storage(StorageError)`, so match on that.
+    /// Most heal object failures wrap `Error::Storage(StorageError)`, while
+    /// compatibility markers can also arrive through Disk/Io/task wrappers.
     fn classify_heal_object_error(err: &Error) -> HealObjectOutcome {
+        if err.is_dangling_delete_grace() {
+            return HealObjectOutcome::Transient;
+        }
+
         let Error::Storage(se) = err else {
             return HealObjectOutcome::Failed;
         };
@@ -206,6 +360,7 @@ impl ErasureSetHealer {
         source: HealRequestSource,
     ) -> Self {
         Self {
+            admin_task: None,
             storage,
             progress,
             cancel_token,
@@ -213,9 +368,22 @@ impl ErasureSetHealer {
             heal_opts,
             source,
             target_endpoints: Vec::new().into(),
+            pool_metadata_target_endpoints: Vec::new().into(),
             replacement_task_id: None,
             replacement_target_identities: None,
+            replacement_execution: None,
+            mainline_pacer: None,
         }
+    }
+
+    pub(crate) fn with_mainline_pacer(mut self, pacer: Option<Arc<super::pacing::MainlinePacer>>) -> Self {
+        self.mainline_pacer = pacer;
+        self
+    }
+
+    pub(crate) fn with_replacement_execution(mut self, execution: Option<Arc<super::storage::ReplacementExecution>>) -> Self {
+        self.replacement_execution = execution;
+        self
     }
 
     pub(crate) fn with_replacement_targets(
@@ -227,6 +395,13 @@ impl ErasureSetHealer {
         target_endpoints.dedup();
         self.target_endpoints = target_endpoints.into();
         self.replacement_task_id = replacement_task_id;
+        self
+    }
+
+    pub(crate) fn with_pool_metadata_targets(mut self, mut target_endpoints: Vec<String>) -> Self {
+        target_endpoints.sort_unstable();
+        target_endpoints.dedup();
+        self.pool_metadata_target_endpoints = target_endpoints.into();
         self
     }
 
@@ -273,6 +448,25 @@ impl ErasureSetHealer {
         // 2. initialize or resume resume state
         let (resume_manager, checkpoint_manager) = self.initialize_resume_state(&task_id, set_disk_id, buckets).await?;
 
+        let admin_buckets = if self.admin_task.is_some() {
+            Some(
+                self.prepare_admin_checkpoint(&checkpoint_manager, buckets, set_disk_id)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let buckets = admin_buckets.as_deref().unwrap_or(buckets);
+        if checkpoint_manager
+            .get_checkpoint()
+            .await
+            .admin
+            .is_some_and(|admin| admin.completed)
+        {
+            self.initialize_progress(buckets, &resume_manager.get_state().await).await;
+            return Ok(());
+        }
+
         // 3. execute heal with resume
         let result = self
             .execute_heal_with_resume(buckets, set_disk_id, &resume_manager, &checkpoint_manager)
@@ -288,13 +482,27 @@ impl ErasureSetHealer {
             return Ok(());
         }
 
-        checkpoint_manager.cleanup().await?;
-        resume_manager.cleanup().await?;
+        if self.admin_task.is_some() {
+            let mut admin = checkpoint_manager
+                .get_checkpoint()
+                .await
+                .admin
+                .ok_or_else(|| Error::InvalidCheckpoint("Missing administrator outcome at completion".to_string()))?;
+            admin.completed = true;
+            admin.outcome.finish(None);
+            checkpoint_manager.set_admin(admin).await?;
+        } else {
+            checkpoint_manager.cleanup().await?;
+            resume_manager.cleanup().await?;
+        }
         Ok(())
     }
 
     /// get or create task id
     async fn get_or_create_task_id(&self, set_disk_id: &str) -> Result<String> {
+        if let Some(task) = &self.admin_task {
+            return Ok(task.id.clone());
+        }
         if let Some(task_id) = &self.replacement_task_id {
             let manager = ResumeManager::load_replacement_intent(self.disk.clone(), task_id).await?;
             let state = manager.get_state().await;
@@ -317,6 +525,9 @@ impl ErasureSetHealer {
             match ResumeManager::load_from_disk(self.disk.clone(), &task_id).await {
                 Ok(manager) => {
                     let state = manager.get_state().await;
+                    if state.task_type == "admin_erasure_set" {
+                        continue;
+                    }
                     if !state.completed
                         && state.set_disk_id == set_disk_id
                         && state.replacement_targets.as_slice() == self.target_endpoints.as_ref()
@@ -408,7 +619,8 @@ impl ErasureSetHealer {
             };
 
             let state = resume_manager.get_state().await;
-            if state.retry_count > 0
+            if self.admin_task.is_none()
+                && state.retry_count > 0
                 && state.completed_buckets.is_empty()
                 && state.resume_cursor.is_none()
                 && state.processed_objects == 0
@@ -441,7 +653,12 @@ impl ErasureSetHealer {
             let resume_manager = ResumeManager::new(
                 self.disk.clone(),
                 task_id.to_string(),
-                "erasure_set".to_string(),
+                if self.admin_task.is_some() {
+                    "admin_erasure_set"
+                } else {
+                    "erasure_set"
+                }
+                .to_string(),
                 set_disk_id.to_string(),
                 buckets.to_vec(),
             )
@@ -664,6 +881,9 @@ impl ErasureSetHealer {
                 }
                 Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
                 Err(e) => {
+                    if self.admin_task.is_some() {
+                        return Err(e);
+                    }
                     failed_buckets = failed_buckets.saturating_add(1);
                     error!(
                         target: "rustfs::heal::erasure_healer",
@@ -686,6 +906,40 @@ impl ErasureSetHealer {
             current_object_index = 0;
         }
 
+        if failed_objects == 0 && skipped_objects == 0 && failed_buckets == 0 {
+            let targets = if self.pool_metadata_target_endpoints.is_empty() {
+                self.target_endpoints.as_ref()
+            } else {
+                self.pool_metadata_target_endpoints.as_ref()
+            };
+            if self.replacement_task_id.is_some() || (!self.heal_opts.dry_run && self.heal_opts.recreate && !targets.is_empty()) {
+                self.verify_replacement_identity_fence("bucket metadata").await?;
+                // Recheck even resumed buckets: their user-object cursor does not
+                // prove that the replacement holds the internal bucket records.
+                for bucket in buckets {
+                    self.storage
+                        .heal_replacement_bucket_metadata(bucket, &self.heal_opts, targets)
+                        .await?;
+                }
+            }
+            self.heal_replacement_pool_metadata(
+                set_disk_id,
+                &mut ErasureSetPassCounters {
+                    processed_objects: &mut processed_objects,
+                    successful_objects: &mut successful_objects,
+                    failed_objects: &mut failed_objects,
+                    skipped_objects: &mut skipped_objects,
+                },
+                resume_manager,
+                checkpoint_manager,
+            )
+            .await?;
+        }
+
+        if self.admin_task.is_some() {
+            return Ok(());
+        }
+
         // 5. finalize. Only declare the set healed when nothing failed AND
         // nothing was transiently skipped — otherwise the resume/checkpoint
         // state must survive so the failed/skipped versions are retried instead
@@ -698,11 +952,28 @@ impl ErasureSetHealer {
         // later heal cycle via the same bounded-retry mechanism as failures —
         // never hot-retried in place here.
         if failed_objects > 0 || skipped_objects > 0 || failed_buckets > 0 {
-            if self.replacement_task_id.is_some() && resume_manager.schedule_retry().await? {
-                checkpoint_manager.reset_for_retry().await?;
-                return Err(Error::transient_skip(format!(
-                    "Replacement erasure set heal incomplete: {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped; retry scheduled"
-                )));
+            if self.replacement_task_id.is_some() {
+                let state = resume_manager.get_state().await;
+                let targets_ready = self
+                    .storage
+                    .replacement_targets_ready_for_retry(
+                        set_disk_id,
+                        &state.replacement_targets,
+                        &state.replacement_target_identities,
+                    )
+                    .await?;
+                if !targets_ready {
+                    // The target may be between process restart, mount
+                    // admission, and format publication. Rewind only the
+                    // object checkpoint so the same generation can retry once
+                    // its identity is ready; do not spend a generation retry
+                    // or release its healing markers.
+                    checkpoint_manager.reset_for_retry().await?;
+                    resume_manager.defer_retry_until_target_ready().await?;
+                    return Err(Error::transient_skip(format!(
+                        "Replacement erasure set heal incomplete: {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped; target readiness deferred retry"
+                    )));
+                }
             }
             if resume_manager.schedule_retry().await? {
                 // Both persistence layers must be reset together: schedule_retry
@@ -727,8 +998,13 @@ impl ErasureSetHealer {
                     state = "retry_scheduled",
                     "Erasure set heal pass finished with unhealed versions; scheduled full re-heal retry"
                 );
+                let prefix = if self.replacement_task_id.is_some() {
+                    "Replacement erasure set heal incomplete"
+                } else {
+                    "Erasure set heal incomplete"
+                };
                 return Err(Error::transient_skip(format!(
-                    "Erasure set heal incomplete: {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped; retry scheduled"
+                    "{prefix}: {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped; retry scheduled"
                 )));
             }
 
@@ -771,6 +1047,244 @@ impl ErasureSetHealer {
         Ok(())
     }
 
+    async fn heal_replacement_pool_metadata(
+        &self,
+        set_disk_id: &str,
+        counters: &mut ErasureSetPassCounters<'_>,
+        resume_manager: &ResumeManager,
+        checkpoint_manager: &CheckpointManager,
+    ) -> Result<()> {
+        let target_endpoints = if self.pool_metadata_target_endpoints.is_empty() {
+            self.target_endpoints.as_ref()
+        } else {
+            self.pool_metadata_target_endpoints.as_ref()
+        };
+        let target_scoped_recreate = !self.heal_opts.dry_run && self.heal_opts.recreate && !target_endpoints.is_empty();
+        if self.replacement_task_id.is_none() && !target_scoped_recreate {
+            return Ok(());
+        }
+        if target_endpoints.is_empty() {
+            return Err(Error::TaskExecutionFailed {
+                message: "Replacement pool metadata heal requires target endpoints".to_string(),
+            });
+        }
+
+        // pool.bin is stored in one hashed set per pool. Requiring it on any
+        // other replacement set would retry a healthy absence forever.
+        if !self.storage.replacement_pool_metadata_required(&self.heal_opts)? {
+            return Ok(());
+        }
+
+        let object_key = format!("{RUSTFS_META_BUCKET}/{POOL_META_NAME}");
+        let checkpoint_key = compose_key(&object_key, None);
+        let checkpoint = checkpoint_manager.get_checkpoint().await;
+        if checkpoint.processed_objects.contains(&checkpoint_key)
+            || checkpoint.failed_objects.contains(&checkpoint_key)
+            || checkpoint.skipped_objects.contains(&checkpoint_key)
+        {
+            return Ok(());
+        }
+        drop(checkpoint);
+
+        self.verify_replacement_identity_fence("pool metadata").await?;
+        resume_manager
+            .set_current_item(Some(RUSTFS_META_BUCKET.to_string()), Some(POOL_META_NAME.to_string()))
+            .await?;
+
+        let result = match self
+            .storage
+            .heal_object(RUSTFS_META_BUCKET, POOL_META_NAME, None, &self.heal_opts)
+            .await
+        {
+            Ok((result, None)) if target_outcomes_complete(&result, target_endpoints) => {
+                let object_size = result_object_size_u64(&result);
+                match self
+                    .storage
+                    .replacement_targets_have_version(RUSTFS_META_BUCKET, POOL_META_NAME, None, &self.heal_opts, target_endpoints)
+                    .await
+                {
+                    Ok(true) => (object_size, Ok(())),
+                    Ok(false) => (
+                        object_size,
+                        Err(Error::transient_skip(
+                            "Skipped replacement pool metadata heal because target readback did not confirm the committed version",
+                        )),
+                    ),
+                    Err(err) => (
+                        object_size,
+                        Err(Error::transient_skip(format!(
+                            "Skipped replacement pool metadata heal because target readback failed: {err}"
+                        ))),
+                    ),
+                }
+            }
+            Ok((result, None)) => (
+                result_object_size_u64(&result),
+                Err(Error::transient_skip(
+                    "Skipped replacement pool metadata heal because a replacement target was not committed",
+                )),
+            ),
+            Ok((result, Some(err))) => {
+                let object_size = result_object_size_u64(&result);
+                match Self::classify_heal_object_error(&err) {
+                    HealObjectOutcome::Absent | HealObjectOutcome::Transient => (
+                        object_size,
+                        Err(Error::transient_skip(format!(
+                            "Skipped replacement pool metadata heal due to transient error: {err}"
+                        ))),
+                    ),
+                    HealObjectOutcome::Failed => (object_size, Err(err)),
+                }
+            }
+            Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
+            Err(err) => match Self::classify_heal_object_error(&err) {
+                HealObjectOutcome::Absent | HealObjectOutcome::Transient => (
+                    0,
+                    Err(Error::transient_skip(format!(
+                        "Skipped replacement pool metadata heal due to transient error: {err}"
+                    ))),
+                ),
+                HealObjectOutcome::Failed => (0, Err(err)),
+            },
+        };
+
+        let (object_size, result) = result;
+        let mut bytes_processed = self.progress.read().await.bytes_processed;
+        let mut telemetry_unknown = false;
+        let checkpoint_outcome = match result {
+            Ok(()) => {
+                telemetry_unknown |= !increment_counter(counters.successful_objects);
+                telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
+                debug!(
+                    target: "rustfs::heal::erasure_healer",
+                    event = EVENT_HEAL_ERASURE_OBJECT_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
+                    set_disk_id,
+                    bucket = RUSTFS_META_BUCKET,
+                    object = POOL_META_NAME,
+                    state = "healed",
+                    "Replacement pool metadata healed"
+                );
+                CheckpointObjectOutcome::Processed
+            }
+            Err(Error::TransientSkip { message }) => {
+                telemetry_unknown |= !increment_counter(counters.skipped_objects);
+                telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
+                warn!(
+                    target: "rustfs::heal::erasure_healer",
+                    event = EVENT_HEAL_ERASURE_OBJECT_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
+                    set_disk_id,
+                    bucket = RUSTFS_META_BUCKET,
+                    object = POOL_META_NAME,
+                    state = "transient_skip",
+                    error = %message,
+                    "Replacement pool metadata heal skipped due to transient error"
+                );
+                CheckpointObjectOutcome::Skipped
+            }
+            Err(err) => {
+                telemetry_unknown |= !increment_counter(counters.failed_objects);
+                telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
+                warn!(
+                    target: "rustfs::heal::erasure_healer",
+                    event = EVENT_HEAL_ERASURE_OBJECT_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
+                    set_disk_id,
+                    bucket = RUSTFS_META_BUCKET,
+                    object = POOL_META_NAME,
+                    state = "failed",
+                    error = %err,
+                    "Replacement pool metadata heal failed"
+                );
+                CheckpointObjectOutcome::Failed
+            }
+        };
+
+        telemetry_unknown |= !increment_counter(counters.processed_objects);
+        let (outcome_record, counter_unknown, skipped_new_versions, skipped_ilm_expired) = {
+            let mut progress = self.progress.write().await;
+            progress.set_current_object(Some(object_key.clone()));
+            progress.update_object_progress(
+                *counters.processed_objects,
+                *counters.successful_objects,
+                *counters.failed_objects,
+                *counters.skipped_objects,
+                bytes_processed,
+            );
+            if telemetry_unknown {
+                progress.mark_unknown();
+            }
+            (
+                CheckpointObjectOutcomeRecord {
+                    object: checkpoint_key,
+                    outcome: checkpoint_outcome,
+                    successful: progress.objects_healed,
+                    failed: progress.objects_failed,
+                    skipped: progress.skipped_objects,
+                    bytes: progress.bytes_processed,
+                    skipped_new_versions: progress.skipped_new_versions,
+                    skipped_ilm_expired: progress.skipped_ilm_expired,
+                    counter_unknown: progress.counter_unknown,
+                },
+                progress.counter_unknown,
+                progress.skipped_new_versions,
+                progress.skipped_ilm_expired,
+            )
+        };
+        let canonical = self.admin_task.as_ref().map(|_| {
+            use super::outcome::{
+                HealDeferredReason, HealFailureClass, HealObjectDisposition, HealObjectIdentity, HealObjectKind,
+                HealObjectOutcome,
+            };
+            let disposition = match checkpoint_outcome {
+                CheckpointObjectOutcome::Processed => HealObjectDisposition::Unknown,
+                CheckpointObjectOutcome::Skipped => HealObjectDisposition::Deferred {
+                    reason: HealDeferredReason::TransientExistenceCheck,
+                    retry_not_before: None,
+                },
+                CheckpointObjectOutcome::Failed => HealObjectDisposition::Failed(HealFailureClass::Permanent),
+            };
+            (
+                HealObjectOutcome {
+                    identity: HealObjectIdentity {
+                        kind: HealObjectKind::Metadata,
+                        bucket: RUSTFS_META_BUCKET.to_string(),
+                        object: POOL_META_NAME.to_string(),
+                        version_id: None,
+                        bucket_incarnation_id: None,
+                        pool_index: self.heal_opts.pool,
+                        set_index: self.heal_opts.set,
+                    },
+                    disposition,
+                    detail: Some("Pool metadata repair has no canonical object receipt".to_string()),
+                },
+                u32::from(!matches!(checkpoint_outcome, CheckpointObjectOutcome::Processed)),
+            )
+        });
+        self.record_checkpoint_outcome(checkpoint_manager, outcome_record, canonical)
+            .await?;
+        resume_manager
+            .update_progress_with_bytes(
+                *counters.processed_objects,
+                *counters.successful_objects,
+                *counters.failed_objects,
+                *counters.skipped_objects,
+                bytes_processed,
+            )
+            .await?;
+        resume_manager
+            .set_skipped_version_counts(skipped_new_versions, skipped_ilm_expired)
+            .await?;
+        if counter_unknown {
+            resume_manager.mark_counter_unknown().await?;
+        }
+        Ok(())
+    }
+
     /// heal single bucket with resume
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(self, current_object_index, processed_objects, successful_objects, failed_objects, skipped_objects, resume_manager, checkpoint_manager), fields(bucket = %bucket, bucket_index = bucket_index))]
@@ -800,6 +1314,25 @@ impl ErasureSetHealer {
             state = "started",
             "Erasure set bucket started"
         );
+
+        let incarnation = self.admin_bucket_incarnation(checkpoint_manager, bucket).await?;
+        if let Some(task) = &self.admin_task {
+            let bucket_opts = HealOpts {
+                recursive: false,
+                remove: false,
+                ..self.heal_opts
+            };
+            let result = match incarnation {
+                Some(expected) => {
+                    self.storage.validate_bucket_incarnation(bucket, Some(expected)).await?;
+                    self.storage
+                        .heal_bucket_at_incarnation(bucket, expected, &bucket_opts)
+                        .await?
+                }
+                None => self.storage.heal_bucket(bucket, &bucket_opts).await?,
+            };
+            task.record_result_item(result).await;
+        }
 
         // 1. get bucket info
         let _bucket_info = match self.storage.get_bucket_info(bucket).await? {
@@ -843,16 +1376,23 @@ impl ErasureSetHealer {
 
         // backlog#920: select the per-erasure-set DISK-WALK union enumerator when
         // the scan is Deep OR the request came from AutoHeal — these are the paths
-        // that must repair sub-quorum-but-reconstructable versions. Every other
-        // (Normal, non-AutoHeal) request keeps the unchanged B5 read-quorum path,
-        // which stays the default.
-        let use_disk_walk =
-            matches!(self.heal_opts.scan_mode, HealScanMode::Deep) || matches!(self.source, HealRequestSource::AutoHeal);
+        // that must repair sub-quorum-but-reconstructable versions. Administrator
+        // pool/set requests also walk their selected set. Other Normal requests
+        // keep the unchanged B5 read-quorum path, which stays the default.
+        let use_disk_walk = matches!(self.heal_opts.scan_mode, HealScanMode::Deep)
+            || matches!(self.source, HealRequestSource::AutoHeal)
+            || self.admin_task.is_some();
         let lifecycle_expiry_context = self.storage.load_heal_lifecycle_expiry_context(bucket).await?;
         let include_lifecycle_object_info = lifecycle_expiry_context.is_some();
 
         loop {
+            if let Some(pacer) = &self.mainline_pacer {
+                pacer.wait(&self.cancel_token).await?;
+            }
             self.verify_replacement_identity_fence("page scan").await?;
+            if let Some(expected) = incarnation {
+                self.storage.validate_bucket_incarnation(bucket, Some(expected)).await?;
+            }
             // Get one page of object versions
             let (objects, next_token, is_truncated) = if use_disk_walk {
                 self.storage
@@ -926,7 +1466,15 @@ impl ErasureSetHealer {
                             progress.counter_unknown,
                         )
                     };
-                    checkpoint_manager.record_object_outcome(outcome_record).await?;
+                    self.record_checkpoint_outcome(
+                        checkpoint_manager,
+                        outcome_record,
+                        admin::skipped(
+                            self.admin_identity(bucket, &item.name, item.version_id.as_deref(), incarnation),
+                            "Version was written after the heal cutoff",
+                        ),
+                    )
+                    .await?;
                     if counter_unknown {
                         resume_manager.mark_counter_unknown().await?;
                     }
@@ -992,7 +1540,15 @@ impl ErasureSetHealer {
                             progress.counter_unknown,
                         )
                     };
-                    checkpoint_manager.record_object_outcome(outcome_record).await?;
+                    self.record_checkpoint_outcome(
+                        checkpoint_manager,
+                        outcome_record,
+                        admin::skipped(
+                            self.admin_identity(bucket, &item.name, item.version_id.as_deref(), incarnation),
+                            "Lifecycle expiry was queued for this version",
+                        ),
+                    )
+                    .await?;
                     if counter_unknown {
                         resume_manager.mark_counter_unknown().await?;
                     }
@@ -1030,20 +1586,29 @@ impl ErasureSetHealer {
                 let semaphore = semaphore.clone();
                 let target_endpoints = self.target_endpoints.clone();
                 let replacement_commit_evidence_required = self.replacement_task_id.is_some();
+                let mainline_pacer = self.mainline_pacer.clone();
 
-                page_tasks.push(async move {
-                    let permit = semaphore
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .map_err(|e| Error::other(format!("Failed to acquire page concurrency permit: {e}")));
+                let admin_identity = self.admin_identity(bucket, &object_name, version_id.as_deref(), incarnation);
+                let admin_task_id = self.admin_task.as_ref().map(|task| task.id.clone());
+                let execution = self.replacement_execution.clone();
+                let failure_identity = execution
+                    .as_ref()
+                    .map(|_| (dedup_key.clone(), object_name.clone(), version_id.clone()));
+                let work = async move {
+                    let permit = acquire_page_permit(semaphore, mainline_pacer.as_deref(), &cancel_token).await;
 
                     let _permit = match permit {
                         Ok(permit) => permit,
-                        Err(err) => return (dedup_key, object_name, version_id, (0, Err(err))),
+                        Err(err) => return (dedup_key, object_name, version_id, (0, Err(err)), None),
                     };
 
                     let _in_flight_guard = PageConcurrencyGuard::new(in_flight, set_label);
+
+                    if let (Some(identity), Some(task_id)) = (admin_identity, admin_task_id) {
+                        let (result, canonical) =
+                            admin::heal_object(storage.as_ref(), &heal_opts, identity, &task_id, &cancel_token).await;
+                        return (dedup_key, object_name, version_id, result, canonical);
+                    }
 
                     // Always go through heal_object. Genuine absence flows through
                     // heal_object -> FileVersionNotFound/FileNotFound ->
@@ -1057,9 +1622,7 @@ impl ErasureSetHealer {
                             .heal_object(&bucket_name, &object_name, version_id.as_deref(), &heal_opts)
                             .await
                         {
-                            Ok((result, None))
-                                if target_outcomes_complete(&result, &target_endpoints) =>
-                            {
+                            Ok((result, None)) if target_outcomes_complete(&result, &target_endpoints) => {
                                 let object_size = result_object_size_u64(&result);
                                 if !replacement_commit_evidence_required {
                                     (object_size, Ok(true))
@@ -1075,15 +1638,21 @@ impl ErasureSetHealer {
                                         .await
                                     {
                                         Ok(true) => (object_size, Ok(true)),
-                                        Ok(false) => (object_size, Err(Error::transient_skip(format!(
-                                            "Skipped heal for {bucket_name}/{object_name} because replacement target readback did not confirm the committed version"
-                                        )))),
-                                        Err(err) => (object_size, Err(Error::transient_skip(format!(
-                                            "Skipped heal for {bucket_name}/{object_name} because replacement target readback failed: {err}"
-                                        )))),
+                                        Ok(false) => (
+                                            object_size,
+                                            Err(Error::transient_skip(format!(
+                                                "Skipped heal for {bucket_name}/{object_name} because replacement target readback did not confirm the committed version"
+                                            ))),
+                                        ),
+                                        Err(err) => (
+                                            object_size,
+                                            Err(Error::transient_skip(format!(
+                                                "Skipped heal for {bucket_name}/{object_name} because replacement target readback failed: {err}"
+                                            ))),
+                                        ),
                                     }
                                 }
-                            },
+                            }
                             Ok((result, None)) if !target_endpoints.is_empty() => (
                                 result_object_size_u64(&result),
                                 Err(Error::transient_skip(format!(
@@ -1098,27 +1667,43 @@ impl ErasureSetHealer {
                                 let object_size = result_object_size_u64(&result);
                                 match Self::classify_heal_object_error(&err) {
                                     HealObjectOutcome::Absent => (object_size, Ok(false)),
-                                    HealObjectOutcome::Transient => (object_size, Err(Error::transient_skip(format!(
-                                        "Skipped heal for {bucket_name}/{object_name} due to transient error: {err}"
-                                    )))),
+                                    HealObjectOutcome::Transient => (
+                                        object_size,
+                                        Err(Error::transient_skip(format!(
+                                            "Skipped heal for {bucket_name}/{object_name} due to transient error: {err}"
+                                        ))),
+                                    ),
                                     HealObjectOutcome::Failed => (object_size, Err(err)),
                                 }
                             }
                             Err(err) => match Self::classify_heal_object_error(&err) {
                                 HealObjectOutcome::Absent => (0, Ok(false)),
-                                HealObjectOutcome::Transient => (0, Err(Error::transient_skip(format!(
-                                    "Skipped heal for {bucket_name}/{object_name} due to transient error: {err}"
-                                )))),
+                                HealObjectOutcome::Transient => (
+                                    0,
+                                    Err(Error::transient_skip(format!(
+                                        "Skipped heal for {bucket_name}/{object_name} due to transient error: {err}"
+                                    ))),
+                                ),
                                 HealObjectOutcome::Failed => (0, Err(err)),
                             },
                         }
                     };
 
-                    (dedup_key, object_name, version_id, result)
+                    (dedup_key, object_name, version_id, result, None)
+                };
+                page_tasks.push(async move {
+                    if let (Some(execution), Some((key, object, version))) = (execution, failure_identity) {
+                        match execution.run(work).await {
+                            Ok(result) => result,
+                            Err(error) => (key, object, version, (0, Err(error)), None),
+                        }
+                    } else {
+                        work.await
+                    }
                 });
             }
 
-            while let Some((key, object, version_id, result)) = page_tasks.next().await {
+            while let Some((key, object, version_id, result, canonical)) = page_tasks.next().await {
                 let (object_size, result) = result;
                 let mut telemetry_unknown = false;
                 let checkpoint_outcome = match result {
@@ -1223,7 +1808,8 @@ impl ErasureSetHealer {
                         progress.counter_unknown,
                     )
                 };
-                checkpoint_manager.record_object_outcome(outcome_record).await?;
+                self.record_checkpoint_outcome(checkpoint_manager, outcome_record, canonical)
+                    .await?;
                 if counter_unknown {
                     resume_manager.mark_counter_unknown().await?;
                 }
@@ -1346,7 +1932,7 @@ impl ErasureSetHealer {
 #[cfg(test)]
 mod tests {
     use super::{ErasureSetHealer, PageConcurrencyGuard};
-    use rustfs_common::heal_channel::{HealRequestSource, HealScanMode};
+    use rustfs_heal_contracts::heal_channel::{HealRequestSource, HealScanMode};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -1459,6 +2045,7 @@ mod tests {
     // genuine object absence, or transient failures get recorded as "healed" and
     // permanently skipped.
     use super::{EcstoreError, Error, HealObjectOutcome};
+    use crate::heal::DiskError;
 
     fn classify(err: EcstoreError) -> HealObjectOutcome {
         ErasureSetHealer::classify_heal_object_error(&Error::Storage(err))
@@ -1475,6 +2062,16 @@ mod tests {
         assert!(matches!(classify(EcstoreError::ErasureReadQuorum), HealObjectOutcome::Transient));
         assert!(matches!(
             classify(EcstoreError::InsufficientReadQuorum(String::new(), String::new())),
+            HealObjectOutcome::Transient
+        ));
+    }
+
+    #[test]
+    fn dangling_delete_grace_is_transient() {
+        assert!(matches!(
+            ErasureSetHealer::classify_heal_object_error(&Error::Disk(DiskError::other(
+                "dangling object deletion deferred by heal grace window; retry_after_secs=3599; grace_secs=3600"
+            ))),
             HealObjectOutcome::Transient
         ));
     }
@@ -1520,10 +2117,11 @@ mod resume_loop_tests {
     use crate::heal::storage::{HealLifecycleExpiryContext, HealListItem, HealObjectInfo, HealStorageAPI};
     use crate::heal::storage_api::status::BucketInfo;
     use crate::heal::{
-        BUCKET_META_PREFIX, DiskOption, DiskStore, EcstoreError, Endpoint, HealDiskExt as _, RUSTFS_META_BUCKET, new_disk,
+        BUCKET_META_PREFIX, DiskOption, DiskStore, EcstoreError, Endpoint, HealDiskExt as _, POOL_META_NAME, RUSTFS_META_BUCKET,
+        new_disk,
     };
     use crate::{Error, Result};
-    use rustfs_common::heal_channel::{HealOpts, HealRequestSource};
+    use rustfs_heal_contracts::heal_channel::{HealOpts, HealRequestSource};
     use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem, Infos};
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1614,6 +2212,28 @@ mod resume_loop_tests {
         assert!(!target_outcomes_complete(&duplicate, &["replacement-a".to_string()]));
     }
 
+    fn replacement_target_ok_result(endpoint: &str, object: &str) -> HealResultItem {
+        HealResultItem {
+            object: object.to_string(),
+            object_size: 1024,
+            before: Infos {
+                drives: vec![HealDriveInfo {
+                    endpoint: endpoint.to_string(),
+                    state: "missing".to_string(),
+                    ..Default::default()
+                }],
+            },
+            after: Infos {
+                drives: vec![HealDriveInfo {
+                    endpoint: endpoint.to_string(),
+                    state: "ok".to_string(),
+                    ..Default::default()
+                }],
+            },
+            ..Default::default()
+        }
+    }
+
     #[derive(Clone)]
     struct Page {
         items: Vec<HealListItem>,
@@ -1626,6 +2246,7 @@ mod resume_loop_tests {
         Ok,
         /// The version vanished before heal ran (deleted mid-heal).
         VersionNotFound,
+        FileNotFound,
         /// A transient infrastructure condition (offline disk / unmet quorum):
         /// the version must be recorded as skipped and retried on a later pass.
         Transient,
@@ -1640,6 +2261,12 @@ mod resume_loop_tests {
 
     #[derive(Default)]
     struct FakeStorage {
+        admin_disk: Mutex<Option<DiskStore>>,
+        bucket_pages: Mutex<HashMap<String, Page>>,
+        incarnations: Mutex<HashMap<String, uuid::Uuid>>,
+        receipts: Mutex<HashMap<String, Option<crate::heal::outcome::HealObjectDisposition>>>,
+        receipt_mismatch: Mutex<Option<&'static str>>,
+        format_failure: AtomicBool,
         /// page keyed by the *incoming* continuation token
         pages: Mutex<HashMap<Option<String>, Page>>,
         /// per-`compose_key` heal outcome; default is `Ok`
@@ -1654,6 +2281,9 @@ mod resume_loop_tests {
         heal_calls: Mutex<Vec<(String, Option<String>)>>,
         list_include_lifecycle_object_info: Mutex<Vec<bool>>,
         replacement_target_identity_sequences: Mutex<VecDeque<Vec<ReplacementTargetIdentity>>>,
+        pool_metadata_placement: Mutex<Option<ReplacementCommitEvidence>>,
+        bucket_metadata_calls: Mutex<Vec<String>>,
+        bucket_metadata_failure: AtomicBool,
         fail_listing: AtomicBool,
         fail_listing_buckets: Mutex<HashSet<String>>,
     }
@@ -1712,8 +2342,83 @@ mod resume_loop_tests {
             }))
         }
         async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
-            Ok(Vec::new())
+            Ok(self
+                .bucket_pages
+                .lock()
+                .expect("bucket pages")
+                .keys()
+                .map(|name| BucketInfo {
+                    name: name.clone(),
+                    ..Default::default()
+                })
+                .collect())
         }
+        async fn admit_bucket_incarnation(&self, bucket: &str) -> Result<uuid::Uuid> {
+            Ok(*self
+                .incarnations
+                .lock()
+                .expect("incarnations")
+                .get(bucket)
+                .unwrap_or(&uuid::Uuid::from_u128(42)))
+        }
+        async fn heal_bucket_at_incarnation(
+            &self,
+            bucket: &str,
+            expected: uuid::Uuid,
+            opts: &HealOpts,
+        ) -> Result<HealResultItem> {
+            self.validate_bucket_incarnation(bucket, Some(expected)).await?;
+            self.heal_bucket(bucket, opts).await
+        }
+        async fn heal_object_at_incarnation(
+            &self,
+            bucket: &str,
+            object: &str,
+            version: Option<&str>,
+            expected: uuid::Uuid,
+            opts: &HealOpts,
+        ) -> Result<crate::heal::storage::HealStorageObjectResult> {
+            use crate::heal::outcome::{HealObjectDisposition, HealObjectIdentity, HealObjectKind, HealObjectReceipt};
+            self.validate_bucket_incarnation(bucket, Some(expected)).await?;
+            let (item, error) = self.heal_object(bucket, object, version, opts).await?;
+            let disposition = self
+                .receipts
+                .lock()
+                .expect("receipt fixture")
+                .get(&compose_key(object, version))
+                .cloned()
+                .unwrap_or(Some(HealObjectDisposition::Repaired));
+            let receipt = if error.is_none() {
+                disposition.map(|disposition| HealObjectReceipt {
+                    identity: HealObjectIdentity {
+                        kind: HealObjectKind::Object,
+                        bucket: bucket.to_owned(),
+                        object: object.to_owned(),
+                        version_id: version.map(str::to_owned),
+                        bucket_incarnation_id: Some(expected),
+                        pool_index: opts.pool,
+                        set_index: opts.set,
+                    },
+                    disposition,
+                })
+            } else {
+                None
+            };
+            let mut receipt = receipt;
+            if let Some(receipt) = receipt.as_mut() {
+                match *self.receipt_mismatch.lock().expect("mismatch") {
+                    Some("bucket") => receipt.identity.bucket.push_str("-other"),
+                    Some("object") => receipt.identity.object.push_str("-other"),
+                    Some("version") => receipt.identity.version_id = Some("other".to_owned()),
+                    Some("incarnation") => receipt.identity.bucket_incarnation_id = Some(uuid::Uuid::from_u128(99)),
+                    Some("pool") => receipt.identity.pool_index = Some(1),
+                    Some("set") => receipt.identity.set_index = Some(1),
+                    _ => {}
+                }
+            }
+            Ok(crate::heal::storage::HealStorageObjectResult { item, error, receipt })
+        }
+
         async fn object_exists(&self, _b: &str, _o: &str) -> Result<bool> {
             // Must never be consulted: the resume loop always goes through heal_object.
             panic!("object_exists must not be called by the resume heal loop");
@@ -1750,6 +2455,7 @@ mod resume_loop_tests {
             let outcome = self.outcomes.lock().unwrap().get(&key).cloned().unwrap_or(HealOutcome::Ok);
             match outcome {
                 HealOutcome::Ok => Ok((self.results.lock().unwrap().get(&key).cloned().unwrap_or_default(), None)),
+                HealOutcome::FileNotFound => Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileNotFound)))),
                 HealOutcome::VersionNotFound => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
                 }
@@ -1761,7 +2467,24 @@ mod resume_loop_tests {
             Ok(HealResultItem::default())
         }
         async fn heal_format(&self, _dry: bool) -> Result<(HealResultItem, Option<Error>)> {
+            if self.format_failure.load(Ordering::SeqCst) {
+                return Err(Error::other("injected format failure"));
+            }
             Ok((HealResultItem::default(), None))
+        }
+        fn replacement_pool_metadata_required(&self, _opts: &HealOpts) -> Result<bool> {
+            match self.pool_metadata_placement.lock().unwrap().as_ref() {
+                Some(ReplacementCommitEvidence::Confirmed(required)) => Ok(*required),
+                Some(ReplacementCommitEvidence::Error(message)) => Err(Error::other(message.clone())),
+                None => Ok(true),
+            }
+        }
+        async fn heal_replacement_bucket_metadata(&self, bucket: &str, _opts: &HealOpts, _targets: &[String]) -> Result<()> {
+            self.bucket_metadata_calls.lock().unwrap().push(bucket.to_owned());
+            if self.bucket_metadata_failure.load(Ordering::SeqCst) {
+                return Err(Error::Storage(EcstoreError::PreconditionFailed));
+            }
+            Ok(())
         }
         async fn replacement_targets_have_version(
             &self,
@@ -1798,14 +2521,33 @@ mod resume_loop_tests {
                 return Err(Error::other("injected listing failure"));
             }
             let key = continuation_token.map(str::to_string);
-            let page = self.pages.lock().unwrap().get(&key).cloned();
+            let page = self.pages.lock().unwrap().get(&key).cloned().or_else(|| {
+                continuation_token
+                    .is_none()
+                    .then(|| self.bucket_pages.lock().expect("bucket pages").get(bucket).cloned())
+                    .flatten()
+            });
             match page {
                 Some(p) => Ok((p.items, p.next, p.truncated)),
                 None => Ok((Vec::new(), None, false)),
             }
         }
+        async fn list_versions_for_heal_page_disk_walk(
+            &self,
+            _: &str,
+            bucket: &str,
+            prefix: &str,
+            token: Option<&str>,
+            include: bool,
+        ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
+            self.list_objects_for_heal_page(bucket, prefix, token, include).await
+        }
         async fn get_disk_for_resume(&self, _id: &str) -> Result<DiskStore> {
-            Err(Error::other("not implemented in tests"))
+            self.admin_disk
+                .lock()
+                .expect("admin disk")
+                .clone()
+                .ok_or_else(|| Error::other("not implemented in tests"))
         }
         async fn replacement_target_identities(&self, _targets: &[String]) -> Result<Vec<ReplacementTargetIdentity>> {
             self.replacement_target_identity_sequences
@@ -2285,6 +3027,8 @@ mod resume_loop_tests {
             HealRequestSource::AutoHeal,
         )
         .with_replacement_targets(vec!["replacement-a".to_string()], Some(replacement_task_id.clone()));
+        env.storage
+            .set_result(POOL_META_NAME, None, replacement_target_ok_result("replacement-a", POOL_META_NAME));
 
         healer
             .heal_erasure_set(&["b".to_string()], "pool_0_set_0")
@@ -2302,7 +3046,223 @@ mod resume_loop_tests {
             CheckpointManager::has_checkpoint(&env.healer.disk, &replacement_task_id).await,
             "the checkpoint must survive until the caller clears the healing marker"
         );
+        assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
         drop(checkpoint);
+    }
+
+    #[tokio::test]
+    async fn replacement_pool_metadata_readback_failure_schedules_retry() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        let replacement_task_id = ResumeUtils::generate_task_id();
+        ResumeManager::new_replacement_intent(
+            env.healer.disk.clone(),
+            replacement_task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["b".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![crate::heal::resume::ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("replacement intent should persist");
+        env.storage
+            .set_result(POOL_META_NAME, None, replacement_target_ok_result("replacement-a", POOL_META_NAME));
+        env.storage.set_replacement_commit_evidence(POOL_META_NAME, None, false);
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts::default(),
+            HealRequestSource::AutoHeal,
+        )
+        .with_replacement_targets(vec!["replacement-a".to_string()], Some(replacement_task_id.clone()));
+
+        env.storage.bucket_metadata_failure.store(true, Ordering::SeqCst);
+        assert!(healer.heal_erasure_set(&["b".to_string()], "pool_0_set_0").await.is_err());
+        let incomplete = ResumeManager::load_replacement_intent(env.healer.disk.clone(), &replacement_task_id)
+            .await
+            .expect("failed metadata repair must retain replacement intent")
+            .get_state()
+            .await;
+        assert!(!incomplete.completed);
+        assert_ne!(incomplete.replacement_phase, crate::heal::resume::ReplacementPhase::Verified);
+        assert!(env.storage.calls().is_empty(), "metadata failure must stop completion before pool.bin");
+        env.storage.bucket_metadata_failure.store(false, Ordering::SeqCst);
+
+        let error = healer
+            .heal_erasure_set(&["b".to_string()], "pool_0_set_0")
+            .await
+            .expect_err("unconfirmed pool metadata readback must keep the replacement incomplete");
+
+        assert!(error.to_string().contains("Replacement erasure set heal incomplete"));
+        let state = ResumeManager::load_replacement_intent(env.healer.disk.clone(), &replacement_task_id)
+            .await
+            .expect("replacement retry state must remain")
+            .get_state()
+            .await;
+        assert!(!state.completed);
+        assert_eq!(state.replacement_phase, crate::heal::resume::ReplacementPhase::Intent);
+        assert_eq!(state.retry_count, 1);
+        assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
+        assert_eq!(
+            *env.storage.bucket_metadata_calls.lock().unwrap(),
+            vec!["b", "b"],
+            "resuming a completed user scan must retry bucket metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_pool_metadata_placement_controls_completion() {
+        // Exercise both replacement intents and the admin/directory-backed path.
+        for automatic in [false, true] {
+            for placement in [Ok(false), Ok(true), Err("placement unavailable")] {
+                let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+                *env.storage.pool_metadata_placement.lock().unwrap() = Some(match placement {
+                    Ok(required) => ReplacementCommitEvidence::Confirmed(required),
+                    Err(message) => ReplacementCommitEvidence::Error(message.to_string()),
+                });
+                // An absent pool.bin is healthy only when another set owns it.
+                env.storage.set_outcome(POOL_META_NAME, None, HealOutcome::FileNotFound);
+                let task_id = ResumeUtils::generate_task_id();
+                if automatic {
+                    ResumeManager::new_replacement_intent(
+                        env.healer.disk.clone(),
+                        task_id.clone(),
+                        "pool_0_set_0".to_string(),
+                        vec![],
+                        vec!["replacement-a".to_string()],
+                        vec![crate::heal::resume::ReplacementTargetIdentity {
+                            endpoint: "replacement-a".to_string(),
+                            canonical_path: "/mnt/replacement-a".to_string(),
+                            physical_device_ids: vec!["device-a".to_string()],
+                            filesystem_identity: "1:2:3".to_string(),
+                        }],
+                    )
+                    .await
+                    .unwrap();
+                }
+                let healer = ErasureSetHealer::new(
+                    env.storage.clone(),
+                    Arc::new(RwLock::new(HealProgress::new())),
+                    CancellationToken::new(),
+                    env.healer.disk.clone(),
+                    HealOpts {
+                        recreate: true,
+                        pool: Some(0),
+                        set: Some(0),
+                        ..Default::default()
+                    },
+                    if automatic {
+                        HealRequestSource::AutoHeal
+                    } else {
+                        HealRequestSource::Admin
+                    },
+                )
+                .with_replacement_targets(vec!["replacement-a".to_string()], automatic.then(|| task_id.clone()));
+                let result = if automatic {
+                    healer.heal_erasure_set(&[], "pool_0_set_0").await
+                } else {
+                    healer
+                        .execute_heal_with_resume(&[], "pool_0_set_0", &env.resume, &env.checkpoint)
+                        .await
+                };
+                let state = if automatic {
+                    ResumeManager::load_replacement_intent(env.healer.disk.clone(), &task_id)
+                        .await
+                        .unwrap()
+                        .get_state()
+                        .await
+                } else {
+                    env.resume.get_state().await
+                };
+                assert_eq!(result.is_ok(), placement == Ok(false));
+                assert_eq!(state.completed, placement == Ok(false));
+                if automatic {
+                    assert_eq!(
+                        state.replacement_phase == crate::heal::resume::ReplacementPhase::Verified,
+                        placement == Ok(false)
+                    );
+                }
+                match placement {
+                    Ok(true) => {
+                        assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
+                        assert_eq!(state.retry_count, 1);
+                    }
+                    Ok(false) => assert!(env.storage.calls().is_empty()),
+                    Err(message) => {
+                        assert!(result.unwrap_err().to_string().contains(message));
+                        assert!(env.storage.calls().is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_recreate_target_heals_pool_metadata_before_completion() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts {
+                recreate: true,
+                pool: Some(0),
+                set: Some(0),
+                ..Default::default()
+            },
+            HealRequestSource::Admin,
+        )
+        .with_pool_metadata_targets(vec!["replacement-a".to_string()]);
+        env.storage
+            .set_result(POOL_META_NAME, None, replacement_target_ok_result("replacement-a", POOL_META_NAME));
+
+        healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect("admin recreate should heal and verify pool metadata");
+
+        assert!(env.resume.get_state().await.completed);
+        assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
+    }
+
+    #[tokio::test]
+    async fn admin_recreate_pool_metadata_readback_failure_keeps_resume_state() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts {
+                recreate: true,
+                pool: Some(0),
+                set: Some(0),
+                ..Default::default()
+            },
+            HealRequestSource::Admin,
+        )
+        .with_pool_metadata_targets(vec!["replacement-a".to_string()]);
+        env.storage
+            .set_result(POOL_META_NAME, None, replacement_target_ok_result("replacement-a", POOL_META_NAME));
+        env.storage.set_replacement_commit_evidence(POOL_META_NAME, None, false);
+
+        let error = healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect_err("unconfirmed admin recreate pool metadata must keep the set incomplete");
+
+        assert!(error.to_string().contains("Erasure set heal incomplete"));
+        let state = env.resume.get_state().await;
+        assert!(!state.completed);
+        assert_eq!(state.retry_count, 1);
+        assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
     }
 
     #[tokio::test]
@@ -2978,4 +3938,5 @@ mod resume_loop_tests {
 
         assert_eq!(env.resume.get_state().await.retry_count, 0);
     }
+    mod admin_outcome;
 }

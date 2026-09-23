@@ -26,7 +26,7 @@ use crate::{
 use crate::data_usage::load_data_usage_cache;
 use crate::storage_api_contracts::admin::StorageAdminApi;
 use crate::storage_api_contracts::bucket::BucketOptions;
-use rustfs_common::heal_channel::DriveState;
+use rustfs_heal_contracts::heal_channel::DriveState;
 use rustfs_madmin::{
     BackendDisks, Disk, ErasureSetInfo, ITEM_INITIALIZING, ITEM_OFFLINE, ITEM_ONLINE, ITEM_UNKNOWN, InfoMessage, MemStats,
     ServerProperties,
@@ -148,7 +148,7 @@ async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
 
         let mut client = node_service_time_out_client(&addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+            .map_err(|err| Error::RemoteClientUnavailable(err.to_string()))?;
 
         let request = Request::new(PingRequest {
             version: 1,

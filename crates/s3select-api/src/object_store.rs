@@ -13,11 +13,14 @@
 // limitations under the License.
 
 use crate::{
-    PrepareSelectObjectSnapshotError, SELECT_DEFAULT_READ_BUFFER_SIZE, SelectError, SelectGetObjectReader, SelectObjectOptions,
-    SelectObjectSnapshot, SelectObjectSnapshotReadError, SelectStorageError, SelectStore, SnapshotConsistencyError,
+    PrepareSelectObjectSnapshotError, QueryError, SELECT_DEFAULT_READ_BUFFER_SIZE, SelectError, SelectGetObjectReader,
+    SelectInputMetrics, SelectObjectOptions, SelectObjectSnapshot, SelectObjectSnapshotReadError, SelectStorageError,
+    SelectStore, SnapshotConsistencyError,
+    input_stream::{CompressionFormat, compressed_input_reader, compressed_input_stream, processed_bytes_limit},
     query::{
+        ast::{JsonPathSegment, JsonSource},
         parser::RustFsDialect,
-        session::{QueryExecutionGuard, QueryExecutionTracker},
+        session::QueryExecutionTracker,
     },
     resolve_select_object_store_handle, select_is_err_bucket_not_found, select_is_err_object_not_found,
     select_is_err_version_not_found,
@@ -26,28 +29,33 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use datafusion::{
-    common::{DataFusionError, runtime::SpawnedTask},
-    execution::memory_pool::{MemoryConsumer, MemoryPool, UnboundedMemoryPool},
+    execution::memory_pool::{MemoryPool, UnboundedMemoryPool},
     object_store::{
         Attributes, CopyOptions, Error as o_Error, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
         MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
     },
-    sql::sqlparser::{
-        ast::{ObjectNamePart, SetExpr, Statement, TableFactor},
-        parser::Parser as SqlParser,
+    sql::{
+        planner::IdentNormalizer,
+        sqlparser::{
+            ast::{Expr, Ident, JsonPathElem, ObjectNamePart, SetExpr, Statement, TableFactor},
+            parser::Parser as SqlParser,
+        },
     },
 };
 use futures::pin_mut;
-use futures::{Stream, StreamExt, future::ready, stream};
+use futures::{Stream, StreamExt, TryStreamExt, future::ready, stream};
 use futures_core::stream::BoxStream;
 use http::{HeaderMap, HeaderValue, header::HeaderName};
-use parking_lot::Mutex;
+use memchr::{memchr, memmem};
 use rustfs_common::DEFAULT_DELIMITER;
 use s3s::header::{
     X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
     X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
 };
-use s3s::{S3Error, S3ErrorCode, S3Result, dto::SelectObjectContentInput};
+use s3s::{
+    S3Error, S3ErrorCode, S3Result,
+    dto::{CompressionType, InputSerialization, ScanRange, SelectObjectContentInput},
+};
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
@@ -57,48 +65,59 @@ use tokio::{io::AsyncReadExt, sync::OnceCell};
 use tokio_util::io::ReaderStream;
 use transform_stream::AsyncTryStream;
 
+use crate::csv_input::{CsvSyntax, csv_input_requires_normalization, normalize_csv_stream};
 use crate::storage_api::object_store::HTTPRangeSpec;
+
+mod json_document;
+
+use json_document::{compressed_json_document_ndjson_stream, json_document_ndjson_stream};
 
 fn select_default_read_buffer_size_u64() -> u64 {
     u64::try_from(SELECT_DEFAULT_READ_BUFFER_SIZE).unwrap_or(u64::MAX)
 }
 
-/// Maximum allowed object size for JSON DOCUMENT mode.
+fn compression_format(input: &InputSerialization) -> Result<Option<CompressionFormat>, SelectError> {
+    match input.compression_type.as_ref().map(|value| value.as_str()) {
+        None | Some(CompressionType::NONE) => Ok(None),
+        Some(CompressionType::GZIP) => Ok(Some(CompressionFormat::Gzip)),
+        Some(CompressionType::BZIP2) => Ok(Some(CompressionFormat::Bzip2)),
+        Some(_) => Err(SelectError::InvalidCompressionFormat),
+    }
+}
+
+/// Maximum decoded input accepted for JSON DOCUMENT mode.
 ///
-/// JSON DOCUMENT format requires loading the entire file into memory for DOM
-/// parsing, so memory consumption grows linearly with file size.  Objects
-/// larger than this threshold are rejected with an error rather than risking
-/// an OOM condition.
-///
-/// To process larger JSON files, convert the input to **JSON LINES** (NDJSON,
-/// `type = LINES`), which supports line-by-line streaming with no memory
-/// size limit.
-///
-/// Default: 128 MiB.  This matches the AWS S3 Select limit for JSON DOCUMENT
-/// inputs. The query memory pool also applies: RustFS reserves 64 times the
-/// input size for parsing and output. With the default 64 MiB query memory
-/// limit, JSON DOCUMENT inputs larger than 1 MiB are rejected; raise
-/// `RUSTFS_S3SELECT_MEMORY_LIMIT_BYTES` to process larger inputs, up to this
-/// hard cap.
+/// Root arrays are parsed incrementally, while a root object or scalar must fit
+/// in the query memory pool as one logical record. The hard cap also bounds
+/// compressed input after decompression.
 pub const MAX_JSON_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
-const JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER: usize = 64;
+#[cfg(test)]
+use json_document::{
+    JSON_CANCELLATION_CHECK_BYTES, JSON_CANCELLATION_CHECK_KEYS, escaped_json_object_with_size, flatten_json_document_to_ndjson,
+    json_key_eq_ignore_ascii_case_with_checkpoint, parse_json_document_to_lines, remove_json_source_key_with_checkpoint,
+    validate_json_document_size,
+};
 pub const INVALID_SCAN_RANGE_MESSAGE: &str =
     "The value of a parameter in ScanRange element is invalid. Check the service API documentation and try again.";
 const NORMALIZED_RECORD_DELIMITER: &[u8] = b"\r\n";
 const NORMALIZED_FIELD_DELIMITER: &[u8] = &[DEFAULT_DELIMITER];
+
+/// Returns true for the MinIO-compatible full-scan range marker.
+pub fn is_noop_scan_range(scan_range: &ScanRange) -> bool {
+    scan_range.start == Some(0) && scan_range.end.is_none()
+}
 
 pub struct EcObjectStore {
     input: Arc<SelectObjectContentInput>,
     need_convert: bool,
     delimiter: String,
     /// True when the JSON input type is DOCUMENT (multi-line formatted JSON).
-    /// In that case the raw bytes are buffered and flattened to NDJSON before
+    /// In that case the input is incrementally framed into NDJSON rows before
     /// being handed to DataFusion's Arrow JSON reader.
     is_json_document: bool,
-    /// Optional JSON sub-path extracted from `FROM s3object.<path>` in the SQL
-    /// expression.  When set, `flatten_json_document_to_ndjson` navigates to
-    /// this key in the root JSON object before flattening.
-    json_sub_path: Option<String>,
+    /// JSON source path produced by the SQL compatibility analyzer.
+    json_source: JsonSource,
+    input_metrics: Arc<SelectInputMetrics>,
     memory_pool: Arc<dyn MemoryPool>,
     query_tracker: Option<QueryExecutionTracker>,
     store: Option<Arc<SelectStore>>,
@@ -172,33 +191,54 @@ pub struct InvalidScanRange;
 
 impl EcObjectStore {
     pub fn new(input: Arc<SelectObjectContentInput>) -> S3Result<Self> {
-        Self::build_lazy(input, Arc::new(UnboundedMemoryPool::default()), None).map_err(map_build_error_to_s3)
+        let source = legacy_json_source_from_input(&input);
+        Self::build_lazy(
+            input,
+            Arc::new(UnboundedMemoryPool::default()),
+            None,
+            Arc::new(SelectInputMetrics::default()),
+            source,
+        )
+        .map_err(map_build_error_to_s3)
     }
 
     pub fn new_with_snapshot(input: Arc<SelectObjectContentInput>, snapshot: Arc<SelectObjectSnapshot>) -> S3Result<Self> {
-        Self::build_with_snapshot(input, Arc::new(UnboundedMemoryPool::default()), None, snapshot).map_err(map_build_error_to_s3)
+        let source = legacy_json_source_from_input(&input);
+        Self::build_with_snapshot(
+            input,
+            Arc::new(UnboundedMemoryPool::default()),
+            None,
+            Arc::new(SelectInputMetrics::default()),
+            snapshot,
+            source,
+        )
+        .map_err(map_build_error_to_s3)
     }
 
-    pub(crate) fn new_with_memory_pool(
+    pub(crate) fn new_with_memory_pool_and_source(
         input: Arc<SelectObjectContentInput>,
         memory_pool: Arc<dyn MemoryPool>,
+        input_metrics: Arc<SelectInputMetrics>,
         snapshot: Option<Arc<SelectObjectSnapshot>>,
+        source: JsonSource,
     ) -> std::result::Result<Self, EcObjectStoreBuildError> {
         match snapshot {
-            Some(snapshot) => Self::build_with_snapshot(input, memory_pool, None, snapshot),
-            None => Self::build_lazy(input, memory_pool, None),
+            Some(snapshot) => Self::build_with_snapshot(input, memory_pool, None, input_metrics, snapshot, source),
+            None => Self::build_lazy(input, memory_pool, None, input_metrics, source),
         }
     }
 
-    pub(crate) fn new_with_query_tracker(
+    pub(crate) fn new_with_query_tracker_and_source(
         input: Arc<SelectObjectContentInput>,
         memory_pool: Arc<dyn MemoryPool>,
         query_tracker: QueryExecutionTracker,
+        input_metrics: Arc<SelectInputMetrics>,
         snapshot: Option<Arc<SelectObjectSnapshot>>,
+        source: JsonSource,
     ) -> std::result::Result<Self, EcObjectStoreBuildError> {
         match snapshot {
-            Some(snapshot) => Self::build_with_snapshot(input, memory_pool, Some(query_tracker), snapshot),
-            None => Self::build_lazy(input, memory_pool, Some(query_tracker)),
+            Some(snapshot) => Self::build_with_snapshot(input, memory_pool, Some(query_tracker), input_metrics, snapshot, source),
+            None => Self::build_lazy(input, memory_pool, Some(query_tracker), input_metrics, source),
         }
     }
 
@@ -206,29 +246,43 @@ impl EcObjectStore {
         input: Arc<SelectObjectContentInput>,
         memory_pool: Arc<dyn MemoryPool>,
         query_tracker: Option<QueryExecutionTracker>,
+        input_metrics: Arc<SelectInputMetrics>,
+        source: JsonSource,
     ) -> std::result::Result<Self, EcObjectStoreBuildError> {
         let store = resolve_select_object_store_handle().ok_or(EcObjectStoreBuildError::StoreUnavailable)?;
-        Ok(Self::build(input, memory_pool, query_tracker, Some(store), None))
+        Ok(Self::build(input, memory_pool, query_tracker, input_metrics, Some(store), None, source))
     }
 
     fn build_with_snapshot(
         input: Arc<SelectObjectContentInput>,
         memory_pool: Arc<dyn MemoryPool>,
         query_tracker: Option<QueryExecutionTracker>,
+        input_metrics: Arc<SelectInputMetrics>,
         snapshot: Arc<SelectObjectSnapshot>,
+        source: JsonSource,
     ) -> std::result::Result<Self, EcObjectStoreBuildError> {
         if !snapshot.is_for(&input.bucket, &input.key) {
             return Err(EcObjectStoreBuildError::Snapshot(SnapshotConsistencyError::ObjectChanged));
         }
-        Ok(Self::build(input, memory_pool, query_tracker, None, Some(snapshot)))
+        Ok(Self::build(
+            input,
+            memory_pool,
+            query_tracker,
+            input_metrics,
+            None,
+            Some(snapshot),
+            source,
+        ))
     }
 
     fn build(
         input: Arc<SelectObjectContentInput>,
         memory_pool: Arc<dyn MemoryPool>,
         query_tracker: Option<QueryExecutionTracker>,
+        input_metrics: Arc<SelectInputMetrics>,
         store: Option<Arc<SelectStore>>,
         snapshot: Option<Arc<SelectObjectSnapshot>>,
+        source: JsonSource,
     ) -> Self {
         let (need_convert, delimiter) = if let Some(csv) = input.request.input_serialization.csv.as_ref() {
             if let Some(delimiter) = csv.field_delimiter.as_ref() {
@@ -246,29 +300,15 @@ impl EcObjectStore {
 
         // Detect JSON DOCUMENT type: the entire file is a single (possibly
         // multi-line) JSON object/array, NOT newline-delimited JSON.
-        let is_json_document = input
-            .request
-            .input_serialization
-            .json
-            .as_ref()
-            .and_then(|j| j.type_.as_ref())
-            .map(|t| t.as_str() == "DOCUMENT")
-            .unwrap_or(false);
-
-        // Extract the JSON sub-path from the SQL expression, e.g.
-        // `SELECT … FROM s3object.employees e` → `Some("employees")`.
-        let json_sub_path = if is_json_document {
-            extract_json_sub_path_from_expression(&input.request.expression)
-        } else {
-            None
-        };
+        let is_json_document = is_json_document_input(&input);
 
         Self {
             input,
             need_convert,
             delimiter,
             is_json_document,
-            json_sub_path,
+            json_source: source,
+            input_metrics,
             memory_pool,
             query_tracker,
             store,
@@ -285,6 +325,9 @@ impl EcObjectStore {
         let Some(scan_range) = self.input.request.scan_range.as_ref() else {
             return Ok(None);
         };
+        if is_noop_scan_range(scan_range) {
+            return Ok(None);
+        }
         scan_range_from_bounds(scan_range.start, scan_range.end, object_size)
     }
 
@@ -302,6 +345,29 @@ impl EcObjectStore {
     fn record_delimiter_for_conversion(&self) -> Option<Vec<u8>> {
         let delimiter = self.record_delimiter();
         (self.need_convert || (delimiter.len() == 2 && delimiter != NORMALIZED_RECORD_DELIMITER)).then_some(delimiter)
+    }
+
+    fn convert_csv_stream<S>(&self, stream: S) -> BoxStream<'static, Result<Bytes>>
+    where
+        S: Stream<Item = Result<Bytes>> + Send + 'static,
+    {
+        if let Some(csv) = self.input.request.input_serialization.csv.as_ref()
+            && csv_input_requires_normalization(csv.quote_character.as_deref(), csv.quote_escape_character.as_deref())
+        {
+            let syntax = CsvSyntax {
+                quote: csv.quote_character.as_deref(),
+                escape: csv.quote_escape_character.as_deref(),
+                field: csv.field_delimiter.as_deref(),
+                record: csv.record_delimiter.as_deref(),
+                comment: csv.comments.as_ref().and_then(|comment| comment.as_bytes().first().copied()),
+            };
+            return normalize_csv_stream(stream, &syntax);
+        }
+        convert_csv_delimiter_stream(
+            stream,
+            self.record_delimiter_for_conversion(),
+            self.need_convert.then(|| self.delimiter.clone()),
+        )
     }
 
     fn csv_has_header(&self) -> bool {
@@ -432,6 +498,86 @@ impl EcObjectStore {
     }
 }
 
+pub(crate) fn is_json_document_input(input: &SelectObjectContentInput) -> bool {
+    input
+        .request
+        .input_serialization
+        .json
+        .as_ref()
+        .and_then(|json| json.type_.as_ref())
+        .is_some_and(|json_type| json_type.as_str() == "DOCUMENT")
+}
+
+/// Preserves the pre-typed-path single-key behavior of public legacy constructors.
+pub(crate) fn legacy_json_source_from_input(input: &SelectObjectContentInput) -> JsonSource {
+    if !is_json_document_input(input) {
+        return JsonSource::default();
+    }
+    let Ok(mut statements) = SqlParser::parse_sql(&RustFsDialect, &input.request.expression) else {
+        return JsonSource::default();
+    };
+    if statements.len() != 1 {
+        return JsonSource::default();
+    }
+    let Some(Statement::Query(query)) = statements.pop() else {
+        return JsonSource::default();
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return JsonSource::default();
+    };
+    let [table] = select.from.as_slice() else {
+        return JsonSource::default();
+    };
+    let TableFactor::Table {
+        name, alias, json_path, ..
+    } = &table.relation
+    else {
+        return JsonSource::default();
+    };
+    let Some(ObjectNamePart::Identifier(table_name)) = name.0.first() else {
+        return JsonSource::default();
+    };
+    if name.0.len() > 2 {
+        return JsonSource::default();
+    }
+    let is_s3_object = if table_name.quote_style.is_some() {
+        table_name.value == "S3Object"
+    } else {
+        table_name.value.eq_ignore_ascii_case("S3Object")
+    };
+    if !is_s3_object {
+        return JsonSource::default();
+    }
+    let path = match (name.0.get(1), json_path.as_ref()) {
+        (Some(ObjectNamePart::Identifier(sub_path)), None) => vec![JsonPathSegment::Key {
+            name: sub_path.value.clone(),
+            quoted: sub_path.quote_style.is_some(),
+        }],
+        (None, None) => Vec::new(),
+        (None, Some(json_path)) if matches!(json_path.path.as_slice(), [JsonPathElem::Bracket { key: Expr::Wildcard(_) }]) => {
+            vec![JsonPathSegment::ArrayWildcard]
+        }
+        _ => return JsonSource::default(),
+    };
+    let scalar_column = alias
+        .as_ref()
+        .map(|alias| IdentNormalizer::default().normalize(alias.name.clone()))
+        .or_else(|| match path.as_slice() {
+            [] => Some(IdentNormalizer::default().normalize(table_name.clone())),
+            [JsonPathSegment::Key { name, quoted }] => {
+                let alias = if *quoted {
+                    Ident::with_quote('"', name)
+                } else {
+                    Ident::new(name)
+                };
+                Some(IdentNormalizer::default().normalize(alias))
+            }
+            [JsonPathSegment::ArrayWildcard] => Some(IdentNormalizer::default().normalize(Ident::new("_1"))),
+            _ => None,
+        });
+    JsonSource::new(path, scalar_column)
+}
+
 impl std::fmt::Debug for EcObjectStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EcObjectStore")
@@ -439,7 +585,7 @@ impl std::fmt::Debug for EcObjectStore {
             .field("object", &self.input.key)
             .field("need_convert", &self.need_convert)
             .field("is_json_document", &self.is_json_document)
-            .field("json_sub_path", &self.json_sub_path)
+            .field("json_source", &self.json_source)
             .finish_non_exhaustive()
     }
 }
@@ -516,11 +662,44 @@ fn http_range_spec_from_start(start: u64) -> HTTPRangeSpec {
     }
 }
 
-fn find_delimiter(bytes: &[u8], delimiter: &[u8]) -> Option<usize> {
-    if delimiter.is_empty() {
-        return None;
+enum DelimiterSearcher {
+    Empty,
+    Byte(u8),
+    Multi(Box<memmem::Finder<'static>>),
+}
+
+impl DelimiterSearcher {
+    fn new(delimiter: &[u8]) -> Self {
+        match delimiter {
+            [] => Self::Empty,
+            [byte] => Self::Byte(*byte),
+            _ => Self::Multi(Box::new(memmem::Finder::new(delimiter).into_owned())),
+        }
     }
-    bytes.windows(delimiter.len()).position(|window| window == delimiter)
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Byte(_) => 1,
+            Self::Multi(finder) => finder.needle().len(),
+        }
+    }
+
+    fn find(&self, bytes: &[u8]) -> Option<usize> {
+        match self {
+            Self::Empty => None,
+            Self::Byte(byte) => memchr(*byte, bytes),
+            Self::Multi(finder) => finder.find(bytes),
+        }
+    }
+}
+
+fn find_delimiter(bytes: &[u8], delimiter: &[u8]) -> Option<usize> {
+    match delimiter {
+        [] => None,
+        [byte] => memchr(*byte, bytes),
+        _ => memmem::find(bytes, delimiter),
+    }
 }
 
 fn map_prepare_snapshot_error(bucket: &str, object: &str, err: PrepareSelectObjectSnapshotError) -> o_Error {
@@ -659,6 +838,22 @@ impl ObjectStore for EcObjectStore {
         // this instance's immutable snapshot; later operations reuse it.
         let snapshot = self.snapshot(options.version.as_deref()).await?;
         let original_size = snapshot.logical_size();
+        let compression = compression_format(&self.input.request.input_serialization).map_err(|source| o_Error::Generic {
+            store: "EcObjectStore",
+            source: Box::new(source),
+        })?;
+        let has_effective_request_range = self
+            .input
+            .request
+            .scan_range
+            .as_ref()
+            .is_some_and(|scan_range| !is_noop_scan_range(scan_range));
+        if compression.is_some() && (options.range.is_some() || has_effective_request_range) {
+            return Err(o_Error::Generic {
+                store: "EcObjectStore",
+                source: Box::new(SelectError::UnsupportedScanRangeInput),
+            });
+        }
         let object_info = snapshot.object_info();
         let meta = ObjectMeta {
             location: location.clone(),
@@ -683,8 +878,7 @@ impl ObjectStore for EcObjectStore {
             });
         }
 
-        let record_delimiter = self.record_delimiter_for_conversion();
-        let needs_scan_context = options.range.is_none() && self.input.request.scan_range.is_some();
+        let needs_scan_context = options.range.is_none() && has_effective_request_range;
         let scan_context = if needs_scan_context {
             if let Some(scan_range) = self.scan_range(original_size)? {
                 let delimiter = self.record_delimiter();
@@ -705,46 +899,88 @@ impl ObjectStore for EcObjectStore {
             self.object_reader(range).await?
         };
 
-        let payload = if options.range.is_some() {
+        let meter_input = self.input.request.input_serialization.parquet.is_none();
+        let payload = if let Some(compression) = compression {
+            let max_processed_bytes = processed_bytes_limit();
+            let query_guard = match self.query_tracker.as_ref() {
+                Some(query_tracker) => Some(query_tracker.query_guard().ok_or_else(|| o_Error::Generic {
+                    store: "EcObjectStore",
+                    source: Box::new(QueryError::Cancel),
+                })?),
+                None => None,
+            };
+            if self.is_json_document {
+                let reader = compressed_input_reader(
+                    reader.stream,
+                    original_size,
+                    compression,
+                    Arc::clone(&self.input_metrics),
+                    max_processed_bytes,
+                    query_guard,
+                );
+                let stream = compressed_json_document_ndjson_stream(
+                    reader,
+                    self.json_source.clone(),
+                    Arc::clone(&self.memory_pool),
+                    self.query_tracker.clone(),
+                );
+                GetResultPayload::Stream(stream)
+            } else {
+                let input_record_delimiter = if self.input.request.input_serialization.csv.is_some() {
+                    self.record_delimiter()
+                } else {
+                    b"\n".to_vec()
+                };
+                let stream = compressed_input_stream(
+                    reader.stream,
+                    original_size,
+                    compression,
+                    Arc::clone(&self.input_metrics),
+                    input_record_delimiter,
+                    max_processed_bytes,
+                    query_guard,
+                )?;
+                let stream = self.convert_csv_stream(stream);
+                GetResultPayload::Stream(stream)
+            }
+        } else if options.range.is_some() {
             let size = usize::try_from(result_range.end - result_range.start).map_err(|err| o_Error::Generic {
                 store: "EcObjectStore",
                 source: Box::new(err),
             })?;
-            GetResultPayload::Stream(
-                bytes_stream(ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE), size).boxed(),
-            )
+            let stream = bytes_stream(ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE), size);
+            if meter_input {
+                GetResultPayload::Stream(meter_uncompressed_input_stream(stream, Arc::clone(&self.input_metrics)).boxed())
+            } else {
+                GetResultPayload::Stream(stream.boxed())
+            }
         } else if self.is_json_document {
-            // JSON DOCUMENT mode: gate on object size before doing any I/O.
-            //
-            // Small files (<= MAX_JSON_DOCUMENT_BYTES): build a lazy stream
-            // that defers all I/O and JSON parsing until DataFusion first
-            // polls it.  Parsing runs inside spawn_blocking so the async
-            // runtime thread is never blocked.
-            //
-            // Large files (> MAX_JSON_DOCUMENT_BYTES): return an error
-            // immediately.  JSON DOCUMENT relies on serde_json DOM parsing
-            // which must load the whole file into memory; rejecting oversized
-            // files upfront is safer than risking OOM.  Users should convert
-            // their data to JSON LINES (NDJSON) format for large files.
-            validate_json_document_size(original_size)?;
+            // Size validation is eager; input and row production remain lazy.
             let stream = json_document_ndjson_stream(
                 reader.stream,
                 original_size,
-                self.json_sub_path.clone(),
+                self.json_source.clone(),
+                Arc::clone(&self.input_metrics),
                 Arc::clone(&self.memory_pool),
                 self.query_tracker.clone(),
-            );
+            )?;
             GetResultPayload::Stream(stream)
         } else if let Some((scan_range, read_start)) = scan_context {
             let delimiter = self.record_delimiter();
             let include_header = self.csv_has_header();
             let header = if include_header && read_start > 0 {
-                Some(self.read_header_record(original_size, &delimiter).await?)
+                let input_metrics = self.input_metrics.recorder();
+                let header = self.read_header_record(original_size, &delimiter).await?;
+                input_metrics.record_uncompressed(header.len());
+                Some(header)
             } else {
                 None
             };
             let stream = scan_range_stream(
-                ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE),
+                meter_uncompressed_input_stream(
+                    ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE),
+                    Arc::clone(&self.input_metrics),
+                ),
                 delimiter,
                 scan_range,
                 include_header && header.is_none(),
@@ -757,22 +993,21 @@ impl ObjectStore for EcObjectStore {
             } else {
                 stream
             };
-            GetResultPayload::Stream(convert_csv_delimiter_stream(
-                stream,
-                record_delimiter,
-                self.need_convert.then(|| self.delimiter.clone()),
-            ))
+            let stream = self.convert_csv_stream(stream);
+            GetResultPayload::Stream(stream)
         } else {
             let stream_size = usize::try_from(original_size).map_err(|err| o_Error::Generic {
                 store: "EcObjectStore",
                 source: Box::new(err),
             })?;
             let stream = bytes_stream(ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE), stream_size);
-            GetResultPayload::Stream(convert_csv_delimiter_stream(
-                stream,
-                record_delimiter,
-                self.need_convert.then(|| self.delimiter.clone()),
-            ))
+            if meter_input {
+                let stream = meter_uncompressed_input_stream(stream, Arc::clone(&self.input_metrics));
+                let stream = self.convert_csv_stream(stream);
+                GetResultPayload::Stream(stream)
+            } else {
+                GetResultPayload::Stream(stream.boxed())
+            }
         };
 
         Ok(GetResult {
@@ -944,7 +1179,7 @@ where
 
 struct ScanRangeState<S> {
     stream: S,
-    delimiter: Vec<u8>,
+    delimiter: DelimiterSearcher,
     range: SelectScanRange,
     include_header: bool,
     offset: u64,
@@ -968,7 +1203,7 @@ where
 {
     let state = ScanRangeState {
         stream,
-        delimiter,
+        delimiter: DelimiterSearcher::new(&delimiter),
         range,
         include_header,
         offset: base_offset,
@@ -1021,26 +1256,36 @@ impl<S> ScanRangeState<S> {
         if self.record.is_empty() {
             self.record_start = self.offset;
         }
-        let search_start = self.record.len().saturating_sub(self.delimiter.len().saturating_sub(1));
+        let delimiter_len = self.delimiter.len();
+        let search_start = self.record.len().saturating_sub(delimiter_len.saturating_sub(1));
         self.record.extend_from_slice(bytes);
         self.offset = self.offset.saturating_add(bytes.len() as u64);
 
+        let mut record_begin = 0;
         let mut search_start = search_start;
-        while let Some(pos) = find_delimiter(&self.record[search_start..], &self.delimiter) {
-            let record_end = search_start + pos + self.delimiter.len();
-            self.finish_record(record_end);
+        while let Some(pos) = self.delimiter.find(&self.record[search_start..]) {
+            let record_end = search_start + pos + delimiter_len;
+            let relative_start = u64::try_from(record_begin).unwrap_or(u64::MAX);
+            let record_start = self.record_start.saturating_add(relative_start);
+            self.finish_record(record_begin..record_end, record_start);
+            record_begin = record_end;
             if self.done {
                 break;
             }
-            search_start = 0;
+            search_start = record_end;
+        }
+
+        if record_begin > 0 {
+            self.record.drain(..record_begin);
+            let consumed = u64::try_from(record_begin).unwrap_or(u64::MAX);
+            self.record_start = self.record_start.saturating_add(consumed);
         }
     }
 
-    fn finish_record(&mut self, record_end: usize) {
-        let record = self.record.drain(..record_end).collect::<Vec<_>>();
-        let record_start = self.record_start;
-        self.record_start = self.record_start.saturating_add(record_end as u64);
-        self.push_record(record, record_start);
+    fn finish_record(&mut self, record_range: Range<usize>, record_start: u64) {
+        if self.should_emit_record(record_start) {
+            self.pending.push_back(Bytes::copy_from_slice(&self.record[record_range]));
+        }
     }
 
     fn finish_pending_record(&mut self) {
@@ -1049,277 +1294,34 @@ impl<S> ScanRangeState<S> {
         }
         let record = std::mem::take(&mut self.record);
         let record_start = self.record_start;
-        self.push_record(record, record_start);
+        if self.should_emit_record(record_start) {
+            self.pending.push_back(Bytes::from(record));
+        }
     }
 
-    fn push_record(&mut self, record: Vec<u8>, record_start: u64) {
+    fn should_emit_record(&mut self, record_start: u64) -> bool {
         let include_header = self.include_header && record_start == 0;
         let include_record = record_start >= self.range.start() && record_start <= self.range.end();
         if include_header || include_record {
-            self.pending.push_back(Bytes::from(record));
-        } else {
-            if record_start > self.range.end() {
-                self.done = true;
-            }
+            return true;
         }
+        if record_start > self.range.end() {
+            self.done = true;
+        }
+        false
     }
 }
 
-fn extract_json_sub_path_from_expression(expression: &str) -> Option<String> {
-    let mut statements = SqlParser::parse_sql(&RustFsDialect, expression).ok()?;
-    if statements.len() != 1 {
-        return None;
-    }
-    let Statement::Query(query) = statements.pop()? else {
-        return None;
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return None;
-    };
-    let [table] = select.from.as_slice() else {
-        return None;
-    };
-    let TableFactor::Table { name, .. } = &table.relation else {
-        return None;
-    };
-    let [ObjectNamePart::Identifier(table_name), ObjectNamePart::Identifier(sub_path)] = name.0.as_slice() else {
-        return None;
-    };
-    let is_s3_object = if table_name.quote_style.is_some() {
-        table_name.value == "S3Object"
-    } else {
-        table_name.value.eq_ignore_ascii_case("S3Object")
-    };
-    is_s3_object.then(|| sub_path.value.clone())
-}
-
-/// Build a lazy NDJSON stream from a JSON DOCUMENT reader.
-///
-/// `get_opts` calls this and returns immediately – no I/O is performed until
-/// DataFusion begins polling the returned stream.  The pipeline is:
-///
-/// 1. **Read** – the object bytes are read asynchronously from `stream` only
-///    when the returned stream is first polled.
-/// 2. **Parse** – JSON deserialization runs inside
-///    `tokio::task::spawn_blocking` so the async runtime is never blocked by
-///    CPU-bound work, even for very large documents.
-/// 3. **Yield** – each NDJSON line (one per array element, or one line for a
-///    scalar/object root) is yielded as a separate [`Bytes`] chunk, so
-///    DataFusion can pipeline row processing as lines arrive.
-fn json_document_ndjson_stream(
-    stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync>,
-    original_size: u64,
-    json_sub_path: Option<String>,
-    memory_pool: Arc<dyn MemoryPool>,
-    query_tracker: Option<QueryExecutionTracker>,
-) -> futures_core::stream::BoxStream<'static, Result<Bytes>> {
-    json_document_ndjson_stream_with_parser(
-        stream,
-        original_size,
-        json_sub_path,
-        memory_pool,
-        query_tracker,
-        |all_bytes, json_sub_path| parse_json_document_to_lines(&all_bytes, json_sub_path.as_deref()),
-    )
-}
-
-fn json_document_ndjson_stream_with_parser<P>(
-    stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync>,
-    original_size: u64,
-    json_sub_path: Option<String>,
-    memory_pool: Arc<dyn MemoryPool>,
-    query_tracker: Option<QueryExecutionTracker>,
-    parser: P,
-) -> futures_core::stream::BoxStream<'static, Result<Bytes>>
+fn meter_uncompressed_input_stream<S, E>(
+    stream: S,
+    input_metrics: Arc<SelectInputMetrics>,
+) -> impl Stream<Item = std::result::Result<Bytes, E>> + Send + 'static
 where
-    P: FnOnce(Vec<u8>, Option<String>) -> std::io::Result<Vec<Bytes>> + Send + 'static,
+    S: Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
+    E: Send + 'static,
 {
-    AsyncTryStream::<Bytes, o_Error, _>::new(|mut y| async move {
-        // Compact JSON can expand substantially into a serde_json DOM and
-        // per-record output buffers, so reserve a conservative upper bound
-        // before the source buffer is allocated.
-        let buffer_capacity = usize::try_from(original_size).map_err(|_| o_Error::Generic {
-            store: "EcObjectStore",
-            source: Box::new(DataFusionError::ResourcesExhausted(format!(
-                "JSON DOCUMENT input size {original_size} does not fit in memory"
-            ))),
-        })?;
-        let reservation_bytes = buffer_capacity
-            .checked_mul(JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER)
-            .ok_or_else(|| o_Error::Generic {
-                store: "EcObjectStore",
-                source: Box::new(DataFusionError::ResourcesExhausted(format!(
-                    "JSON DOCUMENT memory reservation overflow for {original_size} input bytes"
-                ))),
-            })?;
-        let reservation = MemoryConsumer::new("S3 Select JSON document").register(&memory_pool);
-        reservation.try_resize(reservation_bytes).map_err(|err| o_Error::Generic {
-            store: "EcObjectStore",
-            source: Box::new(err),
-        })?;
-
-        pin_mut!(stream);
-        // ── 1. Read phase (lazy: only runs when the stream is polled) ────
-        let mut all_bytes = Vec::with_capacity(buffer_capacity);
-        stream
-            .take(original_size)
-            .read_to_end(&mut all_bytes)
-            .await
-            .map_err(|e| o_Error::Generic {
-                store: "EcObjectStore",
-                source: Box::new(e),
-            })?;
-        if all_bytes.len() != buffer_capacity {
-            return Err(incomplete_object_stream_error(buffer_capacity - all_bytes.len()));
-        }
-
-        // ── 2. Parse phase (blocking thread pool, non-blocking runtime) ──
-        let pending_query_guard = PendingQueryExecutionGuard::new(query_tracker);
-        let task_query_guard = pending_query_guard.task_state();
-        let (lines, _reservation, _query_guard) = SpawnedTask::spawn_blocking(move || {
-            let query_guard = PendingQueryExecutionGuard::start(&task_query_guard)?;
-            parser(all_bytes, json_sub_path).map(|lines| (lines, reservation, query_guard))
-        })
-        .await
-        .map_err(|e| o_Error::Generic {
-            store: "EcObjectStore",
-            source: e.to_string().into(),
-        })?
-        .map_err(|e| o_Error::Generic {
-            store: "EcObjectStore",
-            source: if e.kind() == std::io::ErrorKind::InvalidData {
-                Box::new(SelectError::JsonParsingError)
-            } else {
-                Box::new(e)
-            },
-        })?;
-
-        // ── 3. Yield phase (one Bytes per NDJSON line) ───────────────────
-        for line in lines {
-            y.yield_ok(line).await;
-        }
-        Ok(())
-    })
-    .boxed()
-}
-
-struct PendingQueryExecutionGuard {
-    state: Arc<Mutex<QueryExecutionGuardState>>,
-}
-
-enum QueryExecutionGuardState {
-    Pending(Option<QueryExecutionTracker>),
-    Started,
-    Cancelled,
-}
-
-impl PendingQueryExecutionGuard {
-    fn new(query_tracker: Option<QueryExecutionTracker>) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(QueryExecutionGuardState::Pending(query_tracker))),
-        }
-    }
-
-    fn task_state(&self) -> Arc<Mutex<QueryExecutionGuardState>> {
-        Arc::clone(&self.state)
-    }
-
-    fn start(state: &Mutex<QueryExecutionGuardState>) -> std::io::Result<Option<QueryExecutionGuard>> {
-        let mut state = state.lock();
-        match std::mem::replace(&mut *state, QueryExecutionGuardState::Started) {
-            QueryExecutionGuardState::Pending(None) => Ok(None),
-            QueryExecutionGuardState::Pending(Some(query_tracker)) => query_tracker.query_guard().map(Some).ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::Interrupted, "JSON DOCUMENT parse was cancelled before it started")
-            }),
-            QueryExecutionGuardState::Cancelled => {
-                *state = QueryExecutionGuardState::Cancelled;
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "JSON DOCUMENT parse was cancelled before it started",
-                ))
-            }
-            QueryExecutionGuardState::Started => {
-                *state = QueryExecutionGuardState::Started;
-                Err(std::io::Error::other("JSON DOCUMENT parse started more than once"))
-            }
-        }
-    }
-}
-
-impl Drop for PendingQueryExecutionGuard {
-    fn drop(&mut self) {
-        let query_guard = {
-            let mut state = self.state.lock();
-            match std::mem::replace(&mut *state, QueryExecutionGuardState::Cancelled) {
-                QueryExecutionGuardState::Pending(query_guard) => query_guard,
-                QueryExecutionGuardState::Started => {
-                    *state = QueryExecutionGuardState::Started;
-                    None
-                }
-                QueryExecutionGuardState::Cancelled => None,
-            }
-        };
-        drop(query_guard);
-    }
-}
-
-/// Parse a JSON DOCUMENT (a single JSON value, possibly multi-line) into a
-/// list of NDJSON lines – one [`Bytes`] per record.
-///
-/// `json_sub_path` – when the SQL expression contains `FROM s3object.<key>`,
-/// pass `Some(key)` to navigate into that key before flattening.  For
-/// example, given `{"employees":[{…},{…}]}` and `json_sub_path =
-/// Some("employees")`, each element of the `employees` array becomes one
-/// NDJSON line.
-///
-/// - A JSON array → one line per element.
-/// - A JSON object (no sub-path match, or scalar root) → one line.
-fn parse_json_document_to_lines(bytes: &[u8], json_sub_path: Option<&str>) -> std::io::Result<Vec<Bytes>> {
-    let root: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    // Navigate into the sub-path when the root is an object and a path was
-    // extracted from the SQL FROM clause (e.g. `FROM s3object.employees`).
-    let value = match (root, json_sub_path) {
-        (serde_json::Value::Object(mut object), Some(path)) => {
-            object.remove(path).unwrap_or_else(|| serde_json::Value::Object(object))
-        }
-        (root, _) => root,
-    };
-
-    let mut lines: Vec<Bytes> = Vec::new();
-    match value {
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                let mut line = serde_json::to_vec(&item).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                line.push(b'\n');
-                lines.push(Bytes::from(line));
-            }
-        }
-        other => {
-            let mut line = serde_json::to_vec(&other).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            line.push(b'\n');
-            lines.push(Bytes::from(line));
-        }
-    }
-    Ok(lines)
-}
-
-/// Convert a JSON DOCUMENT to a single concatenated NDJSON [`Bytes`] blob.
-///
-/// This is a convenience wrapper around [`parse_json_document_to_lines`] used
-/// by the unit tests.  Production code uses `json_document_ndjson_stream`
-/// instead, which streams lines lazily without constructing this intermediate
-/// blob.
-#[cfg(test)]
-fn flatten_json_document_to_ndjson(bytes: &[u8], json_sub_path: Option<&str>) -> std::io::Result<Bytes> {
-    let lines = parse_json_document_to_lines(bytes, json_sub_path)?;
-    let total = lines.iter().map(|b| b.len()).sum();
-    let mut output = Vec::with_capacity(total);
-    for line in lines {
-        output.extend_from_slice(&line);
-    }
-    Ok(Bytes::from(output))
+    let input_metrics = input_metrics.recorder();
+    stream.inspect_ok(move |bytes| input_metrics.record_uncompressed(bytes.len()))
 }
 
 pub fn bytes_stream<S>(stream: S, content_length: usize) -> impl Stream<Item = Result<Bytes>> + Send + 'static
@@ -1350,21 +1352,6 @@ where
     })
 }
 
-fn validate_json_document_size(original_size: u64) -> Result<()> {
-    if original_size <= MAX_JSON_DOCUMENT_BYTES {
-        return Ok(());
-    }
-
-    Err(o_Error::Generic {
-        store: "EcObjectStore",
-        source: Box::new(DataFusionError::ResourcesExhausted(format!(
-            "JSON DOCUMENT object is {original_size} bytes, which exceeds the maximum allowed size of \
-             {MAX_JSON_DOCUMENT_BYTES} bytes ({} MiB). Convert the input to JSON LINES (NDJSON) to process large files.",
-            MAX_JSON_DOCUMENT_BYTES / (1024 * 1024)
-        ))),
-    })
-}
-
 fn incomplete_object_stream_error(remaining: impl std::fmt::Display) -> o_Error {
     o_Error::Generic {
         store: "EcObjectStore",
@@ -1378,21 +1365,24 @@ fn incomplete_object_stream_error(remaining: impl std::fmt::Display) -> o_Error 
 #[cfg(test)]
 mod test {
     use super::{
-        EcObjectStore, EcObjectStoreBuildError, JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER, OnceCell,
-        SELECT_DEFAULT_READ_BUFFER_SIZE, SelectObjectOptions, SelectObjectSnapshot, SelectScanRange, SnapshotConsistencyError,
-        bytes_stream, convert_csv_delimiter_stream, convert_field_delimiter_stream, convert_record_delimiter_stream,
-        extract_json_sub_path_from_expression, find_delimiter, flatten_json_document_to_ndjson, http_range_spec_from_get_range,
-        json_document_ndjson_stream, json_document_ndjson_stream_with_parser, map_storage_error, scan_range_from_bounds,
+        EcObjectStore, EcObjectStoreBuildError, OnceCell, SELECT_DEFAULT_READ_BUFFER_SIZE, SelectObjectOptions,
+        SelectObjectSnapshot, SelectScanRange, SnapshotConsistencyError, bytes_stream, compressed_json_document_ndjson_stream,
+        convert_csv_delimiter_stream, convert_field_delimiter_stream, convert_record_delimiter_stream,
+        escaped_json_object_with_size, find_delimiter, flatten_json_document_to_ndjson, http_range_spec_from_get_range,
+        json_document_ndjson_stream, json_key_eq_ignore_ascii_case_with_checkpoint, legacy_json_source_from_input,
+        map_storage_error, meter_uncompressed_input_stream, remove_json_source_key_with_checkpoint, scan_range_from_bounds,
         scan_range_stream, select_read_headers, snapshot_last_modified, validate_json_document_size,
     };
+    use crate::input_stream::{CompressionFormat, MAX_SELECT_RECORD_BYTES, compressed_input_reader, encode_compressed_fixture};
+    use crate::query::ast::{JsonPathSegment, JsonSource};
     use crate::query::session::{QueryExecutionGuard, QueryExecutionOwner, QueryExecutionTracker};
     use crate::storage_api::SelectPutObjReader;
     use crate::storage_api::object_store::ObjectIO as _;
-    use crate::{QueryError, SelectError, SelectStorageError};
+    use crate::{QueryError, SelectError, SelectInputMetrics, SelectStorageError};
     use bytes::Bytes;
     use datafusion::{
         common::DataFusionError,
-        execution::memory_pool::{GreedyMemoryPool, MemoryPool},
+        execution::memory_pool::{GreedyMemoryPool, MemoryLimit, MemoryPool, MemoryReservation},
         execution::{config::SessionConfig, context::SessionContext},
         object_store::{self, GetOptions, GetRange, GetResultPayload, ObjectStore as _, path::Path},
         physical_plan::ExecutionPlanProperties,
@@ -1400,11 +1390,12 @@ mod test {
     };
     use futures::{StreamExt, TryStreamExt, stream};
     use http::HeaderMap;
+    use parking_lot::Mutex;
     use rustfs_test_utils::PutObjectCommitBarrier;
     use s3s::S3ErrorCode;
     use s3s::dto::{
-        CSVInput, CSVOutput, ExpressionType, FileHeaderInfo, InputSerialization, OutputSerialization, ScanRange,
-        SelectObjectContentInput, SelectObjectContentRequest,
+        CSVInput, CSVOutput, CompressionType, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput, JSONOutput,
+        JSONType, OutputSerialization, ScanRange, SelectObjectContentInput, SelectObjectContentRequest,
     };
     use s3s::header::{
         X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
@@ -1416,6 +1407,80 @@ mod test {
     };
 
     use tokio::{io::AsyncReadExt, sync::Semaphore};
+
+    const JSON_DOCUMENT_TEST_MEMORY_BYTES: usize = 8 * 1024 * 1024;
+
+    #[derive(Debug)]
+    struct AdmissionObservingMemoryPool {
+        inner: GreedyMemoryPool,
+        admission: Arc<Semaphore>,
+        reservation_release: Mutex<Option<tokio::sync::oneshot::Sender<bool>>>,
+    }
+
+    impl AdmissionObservingMemoryPool {
+        fn new(pool_size: usize, admission: Arc<Semaphore>) -> (Self, tokio::sync::oneshot::Receiver<bool>) {
+            let (reservation_release, reservation_released) = tokio::sync::oneshot::channel();
+            (
+                Self {
+                    inner: GreedyMemoryPool::new(pool_size),
+                    admission,
+                    reservation_release: Mutex::new(Some(reservation_release)),
+                },
+                reservation_released,
+            )
+        }
+    }
+
+    impl std::fmt::Display for AdmissionObservingMemoryPool {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Display::fmt(&self.inner, f)
+        }
+    }
+
+    impl MemoryPool for AdmissionObservingMemoryPool {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+            self.inner.grow(reservation, additional);
+        }
+
+        fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+            self.inner.shrink(reservation, shrink);
+            if self.inner.reserved() == 0
+                && let Some(reservation_release) = self.reservation_release.lock().take()
+            {
+                let _ = reservation_release.send(self.admission.available_permits() == 0);
+            }
+        }
+
+        fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> datafusion::common::Result<()> {
+            self.inner.try_grow(reservation, additional)
+        }
+
+        fn reserved(&self) -> usize {
+            self.inner.reserved()
+        }
+
+        fn memory_limit(&self) -> MemoryLimit {
+            self.inner.memory_limit()
+        }
+    }
+
+    fn source_key(name: &str) -> JsonPathSegment {
+        JsonPathSegment::Key {
+            name: name.to_string(),
+            quoted: false,
+        }
+    }
+
+    fn quoted_source_key(name: &str) -> JsonPathSegment {
+        JsonPathSegment::Key {
+            name: name.to_string(),
+            quoted: true,
+        }
+    }
 
     fn csv_input(bucket: &str, object: &str) -> Arc<SelectObjectContentInput> {
         Arc::new(SelectObjectContentInput {
@@ -1440,6 +1505,91 @@ mod test {
                 scan_range: None,
             },
         })
+    }
+
+    fn json_document_input(bucket: &str, object: &str, expression: &str) -> Arc<SelectObjectContentInput> {
+        Arc::new(SelectObjectContentInput {
+            bucket: bucket.to_string(),
+            expected_bucket_owner: None,
+            key: object.to_string(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            request: SelectObjectContentRequest {
+                expression: expression.to_string(),
+                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                input_serialization: InputSerialization {
+                    json: Some(JSONInput {
+                        type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
+                    }),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    csv: Some(CSVOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        })
+    }
+
+    #[test]
+    fn legacy_source_adapter_normalizes_scalar_bindings() {
+        let input = json_document_input("bucket", "input.json", "SELECT V FROM S3Object AS V");
+        let implicit = json_document_input("bucket", "input.json", "SELECT S3Object FROM S3Object");
+        let wildcard = json_document_input("bucket", "input.json", "SELECT _1 FROM S3Object[*]");
+        let key = json_document_input("bucket", "input.json", "SELECT * FROM S3Object.LongKey");
+        let quoted_key = json_document_input("bucket", "input.json", "SELECT * FROM S3Object.\"LongKey\"");
+
+        assert_eq!(legacy_json_source_from_input(&input), JsonSource::new(Vec::new(), Some("v".to_string())));
+        assert_eq!(
+            legacy_json_source_from_input(&implicit),
+            JsonSource::new(Vec::new(), Some("s3object".to_string()))
+        );
+        assert_eq!(
+            legacy_json_source_from_input(&wildcard),
+            JsonSource::new(vec![JsonPathSegment::ArrayWildcard], Some("_1".to_string()))
+        );
+        assert_eq!(legacy_json_source_from_input(&key).scalar_column(), Some("longkey"));
+        assert_eq!(legacy_json_source_from_input(&quoted_key).scalar_column(), Some("LongKey"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn legacy_public_constructors_preserve_single_key_json_source() {
+        const BUCKET: &str = "s3select-legacy-json-source";
+        const OBJECT: &str = "input.json";
+
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        env.put_object_bytes(BUCKET, OBJECT, br#"{"employees":[{"name":"Alice"}]}"#.to_vec())
+            .await;
+        let input = json_document_input(BUCKET, OBJECT, "SELECT e.name FROM S3Object.employees AS e");
+        let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
+
+        let lazy = EcObjectStore::new(Arc::clone(&input)).expect("legacy lazy constructor should resolve the global store");
+        let pinned =
+            EcObjectStore::new_with_snapshot(input, snapshot).expect("legacy pinned constructor should accept the snapshot");
+        let expected = JsonSource::new(vec![source_key("employees")], Some("e".to_string()));
+
+        assert_eq!(lazy.json_source, expected);
+        assert_eq!(pinned.json_source, expected);
+    }
+
+    fn json_input(bucket: &str, object: &str, json_type: &'static str) -> Arc<SelectObjectContentInput> {
+        let mut input = (*csv_input(bucket, object)).clone();
+        input.request.input_serialization = InputSerialization {
+            json: Some(JSONInput {
+                type_: Some(JSONType::from_static(json_type)),
+            }),
+            ..Default::default()
+        };
+        input.request.output_serialization = OutputSerialization {
+            json: Some(JSONOutput::default()),
+            ..Default::default()
+        };
+        Arc::new(input)
     }
 
     #[test]
@@ -2067,6 +2217,82 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_scan_range_stream_handles_many_records_in_one_chunk() {
+        const RECORDS: usize = 16 * 1024;
+        let input = b"x\n".repeat(RECORDS);
+        let object_size = u64::try_from(input.len()).expect("fixture length should fit in u64");
+        let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(input.clone()))]);
+        let output = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(0, object_size - 1), false, 0, object_size)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect many ScanRange records")
+            .concat();
+
+        assert_eq!(output, input);
+    }
+
+    #[tokio::test]
+    async fn test_scan_range_stream_matches_reference_across_chunk_boundaries() {
+        fn reference(input: &[u8], delimiter: &[u8], range: SelectScanRange, include_header: bool) -> Vec<u8> {
+            let mut output = Vec::new();
+            let mut record_begin = 0;
+            let mut record_start = 0_u64;
+            loop {
+                let record_end = input[record_begin..]
+                    .windows(delimiter.len())
+                    .position(|window| window == delimiter)
+                    .map(|position| record_begin + position + delimiter.len())
+                    .unwrap_or(input.len());
+                let include_record = record_start >= range.start() && record_start <= range.end();
+                if (include_header && record_start == 0) || include_record {
+                    output.extend_from_slice(&input[record_begin..record_end]);
+                } else if record_start > range.end() {
+                    break;
+                }
+                if record_end == input.len() {
+                    break;
+                }
+                record_start = record_start.saturating_add(u64::try_from(record_end - record_begin).unwrap_or(u64::MAX));
+                record_begin = record_end;
+            }
+            output
+        }
+
+        let fixtures: &[(&[u8], &[u8])] = &[
+            (b"header\none\ntwo\nthree", b"\n"),
+            (b"header\r\none\r\ntwo\r\nthree", b"\r\n"),
+            (b"headeraaoneaaaxaatwo", b"aa"),
+        ];
+        for (input, delimiter) in fixtures {
+            let object_size = u64::try_from(input.len()).expect("fixture length should fit in u64");
+            let ranges = [
+                SelectScanRange::new(0, object_size - 1),
+                SelectScanRange::new(1, object_size / 2),
+                SelectScanRange::new(object_size / 2, object_size - 1),
+            ];
+            for range in ranges {
+                for include_header in [false, true] {
+                    let expected = reference(input, delimiter, range, include_header);
+                    for chunk_size in 1..=input.len() {
+                        let chunks = input
+                            .chunks(chunk_size)
+                            .map(|chunk| Ok::<_, std::io::Error>(Bytes::copy_from_slice(chunk)))
+                            .collect::<Vec<_>>();
+                        let actual =
+                            scan_range_stream(stream::iter(chunks), delimiter.to_vec(), range, include_header, 0, object_size)
+                                .try_collect::<Vec<_>>()
+                                .await
+                                .expect("collect ScanRange output")
+                                .concat();
+
+                        assert_eq!(actual, expected, "delimiter={delimiter:?}, range={range:?}, chunk_size={chunk_size}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_scan_range_stream_converts_custom_delimiter_split_across_chunks() {
         let chunks = stream::iter(vec![
             Ok::<_, std::io::Error>(Bytes::from_static(b"h1,h2^")),
@@ -2192,8 +2418,10 @@ mod test {
 
     #[test]
     fn test_find_delimiter_handles_multi_byte_delimiter() {
+        assert_eq!(find_delimiter(b"one\ntwo", b"\n"), Some(3));
         assert_eq!(find_delimiter(b"one\r\ntwo", b"\r\n"), Some(3));
         assert_eq!(find_delimiter(b"one\ntwo", b"\r\n"), None);
+        assert_eq!(find_delimiter(b"one\ntwo", b""), None);
     }
 
     #[test]
@@ -2233,6 +2461,24 @@ mod test {
             output.extend_from_slice(&bytes.unwrap());
         }
         assert_eq!(output, b"a,1\nb,2\n");
+    }
+
+    #[tokio::test]
+    async fn delimiter_conversion_keeps_uncompressed_metrics_equal() {
+        let input = Bytes::from_static(b"a&&1\nb&&2\n");
+        let input_metrics = Arc::new(SelectInputMetrics::default());
+        let stream = stream::iter([Ok::<_, object_store::Error>(input.clone())]);
+        let stream = meter_uncompressed_input_stream(stream, Arc::clone(&input_metrics));
+        let output = convert_field_delimiter_stream(stream, "&&".to_string())
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("delimiter conversion should succeed")
+            .concat();
+
+        assert_eq!(output, b"a,1\nb,2\n");
+        let input_len = u64::try_from(input.len()).expect("fixture length should fit in u64");
+        assert_eq!(input_metrics.snapshot().bytes_scanned, input_len);
+        assert_eq!(input_metrics.snapshot().bytes_processed, input_len);
     }
 
     #[tokio::test]
@@ -2309,7 +2555,8 @@ mod test {
             need_convert: false,
             delimiter: String::new(),
             is_json_document: false,
-            json_sub_path: None,
+            json_source: JsonSource::default(),
+            input_metrics: Arc::new(SelectInputMetrics::default()),
             memory_pool: Arc::new(GreedyMemoryPool::new(1024)),
             query_tracker: None,
             store: None,
@@ -2495,7 +2742,8 @@ mod test {
             need_convert: false,
             delimiter: String::new(),
             is_json_document: false,
-            json_sub_path: None,
+            json_source: JsonSource::default(),
+            input_metrics: Arc::new(SelectInputMetrics::default()),
             memory_pool: Arc::new(GreedyMemoryPool::new(32 * 1024 * 1024)),
             query_tracker: None,
             store: None,
@@ -2586,12 +2834,14 @@ mod test {
             },
         });
         let snapshot = prepare_test_snapshot(bucket, object).await;
+        let input_metrics = Arc::new(SelectInputMetrics::default());
         let store = super::EcObjectStore {
             input,
             need_convert: true,
             delimiter: "\r\n".to_string(),
             is_json_document: false,
-            json_sub_path: None,
+            json_source: JsonSource::default(),
+            input_metrics: Arc::clone(&input_metrics),
             memory_pool: Arc::new(GreedyMemoryPool::new(1024)),
             query_tracker: None,
             store: None,
@@ -2609,6 +2859,9 @@ mod test {
         let chunks: Vec<Bytes> = stream.try_collect().await.expect("collect converted object stream");
 
         assert_eq!(chunks.concat(), b"a,1\r\n");
+        let input_len = u64::try_from(input_bytes.len()).expect("fixture length should fit in u64");
+        assert_eq!(input_metrics.snapshot().bytes_scanned, input_len);
+        assert_eq!(input_metrics.snapshot().bytes_processed, input_len);
 
         let requested_range = 3..10;
         let ranges = store
@@ -2642,6 +2895,33 @@ mod test {
     }
 
     #[tokio::test]
+    async fn metered_stream_counts_only_polled_chunks() {
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let source_poll_count = Arc::clone(&poll_count);
+        let source = stream::unfold(0, move |index| {
+            let source_poll_count = Arc::clone(&source_poll_count);
+            async move {
+                source_poll_count.fetch_add(1, Ordering::SeqCst);
+                let bytes = match index {
+                    0 => Bytes::from_static(b"abcd"),
+                    1 => Bytes::from_static(b"efgh"),
+                    _ => return None,
+                };
+                Some((Ok::<_, std::io::Error>(bytes), index + 1))
+            }
+        });
+        let input_metrics = Arc::new(SelectInputMetrics::default());
+        let mut metered = Box::pin(meter_uncompressed_input_stream(source, Arc::clone(&input_metrics)));
+
+        assert_eq!(metered.next().await.expect("first chunk").expect("valid chunk"), b"abcd"[..]);
+        drop(metered);
+
+        assert_eq!(input_metrics.snapshot().bytes_scanned, 4);
+        assert_eq!(input_metrics.snapshot().bytes_processed, 4);
+        assert_eq!(poll_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn test_bytes_stream_rejects_early_eof() {
         let source = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"ab"))]);
         let output = bytes_stream(source, 4);
@@ -2664,17 +2944,468 @@ mod test {
     }
 
     #[tokio::test]
+    async fn full_and_range_object_streams_record_input_metrics() {
+        const BUCKET: &str = "s3select-input-metrics";
+        const OBJECT: &str = "input.csv";
+        const DATA: &[u8] = b"id,name\n1,a\n";
+
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        let mut reader = SelectPutObjReader::from_vec(DATA.to_vec());
+        env.ecstore
+            .put_object(BUCKET, OBJECT, &mut reader, &Default::default())
+            .await
+            .expect("put input metrics fixture");
+        let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
+        let input_metrics = Arc::new(SelectInputMetrics::default());
+        let store = EcObjectStore::build_with_snapshot(
+            csv_input(BUCKET, OBJECT),
+            Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+            None,
+            Arc::clone(&input_metrics),
+            Arc::clone(&snapshot),
+            JsonSource::default(),
+        )
+        .expect("build metrics-aware object store");
+
+        let result = store
+            .get_opts(&Path::from(OBJECT), GetOptions::default())
+            .await
+            .expect("open full object stream");
+        let GetResultPayload::Stream(stream) = result.payload else {
+            panic!("expected streaming object payload");
+        };
+        let body = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("read full object stream")
+            .concat();
+        assert_eq!(body, DATA);
+        let data_len = u64::try_from(DATA.len()).expect("fixture length should fit in u64");
+        assert_eq!(input_metrics.snapshot().bytes_scanned, data_len);
+        assert_eq!(input_metrics.snapshot().bytes_processed, data_len);
+
+        input_metrics.reset();
+
+        let result = store
+            .get_opts(
+                &Path::from(OBJECT),
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..2)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("open schema-style range stream");
+        let GetResultPayload::Stream(stream) = result.payload else {
+            panic!("expected range stream payload");
+        };
+        let range = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("read schema-style range")
+            .concat();
+        assert_eq!(range, b"id"[..]);
+        assert_eq!(input_metrics.snapshot().bytes_scanned, 2);
+        assert_eq!(input_metrics.snapshot().bytes_processed, 2);
+    }
+
+    #[tokio::test]
+    async fn unicode_csv_quotes_preserve_raw_offsets_and_metrics() {
+        const BUCKET: &str = "s3select-unicode-csv-stream";
+        const HEADER: &str = "عnameع,عkindع\n";
+        const SKIP: &str = "عskipع,عzeroع\n";
+        const ROW: &str = "عA,Bع,عAععBع\n";
+        let data = format!("{HEADER}{SKIP}{ROW}");
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        for (object, compression, range_offset) in [
+            ("plain.csv", None, None),
+            ("range.csv", None, Some(0)),
+            ("range-mid-character.csv", None, Some(1)),
+            ("gzip.csv", Some(CompressionFormat::Gzip), None),
+            ("bzip.csv", Some(CompressionFormat::Bzip2), None),
+        ] {
+            let bytes = match compression {
+                Some(format) => encode_compressed_fixture(format, data.as_bytes()).await,
+                None => data.as_bytes().to_vec(),
+            };
+            let raw_size = bytes.len();
+            let mut reader = SelectPutObjReader::from_vec(bytes);
+            env.ecstore
+                .put_object(BUCKET, object, &mut reader, &Default::default())
+                .await
+                .expect("write Unicode CSV fixture");
+            let mut input = (*csv_input(BUCKET, object)).clone();
+            let csv = input.request.input_serialization.csv.as_mut().expect("CSV input");
+            csv.file_header_info = Some(FileHeaderInfo::from_static(FileHeaderInfo::USE));
+            csv.quote_character = Some("ع".to_owned());
+            csv.quote_escape_character = Some("\\".to_owned());
+            csv.record_delimiter = Some("\n".to_owned());
+            input.request.input_serialization.compression_type = compression.map(|format| {
+                CompressionType::from_static(match format {
+                    CompressionFormat::Gzip => CompressionType::GZIP,
+                    CompressionFormat::Bzip2 => CompressionType::BZIP2,
+                })
+            });
+            let start = HEADER.len() + SKIP.len();
+            if let Some(range_offset) = range_offset {
+                let offset = i64::try_from(start + range_offset).expect("fixture offset");
+                input.request.scan_range = Some(ScanRange {
+                    start: Some(offset),
+                    end: Some(offset),
+                });
+            }
+            let metrics = Arc::new(SelectInputMetrics::default());
+            let store = EcObjectStore::build_with_snapshot(
+                Arc::new(input),
+                Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+                None,
+                Arc::clone(&metrics),
+                prepare_test_snapshot(BUCKET, object).await,
+                JsonSource::default(),
+            )
+            .expect("snapshot store");
+            let result = store
+                .get_opts(&Path::from(object), GetOptions::default())
+                .await
+                .expect("open Unicode CSV stream");
+            let GetResultPayload::Stream(stream) = result.payload else { panic!("CSV must remain streaming") };
+            let output = stream.try_collect::<Vec<_>>().await.expect("normalize CSV stream").concat();
+            let expected = match range_offset {
+                Some(0) => "\"name\",\"kind\"\n\"A,B\",\"AعB\"\n",
+                Some(_) => "\"name\",\"kind\"\n",
+                None => "\"name\",\"kind\"\n\"skip\",\"zero\"\n\"A,B\",\"AعB\"\n",
+            };
+            assert_eq!(output, expected.as_bytes(), "object={object}");
+            let measured = metrics.snapshot();
+            if let Some(range_offset) = range_offset {
+                // The range reader includes one byte of delimiter context and a
+                // separate header read; offsets always refer to the original CSV.
+                let processed = u64::try_from(ROW.len() + 1 - range_offset + HEADER.len()).expect("raw range length");
+                assert_eq!(measured.bytes_scanned, processed);
+                assert_eq!(measured.bytes_processed, processed);
+            } else {
+                assert_eq!(measured.bytes_scanned, u64::try_from(raw_size).expect("raw length"));
+                assert_eq!(measured.bytes_processed, u64::try_from(data.len()).expect("decoded length"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn compressed_object_uses_one_full_stream_and_rejects_internal_ranges() {
+        const BUCKET: &str = "s3select-compressed-object";
+        const OBJECT: &str = "input.csv";
+        const DATA: &[u8] = b"id,name\n1,Alice\n2,Bob\n";
+
+        let compressed = encode_compressed_fixture(CompressionFormat::Gzip, DATA).await;
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        let mut reader = SelectPutObjReader::from_vec(compressed.clone());
+        env.ecstore
+            .put_object(BUCKET, OBJECT, &mut reader, &Default::default())
+            .await
+            .expect("put compressed CSV fixture");
+        let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
+        let mut input = (*csv_input(BUCKET, OBJECT)).clone();
+        input.request.input_serialization.compression_type = Some(CompressionType::from_static(CompressionType::GZIP));
+        input.request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: None,
+        });
+        let input_metrics = Arc::new(SelectInputMetrics::default());
+        let store = EcObjectStore::build_with_snapshot(
+            Arc::new(input),
+            Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+            None,
+            Arc::clone(&input_metrics),
+            Arc::clone(&snapshot),
+            JsonSource::default(),
+        )
+        .expect("build compressed object store");
+
+        let error = store
+            .get_opts(
+                &Path::from(OBJECT),
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("compressed input must reject DataFusion byte ranges");
+        assert_eq!(
+            QueryError::from(DataFusionError::ObjectStore(Box::new(error))).select_error(),
+            SelectError::UnsupportedScanRangeInput
+        );
+        assert_eq!(store.reader_open_count.load(Ordering::SeqCst), 0);
+
+        let mut scan_input = (*csv_input(BUCKET, OBJECT)).clone();
+        scan_input.request.input_serialization.compression_type = Some(CompressionType::from_static(CompressionType::GZIP));
+        scan_input.request.scan_range = Some(ScanRange {
+            start: Some(1),
+            end: None,
+        });
+        let scan_store = EcObjectStore::build_with_snapshot(
+            Arc::new(scan_input),
+            Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+            None,
+            Arc::new(SelectInputMetrics::default()),
+            snapshot,
+            JsonSource::default(),
+        )
+        .expect("build compressed ScanRange object store");
+        let error = scan_store
+            .get_opts(&Path::from(OBJECT), GetOptions::default())
+            .await
+            .expect_err("compressed request ScanRange must fail before object I/O");
+        assert_eq!(
+            QueryError::from(DataFusionError::ObjectStore(Box::new(error))).select_error(),
+            SelectError::UnsupportedScanRangeInput
+        );
+        assert_eq!(scan_store.reader_open_count.load(Ordering::SeqCst), 0);
+
+        let result = store
+            .get_opts(&Path::from(OBJECT), GetOptions::default())
+            .await
+            .expect("open full compressed object stream");
+        let GetResultPayload::Stream(stream) = result.payload else {
+            panic!("expected compressed stream payload");
+        };
+        let body = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("decode compressed object")
+            .concat();
+
+        assert_eq!(body, DATA);
+        assert_eq!(store.reader_open_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            input_metrics.snapshot().bytes_scanned,
+            u64::try_from(compressed.len()).expect("compressed fixture length should fit in u64")
+        );
+        assert_eq!(
+            input_metrics.snapshot().bytes_processed,
+            u64::try_from(DATA.len()).expect("input fixture length should fit in u64")
+        );
+    }
+
+    #[tokio::test]
+    async fn compressed_stream_throughput_is_independent_of_query_memory_pool() {
+        const BUCKET: &str = "s3select-compressed-throughput";
+        const OBJECT: &str = "input.csv.gz";
+
+        let data = b"a\n".repeat(1024 * 1024);
+        let compressed = encode_compressed_fixture(CompressionFormat::Gzip, &data).await;
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        let mut reader = SelectPutObjReader::from_vec(compressed);
+        env.ecstore
+            .put_object(BUCKET, OBJECT, &mut reader, &Default::default())
+            .await
+            .expect("put compressed throughput fixture");
+        let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
+        let mut input = (*csv_input(BUCKET, OBJECT)).clone();
+        input.request.input_serialization.compression_type = Some(CompressionType::from_static(CompressionType::GZIP));
+        let metrics = Arc::new(SelectInputMetrics::default());
+        let store = EcObjectStore::build_with_snapshot(
+            Arc::new(input),
+            Arc::new(GreedyMemoryPool::new(1)),
+            None,
+            Arc::clone(&metrics),
+            snapshot,
+            JsonSource::default(),
+        )
+        .expect("build compressed throughput store");
+
+        let result = store
+            .get_opts(&Path::from(OBJECT), GetOptions::default())
+            .await
+            .expect("open compressed throughput stream");
+        let GetResultPayload::Stream(stream) = result.payload else {
+            panic!("expected compressed stream payload");
+        };
+        let decoded = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("streamed decoded bytes should not consume the query memory pool")
+            .concat();
+
+        assert_eq!(decoded, data);
+        assert_eq!(
+            metrics.snapshot().bytes_processed,
+            u64::try_from(data.len()).expect("fixture length should fit in u64")
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_real_object_stream_counts_only_consumed_bytes() {
+        const BUCKET: &str = "s3select-partial-input-metrics";
+        const OBJECT: &str = "large.csv";
+
+        let data = vec![b'x'; SELECT_DEFAULT_READ_BUFFER_SIZE * 3];
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        let mut reader = SelectPutObjReader::from_vec(data.clone());
+        env.ecstore
+            .put_object(BUCKET, OBJECT, &mut reader, &Default::default())
+            .await
+            .expect("put partial input metrics fixture");
+        let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
+        let input_metrics = Arc::new(SelectInputMetrics::default());
+        let store = EcObjectStore::build_with_snapshot(
+            csv_input(BUCKET, OBJECT),
+            Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+            None,
+            Arc::clone(&input_metrics),
+            snapshot,
+            JsonSource::default(),
+        )
+        .expect("build metrics-aware object store");
+
+        let result = store
+            .get_opts(&Path::from(OBJECT), GetOptions::default())
+            .await
+            .expect("open partial object stream");
+        let GetResultPayload::Stream(mut stream) = result.payload else {
+            panic!("expected streaming object payload");
+        };
+        let first = stream
+            .next()
+            .await
+            .expect("first object chunk")
+            .expect("first object chunk should be valid");
+        drop(stream);
+
+        assert!(first.len() < data.len(), "fixture must span multiple reader chunks");
+        let consumed = u64::try_from(first.len()).expect("chunk length should fit in u64");
+        assert_eq!(input_metrics.snapshot().bytes_scanned, consumed);
+        assert_eq!(input_metrics.snapshot().bytes_processed, consumed);
+    }
+
+    #[tokio::test]
+    async fn json_object_streams_record_input_metrics() {
+        const BUCKET: &str = "s3select-json-input-metrics";
+        const LINES_OBJECT: &str = "input.jsonl";
+        const LINES_DATA: &[u8] = b"{\"id\":1}\n{\"id\":2}\n";
+        const DOCUMENT_OBJECT: &str = "input.json";
+        const DOCUMENT_DATA: &[u8] = b"[{\"id\":1},{\"id\":2}]";
+
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        for (object, data, json_type) in [
+            (LINES_OBJECT, LINES_DATA, JSONType::LINES),
+            (DOCUMENT_OBJECT, DOCUMENT_DATA, JSONType::DOCUMENT),
+        ] {
+            let mut reader = SelectPutObjReader::from_vec(data.to_vec());
+            env.ecstore
+                .put_object(BUCKET, object, &mut reader, &Default::default())
+                .await
+                .expect("put JSON input metrics fixture");
+            let snapshot = prepare_test_snapshot(BUCKET, object).await;
+            let input_metrics = Arc::new(SelectInputMetrics::default());
+            let memory_limit = if json_type == JSONType::DOCUMENT {
+                JSON_DOCUMENT_TEST_MEMORY_BYTES
+            } else {
+                1024 * 1024
+            };
+            let store = EcObjectStore::build_with_snapshot(
+                json_input(BUCKET, object, json_type),
+                Arc::new(GreedyMemoryPool::new(memory_limit)),
+                None,
+                Arc::clone(&input_metrics),
+                snapshot,
+                JsonSource::default(),
+            )
+            .expect("build metrics-aware JSON object store");
+
+            let result = store
+                .get_opts(&Path::from(object), GetOptions::default())
+                .await
+                .expect("open JSON object stream");
+            let GetResultPayload::Stream(stream) = result.payload else {
+                panic!("expected streaming JSON payload");
+            };
+            stream.try_collect::<Vec<_>>().await.expect("read JSON object stream");
+
+            let input_len = u64::try_from(data.len()).expect("fixture length should fit in u64");
+            assert_eq!(input_metrics.snapshot().bytes_scanned, input_len, "JSON type {json_type}");
+            assert_eq!(input_metrics.snapshot().bytes_processed, input_len, "JSON type {json_type}");
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_range_metrics_include_header_and_raw_range_once() {
+        const BUCKET: &str = "s3select-scan-range-input-metrics";
+        const OBJECT: &str = "input.csv";
+        const DATA: &[u8] = b"h1,h2\nr1,a\nr2,b\n";
+        const HEADER_LEN: usize = b"h1,h2\n".len();
+        const RECORD_START: usize = b"h1,h2\nr1,a\n".len();
+        const READ_START: usize = RECORD_START - 1;
+
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        let mut reader = SelectPutObjReader::from_vec(DATA.to_vec());
+        env.ecstore
+            .put_object(BUCKET, OBJECT, &mut reader, &Default::default())
+            .await
+            .expect("put ScanRange input metrics fixture");
+        let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
+        let mut input = (*csv_input(BUCKET, OBJECT)).clone();
+        input
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("CSV input")
+            .file_header_info = Some(FileHeaderInfo::from_static(FileHeaderInfo::USE));
+        input.request.scan_range = Some(ScanRange {
+            start: Some(i64::try_from(RECORD_START).expect("fixture offset should fit in i64")),
+            end: Some(i64::try_from(RECORD_START).expect("fixture offset should fit in i64")),
+        });
+        let input_metrics = Arc::new(SelectInputMetrics::default());
+        let store = EcObjectStore::build_with_snapshot(
+            Arc::new(input),
+            Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+            None,
+            Arc::clone(&input_metrics),
+            snapshot,
+            JsonSource::default(),
+        )
+        .expect("build ScanRange metrics-aware object store");
+
+        let result = store
+            .get_opts(&Path::from(OBJECT), GetOptions::default())
+            .await
+            .expect("open ScanRange object stream");
+        let GetResultPayload::Stream(stream) = result.payload else {
+            panic!("expected streaming ScanRange payload");
+        };
+        let body = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("read ScanRange object stream")
+            .concat();
+
+        assert_eq!(body, b"h1,h2\nr2,b\n");
+        let expected_input = u64::try_from(HEADER_LEN + DATA.len() - READ_START).expect("fixture length should fit in u64");
+        assert_eq!(input_metrics.snapshot().bytes_scanned, expected_input);
+        assert_eq!(input_metrics.snapshot().bytes_processed, expected_input);
+    }
+
+    #[tokio::test]
     async fn test_json_document_stream_respects_query_memory_pool() {
         let input = b"{}".to_vec();
-        let required = input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER;
-        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(required - 1));
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1));
         let mut output = json_document_ndjson_stream(
             Box::new(std::io::Cursor::new(input.clone())),
             input.len() as u64,
-            None,
+            JsonSource::default(),
+            Arc::new(SelectInputMetrics::default()),
             memory_pool,
             None,
-        );
+        )
+        .expect("build constrained JSON document stream");
 
         let err = output
             .next()
@@ -2691,30 +3422,178 @@ mod test {
     }
 
     #[tokio::test]
+    async fn compressed_json_document_uses_decoded_size_and_metric_boundaries() {
+        const INPUT: &[u8] = br#"[{"id":1},{"id":2}]"#;
+        const EXPECTED: &[u8] = b"{\"id\":1}\n{\"id\":2}\n";
+
+        for format in [CompressionFormat::Gzip, CompressionFormat::Bzip2] {
+            let compressed = encode_compressed_fixture(format, INPUT).await;
+            let compressed_len = u64::try_from(compressed.len()).expect("compressed fixture length should fit in u64");
+            let input_metrics = Arc::new(SelectInputMetrics::default());
+            let reader = compressed_input_reader(
+                Box::new(std::io::Cursor::new(compressed)),
+                compressed_len,
+                format,
+                Arc::clone(&input_metrics),
+                u64::MAX,
+                None,
+            );
+            let output = compressed_json_document_ndjson_stream(
+                reader,
+                JsonSource::default(),
+                Arc::new(GreedyMemoryPool::new(JSON_DOCUMENT_TEST_MEMORY_BYTES)),
+                None,
+            )
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("compressed JSON DOCUMENT should decode and parse")
+            .concat();
+
+            assert_eq!(output, EXPECTED);
+            assert_eq!(input_metrics.snapshot().bytes_scanned, compressed_len);
+            assert_eq!(
+                input_metrics.snapshot().bytes_processed,
+                u64::try_from(INPUT.len()).expect("JSON fixture length should fit in u64")
+            );
+        }
+    }
+
+    async fn compressed_json_document_select_error(
+        format: CompressionFormat,
+        compressed: Vec<u8>,
+        max_processed_bytes: u64,
+    ) -> SelectError {
+        let compressed_len = u64::try_from(compressed.len()).expect("compressed fixture length should fit in u64");
+        let reader = compressed_input_reader(
+            Box::new(std::io::Cursor::new(compressed)),
+            compressed_len,
+            format,
+            Arc::new(SelectInputMetrics::default()),
+            max_processed_bytes,
+            None,
+        );
+        let mut output = compressed_json_document_ndjson_stream(
+            reader,
+            JsonSource::default(),
+            Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024)),
+            None,
+        );
+        while let Some(result) = output.next().await {
+            if let Err(source) = result {
+                assert!(output.next().await.is_none());
+                return QueryError::from(DataFusionError::ObjectStore(Box::new(source))).select_error();
+            }
+        }
+        panic!("compressed JSON DOCUMENT decoding must fail");
+    }
+
+    #[tokio::test]
+    async fn compressed_json_document_preserves_decoder_select_errors() {
+        const INPUT: &[u8] = br#"[{"id":1}]"#;
+
+        for (format, compression) in [(CompressionFormat::Gzip, "GZIP"), (CompressionFormat::Bzip2, "BZIP2")] {
+            assert_eq!(
+                compressed_json_document_select_error(format, b"not compressed".to_vec(), u64::MAX).await,
+                SelectError::InvalidCompressionFormatForObject { compression }
+            );
+
+            let mut truncated = encode_compressed_fixture(format, INPUT).await;
+            truncated.truncate(truncated.len() - 1);
+            assert_eq!(
+                compressed_json_document_select_error(format, truncated, u64::MAX).await,
+                SelectError::TruncatedInput
+            );
+
+            let compressed = encode_compressed_fixture(format, INPUT).await;
+            let max_processed_bytes = u64::try_from(INPUT.len() - 1).expect("fixture length should fit in u64");
+            assert_eq!(
+                compressed_json_document_select_error(format, compressed, max_processed_bytes).await,
+                SelectError::ResourceExhausted
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn json_document_input_record_limit_applies_after_decompression() {
+        let at_limit = escaped_json_object_with_size(MAX_SELECT_RECORD_BYTES);
+        let over_limit = escaped_json_object_with_size(MAX_SELECT_RECORD_BYTES + 1);
+
+        for format in [CompressionFormat::Gzip, CompressionFormat::Bzip2] {
+            let compressed = encode_compressed_fixture(format, &at_limit).await;
+            let compressed_len = u64::try_from(compressed.len()).expect("compressed fixture length should fit in u64");
+            let reader = compressed_input_reader(
+                Box::new(std::io::Cursor::new(compressed)),
+                compressed_len,
+                format,
+                Arc::new(SelectInputMetrics::default()),
+                u64::MAX,
+                None,
+            );
+            compressed_json_document_ndjson_stream(
+                reader,
+                JsonSource::default(),
+                Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024)),
+                None,
+            )
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("one-megabyte compressed input record should be accepted");
+
+            let compressed = encode_compressed_fixture(format, &over_limit).await;
+            assert_eq!(
+                compressed_json_document_select_error(format, compressed, u64::MAX).await,
+                SelectError::OverMaxRecordSize
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_json_document_stream_releases_memory_reservation() {
         let input = b"[1,2]".to_vec();
-        let required = input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER;
-        let memory_pool = Arc::new(GreedyMemoryPool::new(required));
+        let memory_pool = Arc::new(GreedyMemoryPool::new(JSON_DOCUMENT_TEST_MEMORY_BYTES));
+        let input_metrics = Arc::new(SelectInputMetrics::default());
         let output: Vec<Bytes> = json_document_ndjson_stream(
             Box::new(std::io::Cursor::new(input.clone())),
             input.len() as u64,
-            None,
+            JsonSource::default(),
+            Arc::clone(&input_metrics),
             memory_pool.clone(),
             None,
         )
+        .expect("build JSON document stream")
         .try_collect()
         .await
         .expect("JSON conversion should fit the pool");
+        let input_len = u64::try_from(input.len()).expect("fixture length should fit in u64");
+        assert_eq!(input_metrics.snapshot().bytes_scanned, input_len);
+        assert_eq!(input_metrics.snapshot().bytes_processed, input_len);
 
-        assert_eq!(output, vec![Bytes::from_static(b"1\n"), Bytes::from_static(b"2\n")]);
+        assert_eq!(output, vec![Bytes::from_static(b"{\"_1\":1}\n"), Bytes::from_static(b"{\"_1\":2}\n")]);
         assert_eq!(memory_pool.reserved(), 0);
     }
 
     #[tokio::test]
-    async fn test_json_document_stream_rejects_early_eof() {
+    async fn test_json_document_stream_reports_early_eof_after_completed_rows() {
         let input = b"{}".to_vec();
-        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(4 * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
-        let mut output = json_document_ndjson_stream(Box::new(std::io::Cursor::new(input)), 4, None, memory_pool, None);
+        let input_len = u64::try_from(input.len()).expect("fixture length should fit in u64");
+        let input_metrics = Arc::new(SelectInputMetrics::default());
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(JSON_DOCUMENT_TEST_MEMORY_BYTES));
+        let mut output = json_document_ndjson_stream(
+            Box::new(std::io::Cursor::new(input)),
+            4,
+            JsonSource::default(),
+            Arc::clone(&input_metrics),
+            memory_pool,
+            None,
+        )
+        .expect("build short JSON document stream");
+
+        let row = output
+            .next()
+            .await
+            .expect("completed row")
+            .expect("completed rows may precede a terminal stream error");
+        assert_eq!(row, Bytes::from_static(b"{}\n"));
 
         let err = output
             .next()
@@ -2727,21 +3606,24 @@ mod test {
         let source = source.downcast_ref::<std::io::Error>().expect("I/O error source");
         assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof);
         assert!(source.to_string().contains("2 bytes remaining"));
+        assert_eq!(input_metrics.snapshot().bytes_scanned, input_len);
+        assert_eq!(input_metrics.snapshot().bytes_processed, input_len);
         assert!(output.next().await.is_none());
     }
 
     #[tokio::test]
     async fn malformed_json_document_stream_has_typed_select_error() {
         let input = b"{bad".to_vec();
-        let memory_pool: Arc<dyn MemoryPool> =
-            Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(JSON_DOCUMENT_TEST_MEMORY_BYTES));
         let mut output = json_document_ndjson_stream(
             Box::new(std::io::Cursor::new(input.clone())),
             input.len() as u64,
-            None,
+            JsonSource::default(),
+            Arc::new(SelectInputMetrics::default()),
             memory_pool,
             None,
-        );
+        )
+        .expect("build malformed JSON document stream");
 
         let source = output
             .next()
@@ -2808,7 +3690,7 @@ mod test {
     }
 
     #[test]
-    fn test_json_document_queued_parse_releases_query_guard_when_cancelled() {
+    fn test_json_document_parser_does_not_use_tokio_blocking_pool() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .max_blocking_threads(1)
@@ -2838,162 +3720,52 @@ mod test {
                 30,
             );
             let input = b"{}".to_vec();
-            let memory_pool: Arc<dyn MemoryPool> =
-                Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
+            let (memory_pool, reservation_released) =
+                AdmissionObservingMemoryPool::new(JSON_DOCUMENT_TEST_MEMORY_BYTES, Arc::clone(&admission));
+            let memory_pool = Arc::new(memory_pool);
+            let query_memory_pool: Arc<dyn MemoryPool> = memory_pool.clone();
             let mut output = json_document_ndjson_stream(
                 Box::new(std::io::Cursor::new(input.clone())),
                 input.len() as u64,
-                None,
-                memory_pool,
+                JsonSource::default(),
+                Arc::new(SelectInputMetrics::default()),
+                query_memory_pool,
                 Some(query_tracker),
-            );
+            )
+            .expect("build JSON document stream");
 
-            {
-                let next = output.next();
-                futures::pin_mut!(next);
-                assert!(futures::poll!(next.as_mut()).is_pending());
-            }
+            let row = tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
+                .await
+                .expect("dedicated parser must not wait for Tokio's blocking pool")
+                .expect("JSON document should produce one row")
+                .expect("JSON document row should be valid");
+            assert_eq!(row, Bytes::from_static(b"{}\n"));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
+                    .await
+                    .expect("parser should finish while the blocking pool is occupied")
+                    .is_none()
+            );
             drop(output);
 
-            let recovered_permit =
-                tokio::time::timeout(std::time::Duration::from_secs(5), Arc::clone(&admission).acquire_owned())
+            tokio::pin!(reservation_released);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), &mut reservation_released)
                     .await
-                    .expect("queued JSON parse should be cancelled")
-                    .expect("query admission should remain open");
-            release_blocking_tx.send(()).expect("release blocking worker");
-            blocker.await.expect("blocking worker should finish");
-            drop(recovered_permit);
-            assert_eq!(admission.available_permits(), 1);
-        });
-    }
-
-    #[test]
-    fn test_json_document_expired_queued_parse_does_not_start() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .max_blocking_threads(1)
-            .enable_all()
-            .build()
-            .expect("build test runtime");
-
-        runtime.block_on(async {
-            let (blocking_started_tx, blocking_started_rx) = tokio::sync::oneshot::channel();
-            let (release_blocking_tx, release_blocking_rx) = std::sync::mpsc::channel();
-            let blocker = tokio::task::spawn_blocking(move || {
-                let _ = blocking_started_tx.send(());
-                release_blocking_rx.recv().expect("release blocking worker");
-            });
-            blocking_started_rx.await.expect("blocking worker should start");
-
-            let admission = Arc::new(Semaphore::new(1));
-            let permit = Arc::clone(&admission)
-                .acquire_owned()
-                .await
-                .expect("query permit should be available");
-            let owner = QueryExecutionOwner::new();
-            let query_tracker = QueryExecutionTracker::new(
-                &owner,
-                Arc::new(permit),
-                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
-                30,
+                    .expect("completed parser should release memory")
+                    .expect("memory reservation release observer should remain open"),
+                "query admission must cover the memory reservation through teardown"
             );
-            let input = b"{}".to_vec();
-            let memory_pool: Arc<dyn MemoryPool> =
-                Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
-            let parser_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let parser_started_in_task = Arc::clone(&parser_started);
-            let mut output = json_document_ndjson_stream_with_parser(
-                Box::new(std::io::Cursor::new(input.clone())),
-                input.len() as u64,
-                None,
-                memory_pool,
-                Some(query_tracker.clone()),
-                move |_, _| {
-                    parser_started_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
-                    Ok(vec![Bytes::from_static(b"{}\n")])
-                },
-            );
-
-            {
-                let next = output.next();
-                futures::pin_mut!(next);
-                assert!(futures::poll!(next.as_mut()).is_pending());
-            }
-            query_tracker.expire(&owner);
-            assert_eq!(admission.available_permits(), 1);
-            release_blocking_tx.send(()).expect("release blocking worker");
-            blocker.await.expect("blocking worker should finish");
-
-            let err = tokio::time::timeout(std::time::Duration::from_secs(5), output.next())
-                .await
-                .expect("queued parser should resume")
-                .expect("queued parser should return an error")
-                .expect_err("expired queued parser must not run");
-            let object_store::Error::Generic { source, .. } = err else {
-                panic!("expected generic object store error");
-            };
-            let source = source.downcast_ref::<std::io::Error>().expect("I/O error source");
-            assert_eq!(source.kind(), std::io::ErrorKind::Interrupted);
-            assert!(!parser_started.load(std::sync::atomic::Ordering::SeqCst));
-        });
-    }
-
-    #[test]
-    fn test_json_document_started_parse_retains_query_guard_when_cancelled() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .max_blocking_threads(1)
-            .enable_all()
-            .build()
-            .expect("build test runtime");
-
-        runtime.block_on(async {
-            let admission = Arc::new(Semaphore::new(1));
-            let permit = Arc::clone(&admission)
-                .acquire_owned()
-                .await
-                .expect("query permit should be available");
-            let query_guard: QueryExecutionGuard = Arc::new(permit);
-            let query_tracker = QueryExecutionTracker::new(
-                &QueryExecutionOwner::new(),
-                query_guard,
-                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
-                30,
-            );
-            let input = b"{}".to_vec();
-            let memory_pool: Arc<dyn MemoryPool> =
-                Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
-            let (parse_started_tx, parse_started_rx) = tokio::sync::oneshot::channel();
-            let (release_parse_tx, release_parse_rx) = std::sync::mpsc::channel();
-            let mut output = json_document_ndjson_stream_with_parser(
-                Box::new(std::io::Cursor::new(input.clone())),
-                input.len() as u64,
-                None,
-                memory_pool,
-                Some(query_tracker),
-                move |_, _| {
-                    let _ = parse_started_tx.send(());
-                    release_parse_rx.recv().expect("release JSON parser");
-                    Ok(vec![Bytes::from_static(b"{}\n")])
-                },
-            );
-
-            {
-                let next = output.next();
-                futures::pin_mut!(next);
-                assert!(futures::poll!(next.as_mut()).is_pending());
-            }
-            parse_started_rx.await.expect("JSON parser should start");
-            drop(output);
-
-            assert!(Arc::clone(&admission).try_acquire_owned().is_err());
-            release_parse_tx.send(()).expect("release JSON parser");
+            assert_eq!(memory_pool.reserved(), 0);
             let recovered_permit =
-                tokio::time::timeout(std::time::Duration::from_secs(5), Arc::clone(&admission).acquire_owned())
+                tokio::time::timeout(std::time::Duration::from_secs(1), Arc::clone(&admission).acquire_owned())
                     .await
-                    .expect("started JSON parse should release the query guard")
+                    .expect("completed parser should release query admission")
                     .expect("query admission should remain open");
             drop(recovered_permit);
+
+            release_blocking_tx.send(()).expect("release blocking worker");
+            blocker.await.expect("blocking worker should finish");
             assert_eq!(admission.available_permits(), 1);
         });
     }
@@ -3002,7 +3774,7 @@ mod test {
     #[test]
     fn test_flatten_array_produces_one_line_per_element() {
         let input = br#"[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]"#;
-        let result = flatten_json_document_to_ndjson(input, None).expect("should succeed");
+        let result = flatten_json_document_to_ndjson(input, &[]).expect("should succeed");
         let text = std::str::from_utf8(&result).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -3020,7 +3792,7 @@ mod test {
     #[test]
     fn test_flatten_single_object_produces_one_line() {
         let input = br#"{"id":42,"value":"hello world"}"#;
-        let result = flatten_json_document_to_ndjson(input, None).expect("should succeed");
+        let result = flatten_json_document_to_ndjson(input, &[]).expect("should succeed");
         let text = std::str::from_utf8(&result).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 1);
@@ -3033,7 +3805,7 @@ mod test {
     #[test]
     fn test_flatten_empty_array_produces_no_output() {
         let input = b"[]";
-        let result = flatten_json_document_to_ndjson(input, None).expect("should succeed");
+        let result = flatten_json_document_to_ndjson(input, &[]).expect("should succeed");
         assert!(result.is_empty(), "empty array should yield zero bytes");
     }
 
@@ -3041,7 +3813,7 @@ mod test {
     #[test]
     fn test_flatten_pretty_printed_document() {
         let input = b"[\n  {\"a\": 1},\n  {\"a\": 2},\n  {\"a\": 3}\n]";
-        let result = flatten_json_document_to_ndjson(input, None).expect("should succeed");
+        let result = flatten_json_document_to_ndjson(input, &[]).expect("should succeed");
         let text = std::str::from_utf8(&result).unwrap();
         assert_eq!(text.lines().count(), 3);
     }
@@ -3050,7 +3822,7 @@ mod test {
     #[test]
     fn test_flatten_array_with_nested_objects() {
         let input = br#"[{"outer":{"inner":99}},{"outer":{"inner":100}}]"#;
-        let result = flatten_json_document_to_ndjson(input, None).expect("should succeed");
+        let result = flatten_json_document_to_ndjson(input, &[]).expect("should succeed");
         let text = std::str::from_utf8(&result).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -3066,7 +3838,7 @@ mod test {
     #[test]
     fn test_flatten_output_ends_with_newline_per_record() {
         let input = br#"[{"x":1},{"x":2}]"#;
-        let result = flatten_json_document_to_ndjson(input, None).expect("should succeed");
+        let result = flatten_json_document_to_ndjson(input, &[]).expect("should succeed");
         let text = std::str::from_utf8(&result).unwrap();
         // Exactly 2 newlines for 2 records
         assert_eq!(text.chars().filter(|&c| c == '\n').count(), 2);
@@ -3078,25 +3850,53 @@ mod test {
     #[test]
     fn test_flatten_invalid_json_returns_error() {
         let input = b"{ not valid json }";
-        let err = flatten_json_document_to_ndjson(input, None).expect_err("should fail on invalid JSON");
+        let err = flatten_json_document_to_ndjson(input, &[]).expect_err("should fail on invalid JSON");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn json_document_logical_record_enforces_one_megabyte_limit() {
+        const SCALAR_WRAPPER_BYTES: usize = br#"{"":0}"#.len();
+        let input = br#"{"v":0}"#;
+        let path = vec![source_key("v")];
+
+        let alias = "a".repeat(MAX_SELECT_RECORD_BYTES - SCALAR_WRAPPER_BYTES);
+        let source = JsonSource::new(path.clone(), Some(alias));
+        let line = super::parse_json_document_to_lines(input, &source).expect("one-megabyte logical record should be accepted");
+        assert_eq!(line[0].len(), MAX_SELECT_RECORD_BYTES + 1);
+
+        let alias = "a".repeat(MAX_SELECT_RECORD_BYTES + 1 - SCALAR_WRAPPER_BYTES);
+        let source = JsonSource::new(path.clone(), Some(alias));
+        let error = super::parse_json_document_to_lines(input, &source).expect_err("oversized logical record must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.get_ref().is_some_and(|source| {
+            source
+                .downcast_ref::<SelectError>()
+                .is_some_and(|error| error == &SelectError::OverMaxRecordSize)
+        }));
+
+        let escaped_alias = "\0".repeat(MAX_SELECT_RECORD_BYTES / 6);
+        let source = JsonSource::new(path, Some(escaped_alias));
+        let error = super::parse_json_document_to_lines(input, &source)
+            .expect_err("escaped output must be bounded while it is serialized");
+        assert!(error.get_ref().is_some_and(|source| {
+            source
+                .downcast_ref::<SelectError>()
+                .is_some_and(|error| error == &SelectError::OverMaxRecordSize)
+        }));
     }
 
     /// Completely empty input returns an error (not valid JSON).
     #[test]
     fn test_flatten_empty_input_returns_error() {
-        let err = flatten_json_document_to_ndjson(b"", None).expect_err("empty bytes are not valid JSON");
+        let err = flatten_json_document_to_ndjson(b"", &[]).expect_err("empty bytes are not valid JSON");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
-    // ── sub-path navigation tests ─────────────────────────────────────────
-
-    /// `FROM s3object.employees` with a root JSON object navigates into the
-    /// `employees` array and emits one NDJSON line per element.
     #[test]
-    fn test_flatten_sub_path_object_with_array() {
+    fn key_path_expands_final_array_for_legacy_queries() {
         let input = br#"{"employees":[{"id":1,"name":"Alice","salary":75000},{"id":2,"name":"Bob","salary":65000}]}"#;
-        let result = flatten_json_document_to_ndjson(input, Some("employees")).expect("should succeed");
+        let result = flatten_json_document_to_ndjson(input, &[source_key("employees")]).expect("key path should succeed");
         let text = std::str::from_utf8(&result).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "each employee should be its own NDJSON line");
@@ -3107,70 +3907,302 @@ mod test {
         assert_eq!(second["name"], "Bob");
     }
 
-    /// Sub-path that does not exist in the root object falls back to emitting the
-    /// entire root object as one NDJSON line (graceful degradation).
     #[test]
-    fn test_flatten_sub_path_missing_key_falls_back() {
-        let input = br#"{"employees":[]}"#;
-        let result = flatten_json_document_to_ndjson(input, Some("nonexistent")).expect("should succeed");
-        let text = std::str::from_utf8(&result).unwrap();
-        // Falls back to emitting the whole root object.
-        assert_eq!(text.lines().count(), 1);
-        let parsed: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
-        assert!(parsed.get("employees").is_some(), "root object preserved");
+    fn nested_array_wildcards_expand_in_source_order() {
+        let input = br#"{"departments":[{"employees":[{"id":1},{"id":2}]},{"employees":[{"id":3}]}]}"#;
+        let path = [
+            JsonPathSegment::ArrayWildcard,
+            source_key("departments"),
+            JsonPathSegment::ArrayWildcard,
+            source_key("employees"),
+            JsonPathSegment::ArrayWildcard,
+        ];
+
+        let result = flatten_json_document_to_ndjson(input, &path).expect("nested wildcard path should succeed");
+        let ids: Vec<i64> = std::str::from_utf8(&result)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect();
+
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 
-    /// Sub-path is ignored when the root is already an array.
     #[test]
-    fn test_flatten_sub_path_ignored_for_root_array() {
+    fn explicit_array_wildcard_does_not_expand_nested_array_records_twice() {
+        let input = br#"{"groups":[[1,2],[3,4]]}"#;
+        let source = JsonSource::new(vec![source_key("groups"), JsonPathSegment::ArrayWildcard], Some("g".to_string()));
+
+        let result = super::parse_json_document_to_lines(input, &source).expect("explicit wildcard path should succeed");
+
+        assert_eq!(
+            result,
+            vec![Bytes::from_static(b"{\"g\":[1,2]}\n"), Bytes::from_static(b"{\"g\":[3,4]}\n")]
+        );
+    }
+
+    #[test]
+    fn leading_array_wildcard_expands_a_root_array_before_nested_keys() {
+        let input = br#"[{"employees":[{"id":1}]},{"employees":[{"id":2}]}]"#;
+        let path = [
+            JsonPathSegment::ArrayWildcard,
+            source_key("employees"),
+            JsonPathSegment::ArrayWildcard,
+        ];
+
+        let result = flatten_json_document_to_ndjson(input, &path).expect("root array path should succeed");
+        let ids: Vec<i64> = std::str::from_utf8(&result)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect();
+
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn root_array_index_selects_one_record() {
         let input = br#"[{"id":1},{"id":2}]"#;
-        let result = flatten_json_document_to_ndjson(input, Some("employees")).expect("should succeed");
-        let text = std::str::from_utf8(&result).unwrap();
-        // The root array is flattened directly regardless of the sub-path hint.
-        assert_eq!(text.lines().count(), 2);
-    }
 
-    // ── SQL path extraction tests ─────────────────────────────────────────
+        let result = flatten_json_document_to_ndjson(input, &[JsonPathSegment::Index(1)]).expect("array index should succeed");
 
-    #[test]
-    fn test_extract_json_sub_path_basic() {
-        let sql = "SELECT e.name FROM s3object.employees e WHERE e.salary > 70000";
-        assert_eq!(extract_json_sub_path_from_expression(sql), Some("employees".to_string()));
+        assert_eq!(result, Bytes::from_static(b"{\"id\":2}\n"));
     }
 
     #[test]
-    fn test_extract_json_sub_path_uppercase() {
-        let sql = "SELECT s.name FROM S3Object.records s";
-        assert_eq!(extract_json_sub_path_from_expression(sql), Some("records".to_string()));
+    fn canonical_root_array_index_selects_one_record() {
+        let input = br#"[{"id":1},{"id":2}]"#;
+        let path = [JsonPathSegment::ArrayWildcard, JsonPathSegment::Index(0)];
+
+        let result = flatten_json_document_to_ndjson(input, &path).expect("canonical array index should succeed");
+
+        assert_eq!(result, Bytes::from_static(b"{\"id\":1}\n"));
     }
 
     #[test]
-    fn test_extract_json_sub_path_no_sub_path() {
-        let sql = "SELECT * FROM s3object WHERE s3object.age > 30";
-        assert_eq!(extract_json_sub_path_from_expression(sql), None);
+    fn out_of_range_root_array_indexes_produce_no_records() {
+        let input = br#"[{"id":1}]"#;
+
+        for path in [
+            vec![JsonPathSegment::Index(1)],
+            vec![JsonPathSegment::ArrayWildcard, JsonPathSegment::Index(1)],
+        ] {
+            let result = flatten_json_document_to_ndjson(input, &path).expect("out-of-range index should not fail");
+            assert!(result.is_empty());
+        }
     }
 
     #[test]
-    fn test_extract_json_sub_path_rejects_unsupported_bracket_path() {
-        let sql = "SELECT e.name FROM s3object.employees[*] e";
-        assert_eq!(extract_json_sub_path_from_expression(sql), None);
+    fn canonical_key_path_does_not_expand_an_array_without_a_wildcard() {
+        let input = br#"{"rules":[{"id":1},{"id":2}]}"#;
+        let source = JsonSource::new(vec![JsonPathSegment::ArrayWildcard, source_key("rules")], Some("r".to_string()));
+
+        let result = super::parse_json_document_to_lines(input, &source).expect("array-valued source path should remain one row");
+
+        assert_eq!(result, vec![Bytes::from_static(b"{\"r\":[{\"id\":1},{\"id\":2}]}\n")]);
     }
 
     #[test]
-    fn test_extract_json_sub_path_ignores_from_in_string_literal() {
-        let sql = "SELECT ' from ' AS marker FROM S3Object.employees";
-        assert_eq!(extract_json_sub_path_from_expression(sql), Some("employees".to_string()));
+    fn object_wildcard_expands_values_and_allows_continuation() {
+        let input = br#"{"groups":{"first":{"id":1},"second":{"id":2}}}"#;
+        let path = [
+            JsonPathSegment::ArrayWildcard,
+            source_key("groups"),
+            JsonPathSegment::ObjectWildcard,
+            source_key("id"),
+        ];
+
+        let result = flatten_json_document_to_ndjson(input, &path).expect("object wildcard should succeed");
+        let values: Vec<serde_json::Value> = std::str::from_utf8(&result)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(values, vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})]);
     }
 
     #[test]
-    fn test_extract_json_sub_path_ignores_from_in_comment() {
-        let sql = "SELECT /* from S3Object.wrong */ e.name FROM S3Object.employees AS e";
-        assert_eq!(extract_json_sub_path_from_expression(sql), Some("employees".to_string()));
+    fn canonical_double_wildcard_expands_a_root_array() {
+        let input = br#"[{"id":1},{"id":2}]"#;
+        let path = [JsonPathSegment::ArrayWildcard, JsonPathSegment::ArrayWildcard];
+
+        let result = flatten_json_document_to_ndjson(input, &path).expect("root wildcard should succeed");
+
+        assert_eq!(result, Bytes::from_static(b"{\"id\":1}\n{\"id\":2}\n"));
     }
 
     #[test]
-    fn test_extract_json_sub_path_supports_quoted_identifier() {
-        let sql = "SELECT \" from \" FROM S3Object.\"employee data\"";
-        assert_eq!(extract_json_sub_path_from_expression(sql), Some("employee data".to_string()));
+    fn terminal_scalar_path_uses_the_terminal_key_as_its_column() {
+        let input = br#"{"rules":[{"id":"one"},{"id":"two"}]}"#;
+        let path = [
+            JsonPathSegment::ArrayWildcard,
+            source_key("rules"),
+            JsonPathSegment::ArrayWildcard,
+            source_key("id"),
+        ];
+
+        let result = flatten_json_document_to_ndjson(input, &path).expect("scalar source path should succeed");
+
+        assert_eq!(result, Bytes::from_static(b"{\"id\":\"one\"}\n{\"id\":\"two\"}\n"));
+    }
+
+    #[test]
+    fn terminal_scalar_path_uses_the_explicit_source_alias() {
+        let input = br#"{"rules":[{"id":"one"},{"id":"two"}]}"#;
+        let source = JsonSource::new(
+            vec![
+                JsonPathSegment::ArrayWildcard,
+                source_key("rules"),
+                JsonPathSegment::ArrayWildcard,
+                source_key("id"),
+            ],
+            Some("v".to_string()),
+        );
+
+        let result =
+            super::parse_json_document_to_lines(input, &source).expect("explicit scalar source alias should be preserved");
+
+        assert_eq!(
+            result,
+            vec![
+                Bytes::from_static(b"{\"v\":\"one\"}\n"),
+                Bytes::from_static(b"{\"v\":\"two\"}\n")
+            ]
+        );
+    }
+
+    #[test]
+    fn source_keys_follow_s3_case_sensitivity_rules() {
+        let input = br#"{"Employees":[{"id":1}]}"#;
+
+        let unquoted = flatten_json_document_to_ndjson(input, &[source_key("employees")])
+            .expect("unquoted source key should be case insensitive");
+        let quoted_exact = flatten_json_document_to_ndjson(input, &[quoted_source_key("Employees")])
+            .expect("exact quoted source key should match");
+        let quoted = flatten_json_document_to_ndjson(input, &[quoted_source_key("employees")])
+            .expect("missing quoted source key should not fail");
+
+        assert_eq!(unquoted, Bytes::from_static(b"{\"id\":1}\n"));
+        assert_eq!(quoted_exact, Bytes::from_static(b"{\"id\":1}\n"));
+        assert!(quoted.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_unquoted_source_key_is_rejected() {
+        let input = br#"{"Employees":[],"employees":[]}"#;
+
+        let error =
+            flatten_json_document_to_ndjson(input, &[source_key("EMPLOYEES")]).expect_err("ambiguous source key should fail");
+
+        assert!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<SelectError>())
+                .is_some_and(|error| *error == SelectError::AmbiguousFieldName)
+        );
+    }
+
+    #[test]
+    fn unquoted_source_key_scan_honors_cancellation() {
+        let mut object = serde_json::Map::new();
+        for index in 0..=super::JSON_CANCELLATION_CHECK_KEYS {
+            object.insert(format!("field-{index}"), serde_json::Value::Null);
+        }
+        let mut checkpoints = 0;
+        let mut cancel_on_second_checkpoint = || {
+            checkpoints += 1;
+            if checkpoints == 2 {
+                Err(std::io::Error::new(std::io::ErrorKind::Interrupted, SelectError::Canceled))
+            } else {
+                Ok(())
+            }
+        };
+
+        let error = remove_json_source_key_with_checkpoint(&mut object, "x", false, &mut cancel_on_second_checkpoint)
+            .expect_err("key scan should stop at its second cancellation checkpoint");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(checkpoints, 2);
+        assert!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<SelectError>())
+                .is_some_and(|error| *error == SelectError::Canceled)
+        );
+    }
+
+    #[test]
+    fn long_json_key_comparison_honors_cancellation() {
+        let key = "x".repeat(super::JSON_CANCELLATION_CHECK_BYTES * 2);
+        let mut checkpoints = 0;
+        let mut cancel_on_second_checkpoint = || {
+            checkpoints += 1;
+            if checkpoints == 2 {
+                Err(std::io::Error::new(std::io::ErrorKind::Interrupted, SelectError::Canceled))
+            } else {
+                Ok(())
+            }
+        };
+
+        let error = json_key_eq_ignore_ascii_case_with_checkpoint(&key, &key, &mut cancel_on_second_checkpoint)
+            .expect_err("long-key comparison should stop at its second cancellation checkpoint");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(checkpoints, 2);
+    }
+
+    #[test]
+    fn missing_source_key_produces_no_records() {
+        let input = br#"{"employees":[]}"#;
+
+        let result = flatten_json_document_to_ndjson(input, &[source_key("nonexistent")])
+            .expect("missing source key should not fail the query");
+
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_path_type_mismatches_are_json_parsing_errors() {
+        let cases: [(&str, &[u8], Vec<JsonPathSegment>); 4] = [
+            ("key on array", b"[1]", vec![source_key("id")]),
+            ("index on object", b"{}", vec![JsonPathSegment::Index(0)]),
+            (
+                "array wildcard on object",
+                b"{}",
+                vec![JsonPathSegment::ArrayWildcard, JsonPathSegment::ArrayWildcard],
+            ),
+            ("object wildcard on array", b"[1]", vec![JsonPathSegment::ObjectWildcard]),
+        ];
+
+        for (case, input, path) in cases {
+            let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(JSON_DOCUMENT_TEST_MEMORY_BYTES));
+            let mut output = json_document_ndjson_stream(
+                Box::new(std::io::Cursor::new(input.to_vec())),
+                input.len() as u64,
+                JsonSource::from_path(path),
+                Arc::new(SelectInputMetrics::default()),
+                memory_pool,
+                None,
+            )
+            .expect("build source-path JSON document stream");
+            let source = output
+                .next()
+                .await
+                .unwrap_or_else(|| panic!("{case} should produce one stream error"))
+                .unwrap_err();
+            let error = QueryError::from(DataFusionError::ObjectStore(Box::new(source)));
+
+            assert_eq!(error.select_error(), SelectError::JsonParsingError, "{case}");
+            assert!(output.next().await.is_none(), "{case}");
+        }
     }
 }

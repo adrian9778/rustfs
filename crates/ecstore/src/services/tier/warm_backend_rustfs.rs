@@ -15,38 +15,57 @@
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(unused_assignments)]
-#![allow(unused_must_use)]
-#![allow(clippy::all)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use crate::client::{
-    admin_handler_utils::AdminError,
-    api_put_object::PutObjectOptions,
-    credentials::{Credentials, SignatureType, Static, Value},
-    transition_api::{Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
-};
 use crate::services::tier::{
     tier_config::TierRustFS,
-    warm_backend::{TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options},
+    warm_backend::{
+        S3CompatibleWarmBackendParams, TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options,
+        new_s3_compatible_warm_backend, optimal_part_size,
+    },
     warm_backend_s3::WarmBackendS3,
 };
+use rustfs_s3_client::transition_api::{BucketLookupType, ReadCloser, ReaderImpl};
+use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url};
 
-const MAX_MULTIPART_PUT_OBJECT_SIZE: i64 = 1024 * 1024 * 1024 * 1024 * 5;
-const MAX_PARTS_COUNT: i64 = 10000;
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
+// Debug-only opt-in for single-host test/dev setups; release builds always reject loopback.
+const ALLOW_LOOPBACK_TIER_ENDPOINT_ENV: &str = "RUSTFS_TIER_RUSTFS_ALLOW_LOOPBACK_ENDPOINT";
+
+fn validate_rustfs_tier_endpoint(url: &url::Url) -> Result<(), OutboundUrlError> {
+    let allow_loopback = cfg!(debug_assertions)
+        && std::env::var(ALLOW_LOOPBACK_TIER_ENDPOINT_ENV)
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    validate_rustfs_tier_endpoint_inner(url, allow_loopback)
+}
+
+fn validate_rustfs_tier_endpoint_inner(url: &url::Url, allow_loopback: bool) -> Result<(), OutboundUrlError> {
+    match validate_outbound_url(url) {
+        Err(OutboundUrlError::ForbiddenHost {
+            reason: "loopback address" | "loopback host",
+            ..
+        }) if allow_loopback => Ok(()),
+        result => result,
+    }
+}
 
 pub struct WarmBackendRustFS(WarmBackendS3);
 
 impl WarmBackendRustFS {
     pub async fn new(conf: &TierRustFS, tier: &str) -> Result<Self, std::io::Error> {
-        if conf.access_key == "" || conf.secret_key == "" {
+        // This provider reports endpoint problems with its own wording (and keeps the
+        // `url::ParseError` as the io::Error source) while the shared constructor carries the
+        // MinIO-derived texts. Unifying the two is a separate change, so the endpoint is
+        // pre-validated here, after the credential and bucket checks so the order in which the
+        // shared constructor would report the same failures is preserved.
+        if conf.access_key.is_empty() || conf.secret_key.is_empty() {
             return Err(std::io::Error::other("both access and secret keys are required"));
         }
 
-        if conf.bucket == "" {
+        if conf.bucket.is_empty() {
             return Err(std::io::Error::other("no bucket name was provided"));
         }
 
@@ -55,36 +74,29 @@ impl WarmBackendRustFS {
             Err(e) => return Err(std::io::Error::other(e)),
         };
 
-        let creds = Credentials::new(Static(Value {
-            access_key_id: conf.access_key.clone(),
-            secret_access_key: conf.secret_key.clone(),
-            session_token: "".to_string(),
-            signer_type: SignatureType::SignatureV4,
-            ..Default::default()
-        }));
-        let opts = Options {
-            creds,
-            secure: u.scheme() == "https",
-            trailing_headers: true,
-            region: conf.region.clone(),
-            ..Default::default()
-        };
-        let scheme = u.scheme();
-        let default_port = if scheme == "https" { 443 } else { 80 };
-        let host = u
-            .host_str()
-            .ok_or_else(|| std::io::Error::other("endpoint URL must include a host"))?;
-        let client = TransitionClient::new(&format!("{host}:{}", u.port().unwrap_or(default_port)), opts, "rustfs").await?;
+        if u.host_str().is_none() {
+            return Err(std::io::Error::other("endpoint URL must include a host"));
+        }
 
-        let client = Arc::new(client);
-        let core = TransitionCore(Arc::clone(&client));
-        Ok(Self(WarmBackendS3 {
-            client,
-            core,
-            bucket: conf.bucket.clone(),
-            prefix: conf.prefix.strip_suffix("/").unwrap_or(&conf.prefix).to_owned(),
-            storage_class: "".to_string(),
-        }))
+        Ok(Self(
+            new_s3_compatible_warm_backend(S3CompatibleWarmBackendParams {
+                endpoint: &conf.endpoint,
+                access_key: &conf.access_key,
+                secret_key: &conf.secret_key,
+                bucket: &conf.bucket,
+                prefix: &conf.prefix,
+                region: &conf.region,
+                // RustFS tier endpoints are path-style, so bucket addressing stays on
+                // `BucketLookupAuto`; pinning DNS here would break those endpoints.
+                bucket_lookup: BucketLookupType::BucketLookupAuto,
+                provider_tag: "rustfs",
+                // Debug-only, env-gated loopback exception for this provider's own e2e tier
+                // tests (rustfs/rustfs#6773); every other provider passes plain
+                // `validate_outbound_url`.
+                validate_endpoint: validate_rustfs_tier_endpoint,
+            })
+            .await?,
+        ))
     }
 }
 
@@ -97,7 +109,7 @@ impl WarmBackend for WarmBackendRustFS {
         length: i64,
         meta: HashMap<String, String>,
     ) -> Result<String, std::io::Error> {
-        let part_size = optimal_part_size(length)?;
+        let part_size = optimal_part_size(length, MIN_PART_SIZE)?;
         let client = self.0.client.clone();
         let res = client
             .put_object(&self.0.bucket, &self.0.get_dest(object), r, length, &{
@@ -134,6 +146,19 @@ impl WarmBackend for WarmBackendRustFS {
 
 #[async_trait::async_trait]
 impl crate::services::tier::warm_backend::TransitionCandidateReconciler for WarmBackendRustFS {
+    async fn probe_legacy_transition_state(
+        &self,
+        object: &str,
+        remote_version: Option<&str>,
+    ) -> Result<super::warm_backend::LegacyTransitionStateProbe, std::io::Error> {
+        crate::services::tier::warm_backend::TransitionCandidateReconciler::probe_legacy_transition_state(
+            &self.0,
+            object,
+            remote_version,
+        )
+        .await
+    }
+
     async fn probe_transition_candidate_for(
         &self,
         object: &str,
@@ -144,27 +169,6 @@ impl crate::services::tier::warm_backend::TransitionCandidateReconciler for Warm
         )
         .await
     }
-}
-
-fn optimal_part_size(object_size: i64) -> Result<i64, std::io::Error> {
-    let mut object_size = object_size;
-    if object_size == -1 {
-        object_size = MAX_MULTIPART_PUT_OBJECT_SIZE;
-    }
-
-    if object_size > MAX_MULTIPART_PUT_OBJECT_SIZE {
-        return Err(std::io::Error::other("entity too large"));
-    }
-
-    let configured_part_size = MIN_PART_SIZE;
-    let mut part_size_flt = object_size as f64 / MAX_PARTS_COUNT as f64;
-    part_size_flt = (part_size_flt as f64 / configured_part_size as f64).ceil() * configured_part_size as f64;
-
-    let part_size = part_size_flt as i64;
-    if part_size == 0 {
-        return Ok(MIN_PART_SIZE);
-    }
-    Ok(part_size)
 }
 
 #[cfg(test)]
@@ -196,5 +200,24 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("host"), "expected host validation error, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn new_rejects_loopback_endpoint_before_network_setup() {
+        let conf = rustfs_tier("https://127.0.0.1:9000");
+
+        match WarmBackendRustFS::new(&conf, "tier").await {
+            Ok(_) => panic!("loopback endpoint should be rejected"),
+            Err(err) => assert!(err.to_string().contains("not allowed")),
+        }
+    }
+
+    #[test]
+    fn loopback_opt_in_does_not_allow_other_private_endpoints() {
+        let loopback = url::Url::parse("https://127.0.0.1:9000").unwrap();
+        assert!(validate_rustfs_tier_endpoint_inner(&loopback, true).is_ok());
+
+        let private = url::Url::parse("https://10.0.0.1:9000").unwrap();
+        assert!(validate_rustfs_tier_endpoint_inner(&private, true).is_err());
     }
 }

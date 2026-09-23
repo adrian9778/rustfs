@@ -207,12 +207,12 @@ jobs:
           fi
 
           all='{"include":[
-            {"target_id":"linux-x86_64-musl","os":"sm-standard-2","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":""},
-            {"target_id":"linux-aarch64-musl","os":"sm-standard-2","target":"aarch64-unknown-linux-musl","cross":true,"platform":"linux","rustflags":""},
-            {"target_id":"linux-x86_64-gnu","os":"sm-standard-2","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":""},
-            {"target_id":"linux-aarch64-gnu","os":"sm-standard-2","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":""},
-            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":""},
-            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":""}
+            {"target_id":"linux-x86_64-musl","os":"sm-standard-4","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":""},
+            {"target_id":"linux-aarch64-musl","os":"sm-standard-4","target":"aarch64-unknown-linux-musl","cross":true,"platform":"linux","rustflags":"","features":""},
+            {"target_id":"linux-x86_64-gnu","os":"sm-standard-4","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":"","features":"pyroscope"},
+            {"target_id":"linux-aarch64-gnu","os":"sm-standard-4","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope"},
+            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":"","features":"pyroscope"},
+            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":"","features":""}
           ]}'
 
           if [[ "${selected}" == "all" ]]; then
@@ -244,7 +244,7 @@ jobs:
     needs: [ build-check, prepare-platform-matrix ]
     if: needs.build-check.outputs.should_build == 'true' && needs.prepare-platform-matrix.result == 'success'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 150
+    timeout-minutes: 180
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       # Release binaries ship without dial9 telemetry and therefore do not need
@@ -406,12 +406,25 @@ jobs:
           # Force rebuild by touching build.rs
           touch rustfs/build.rs
 
-          if [[ "${{ matrix.cross }}" == "true" ]]; then
-            # All cross targets in the matrix are Linux; zigbuild handles them.
-            cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bins
-          else
-            cargo build --release --target ${{ matrix.target }} -p rustfs --bins
+          BINARY_NAMES=(rustfs)
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            BINARY_NAMES+=(rustfs-cli)
           fi
+          FEATURE_ARGS=()
+          if [[ -n "${{ matrix.features }}" ]]; then
+            FEATURE_ARGS=(--features "${{ matrix.features }}")
+          fi
+
+          # Build one binary at a time so release LTO links cannot exhaust a
+          # self-hosted runner by running concurrently.
+          for binary in "${BINARY_NAMES[@]}"; do
+            if [[ "${{ matrix.cross }}" == "true" ]]; then
+              # All cross targets in the matrix are Linux; zigbuild handles them.
+              cargo zigbuild --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" -p rustfs --bin "$binary"
+            else
+              cargo build --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" -p rustfs --bin "$binary"
+            fi
+          done
 
       - name: Create release package
         id: package
@@ -498,16 +511,23 @@ jobs:
             BINARY_NAME="rustfs"
           fi
 
-          # Verify the binary exists before packaging
-          if [[ ! -f "$BINARY_NAME" ]]; then
-            echo "❌ Binary $BINARY_NAME not found in $(pwd)"
-            if [[ "${{ matrix.platform }}" == "windows" ]]; then
-              dir
-            else
-              ls -la
-            fi
-            exit 1
+          BINARY_FILES=("$BINARY_NAME")
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            BINARY_FILES+=("rustfs-cli")
           fi
+
+          # Verify the binaries exist before packaging
+          for binary in "${BINARY_FILES[@]}"; do
+            if [[ ! -f "$binary" ]]; then
+              echo "❌ Binary $binary not found in $(pwd)"
+              if [[ "${{ matrix.platform }}" == "windows" ]]; then
+                dir
+              else
+                ls -la
+              fi
+              exit 1
+            fi
+          done
 
           # Universal packaging function
           package_zip() {
@@ -526,8 +546,12 @@ jobs:
           }
 
           # Create the zip package
-          echo "Start packaging: $BINARY_NAME -> ../../../${PACKAGE_NAME}.zip"
-          package_zip "$BINARY_NAME" "../../../${PACKAGE_NAME}.zip"
+          echo "Start packaging: ${BINARY_FILES[*]} -> ../../../${PACKAGE_NAME}.zip"
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            zip "../../../${PACKAGE_NAME}.zip" "${BINARY_FILES[@]}"
+          else
+            package_zip "$BINARY_NAME" "../../../${PACKAGE_NAME}.zip"
+          fi
 
           cd ../../..
 
@@ -600,6 +624,28 @@ jobs:
           fi
           echo "🔧 Build type: ${BUILD_TYPE}"
           echo "📊 Version: ${VERSION}"
+
+      - name: Verify packaged Linux CLI
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_file="${{ steps.package.outputs.package_file }}"
+          archive_members="$(unzip -Z1 "$package_file" | sort)"
+          expected_members=$'rustfs\nrustfs-cli'
+          if [[ "$archive_members" != "$expected_members" ]]; then
+            echo "Linux package must contain exactly rustfs and rustfs-cli" >&2
+            printf '%s\n' "$archive_members" >&2
+            exit 1
+          fi
+
+          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+            cli_dir="$(mktemp -d)"
+            trap 'rm -rf "$cli_dir"' EXIT
+            unzip -q "$package_file" rustfs-cli -d "$cli_dir"
+            "$cli_dir/rustfs-cli" --help >/dev/null
+          fi
 
       - name: Verify packaged console
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -772,9 +818,7 @@ jobs:
 
           echo ""
           echo "🐳 Docker Images:"
-          if [[ "$BUILD_TYPE" == "preview" ]]; then
-            echo "⏭️  Preview tags do not publish Docker images"
-          elif [[ "$INPUT_BUILD_DOCKER" == "false" ]]; then
+          if [[ "$INPUT_BUILD_DOCKER" == "false" ]]; then
             echo "⏭️  Docker image build was skipped (binary only build)"
           elif [[ "$BUILD_STATUS" == "success" ]]; then
             echo "🔄 Docker images will be built and pushed automatically via workflow_run event"
@@ -1033,6 +1077,55 @@ jobs:
           echo "🎉 Released $TAG successfully!"
           echo "📄 Release URL: ${{ needs.create-release.outputs.release_url }}"
 
+  # Remove the internal preview releases once the deliverable release is live.
+  # Only the Releases are deleted; the -preview.N tags stay so the validated
+  # commit remains traceable.
+  cleanup-preview-releases:
+    name: Cleanup Preview Releases
+    needs: [ build-check, publish-release ]
+    if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Delete preview releases for this target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${{ needs.build-check.outputs.version }}"
+          RELEASES_JSON="${RUNNER_TEMP}/releases.json"
+
+          # Fetch before filtering: a failed listing must abort here instead of
+          # looking like "nothing to clean up".
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$RELEASES_JSON"
+
+          # Match only <target>-preview.<digits>. String operations, not a
+          # regex over the tag, so dots in the version cannot widen the match.
+          DELETED=0
+          while IFS= read -r preview_tag; do
+            [[ -n "$preview_tag" ]] || continue
+            echo "🧹 Deleting preview release $preview_tag (tag kept)"
+            gh release delete "$preview_tag" --repo "${GITHUB_REPOSITORY}" --yes
+            DELETED=$((DELETED + 1))
+          done < <(
+            jq -r --arg tag "$TAG" '
+              .[]
+              | select(.tag_name | startswith($tag + "-preview."))
+              | select(.tag_name | ltrimstr($tag + "-preview.") | test("^[0-9]+$"))
+              | .tag_name
+            ' "$RELEASES_JSON"
+          )
+
+          if [[ "$DELETED" -eq 0 ]]; then
+            echo "ℹ️  No preview releases to clean up for $TAG"
+          else
+            echo "✅ Removed $DELETED preview release(s) for $TAG"
+          fi
+
   alert-on-failure:
     name: Alert on scheduled failure
     needs: [build-check, prepare-platform-matrix, build-rustfs, build-summary]
@@ -1051,4 +1144,4 @@ jobs:
       - name: Open or update failure-tracking issue
         uses: ./.github/actions/schedule-failure-issue
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}

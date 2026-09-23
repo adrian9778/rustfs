@@ -32,11 +32,22 @@ pub mod bucket {
     pub mod bucket_target_sys {
         pub use crate::bucket::bucket_target_sys::{
             AdvancedPutOptions, BucketTargetError, BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError,
-            SsecPassthroughCapability, TargetClient, append_version_id_query,
+            SsecPassthroughCapability, TargetClient, VersionIdentityCapability, append_version_id_query,
+            resolve_delete_api_version_id,
         };
     }
 
     pub mod lifecycle {
+        pub mod legacy_transition_state_reconcile {
+            pub use crate::bucket::lifecycle::legacy_transition_state_reconcile::{
+                LegacyTransitionStateCopyRepresentation, LegacyTransitionStateMetadataAlias, LegacyTransitionStateReconcileError,
+                LegacyTransitionStateReconcileOutcome, LegacyTransitionStateReconcileReadiness,
+                LegacyTransitionStateReconcileRequest, LegacyTransitionStateReconcileResponse,
+                LegacyTransitionStateReconcileSelector, LegacyTransitionStateSetRepresentation, LegacyTransitionStateSource,
+                LegacyTransitionStateTarget,
+            };
+        }
+
         pub mod bucket_lifecycle_audit {
             pub use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
         }
@@ -49,7 +60,7 @@ pub mod bucket {
                 apply_transition_rule, enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects,
                 enqueue_transition_for_existing_objects_scoped, enqueue_transition_for_existing_objects_scoped_with_cancel,
                 enqueue_transition_immediate, expire_transitioned_object, get_global_expiry_state, get_global_transition_state,
-                init_background_expiry, manual_transition_queue_snapshot, post_restore_opts,
+                init_background_expiry, lifecycle_version_delete_target, manual_transition_queue_snapshot, post_restore_opts,
                 run_stale_multipart_upload_cleanup_once, validate_transition_tier,
             };
         }
@@ -69,11 +80,38 @@ pub mod bucket {
             };
         }
 
+        pub mod recovery_control {
+            pub use crate::bucket::lifecycle::recovery_control::{
+                IlmRecoveryClassification, IlmRecoveryControlPage, IlmRecoveryControlView, IlmRecoveryProtocol,
+                inspect_recovery_control, list_recovery_controls,
+            };
+        }
+
+        pub mod recovery_disposition {
+            pub use crate::bucket::lifecycle::recovery_disposition::{
+                IlmRecoveryDispositionExecutionOutcome, IlmRecoveryDispositionReasonCode, IlmRecoveryDispositionState,
+                dry_run_recovery_disposition, execute_recovery_disposition,
+            };
+        }
+
+        pub mod recovery_export {
+            pub use crate::bucket::lifecycle::recovery_export::{
+                IlmRecoveryExportCreated, IlmRecoveryExportObservation, create_recovery_export,
+                inspect_recovery_export_observation, load_recovery_export,
+            };
+        }
+
         pub mod transition_transaction {
             pub use crate::bucket::lifecycle::transition_transaction::{
                 TransitionOperatorDeleteResult, TransitionOperatorError, TransitionOperatorProbe, TransitionOperatorStatus,
-                delete_transition_candidate_for_operator, finalize_missing_transition_transaction_for_operator,
-                inspect_transition_transaction_for_operator,
+                TransitionRecoveryRetryResult, TransitionRecoveryRetryStatus, delete_transition_candidate_for_operator,
+                finalize_missing_transition_transaction_for_operator, inspect_transition_recovery_retry_for_operator,
+                inspect_transition_transaction_for_operator, retry_transition_recovery_for_operator,
+            };
+            #[cfg(feature = "test-util")]
+            pub use crate::bucket::lifecycle::transition_transaction::{
+                TransitionTransactionRecoveryStats, recover_transition_transaction_records,
+                recover_transition_transaction_records_at,
             };
         }
 
@@ -84,8 +122,9 @@ pub mod bucket {
         #[allow(clippy::module_inception)]
         pub mod lifecycle {
             pub use crate::bucket::lifecycle::lifecycle::{
-                Event, ExpirationOptions, IlmAction, Lifecycle, LifecycleCalculate, ObjectOpts, RuleValidate,
-                TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions, expected_expiry_time, object_opts_from_object_info,
+                Event, ExpirationOptions, IlmAction, LIFECYCLE_MALFORMED_XML_ERROR_KIND, Lifecycle, LifecycleCalculate,
+                ObjectOpts, RuleValidate, TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions, expected_expiry_time,
+                object_opts_from_object_info,
             };
         }
 
@@ -99,10 +138,21 @@ pub mod bucket {
             pub use crate::bucket::lifecycle::tier_delete_journal::{
                 persist_tier_delete_journal_entry, record_tier_delete_journal_backend_identity,
             };
+
+            #[cfg(feature = "test-util")]
+            pub mod test_util {
+                /// Model a single-node, all-v6 fleet after its capability probe has completed.
+                ///
+                /// Call this only once while constructing an isolated test store, before any
+                /// tier-delete journal permit or background worker can be active.
+                pub fn install_all_v6_fleet_capability_proof() {
+                    crate::services::notification_sys::install_cross_pool_fence_fleet_proof_for_test();
+                }
+            }
         }
 
         pub mod tier_last_day_stats {
-            pub use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
+            pub use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats, TierDailyStatsWire};
         }
 
         pub mod tier_sweeper {
@@ -113,14 +163,21 @@ pub mod bucket {
     }
 
     pub mod metadata {
-        pub use crate::bucket::metadata::BUCKET_DURABILITY_CONFIG;
         pub use crate::bucket::metadata::{
             BUCKET_ACCELERATE_CONFIG, BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_LOGGING_CONFIG,
             BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_QUOTA_CONFIG_FILE,
             BUCKET_REPLICATION_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_SSECONFIG, BUCKET_TABLE_CATALOG_META_PREFIX,
             BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG, BUCKET_TABLE_RESERVED_PREFIX, BUCKET_TAGGING_CONFIG,
-            BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BUCKET_WEBSITE_CONFIG, BucketMetadata, OBJECT_LOCK_CONFIG,
-            load_bucket_metadata, table_catalog_path_hash,
+            BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BUCKET_WEBSITE_CONFIG, BucketMetadata, ConfigState,
+            OBJECT_LOCK_CONFIG, UnreadableBucketConfig, is_unreadable_config_error, load_bucket_metadata,
+            table_catalog_path_hash, unreadable_config_refusal,
+        };
+        pub use crate::bucket::metadata::{BUCKET_DURABILITY_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG};
+    }
+
+    pub mod config_parse_mode {
+        pub use crate::bucket::config_parse_mode::{
+            BucketConfigParseMode, bucket_config_parse_mode, validate_bucket_config_parse_mode_env,
         };
     }
 
@@ -131,28 +188,40 @@ pub mod bucket {
     }
 
     pub mod metadata_sys {
-        #[cfg(feature = "test-util")]
-        pub use crate::bucket::metadata_sys::ConfigWriteLockProbe;
         pub use crate::bucket::metadata_sys::{
-            BucketMetadataMutationGuard, BucketMetadataSys, ObjectLockConfigState, acquire_bucket_metadata_transaction_lock,
-            acquire_bucket_metadata_transaction_lock_for_incarnation, capture_bucket_metadata_incarnation, delete,
-            delete_if_incarnation, delete_under_transaction_lock, get, get_accelerate_config, get_bucket_policy,
-            get_bucket_policy_raw, get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
+            BUCKET_CONFIG_PUBLISH_HOOK, BucketConfigPublishHook, BucketMetadataMutationGuard, BucketMetadataSys,
+            ObjectLockConfigState, acquire_bucket_metadata_transaction_lock,
+            acquire_bucket_metadata_transaction_lock_for_incarnation, acquire_scanner_bucket_incarnation_fence,
+            capture_bucket_metadata_incarnation, delete, delete_if_incarnation, delete_if_incarnation_at,
+            delete_under_transaction_lock, get, get_accelerate_config, get_bucket_policy, get_bucket_policy_raw,
+            get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
             get_global_bucket_metadata_sys, get_lifecycle_config, get_logging_config, get_notification_config,
-            get_object_lock_config, get_object_lock_config_state, get_public_access_block_config, get_quota_config,
-            get_replication_config, get_request_payment_config, get_sse_config, get_tagging_config, get_versioning_config,
-            get_website_config, init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata,
-            set_bucket_metadata, update, update_bucket_targets_under_transaction_lock, update_config_with, update_if_incarnation,
-            update_quota_if_incarnation, update_under_transaction_lock,
+            get_object_lock_config, get_object_lock_config_state, get_on_demand_migration_config,
+            get_on_demand_migration_config_in, get_public_access_block_config, get_quota_config, get_replication_config,
+            get_request_payment_config, get_sse_config, get_tagging_config, get_versioning_config, get_website_config,
+            init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata, set_bucket_metadata,
+            update, update_bucket_targets_under_transaction_lock, update_config_with, update_if_incarnation,
+            update_if_incarnation_at, update_quota_if_incarnation, update_quota_if_incarnation_at, update_under_transaction_lock,
+            update_under_transaction_lock_at,
         };
+        #[cfg(feature = "test-util")]
+        pub use crate::bucket::metadata_sys::{ConfigWriteLockProbe, test_support};
     }
 
     pub mod migration {
-        pub use crate::bucket::migration::{LegacyBlobDecryptFn, try_migrate_bucket_metadata, try_migrate_iam_config};
+        pub use crate::bucket::migration::{
+            LegacyBlobDecryptFn, migration_startup_error, try_migrate_bucket_metadata, try_migrate_iam_config,
+        };
     }
 
     pub mod object_lock {
         pub use crate::bucket::object_lock::{ObjectLockApi, ObjectLockStatusExt};
+
+        pub mod types {
+            pub use crate::bucket::object_lock::types::{
+                DefaultRetention, LegalHoldStatus, ObjectLegalHold, ObjectRetention, RetentionMode,
+            };
+        }
 
         pub mod objectlock {
             pub use crate::bucket::object_lock::objectlock::{get_object_legalhold_meta, get_object_retention_meta};
@@ -161,7 +230,7 @@ pub mod bucket {
         pub mod objectlock_sys {
             pub use crate::bucket::object_lock::objectlock_sys::{
                 BucketObjectLockSys, ObjectLockBlockReason, add_years, check_object_lock_for_deletion,
-                check_retention_for_modification, is_retention_active,
+                check_retention_for_modification, is_retention_active, replication_write_may_pass_worm_gate,
             };
         }
     }
@@ -178,6 +247,20 @@ pub mod bucket {
         }
     }
 
+    pub mod remote_s3_client {
+        pub use crate::bucket::remote_s3_client::{
+            PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, RemoteS3RetryPolicy, build_remote_s3_client,
+            build_remote_s3_config, validate_remote_endpoint, validate_target_ca_pem,
+        };
+    }
+
+    pub mod sealed_credentials {
+        pub use crate::bucket::sealed_credentials::{
+            CredentialSealer, SEALED_CREDENTIAL_VERSION, SealScope, SealedCredential, SealedCredentialError,
+            SealedCredentialStore, credential_sealer, install_credential_sealer, seal_secret, unseal_secret,
+        };
+    }
+
     pub mod replication {
         pub use crate::bucket::replication::replication_pool::{
             DurableMrfBacklogSummary, DurableMrfBucketBacklog, DurableMrfTargetBacklog, MrfBacklogObservabilitySummary,
@@ -188,25 +271,27 @@ pub mod bucket {
             BucketReplicationResyncStatus, BucketReplicationStat, BucketReplicationStats, BucketStats,
             DeleteReplicationConfigSnapshot, DeletedObjectReplicationInfo, DurableMrfBacklog, DynReplicationPool, InQueueMetric,
             MrfOpKind, MrfReplicateEntry, MustReplicateOptions, ObjectOpts, OperatorRuleContract,
-            REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
-            REPLICATE_INCOMING_DELETE, REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS,
-            REPLICATION_WRITABLE_FIELDS, ReplicateDecision, ReplicateObjectInfo, ReplicationBatchAdmission, ReplicationConfig,
+            REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS,
+            REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, REPLICATE_INCOMING_DELETE,
+            REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
+            ReplicateDecision, ReplicateObjectInfo, ReplicationBatchAdmission, ReplicationConfig,
             ReplicationConfigStructureError, ReplicationConfigurationExt, ReplicationDeleteScheduleInput,
             ReplicationDeleteStateSource, ReplicationHealQueueResult, ReplicationObjectBridge, ReplicationObjectIO,
             ReplicationOperation, ReplicationPoolTrait, ReplicationPriority, ReplicationQueueAdmission, ReplicationScannerBridge,
             ReplicationState, ReplicationStats, ReplicationStatusType, ReplicationStorage, ReplicationTargetValidationError,
-            ReplicationType, ResyncOpts, ResyncStatusType, RuntimeReplicationTargetBacklog, TargetReplicationResyncStatus,
-            VersionPurgeStatusType, XferStats, assign_site_replication_rule_priorities, commit_force_delete_intent,
-            complete_force_delete_intent, delete_replication_state_from_config, delete_replication_version_id,
-            get_global_replication_pool, get_global_replication_stats, get_proxy_targets, init_background_replication,
+            ReplicationType, ResyncOpts, ResyncStatusType, RuntimeReplicationTargetBacklog, ScannerDirtyUsageMutationObserver,
+            ScannerDirtyUsageMutationSource, TargetReplicationResyncStatus, VersionPurgeStatusType, XferStats,
+            assign_site_replication_rule_priorities, commit_force_delete_intent, complete_force_delete_intent,
+            delete_replication_state_from_config, delete_replication_version_id, get_global_replication_pool,
+            get_global_replication_stats, get_proxy_targets, init_background_replication,
             invalid_replication_config_status_field, is_site_replication_role, is_site_replication_rule,
             merge_incoming_replication_config, merge_user_replication_config, persist_force_delete_intent,
             read_durable_mrf_backlog, replication_state_to_filemeta, replication_status_to_filemeta, replication_statuses_map,
             replication_target_arn_deployment_id, replication_target_arns, resync_start_conflict_id,
-            should_remove_replication_target, should_schedule_delete_replication, should_use_existing_delete_replication_info,
-            should_use_existing_delete_replication_source, site_replication_rule_deployment_id,
-            unsupported_replication_config_field, validate_replication_config_structure, validate_replication_config_target_arns,
-            version_purge_status_to_filemeta,
+            set_scanner_dirty_usage_mutation_observer, should_remove_replication_target, should_schedule_delete_replication,
+            should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
+            site_replication_rule_deployment_id, unsupported_replication_config_field, validate_replication_config_structure,
+            validate_replication_config_target_arns, version_purge_status_to_filemeta,
         };
     }
 
@@ -243,32 +328,14 @@ pub mod cache {
 
 pub mod capacity {
     pub use crate::core::pools::{
-        PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free, path2_bucket_object,
-        path2_bucket_object_with_base_path,
+        DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
+        is_pool_activation_fleet_proof_error, path2_bucket_object, path2_bucket_object_with_base_path,
     };
     pub use crate::store::utils::is_reserved_or_invalid_bucket;
 }
 
-pub mod client {
-    pub mod admin_handler_utils {
-        pub use crate::client::admin_handler_utils::AdminError;
-    }
-
-    pub mod api_put_object {
-        pub use crate::client::api_put_object::{AdvancedPutOptions, PutObjectOptions};
-    }
-
-    pub mod object_api_utils {
-        pub use crate::client::object_api_utils::{ObjReaderFn, PutObjReader, get_raw_etag, new_getobjectreader, to_s3s_etag};
-    }
-
-    pub mod transition_api {
-        pub use crate::client::transition_api::{
-            BucketLookupType, CreateBucketConfiguration, LocationConstraint, ObjectInfo, ObjectMultipartInfo, Options,
-            PutObjectPartOptions, ReadCloser, ReaderImpl, RequestMetadata, RestoreInfo, SendRequest, TransitionClient,
-            TransitionCore, UploadInfo, to_object_info,
-        };
-    }
+pub mod object_api_utils {
+    pub use crate::object_api::object_api_utils::{ObjReaderFn, PutObjReader, get_raw_etag, new_getobjectreader, to_s3s_etag};
 }
 
 pub mod cluster {
@@ -319,6 +386,15 @@ pub mod config {
 }
 
 pub mod data_usage {
+    #[cfg(feature = "test-util")]
+    pub use crate::data_movement::SourceCleanupDeleteBarrier;
+    #[cfg(feature = "test-util")]
+    pub use crate::data_movement::scanner_backlog::test_util::NativeScannerPauseBacklogWriteFault;
+    pub use crate::data_movement::scanner_backlog::{
+        MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
+        ScannerPauseBacklogRetirementPlanner, ScannerPauseBacklogRetirementReplica,
+        register_scanner_pause_backlog_retirement_planner,
+    };
     pub use crate::data_usage::{
         DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, compute_bucket_usage,
         init_compression_total_memory_from_backend, invalidate_admin_data_usage_snapshot_cache,
@@ -336,7 +412,9 @@ pub mod data_usage {
 
 pub mod disk {
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
-    pub use crate::disk::local::ScanGuard;
+    pub use crate::disk::local::{ReplacementExecutionLease, ScanGuard};
+    #[cfg(all(feature = "test-util", not(windows)))]
+    pub use crate::disk::os::{LocalPublicationPause, LocalPublicationStage};
     pub use crate::disk::{
         BATCH_READ_VERSION_MAX_ITEMS, BUCKET_META_PREFIX, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp,
         CheckPartsResp, ConditionalFileUpdate, DeleteOptions, Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption,
@@ -369,8 +447,8 @@ pub mod disk {
 
 pub mod error {
     pub use crate::error::{
-        Error, Result, StorageError, classify_system_path_failure_reason, is_err_bucket_not_found, is_err_object_not_found,
-        is_err_version_not_found,
+        Error, PoolMetadataError, PoolMetadataFailure, Result, StorageError, classify_system_path_failure_reason,
+        is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
     };
 }
 
@@ -415,9 +493,21 @@ pub mod notification {
     #[cfg(any(test, feature = "test-util"))]
     pub use crate::services::notification_sys::rotate_cross_pool_fence_fleet_proof_for_test;
     pub use crate::services::notification_sys::{
-        CrossPoolFenceFleetProofToken, NotificationPeerErr, NotificationSys, acquire_cross_pool_fence_fleet_proof,
-        cross_pool_fence_fleet_proof_matches, get_global_notification_sys, new_global_notification_sys,
-        start_remote_version_state_fleet_probe,
+        ClusterTierDailyStats, CrossPoolFenceFleetProofToken, IlmRecoveryExportFleetProofToken,
+        LegacyTransitionStateReconcileFleetProofToken, NotificationPeerErr, NotificationSys, ScannerPublicationLeaseGrant,
+        acquire_cross_pool_fence_fleet_proof, acquire_ilm_recovery_export_fleet_proof,
+        acquire_legacy_transition_state_reconcile_fleet_proof, cross_pool_fence_fleet_proof_matches, get_global_notification_sys,
+        ilm_recovery_export_fleet_proof_matches, ilm_recovery_export_local_process_epoch,
+        ilm_recovery_export_member_epochs_sha256, ilm_recovery_export_topology_generation,
+        legacy_transition_state_reconcile_fleet_proof_matches, new_global_notification_sys,
+        scanner_peer_transport_error_message_is_retryable, start_remote_version_state_fleet_probe,
+    };
+}
+
+pub mod integrity {
+    pub use crate::services::integrity::{
+        IntegrityError, InventoryItem, InventoryPage, ItemRequest, ItemResult, ItemState, Job, JobMode, JobRequest, JobState,
+        Protection, Readiness, control_job, create_job, get_job, inventory, readiness, resume_job,
     };
 }
 
@@ -426,7 +516,9 @@ pub mod object {
         BLOCK_SIZE_V2, ERASURE_ALGORITHM, EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook,
         GetObjectBodyCacheHookLookup, GetObjectBodySource, GetObjectReader, NamespaceLockFence, ObjectEncryptionResolver,
         ObjectInfo, ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions, PutObjReader, QuotaAdmission,
-        RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest, StreamConsumer,
+        RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
+        SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, ScannerPublicationCommitScope, ScannerPublicationCommitStartError,
+        ScannerPublicationCommitState, ShardIntegrityWriteMode, StreamConsumer, WriteCompletion,
         get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
         register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
@@ -434,6 +526,11 @@ pub mod object {
         PrepareSelectObjectSnapshotError, PreparedGetObjectReader, SelectObjectSnapshot, SelectObjectSnapshotReadError,
         SnapshotConsistencyError,
     };
+
+    #[cfg(feature = "test-util")]
+    pub mod test_util {
+        pub use crate::store::DeleteAfterObjectLockSnapshotBarrier;
+    }
 }
 
 pub mod rebalance {
@@ -442,6 +539,12 @@ pub mod rebalance {
         RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, decode_rebalance_stop_propagation_record,
         encode_rebalance_stop_propagation_record,
     };
+
+    #[cfg(feature = "test-util")]
+    pub mod test_util {
+        pub use crate::services::rebalance::PausedRebalanceEntryTestFixture;
+        pub use crate::services::rebalance::test_store_with_persisted_rebalance_meta;
+    }
 }
 
 pub mod rio {
@@ -453,15 +556,20 @@ pub mod rio {
 
 pub mod rpc {
     pub use crate::cluster::rpc::{
-        AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
-        PeerRestClient, PeerS3Client, S3PeerSys, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
-        ScannerBucketListing, ScannerPeerActivity, TONIC_RPC_PREFIX, TonicInterceptor, build_put_file_auth_trailer,
-        check_and_record_signed_rpc_nonce, gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers,
-        gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
-        normalize_tonic_rpc_audience, set_tonic_canonical_body_digest, sign_ns_scanner_capability, sign_put_file_capability,
+        AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION,
+        NetworkPeerProbeClient, NetworkPeerProbeError, NetworkPeerProbeMeasurement, NetworkPeerTarget, PEER_RESTDRY_RUN,
+        PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, S3PeerSys, SERVICE_SIGNAL_REFRESH_CONFIG,
+        SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerBucketListing, ScannerDirtyUsageAcknowledgement, ScannerPeerActivity,
+        ScannerPeerDirtyUsageBucket, ScannerPeerDirtyUsageSnapshot, ScannerPublicationLease, ScannerScopedDirtyUsageAckEntry,
+        TONIC_RPC_PREFIX, TonicInterceptor, build_put_file_auth_trailer, check_and_record_signed_rpc_nonce,
+        decode_heal_bucket_rpc_options, encode_heal_bucket_rpc_options, gen_signature_headers, gen_tonic_replay_scope_headers,
+        gen_tonic_signature_headers, gen_tonic_signature_interceptor, node_service_time_out_client,
+        node_service_time_out_client_no_auth, normalize_tonic_rpc_audience, set_tonic_canonical_body_digest,
+        sign_ns_scanner_capability, sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability,
         sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
-        tonic_rpc_auth_failure_reason, verify_put_file_auth_trailer, verify_put_file_capability, verify_rpc_signature,
-        verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
+        tonic_rpc_auth_failure_reason, verify_ns_scanner_capability, verify_ns_scanner_capability_with_tier_registry_generation,
+        verify_put_file_auth_trailer, verify_put_file_capability, verify_rpc_signature, verify_tonic_boot_epoch_response,
+        verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest, verify_tonic_mutation_body_digest_reject_unsigned,
         verify_tonic_rpc_response_proof, verify_tonic_rpc_signature, verify_tonic_rpc_signature_with_bootstrap,
     };
 }
@@ -478,6 +586,12 @@ pub mod set_disk {
     pub mod test_util {
         pub use crate::bucket::quota::reservation::fail_next_quota_ledger_save_for_test;
         pub use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause};
+
+        /// Keep a namespace commit pending until the returned owner is dropped.
+        #[must_use]
+        pub fn hold_namespace_commit(store: &crate::store::ECStore) -> impl Send + Sync {
+            store.ctx.begin_namespace_commit()
+        }
     }
 }
 
@@ -486,13 +600,14 @@ pub mod store_list {
 }
 
 pub mod storage {
-    pub use crate::core::pools::HealLifecycleExpiryContext;
+    pub use crate::core::pools::{HealLifecycleExpiryContext, POOL_META_NAME};
     pub use crate::store::HealWalkVersion;
     pub use crate::store::{
-        ECStore, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks,
-        init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
-        prewarm_local_disk_id_map_with_instance_ctx,
+        BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,
+        all_local_disk_path, find_local_disk_by_ref, init_local_disks, init_local_disks_with_instance_ctx, init_lock_clients,
+        prewarm_local_disk_id_map, prewarm_local_disk_id_map_with_instance_ctx,
     };
+    pub use crate::store::{HealObjectAbsenceProof, HealObjectStorageResult};
 }
 
 pub mod tier {

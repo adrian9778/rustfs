@@ -25,7 +25,7 @@ use rustfs_utils::http::{
     SUFFIX_TAGGING_TIMESTAMP, get_header,
     header_compat::{MINIO_ENCRYPTION_PREFIX, RUSTFS_ENCRYPTION_PREFIX},
     insert_header_map, insert_str,
-    metadata_compat::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX},
+    metadata_compat::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, starts_with_ignore_ascii_case},
 };
 use rustfs_utils::http::{
     AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
@@ -145,6 +145,17 @@ fn get_skip_verify_bitrot() -> bool {
     }
 }
 
+/// Like [`bucket_versioning_config`], for laying out an object write or
+/// delete: an unreadable stored configuration is refused in strict mode
+/// instead of being read as unversioned (rustfs/backlog#1734).
+async fn bucket_versioning_config_for_write(bucket: &str) -> Result<VersioningConfiguration> {
+    #[cfg(test)]
+    VERSIONING_CONFIG_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    wait_for_versioning_config_test_hook(bucket).await;
+    BucketVersioningSys::get_for_write(bucket).await
+}
+
 /// Creates options for deleting an object in a bucket.
 pub async fn del_opts(
     bucket: &str,
@@ -153,7 +164,7 @@ pub async fn del_opts(
     headers: &HeaderMap<HeaderValue>,
     metadata: HashMap<String, String>,
 ) -> Result<ObjectOptions> {
-    let versioning_cfg = bucket_versioning_config(bucket).await;
+    let versioning_cfg = bucket_versioning_config_for_write(bucket).await?;
     del_opts_with_versioning(bucket, object, vid, headers, metadata, &versioning_cfg, false)
 }
 
@@ -350,7 +361,7 @@ pub async fn put_opts_with_replication_authorization(
     metadata: HashMap<String, String>,
     replication_request_authorized: bool,
 ) -> Result<ObjectOptions> {
-    let versioning_cfg = bucket_versioning_config(bucket).await;
+    let versioning_cfg = bucket_versioning_config_for_write(bucket).await?;
     let versioned = versioning_cfg.prefix_enabled(object);
     let version_suspended = versioning_cfg.prefix_suspended(object);
 
@@ -500,6 +511,25 @@ pub fn put_opts_from_headers_with_replication_authorization(
         if let Some(restored) = rustfs_utils::http::ssec_transport_to_stored_metadata(headers) {
             opts.user_defined.extend(restored);
             opts.preserve_ciphertext = true;
+            // A compressed passthrough object restores its compression
+            // layout as well, so the replica decompresses after decrypting
+            // (backlog#2363). The value is validated when the object is read.
+            if let Some(scheme) = get_header(headers, rustfs_utils::http::SUFFIX_REPLICATION_COMPRESSION) {
+                rustfs_utils::http::insert_str(
+                    &mut opts.user_defined,
+                    rustfs_utils::http::SUFFIX_COMPRESSION,
+                    scheme.into_owned(),
+                );
+                if let Some(actual_size) = get_header(headers, rustfs_utils::http::SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE)
+                    && actual_size.parse::<i64>().is_ok_and(|size| size >= 0)
+                {
+                    rustfs_utils::http::insert_str(
+                        &mut opts.user_defined,
+                        rustfs_utils::http::SUFFIX_ACTUAL_SIZE,
+                        actual_size.into_owned(),
+                    );
+                }
+            }
         }
         if let Some(crc) = get_header(headers, SUFFIX_REPLICATION_SSEC_CRC) {
             insert_header_map(&mut opts.user_defined, SUFFIX_REPLICATION_SSEC_CRC, crc.into_owned());
@@ -554,10 +584,11 @@ fn apply_replication_timestamps_from_headers(headers: &HeaderMap<HeaderValue>, o
 
     // Persist into the internal metadata keys so a later outbound replication
     // pass (replication_target_boundary) reads the source's modification
-    // times instead of falling back to mod_time.
-    // TODO(P1-6): receiver-side LWW is still missing — when the stored
-    // per-category timestamp is newer than the inbound one, the existing
-    // tags/retention/legal-hold should win instead of being overwritten.
+    // times instead of falling back to mod_time. Receiver-side LWW happens at
+    // the set layer under the object write lock
+    // (ecstore set_disk::ops::object::merge_replication_metadata_lww,
+    // rustfs/backlog#1953): a category whose stored timestamp is newer than
+    // the inbound one keeps the local values.
     for (timestamp, suffix) in [
         (opts.replication_tagging_timestamp, SUFFIX_TAGGING_TIMESTAMP),
         (opts.replication_retention_timestamp, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP),
@@ -814,12 +845,6 @@ pub fn extract_metadata_from_mime_with_object_name(
     }
 }
 
-fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
-    value
-        .get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-}
-
 fn should_skip_object_metadata_key(key: &str, value: &str, excluded_headers: &[&str]) -> bool {
     const X_AMZ_PREFIX: &str = "x-amz-";
 
@@ -1018,9 +1043,25 @@ pub fn parse_copy_source_range(range_str: &str) -> S3Result<HTTPRangeSpec> {
         Err(s3_error!(InvalidArgument, "Invalid range format"))
     }
 }
+/// Returns the `x-amz-content-sha256` digest the storage layer still has to
+/// verify itself, or `None` when the payload hash has already been enforced.
+///
+/// The s3s auth layer wraps a single-chunk body in a hash-checking
+/// `UploadStream` whenever the `x-amz-content-sha256` *header* carries a real
+/// digest, for both header-signed and presigned SigV4 requests, and rejects a
+/// malformed header outright. Every request that reaches a handler with that
+/// header has therefore already had its body verified (or is about to fail in
+/// the body stream with the same `BadDigest` mapping), so hashing it again in
+/// `HashReader` would cost a second full SHA-256 pass per PUT for no extra
+/// protection. Streaming payloads are verified chunk by chunk by s3s and never
+/// produced a digest here.
+///
+/// s3s reads the header only. The one case it does not cover is a presigned
+/// request whose digest arrives in the query string alone, which is why that
+/// path still hands the digest to the storage layer.
 pub(crate) fn get_content_sha256_with_query(headers: &HeaderMap<HeaderValue>, query: Option<&str>) -> Option<String> {
     match get_request_auth_type_with_query(headers, query) {
-        AuthType::Presigned | AuthType::Signed => {
+        AuthType::Presigned if !headers.contains_key(AMZ_CONTENT_SHA256) => {
             if skip_content_sha256_cksum_with_query(headers, query) {
                 None
             } else {
@@ -1136,16 +1177,16 @@ mod tests {
         del_opts_with_versioning, detect_content_type_from_object_name, extract_metadata, extract_metadata_from_mime,
         extract_metadata_from_mime_with_object_name, filter_object_metadata, get_complete_multipart_upload_opts,
         get_complete_multipart_upload_opts_with_replication_authorization, get_default_opts, get_opts,
-        has_replication_retention_update, namespace_reserved_user_metadata, parse_copy_source_range, put_opts,
-        put_opts_from_headers, put_opts_from_headers_with_replication_authorization, put_opts_with_replication_authorization,
-        validate_archive_content_encoding,
+        has_replication_retention_update, is_reserved_user_metadata_key, namespace_reserved_user_metadata,
+        parse_copy_source_range, put_opts, put_opts_from_headers, put_opts_from_headers_with_replication_authorization,
+        put_opts_with_replication_authorization, should_skip_object_metadata_key, validate_archive_content_encoding,
     };
     use http::{HeaderMap, HeaderValue};
     use rustfs_utils::http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER,
         AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG,
         SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
-        SUFFIX_SOURCE_VERSION_ID, insert_header,
+        SUFFIX_SOURCE_VERSION_ID, header_compat::RUSTFS_ENCRYPTION_PREFIX, insert_header,
     };
     use s3s::S3ErrorCode;
     use s3s::dto::{BucketVersioningStatus, ExcludedPrefix, VersioningConfiguration};
@@ -1594,6 +1635,59 @@ mod tests {
     }
 
     #[test]
+    fn put_opts_from_headers_restores_the_compression_layout_only_for_ssec_passthrough() {
+        use rustfs_utils::http::object_encryption_keys::REPLICATION_SSEC_ALGORITHM_HEADER;
+        use rustfs_utils::http::{
+            SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_REPLICATION_COMPRESSION, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE,
+            get_str,
+        };
+
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        insert_header(&mut headers, SUFFIX_REPLICATION_COMPRESSION, "klauspost/compress/s2");
+        insert_header(&mut headers, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE, "6295552");
+
+        // Without SSE-C transport headers the request is not a passthrough:
+        // the target compresses (or not) by its own policy and must not adopt
+        // a layout the body does not have.
+        let plain = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
+            .expect("authorized replication request should parse");
+        assert!(!plain.preserve_ciphertext);
+        assert!(get_str(&plain.user_defined, SUFFIX_COMPRESSION).is_none());
+        assert!(get_str(&plain.user_defined, SUFFIX_ACTUAL_SIZE).is_none());
+
+        headers.insert(
+            REPLICATION_SSEC_ALGORITHM_HEADER.parse::<http::HeaderName>().unwrap(),
+            HeaderValue::from_static("AES256"),
+        );
+
+        // Unauthorized: inert, like the SSE-C transport itself.
+        let untrusted = put_opts_from_headers(&headers, HashMap::new()).expect("ordinary PUT options should be created");
+        assert!(!untrusted.preserve_ciphertext);
+        assert!(get_str(&untrusted.user_defined, SUFFIX_COMPRESSION).is_none());
+
+        // Authorized passthrough: the stored bytes are compressed ciphertext,
+        // so the replica records the scheme and the plaintext size
+        // (backlog#2363).
+        let trusted = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
+            .expect("authorized replication request should parse");
+        assert!(trusted.preserve_ciphertext);
+        assert_eq!(
+            get_str(&trusted.user_defined, SUFFIX_COMPRESSION).as_deref(),
+            Some("klauspost/compress/s2")
+        );
+        assert_eq!(get_str(&trusted.user_defined, SUFFIX_ACTUAL_SIZE).as_deref(), Some("6295552"));
+
+        // A malformed plaintext size is dropped; the scheme alone still lets
+        // the read path derive the size from the parts.
+        insert_header(&mut headers, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE, "-5");
+        let malformed = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
+            .expect("authorized replication request should parse");
+        assert!(get_str(&malformed.user_defined, SUFFIX_COMPRESSION).is_some());
+        assert!(get_str(&malformed.user_defined, SUFFIX_ACTUAL_SIZE).is_none());
+    }
+
+    #[test]
     fn test_put_opts_from_headers_gates_ssec_passthrough_on_authorization() {
         use rustfs_utils::http::object_encryption_keys::{
             INTERNAL_ENCRYPTION_IV_HEADER, REPLICATION_ENCRYPTION_IV_HEADER, REPLICATION_SSEC_ALGORITHM_HEADER,
@@ -1881,6 +1975,10 @@ mod tests {
 
         let authorized = get_complete_multipart_upload_opts_with_replication_authorization(&headers, true)
             .expect("authorized replica status header should parse");
+        assert!(
+            !authorized.replication_request,
+            "REPLICA-only compatibility requests intentionally omit the source-request marker"
+        );
         assert_eq!(authorized.delete_marker_replication_status(), ReplicationStatusType::Replica);
         // For multipart the on-disk stamp actually comes from the SAME header
         // at initiate time (create-multipart builds its options through
@@ -2275,6 +2373,57 @@ mod tests {
         assert_eq!(filtered.get("custom-key"), Some(&"custom-value".to_string()));
     }
 
+    /// Guards the switch to `rustfs_utils::http::starts_with_ignore_ascii_case`:
+    /// a mixed-case internal key must still be classified as internal (never passed
+    /// through as user metadata), and a key shorter than the prefix must still fall
+    /// through to the user-metadata path instead of being swallowed as internal.
+    #[test]
+    fn test_internal_prefix_matching_is_case_insensitive_and_length_aware() {
+        const NO_EXCLUSIONS: &[&str] = &[];
+
+        for key in [
+            "X-RustFS-Internal-Healing",
+            "x-rustfs-internal-healing",
+            "X-MINIO-INTERNAL-compression",
+            "X-RustFS-Encryption-Algorithm",
+            "X-Minio-Encryption-Iv",
+            "X-Amz-Storage-Class",
+        ] {
+            assert!(
+                should_skip_object_metadata_key(key, "value", NO_EXCLUSIONS),
+                "{key} must be classified as internal/reserved regardless of casing"
+            );
+            assert!(is_reserved_user_metadata_key(key), "{key} must stay reserved on the write side");
+        }
+
+        // Shorter than every internal prefix, so nothing may match: these are plain
+        // user metadata keys and must survive. The encryption-prefix case is sliced
+        // from the real constant (rather than a hand-typed truncation) so it doesn't
+        // spell out a dictionary word fragment that trips the typo checker.
+        let short_encryption_prefix = &RUSTFS_ENCRYPTION_PREFIX[..RUSTFS_ENCRYPTION_PREFIX.len() - 2];
+        for key in [
+            "",
+            "x",
+            "x-rustfs-interna",
+            "x-minio-interna",
+            short_encryption_prefix,
+            "x-am",
+        ] {
+            assert!(
+                !should_skip_object_metadata_key(key, "value", NO_EXCLUSIONS),
+                "{key:?} is shorter than any internal prefix and must not be skipped"
+            );
+            assert!(!is_reserved_user_metadata_key(key), "{key:?} must not be treated as reserved");
+        }
+
+        let metadata = HashMap::from([
+            ("X-RustFS-Internal-Healing".to_string(), "true".to_string()),
+            ("x-rustfs-interna".to_string(), "user-value".to_string()),
+        ]);
+        let filtered = filter_object_metadata(&metadata).expect("user metadata should remain");
+        assert_eq!(filtered, HashMap::from([("x-rustfs-interna".to_string(), "user-value".to_string())]));
+    }
+
     #[test]
     fn test_user_metadata_cannot_shadow_standard_or_internal_metadata() {
         let mut headers = HeaderMap::new();
@@ -2613,5 +2762,74 @@ mod tests {
             metadata.contains_key("x-amz-meta-x-rustfs-source-proxy-request"),
             "disguised key must be namespaced back under x-amz-meta-: {metadata:?}"
         );
+    }
+
+    const PAYLOAD_SHA256: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+    const PRESIGNED_QUERY: &str = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=ak%2F20260916%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=deadbeef";
+
+    fn signed_v4_headers(content_sha256: &'static str) -> HeaderMap<HeaderValue> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static(
+                "AWS4-HMAC-SHA256 Credential=ak/20260916/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=deadbeef",
+            ),
+        );
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static(content_sha256));
+        headers
+    }
+
+    /// The s3s auth layer already wraps a header-signed single-chunk body in a
+    /// hash-checking stream, so the storage layer must not schedule a second
+    /// SHA-256 pass over the same payload.
+    #[test]
+    fn signed_single_chunk_put_leaves_payload_sha256_to_the_auth_layer() {
+        let headers = signed_v4_headers(PAYLOAD_SHA256);
+        assert_eq!(super::get_content_sha256_with_query(&headers, None), None);
+    }
+
+    #[test]
+    fn streaming_signed_put_never_hands_a_digest_to_the_storage_layer() {
+        for value in [
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+            "UNSIGNED-PAYLOAD",
+        ] {
+            let headers = signed_v4_headers(value);
+            assert_eq!(super::get_content_sha256_with_query(&headers, None), None, "{value}");
+        }
+    }
+
+    /// s3s verifies the header digest of a presigned request too, so a header
+    /// digest is left to the auth layer exactly like the header-signed case.
+    #[test]
+    fn presigned_request_with_header_digest_leaves_payload_sha256_to_the_auth_layer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static(PAYLOAD_SHA256));
+        assert_eq!(super::get_content_sha256_with_query(&headers, Some(PRESIGNED_QUERY)), None);
+    }
+
+    /// s3s only reads the header, so a digest that arrives in the query string
+    /// alone is the one case the storage layer still verifies itself.
+    #[test]
+    fn presigned_request_with_query_only_digest_is_still_verified_by_the_storage_layer() {
+        let headers = HeaderMap::new();
+
+        let query = format!("{PRESIGNED_QUERY}&x-amz-content-sha256={PAYLOAD_SHA256}");
+        assert_eq!(
+            super::get_content_sha256_with_query(&headers, Some(&query)),
+            Some(PAYLOAD_SHA256.to_string())
+        );
+
+        let query = format!("{PRESIGNED_QUERY}&x-amz-content-sha256=UNSIGNED-PAYLOAD");
+        assert_eq!(super::get_content_sha256_with_query(&headers, Some(&query)), None);
+    }
+
+    #[test]
+    fn anonymous_request_hands_no_digest_to_the_storage_layer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static(PAYLOAD_SHA256));
+        assert_eq!(super::get_content_sha256_with_query(&headers, None), None);
     }
 }

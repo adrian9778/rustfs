@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::NodeService;
+use super::{LocalMutationTarget, NodeService};
 use crate::storage::storage_api::rpc_consumer::node_service::{
-    BatchReadVersionReq, BatchReadVersionResp, DeleteOptions, DiskError, DiskInfoOptions, FileInfoVersions, ReadMultipleReq,
-    ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts, validate_batch_read_version_item_count,
+    BatchReadVersionReq, BatchReadVersionResp, ConditionalFileUpdate, DeleteOptions, DiskError, DiskInfoOptions,
+    FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts,
+    validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::storage_api::{PartTransactionAction, RenameDataResp, SnapshotLeaseToken, verify_tonic_mutation_body_digest};
@@ -23,19 +24,94 @@ use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_MSGPACK_CODEC_JSON, INTERNODE_MSGPACK_CODEC_MSGPACK, INTERNODE_MSGPACK_DIRECTION_REQUEST,
-    INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_VERSION,
-    INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_STAGE_BATCH_READ_VERSION_DISK_READ,
-    INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_DECODE, INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_JSON_ENCODE,
-    INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MSGPACK_ENCODE, INTERNODE_STAGE_READ_VERSION_DISK_READ,
-    INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE, INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE,
-    INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE, INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
+    INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
+    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_VERSION, INTERNODE_OPERATION_GRPC_WRITE_ALL,
+    INTERNODE_STAGE_BATCH_READ_VERSION_DISK_READ, INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_DECODE,
+    INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_JSON_ENCODE, INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MSGPACK_ENCODE,
+    INTERNODE_STAGE_READ_VERSION_DISK_READ, INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE,
+    INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE, INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE,
+    INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
 };
 use rustfs_protos::proto_gen::node_service::*;
 use serde::de::DeserializeOwned;
 use std::io::Cursor;
+use std::sync::Arc;
 use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::debug;
+use uuid::Uuid;
+
+#[cfg(feature = "e2e-test-hooks")]
+fn startup_cas_rename_observation(
+    target: &LocalMutationTarget,
+    request: &RenameDataRequest,
+    file_info: &FileInfo,
+) -> Option<serde_json::Value> {
+    use sha2::{Digest, Sha256};
+    if request.dst_volume != ".rustfs.sys" || !matches!(request.dst_path.as_str(), "pool.bin" | "pool.bin.identity") {
+        return None;
+    }
+    let nonce = uuid::Uuid::parse_str(&std::env::var("RUSTFS_E2E_STARTUP_CAS_NONCE").ok()?).ok()?;
+    let body = rustfs_protos::canonical_rename_data_request_body(request).ok()?;
+    Some(serde_json::json!({
+        "kind": "receiver", "nonce": nonce, "pid": std::process::id(),
+        "target": match target { LocalMutationTarget::Ready(_) => "ready", LocalMutationTarget::Bootstrap(_) => "bootstrap", LocalMutationTarget::Unbound => "unbound" },
+        "disk": request.disk, "src_volume": request.src_volume, "src_path": request.src_path,
+        "dst_volume": request.dst_volume, "dst_path": request.dst_path,
+        "body_sha256": rustfs_utils::crypto::hex(Sha256::digest(body)),
+        "etag": file_info.metadata.get("etag"),
+        "mod_time": file_info.mod_time.map(|time| time.unix_timestamp_nanos().to_string()),
+    }))
+}
+
+impl LocalMutationTarget {
+    async fn rename_local_data(
+        &self,
+        disk_ref: &str,
+        source: (&str, &str),
+        fi: &FileInfo,
+        destination: (&str, &str),
+        scanner_token: Option<Uuid>,
+        bucket_incarnation: Option<Uuid>,
+    ) -> Result<RenameDataResp, DiskError> {
+        match self {
+            Self::Ready(store) => {
+                if let Some(expected) = bucket_incarnation {
+                    return store
+                        .rename_local_data_at_incarnation(disk_ref, source, fi, destination, expected)
+                        .await;
+                }
+                store
+                    .rename_local_data(disk_ref, source, fi, destination, scanner_token)
+                    .await
+            }
+            Self::Bootstrap(target) => {
+                if bucket_incarnation.is_some() {
+                    return Err(DiskError::other("incarnation-bound rename requires a ready storage instance"));
+                }
+                target
+                    .rename_local_data(disk_ref, source, fi, destination, scanner_token)
+                    .await
+            }
+            Self::Unbound => Err(DiskError::other("target disk instance is unavailable")),
+        }
+    }
+
+    async fn undo_local_write(
+        &self,
+        disk_ref: &str,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        opts: DeleteOptions,
+    ) -> Result<(), DiskError> {
+        match self {
+            Self::Ready(store) => store.undo_local_write(disk_ref, volume, path, fi, opts).await,
+            Self::Bootstrap(target) => target.undo_local_write(disk_ref, volume, path, fi, opts).await,
+            Self::Unbound => Err(DiskError::other("target disk instance is unavailable")),
+        }
+    }
+}
 
 /// Initial capacity hint (bytes) for typical small msgpack requests and responses.
 const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
@@ -661,62 +737,117 @@ impl NodeService {
     pub(super) async fn handle_delete_version(
         &self,
         request: Request<DeleteVersionRequest>,
+        require_marker_condition: bool,
     ) -> Result<Response<DeleteVersionResponse>, Status> {
+        if !request.get_ref().bucket_incarnation_id.is_empty()
+            && !request
+                .metadata()
+                .get("x-rustfs-content-sha256")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value != "UNSIGNED-PAYLOAD")
+        {
+            return Err(Status::permission_denied("incarnation-bound delete requires a body-bound digest"));
+        }
         verify_disk_mutation_digest(
             &request,
             rustfs_protos::canonical_delete_version_request_body(request.get_ref()),
             "delete_version",
         )?;
+        if require_marker_condition
+            && Uuid::from_slice(&request.get_ref().bucket_incarnation_id)
+                .ok()
+                .filter(|id| !id.is_nil())
+                .is_none()
+        {
+            return Err(Status::invalid_argument("retired marker deletion requires a non-nil bucket incarnation"));
+        }
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
-            let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
-                Ok(file_info) => file_info,
-                Err(err) => {
-                    return Ok(Response::new(DeleteVersionResponse {
-                        success: false,
-                        raw_file_info: "".to_string(),
-                        error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
-                    }));
-                }
+        let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
+            Ok(file_info) => file_info,
+            Err(err) => {
+                return Ok(Response::new(DeleteVersionResponse {
+                    success: false,
+                    raw_file_info: "".to_string(),
+                    error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
+                }));
+            }
+        };
+        let opts = match decode_msgpack_or_json::<DeleteOptions>(&request.opts_bin, &request.opts, "DeleteOptions") {
+            Ok(opts) => opts,
+            Err(err) => {
+                return Ok(Response::new(DeleteVersionResponse {
+                    success: false,
+                    raw_file_info: "".to_string(),
+                    error: Some(DiskError::other(format!("decode DeleteOptions failed: {err}")).into()),
+                }));
+            }
+        };
+        if require_marker_condition && opts.expected_delete_marker.is_none() {
+            return Err(Status::invalid_argument("retired marker deletion requires a marker precondition"));
+        }
+        if opts.expected_delete_marker.is_some()
+            && (request.force_del_marker
+                || opts.undo_write
+                || opts.undo_delete
+                || opts.recursive
+                || opts.immediate
+                || opts.old_data_dir.is_some())
+        {
+            return Err(Status::invalid_argument(
+                "retired marker preconditions cannot be combined with other mutations",
+            ));
+        }
+        let result = if !request.bucket_incarnation_id.is_empty() {
+            let expected = Uuid::from_slice(&request.bucket_incarnation_id)
+                .ok()
+                .filter(|id| !id.is_nil())
+                .ok_or_else(|| Status::invalid_argument("bucket incarnation must be a non-nil UUID"))?;
+            let LocalMutationTarget::Ready(store) = self.local_mutation_target() else {
+                return Err(Status::failed_precondition("bucket heal requires a ready storage instance"));
             };
-            let opts = match decode_msgpack_or_json::<DeleteOptions>(&request.opts_bin, &request.opts, "DeleteOptions") {
-                Ok(opts) => opts,
-                Err(err) => {
-                    return Ok(Response::new(DeleteVersionResponse {
-                        success: false,
-                        raw_file_info: "".to_string(),
-                        error: Some(DiskError::other(format!("decode DeleteOptions failed: {err}")).into()),
-                    }));
-                }
-            };
-            match disk
-                .delete_version(&request.volume, &request.path, file_info, request.force_del_marker, opts)
+            store
+                .delete_local_version_at_incarnation(
+                    &request.disk,
+                    (&request.volume, &request.path),
+                    file_info,
+                    request.force_del_marker,
+                    opts,
+                    expected,
+                )
                 .await
-            {
-                Ok(raw_file_info) => match serde_json::to_string(&raw_file_info) {
-                    Ok(raw_file_info) => Ok(Response::new(DeleteVersionResponse {
-                        success: true,
-                        raw_file_info,
-                        error: None,
-                    })),
-                    Err(err) => Ok(Response::new(DeleteVersionResponse {
-                        success: false,
-                        raw_file_info: "".to_string(),
-                        error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
-                    })),
-                },
+        } else if opts.undo_write {
+            if request.force_del_marker {
+                Err(DiskError::other("undo_write cannot force a delete marker"))
+            } else {
+                let target = self.local_mutation_target();
+                target
+                    .undo_local_write(&request.disk, &request.volume, &request.path, file_info, opts)
+                    .await
+            }
+        } else if let Some(disk) = self.find_disk(&request.disk).await {
+            disk.delete_version(&request.volume, &request.path, file_info, request.force_del_marker, opts)
+                .await
+        } else {
+            Err(DiskError::other("cannot find disk"))
+        };
+        match result {
+            Ok(raw_file_info) => match serde_json::to_string(&raw_file_info) {
+                Ok(raw_file_info) => Ok(Response::new(DeleteVersionResponse {
+                    success: true,
+                    raw_file_info,
+                    error: None,
+                })),
                 Err(err) => Ok(Response::new(DeleteVersionResponse {
                     success: false,
                     raw_file_info: "".to_string(),
-                    error: Some(err.into()),
+                    error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
                 })),
-            }
-        } else {
-            Ok(Response::new(DeleteVersionResponse {
+            },
+            Err(err) => Ok(Response::new(DeleteVersionResponse {
                 success: false,
                 raw_file_info: "".to_string(),
-                error: Some(DiskError::other("cannot find disk".to_string()).into()),
-            }))
+                error: Some(err.into()),
+            })),
         }
     }
 
@@ -915,6 +1046,24 @@ impl NodeService {
             "write_metadata",
         )?;
         let request = request.into_inner();
+        if !request.bucket_incarnation_id.is_empty() {
+            let expected = Uuid::from_slice(&request.bucket_incarnation_id)
+                .ok()
+                .filter(|id| !id.is_nil())
+                .ok_or_else(|| Status::invalid_argument("bucket incarnation must be a non-nil UUID"))?;
+            let LocalMutationTarget::Ready(store) = self.local_mutation_target() else {
+                return Err(Status::failed_precondition("bucket heal requires a ready storage instance"));
+            };
+            let value = decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo")
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            let result = store
+                .write_local_metadata_at_incarnation(&request.disk, (&request.volume, &request.path), value, expected)
+                .await;
+            return Ok(Response::new(WriteMetadataResponse {
+                success: result.is_ok(),
+                error: result.err().map(Into::into),
+            }));
+        }
         if let Some(disk) = self.find_disk(&request.disk).await {
             let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
                 Ok(file_info) => file_info,
@@ -1188,65 +1337,101 @@ impl NodeService {
         &self,
         request: Request<RenameDataRequest>,
     ) -> Result<Response<RenameDataResponse>, Status> {
+        if !request.get_ref().scanner_publication_lease_token.is_empty() || !request.get_ref().bucket_incarnation_id.is_empty() {
+            let has_body_digest = request
+                .metadata()
+                .get("x-rustfs-content-sha256")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value != "UNSIGNED-PAYLOAD");
+            if !has_body_digest {
+                return Err(Status::permission_denied("scanner publication lease rename requires a body-bound digest"));
+            }
+        }
         verify_disk_mutation_digest(
             &request,
             rustfs_protos::canonical_rename_data_request_body(request.get_ref()),
             "rename_data",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
-            let decoded_file_info = match decode_rename_data_request_file_info(&request.file_info_bin, &request.file_info) {
-                Ok(file_info) => file_info,
-                Err(err) => {
-                    return Ok(Response::new(RenameDataResponse {
-                        success: false,
-                        rename_data_resp: String::new(),
-                        rename_data_resp_bin: Vec::new().into(),
-                        error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
-                    }));
-                }
-            };
-            let request_decoded_from_msgpack = decoded_file_info.from_msgpack;
-            match disk
-                .rename_data(
-                    &request.src_volume,
-                    &request.src_path,
-                    &decoded_file_info.value,
-                    &request.dst_volume,
-                    &request.dst_path,
-                )
-                .await
-            {
-                Ok(rename_data_resp) => {
-                    match encode_rename_data_response_payloads(&rename_data_resp, request_decoded_from_msgpack) {
-                        Ok((rename_data_resp, rename_data_resp_bin)) => Ok(Response::new(RenameDataResponse {
-                            success: true,
-                            rename_data_resp,
-                            rename_data_resp_bin: rename_data_resp_bin.into(),
-                            error: None,
-                        })),
-                        Err(err) => Ok(Response::new(RenameDataResponse {
-                            success: false,
-                            rename_data_resp: String::new(),
-                            rename_data_resp_bin: Vec::new().into(),
-                            error: Some(err.into()),
-                        })),
-                    }
-                }
+        let target = self.local_mutation_target();
+        let bucket_incarnation = if request.bucket_incarnation_id.is_empty() {
+            None
+        } else {
+            let expected = Uuid::from_slice(&request.bucket_incarnation_id)
+                .ok()
+                .filter(|id| !id.is_nil())
+                .ok_or_else(|| Status::invalid_argument("bucket incarnation must be a non-nil UUID"))?;
+            if !request.scanner_publication_lease_token.is_empty() {
+                return Err(Status::invalid_argument(
+                    "heal incarnation and scanner publication lease cannot be combined",
+                ));
+            }
+            Some(expected)
+        };
+        #[cfg(feature = "e2e-test-hooks")]
+        super::rename_target_capture_test_hook::wait(&target, &request).await;
+        let decoded_file_info = match decode_rename_data_request_file_info(&request.file_info_bin, &request.file_info) {
+            Ok(file_info) => file_info,
+            Err(err) => {
+                return Ok(Response::new(RenameDataResponse {
+                    success: false,
+                    rename_data_resp: String::new(),
+                    rename_data_resp_bin: Vec::new().into(),
+                    error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
+                }));
+            }
+        };
+        let scanner_publication_lease_token = if request.scanner_publication_lease_token.is_empty() {
+            None
+        } else {
+            let token = Uuid::from_slice(&request.scanner_publication_lease_token)
+                .map_err(|_| Status::invalid_argument("scanner publication lease token must be a UUID"))?;
+            if token.is_nil() {
+                return Err(Status::invalid_argument("scanner publication lease token must not be nil"));
+            }
+            Some(token)
+        };
+        let request_decoded_from_msgpack = decoded_file_info.from_msgpack;
+        #[cfg(feature = "e2e-test-hooks")]
+        let observation = startup_cas_rename_observation(&target, &request, &decoded_file_info.value);
+        let result = target
+            .rename_local_data(
+                &request.disk,
+                (&request.src_volume, &request.src_path),
+                &decoded_file_info.value,
+                (&request.dst_volume, &request.dst_path),
+                scanner_publication_lease_token,
+                bucket_incarnation,
+            )
+            .await;
+        #[cfg(feature = "e2e-test-hooks")]
+        if let Some(mut observation) = observation {
+            observation["ok"] = serde_json::json!(result.is_ok());
+            observation["error"] = serde_json::json!(result.as_ref().err().map(ToString::to_string));
+            let line = format!("RUSTFS_E2E_STARTUP_CAS {observation}\n");
+            let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
+        }
+        match result {
+            Ok(rename_data_resp) => match encode_rename_data_response_payloads(&rename_data_resp, request_decoded_from_msgpack) {
+                Ok((rename_data_resp, rename_data_resp_bin)) => Ok(Response::new(RenameDataResponse {
+                    success: true,
+                    rename_data_resp,
+                    rename_data_resp_bin: rename_data_resp_bin.into(),
+                    error: None,
+                })),
                 Err(err) => Ok(Response::new(RenameDataResponse {
                     success: false,
                     rename_data_resp: String::new(),
                     rename_data_resp_bin: Vec::new().into(),
                     error: Some(err.into()),
                 })),
-            }
-        } else {
-            Ok(Response::new(RenameDataResponse {
+            },
+            Err(err) => Ok(Response::new(RenameDataResponse {
                 success: false,
                 rename_data_resp: String::new(),
                 rename_data_resp_bin: Vec::new().into(),
-                error: Some(DiskError::other("cannot find disk".to_string()).into()),
-            }))
+                error: Some(err.into()),
+            })),
         }
     }
 
@@ -1289,22 +1474,29 @@ impl NodeService {
         )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            match disk
-                .rename_file(&request.src_volume, &request.src_path, &request.dst_volume, &request.dst_path)
-                .await
-            {
+            let result = if request.durable {
+                disk.rename_file_durable(&request.src_volume, &request.src_path, &request.dst_volume, &request.dst_path)
+                    .await
+            } else {
+                disk.rename_file(&request.src_volume, &request.src_path, &request.dst_volume, &request.dst_path)
+                    .await
+            };
+            match result {
                 Ok(_) => Ok(Response::new(RenameFileResponse {
                     success: true,
+                    durability_applied: request.durable,
                     error: None,
                 })),
                 Err(err) => Ok(Response::new(RenameFileResponse {
                     success: false,
+                    durability_applied: false,
                     error: Some(err.into()),
                 })),
             }
         } else {
             Ok(Response::new(RenameFileResponse {
                 success: false,
+                durability_applied: false,
                 error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
@@ -1559,8 +1751,39 @@ impl NodeService {
     }
 
     pub(super) async fn handle_delete(&self, request: Request<DeleteRequest>) -> Result<Response<DeleteResponse>, Status> {
+        if !request.get_ref().scanner_publication_lease_token.is_empty() {
+            let has_body_digest = request
+                .metadata()
+                .get("x-rustfs-content-sha256")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value != "UNSIGNED-PAYLOAD");
+            if !has_body_digest {
+                return Err(Status::permission_denied("scanner publication lease delete requires a body-bound digest"));
+            }
+        }
         verify_disk_mutation_digest(&request, rustfs_protos::canonical_delete_request_body(request.get_ref()), "delete")?;
         let request = request.into_inner();
+        if !request.bucket_incarnation_id.is_empty() {
+            if !request.scanner_publication_lease_token.is_empty() {
+                return Err(Status::invalid_argument("heal incarnation and scanner lease cannot be combined"));
+            }
+            let expected = Uuid::from_slice(&request.bucket_incarnation_id)
+                .ok()
+                .filter(|id| !id.is_nil())
+                .ok_or_else(|| Status::invalid_argument("bucket incarnation must be a non-nil UUID"))?;
+            let LocalMutationTarget::Ready(store) = self.local_mutation_target() else {
+                return Err(Status::failed_precondition("bucket heal requires a ready storage instance"));
+            };
+            let value = serde_json::from_str::<DeleteOptions>(&request.options)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            let result = store
+                .delete_local_path_at_incarnation(&request.disk, (&request.volume, &request.path), value, expected)
+                .await;
+            return Ok(Response::new(DeleteResponse {
+                success: result.is_ok(),
+                error: result.err().map(Into::into),
+            }));
+        }
         if let Some(disk) = self.find_disk(&request.disk).await {
             let options = match serde_json::from_str::<DeleteOptions>(&request.options) {
                 Ok(options) => options,
@@ -1571,7 +1794,49 @@ impl NodeService {
                     }));
                 }
             };
-            match disk.delete(&request.volume, &request.path, options).await {
+            let scanner_publication_lease_token = if request.scanner_publication_lease_token.is_empty() {
+                None
+            } else {
+                let token = Uuid::from_slice(&request.scanner_publication_lease_token)
+                    .map_err(|_| Status::invalid_argument("scanner publication lease token must be a UUID"))?;
+                if token.is_nil() {
+                    return Err(Status::invalid_argument("scanner publication lease token must not be nil"));
+                }
+                Some(token)
+            };
+            // The target-side guard spans the complete delete operation. A
+            // lease expiry or movement transition cannot occur between this
+            // validation and the disk delete linearization point.
+            let scanner_publication_lease_guard: Option<Arc<dyn Send + Sync>> =
+                if let Some(token) = scanner_publication_lease_token {
+                    let Some(store) = self.resolve_object_store() else {
+                        return Ok(Response::new(DeleteResponse {
+                            success: false,
+                            error: Some(DiskError::other("scanner publication lease owner is unavailable").into()),
+                        }));
+                    };
+                    match store.acquire_scanner_publication_lease_guard(token).await {
+                        Ok(guard) => Some(Arc::new(guard)),
+                        Err(err) => {
+                            return Ok(Response::new(DeleteResponse {
+                                success: false,
+                                error: Some(DiskError::other(err.to_string()).into()),
+                            }));
+                        }
+                    }
+                } else {
+                    None
+                };
+            match disk
+                .delete_with_scanner_publication_lease_and_guard(
+                    &request.volume,
+                    &request.path,
+                    options,
+                    scanner_publication_lease_token,
+                    scanner_publication_lease_guard,
+                )
+                .await
+            {
                 Ok(_) => Ok(Response::new(DeleteResponse {
                     success: true,
                     error: None,
@@ -1624,6 +1889,70 @@ impl NodeService {
             metrics.record_error_for_operation_and_backend(INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC);
             Ok(Response::new(WriteAllResponse {
                 success: false,
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
+            }))
+        }
+    }
+
+    pub(super) async fn handle_compare_and_update_file(
+        &self,
+        request: Request<CompareAndUpdateFileRequest>,
+    ) -> Result<Response<CompareAndUpdateFileResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_compare_and_update_file_request_body(request.get_ref()),
+            "compare_and_update_file",
+        )?;
+        let request = request.into_inner();
+        let data_len = request
+            .expected
+            .as_ref()
+            .map_or(0, Bytes::len)
+            .saturating_add(request.replacement.as_ref().map_or(0, Bytes::len));
+        let metrics = runtime_sources::current_internode_metrics();
+        metrics.record_incoming_request_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+        );
+        metrics.record_recv_bytes_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+            data_len,
+        );
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            match disk
+                .compare_and_update_file(&request.volume, &request.path, request.expected, request.replacement)
+                .await
+            {
+                Ok(outcome) => Ok(Response::new(CompareAndUpdateFileResponse {
+                    success: true,
+                    outcome: match outcome {
+                        ConditionalFileUpdate::Updated => CompareAndUpdateFileOutcome::CompareAndUpdateFileUpdated as i32,
+                        ConditionalFileUpdate::Missing => CompareAndUpdateFileOutcome::CompareAndUpdateFileMissing as i32,
+                        ConditionalFileUpdate::Mismatch => CompareAndUpdateFileOutcome::CompareAndUpdateFileMismatch as i32,
+                    },
+                    error: None,
+                })),
+                Err(err) => {
+                    metrics.record_error_for_operation_and_backend(
+                        INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
+                        INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    );
+                    Ok(Response::new(CompareAndUpdateFileResponse {
+                        success: false,
+                        outcome: CompareAndUpdateFileOutcome::CompareAndUpdateFileUnspecified as i32,
+                        error: Some(err.into()),
+                    }))
+                }
+            }
+        } else {
+            metrics.record_error_for_operation_and_backend(
+                INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+            );
+            Ok(Response::new(CompareAndUpdateFileResponse {
+                success: false,
+                outcome: CompareAndUpdateFileOutcome::CompareAndUpdateFileUnspecified as i32,
                 error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
@@ -1698,6 +2027,26 @@ mod tests {
     struct SamplePayload {
         name: String,
         count: u32,
+    }
+
+    #[test]
+    fn response_compat_send_sites_keep_manifest_json_encoders() {
+        // Rolling-upgrade contract (rustfs-protos compat manifest): every
+        // dual-write response field must keep producing its JSON side with the
+        // exact encoder the manifest pins. The manifest itself is pinned
+        // against node.proto by tests in rustfs-protos; this test keeps the
+        // send-site assertion in the crate that owns the source file.
+        let source = rustfs_protos::compat_manifest::production_source(include_str!("disk.rs"), "disk.rs");
+
+        for send_site in rustfs_protos::compat_manifest::RESPONSE_COMPAT_SEND_SITES {
+            assert!(
+                source.contains(send_site.json_encoder),
+                "{}.{} must keep its manifest encoder: {}",
+                send_site.field.message,
+                send_site.field.json_field,
+                send_site.json_encoder
+            );
+        }
     }
 
     #[test]

@@ -14,33 +14,40 @@
 
 use std::time::Duration;
 
-use base64::Engine as _;
-use reqwest::{Client, StatusCode, Url};
+use chrono::{DateTime, Utc};
+use reqwest::{Client, StatusCode, Url, header};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, pem::PemObject as _};
 use serde::Deserialize;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use super::config::{ProxyConfig, ProxyConfigError};
 use super::credential_store::{
-    CompletedRegistration, CredentialStore, CredentialStoreError, DeviceCredential, PendingRegistration, PendingRotation,
+    CompletedRegistration, CredentialLock, CredentialStore, CredentialStoreError, DeviceCredential, PendingRegistration,
+    PendingRotation,
 };
 use super::identity::{IdentityError, RegistrationTranscript};
 use super::identity_store::{IdentityStore, StoreError};
 use super::registration::{
     CredentialResponse, CredentialValidationError, ExpectedDevice, RegistrationRequest, RegistrationToken, RotationRequest,
-    certificate_fingerprint, certificate_request_matches, public_key_fingerprint, validate_credential,
+    certificate_fingerprint, certificate_request_matches, is_uuid_v7, public_key_fingerprint, validate_credential,
     validate_stored_credential,
 };
 
 const MAX_ATTEMPTS: usize = 3;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+#[cfg(feature = "connect-e2e-short-credentials")]
+const ROTATION_THRESHOLD_SECONDS: i64 = 120;
+#[cfg(not(feature = "connect-e2e-short-credentials"))]
 const ROTATION_THRESHOLD_SECONDS: i64 = 8 * 60 * 60;
+const PENDING_REGISTRATION_STATE_DOMAIN: &[u8] = b"RUSTFS-CONNECT-PENDING-REGISTRATION-V1";
 
 pub struct ConnectConfig<'a> {
     pub endpoint: &'a str,
     pub root_ca_pem: &'a [u8],
     pub timeout: Duration,
+    pub proxy: Option<&'a ProxyConfig>,
 }
 
 pub struct ConnectClient {
@@ -49,6 +56,24 @@ pub struct ConnectClient {
     root_certificates: Vec<CertificateDer<'static>>,
     client: Client,
     timeout: Duration,
+    proxy: Option<ProxyConfig>,
+}
+
+pub(crate) enum RotationAttempt {
+    Completed(Option<DeviceCredential>),
+    ReenrollmentPending,
+    Unavailable {
+        status: Option<StatusCode>,
+        retry_after: Option<Duration>,
+    },
+}
+
+enum SingleRequest {
+    Response(Box<CredentialResponse>),
+    Unavailable {
+        status: Option<StatusCode>,
+        retry_after: Option<Duration>,
+    },
 }
 
 impl ConnectClient {
@@ -84,13 +109,14 @@ impl ConnectClient {
             return Err(ClientError::RootCertificate);
         }
 
-        let client = build_client(&root_certificates, config.timeout, None)?;
+        let client = build_client(&root_certificates, config.timeout, None, config.proxy)?;
         Ok(Self {
             endpoint,
             roots,
             root_certificates,
             client,
             timeout: config.timeout,
+            proxy: config.proxy.cloned(),
         })
     }
 
@@ -100,26 +126,31 @@ impl ConnectClient {
         credential_store: &CredentialStore,
         token: &RegistrationToken,
     ) -> Result<DeviceCredential, ClientError> {
-        let _lock = credential_store.lock().await?;
-        if let Some((credential, _)) = self.load_valid_credential(identity_store, credential_store)? {
+        let lock = credential_store.lock().await?;
+        if let Some((credential, _, _)) =
+            Self::recover_valid_credential_locked(&lock, identity_store, credential_store, &self.roots, &self.root_certificates)?
+        {
             ensure_credential_time(&credential, unix_now())?;
             return Ok(credential);
         }
 
         let identity = identity_store.load_or_create()?;
-        let candidate = PendingRegistration {
+        let mut candidate = PendingRegistration {
             token_uid: token.registration_token_uid.clone(),
             request_id: Uuid::new_v4().to_string(),
             certificate_request: identity.certificate_request_base64()?,
             previous_credential_fingerprint: None,
             next_public_key_sha256: None,
+            state_proof: String::new(),
         };
+        candidate.state_proof = identity.sign_pending_registration_state(&pending_registration_state(&candidate));
         let pending = credential_store.claim_pending_registration(&candidate)?;
         if pending.token_uid != token.registration_token_uid
             || pending.previous_credential_fingerprint.is_some()
             || pending.next_public_key_sha256.is_some()
             || !is_request_id(&pending.request_id)
             || !certificate_request_matches(&pending.certificate_request, &identity)?
+            || !pending_registration_is_bound(&pending, &identity)
         {
             return Err(ClientError::PendingRegistration);
         }
@@ -143,10 +174,10 @@ impl ConnectClient {
         credential_store: &CredentialStore,
         token: &RegistrationToken,
     ) -> Result<DeviceCredential, ClientError> {
-        let _lock = credential_store.lock().await?;
-        let (credential, _) = self
-            .load_valid_credential(identity_store, credential_store)?
-            .ok_or(ClientError::NotRegistered)?;
+        let lock = credential_store.lock().await?;
+        let (credential, _, _) =
+            Self::recover_valid_credential_locked(&lock, identity_store, credential_store, &self.roots, &self.root_certificates)?
+                .ok_or(ClientError::NotRegistered)?;
         let fingerprint = certificate_fingerprint(&credential.certificate)?;
         if credential_store.load_completed_registration()?.is_some_and(|completed| {
             completed.token_uid == token.registration_token_uid && completed.credential_fingerprint == fingerprint
@@ -156,19 +187,22 @@ impl ConnectClient {
         credential_store.clear_pending_rotation()?;
         let next = identity_store.load_or_create_next()?;
         let next_fingerprint = public_key_fingerprint(&next);
-        let candidate = PendingRegistration {
+        let mut candidate = PendingRegistration {
             token_uid: token.registration_token_uid.clone(),
             request_id: Uuid::new_v4().to_string(),
             certificate_request: next.certificate_request_base64()?,
             previous_credential_fingerprint: Some(fingerprint.clone()),
             next_public_key_sha256: Some(next_fingerprint.clone()),
+            state_proof: String::new(),
         };
+        candidate.state_proof = next.sign_pending_registration_state(&pending_registration_state(&candidate));
         let pending = credential_store.claim_pending_registration(&candidate)?;
         if pending.token_uid != token.registration_token_uid
             || pending.previous_credential_fingerprint.as_deref() != Some(&fingerprint)
             || pending.next_public_key_sha256.as_deref() != Some(&next_fingerprint)
             || !is_request_id(&pending.request_id)
             || !certificate_request_matches(&pending.certificate_request, &next)?
+            || !pending_registration_is_bound(&pending, &next)
         {
             return Err(ClientError::PendingRegistration);
         }
@@ -197,8 +231,8 @@ impl ConnectClient {
         pending: &PendingRegistration,
         identity: &super::identity::DeviceIdentity,
     ) -> Result<DeviceCredential, ClientError> {
-        let csr_der = base64::engine::general_purpose::STANDARD
-            .decode(&pending.certificate_request)
+        let csr_der = base64_simd::STANDARD
+            .decode_to_vec(&pending.certificate_request)
             .map_err(|_| ClientError::PendingRegistration)?;
         let transcript = RegistrationTranscript::build(
             &token.registration_token_uid,
@@ -232,16 +266,39 @@ impl ConnectClient {
         credential_store: &CredentialStore,
         now_unix: i64,
     ) -> Result<Option<DeviceCredential>, ClientError> {
-        let _lock = credential_store.lock().await?;
-        let (credential, identity) = self
-            .load_valid_credential(identity_store, credential_store)?
-            .ok_or(ClientError::NotRegistered)?;
-        if credential_store.load_pending_registration()?.is_some() {
-            return Err(ClientError::PendingRegistration);
+        let mut last_status = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            match self.rotate_if_due_once(identity_store, credential_store, now_unix).await? {
+                RotationAttempt::Completed(credential) => return Ok(credential),
+                RotationAttempt::ReenrollmentPending => return Err(ClientError::PendingRegistration),
+                RotationAttempt::Unavailable {
+                    status: Some(status), ..
+                } => last_status = Some(status),
+                RotationAttempt::Unavailable { status: None, .. } => {}
+            }
+            if attempt + 1 < MAX_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(50 * (attempt as u64 + 1))).await;
+            }
+        }
+        Err(ClientError::Unavailable { status: last_status })
+    }
+
+    pub(crate) async fn rotate_if_due_once(
+        &self,
+        identity_store: &IdentityStore,
+        credential_store: &CredentialStore,
+        now_unix: i64,
+    ) -> Result<RotationAttempt, ClientError> {
+        let lock = credential_store.lock().await?;
+        let (credential, identity, reenrollment_pending) =
+            Self::recover_valid_credential_locked(&lock, identity_store, credential_store, &self.roots, &self.root_certificates)?
+                .ok_or(ClientError::NotRegistered)?;
+        if reenrollment_pending {
+            return Ok(RotationAttempt::ReenrollmentPending);
         }
         ensure_credential_time(&credential, now_unix)?;
         if credential.not_after_unix - now_unix > ROTATION_THRESHOLD_SECONDS {
-            return Ok(None);
+            return Ok(RotationAttempt::Completed(None));
         }
         let fingerprint = certificate_fingerprint(&credential.certificate)?;
         let next = identity_store.load_or_create_next()?;
@@ -274,10 +331,15 @@ impl ConnectClient {
         identity_pem.push(b'\n');
         identity_pem.extend_from_slice(private_key.as_bytes());
         let tls_identity = reqwest::Identity::from_pem(&identity_pem).map_err(|_| ClientError::IdentityCertificate)?;
-        let client = build_client(&self.root_certificates, self.timeout, Some(tls_identity))?;
+        let client = build_client(&self.root_certificates, self.timeout, Some(tls_identity), self.proxy.as_ref())?;
         let path = format!("clusterDevices/{}:rotateCredential", credential.uid);
         let url = self.url(&path)?;
-        let response = self.send(StatusCode::OK, || client.post(url.clone()).json(&body)).await?;
+        let response = match self.send_once(StatusCode::OK, client.post(url).json(&body)).await? {
+            SingleRequest::Response(response) => *response,
+            SingleRequest::Unavailable { status, retry_after } => {
+                return Ok(RotationAttempt::Unavailable { status, retry_after });
+            }
+        };
         let rotated = validate_credential(
             response,
             &next,
@@ -291,29 +353,35 @@ impl ConnectClient {
         credential_store.save(&rotated)?;
         identity_store.commit_next(&next)?;
         credential_store.clear_pending_rotation()?;
-        Ok(Some(rotated))
+        Ok(RotationAttempt::Completed(Some(rotated)))
     }
 
-    fn load_valid_credential(
-        &self,
+    pub(crate) fn recover_valid_credential_locked(
+        _lock: &CredentialLock,
         identity_store: &IdentityStore,
         credential_store: &CredentialStore,
-    ) -> Result<Option<(DeviceCredential, super::identity::DeviceIdentity)>, ClientError> {
+        roots: &RootCertStore,
+        root_certificates: &[CertificateDer<'static>],
+    ) -> Result<Option<(DeviceCredential, super::identity::DeviceIdentity, bool)>, ClientError> {
         let Some(credential) = credential_store.load()? else {
             return Ok(None);
         };
         let current = identity_store.load()?.ok_or(ClientError::IdentityMissing)?;
         if let Some(pending) = credential_store.load_pending_registration()? {
+            if !is_uuid_v7(&pending.token_uid) {
+                return Err(ClientError::PendingRegistration);
+            }
             let Some(previous) = pending.previous_credential_fingerprint.as_deref() else {
                 if pending.next_public_key_sha256.is_some()
                     || !is_request_id(&pending.request_id)
                     || !certificate_request_matches(&pending.certificate_request, &current)?
+                    || !pending_registration_is_bound(&pending, &current)
                 {
                     return Err(ClientError::PendingRegistration);
                 }
-                validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
+                validate_stored_credential(&credential, &current, roots, root_certificates)?;
                 credential_store.clear_pending_registration()?;
-                return Ok(Some((credential, current)));
+                return Ok(Some((credential, current, false)));
             };
             let next_fingerprint = pending
                 .next_public_key_sha256
@@ -324,28 +392,38 @@ impl ConnectClient {
             }
             let fingerprint = certificate_fingerprint(&credential.certificate)?;
             if fingerprint == previous {
-                validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
+                validate_stored_credential(&credential, &current, roots, root_certificates)?;
                 let next = identity_store.load_next()?.ok_or(ClientError::PendingRegistration)?;
                 if public_key_fingerprint(&next) != next_fingerprint
                     || !certificate_request_matches(&pending.certificate_request, &next)?
+                    || !pending_registration_is_bound(&pending, &next)
                 {
                     return Err(ClientError::PendingRegistration);
                 }
-                return Ok(Some((credential, current)));
-            }
-            if public_key_fingerprint(&current) == next_fingerprint {
-                if !certificate_request_matches(&pending.certificate_request, &current)? {
+                if credential_store.load_completed_registration()?.is_some_and(|completed| {
+                    completed.credential_fingerprint == fingerprint
+                        && (!is_uuid_v7(&completed.token_uid) || completed.token_uid == pending.token_uid)
+                }) {
                     return Err(ClientError::PendingRegistration);
                 }
-                validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
+                return Ok(Some((credential, current, true)));
+            }
+            if public_key_fingerprint(&current) == next_fingerprint {
+                if !certificate_request_matches(&pending.certificate_request, &current)?
+                    || !pending_registration_is_bound(&pending, &current)
+                {
+                    return Err(ClientError::PendingRegistration);
+                }
+                validate_stored_credential(&credential, &current, roots, root_certificates)?;
             } else {
                 let next = identity_store.load_next()?.ok_or(ClientError::PendingRegistration)?;
                 if public_key_fingerprint(&next) != next_fingerprint
                     || !certificate_request_matches(&pending.certificate_request, &next)?
+                    || !pending_registration_is_bound(&pending, &next)
                 {
                     return Err(ClientError::PendingRegistration);
                 }
-                validate_stored_credential(&credential, &next, &self.roots, &self.root_certificates)?;
+                validate_stored_credential(&credential, &next, roots, root_certificates)?;
                 identity_store.commit_next(&next)?;
             }
             credential_store.save_completed_registration(&CompletedRegistration {
@@ -354,32 +432,32 @@ impl ConnectClient {
             })?;
             credential_store.clear_pending_registration()?;
             let current = identity_store.load()?.ok_or(ClientError::IdentityMissing)?;
-            return Ok(Some((credential, current)));
+            return Ok(Some((credential, current, false)));
         }
         let Some(pending) = credential_store.load_pending_rotation()? else {
-            validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
-            return Ok(Some((credential, current)));
+            validate_stored_credential(&credential, &current, roots, root_certificates)?;
+            return Ok(Some((credential, current, false)));
         };
         let fingerprint = certificate_fingerprint(&credential.certificate)?;
         if pending.device_name != credential.name || !is_request_id(&pending.request_id) {
             return Err(ClientError::PendingRotation);
         }
         if fingerprint == pending.credential_fingerprint {
-            validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
+            validate_stored_credential(&credential, &current, roots, root_certificates)?;
             let next = identity_store.load_next()?.ok_or(ClientError::PendingRotation)?;
             if pending.next_public_key_sha256 != public_key_fingerprint(&next)
                 || !certificate_request_matches(&pending.certificate_request, &next)?
             {
                 return Err(ClientError::PendingRotation);
             }
-            return Ok(Some((credential, current)));
+            return Ok(Some((credential, current, false)));
         }
 
         if public_key_fingerprint(&current) == pending.next_public_key_sha256 {
             if !certificate_request_matches(&pending.certificate_request, &current)? {
                 return Err(ClientError::PendingRotation);
             }
-            validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
+            validate_stored_credential(&credential, &current, roots, root_certificates)?;
         } else {
             let next = identity_store.load_next()?.ok_or(ClientError::PendingRotation)?;
             if public_key_fingerprint(&next) != pending.next_public_key_sha256
@@ -387,12 +465,12 @@ impl ConnectClient {
             {
                 return Err(ClientError::PendingRotation);
             }
-            validate_stored_credential(&credential, &next, &self.roots, &self.root_certificates)?;
+            validate_stored_credential(&credential, &next, roots, root_certificates)?;
             identity_store.commit_next(&next)?;
         }
         credential_store.clear_pending_rotation()?;
         let current = identity_store.load()?.ok_or(ClientError::IdentityMissing)?;
-        Ok(Some((credential, current)))
+        Ok(Some((credential, current, false)))
     }
 
     async fn send<F>(&self, success: StatusCode, mut request: F) -> Result<CredentialResponse, ClientError>
@@ -400,6 +478,7 @@ impl ConnectClient {
         F: FnMut() -> reqwest::RequestBuilder,
     {
         let mut last_status = None;
+        let mut last_transport_failure = None;
         for attempt in 0..MAX_ATTEMPTS {
             match request().send().await {
                 Ok(response) if response.status() == success => return decode_response(response).await,
@@ -424,15 +503,59 @@ impl ConnectClient {
                     let reason = decode_reason(response).await;
                     return Err(ClientError::Rejected { status, reason });
                 }
-                Err(error) if !error.is_timeout() && !error.is_connect() => return Err(ClientError::Transport(error)),
-                Err(_) => {}
+                Err(error) => {
+                    if let Some(failure) = classify_transport_failure(&error, self.proxy.is_some()) {
+                        last_transport_failure = Some(failure);
+                    } else if !error.is_timeout() && !error.is_connect() {
+                        return Err(ClientError::Transport(error));
+                    }
+                }
             }
 
             if attempt + 1 < MAX_ATTEMPTS {
                 tokio::time::sleep(Duration::from_millis(50 * (attempt as u64 + 1))).await;
             }
         }
+        if let Some(failure) = last_transport_failure {
+            return Err(failure.into());
+        }
         Err(ClientError::Unavailable { status: last_status })
+    }
+
+    async fn send_once(&self, success: StatusCode, request: reqwest::RequestBuilder) -> Result<SingleRequest, ClientError> {
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(failure) = classify_transport_failure(&error, self.proxy.is_some()) {
+                    return Err(failure.into());
+                }
+                if error.is_timeout() || error.is_connect() {
+                    return Ok(SingleRequest::Unavailable {
+                        status: None,
+                        retry_after: None,
+                    });
+                }
+                return Err(ClientError::Transport(error));
+            }
+        };
+        let status = response.status();
+        if status == success {
+            return decode_response(response)
+                .await
+                .map(|response| SingleRequest::Response(Box::new(response)));
+        }
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            let reason = decode_reason(response).await;
+            return Err(ClientError::AccessRevoked { status, reason });
+        }
+        if matches!(status, StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS) || status.is_server_error() {
+            return Ok(SingleRequest::Unavailable {
+                status: Some(status),
+                retry_after: retry_after(response.headers(), Utc::now()),
+            });
+        }
+        let reason = decode_reason(response).await;
+        Err(ClientError::Rejected { status, reason })
     }
 
     fn url(&self, path: &str) -> Result<Url, ClientError> {
@@ -442,6 +565,32 @@ impl ConnectClient {
 
 fn is_request_id(value: &str) -> bool {
     Uuid::parse_str(value).is_ok_and(|uuid| uuid.get_version() == Some(uuid::Version::Random) && uuid.to_string() == value)
+}
+
+fn pending_registration_is_bound(pending: &PendingRegistration, identity: &super::identity::DeviceIdentity) -> bool {
+    identity.verifies_pending_registration_state(&pending_registration_state(pending), &pending.state_proof)
+}
+
+fn pending_registration_state(pending: &PendingRegistration) -> Vec<u8> {
+    let mut state = Vec::with_capacity(PENDING_REGISTRATION_STATE_DOMAIN.len() + 512);
+    state.extend_from_slice(PENDING_REGISTRATION_STATE_DOMAIN);
+    for field in [
+        Some(pending.token_uid.as_str()),
+        Some(pending.request_id.as_str()),
+        Some(pending.certificate_request.as_str()),
+        pending.previous_credential_fingerprint.as_deref(),
+        pending.next_public_key_sha256.as_deref(),
+    ] {
+        match field {
+            Some(value) => {
+                state.push(1);
+                state.extend_from_slice(&(value.len() as u64).to_be_bytes());
+                state.extend_from_slice(value.as_bytes());
+            }
+            None => state.push(0),
+        }
+    }
+    state
 }
 
 fn unix_now() -> i64 {
@@ -460,24 +609,80 @@ fn ensure_credential_time(credential: &DeviceCredential, now_unix: i64) -> Resul
     Ok(())
 }
 
-fn build_client(
+fn retry_after(headers: &header::HeaderMap, now: DateTime<Utc>) -> Option<Duration> {
+    let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?;
+    value.parse::<u64>().ok().map(Duration::from_secs).or_else(|| {
+        DateTime::parse_from_rfc2822(value)
+            .ok()
+            .and_then(|at| (at.with_timezone(&Utc) - now).to_std().ok())
+    })
+}
+
+pub(crate) fn build_client(
     roots: &[CertificateDer<'static>],
     timeout: Duration,
     identity: Option<reqwest::Identity>,
+    proxy: Option<&ProxyConfig>,
 ) -> Result<Client, ClientError> {
     let certificates = roots
         .iter()
         .map(|root| reqwest::Certificate::from_der(root.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let mut builder = Client::builder()
+        .no_proxy()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .tls_certs_only(certificates);
+    if let Some(proxy) = proxy {
+        builder = proxy.apply(builder)?;
+    }
     if let Some(identity) = identity {
         builder = builder.identity(identity);
     }
     builder.build().map_err(ClientError::Transport)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TransportFailure {
+    ProxyAuthentication,
+    ProxyRejected,
+    TlsPeer,
+}
+
+pub(crate) fn classify_transport_failure(error: &reqwest::Error, proxy_configured: bool) -> Option<TransportFailure> {
+    if proxy_configured && error.status() == Some(StatusCode::PROXY_AUTHENTICATION_REQUIRED) {
+        return Some(TransportFailure::ProxyAuthentication);
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(error) = source {
+        let message = error.to_string().to_ascii_lowercase();
+        if proxy_configured && (message.contains("proxy authentication") || message.contains("proxy authorization required")) {
+            return Some(TransportFailure::ProxyAuthentication);
+        }
+        if message.contains("certificate")
+            || message.contains("unknown issuer")
+            || message.contains("invalid peer")
+            || message.contains("not valid for")
+        {
+            return Some(TransportFailure::TlsPeer);
+        }
+        if proxy_configured && message.contains("tunnel error: unsuccessful") {
+            return Some(TransportFailure::ProxyRejected);
+        }
+        source = error.source();
+    }
+    None
+}
+
+impl From<TransportFailure> for ClientError {
+    fn from(failure: TransportFailure) -> Self {
+        match failure {
+            TransportFailure::ProxyAuthentication => Self::ProxyAuthentication,
+            TransportFailure::ProxyRejected => Self::ProxyRejected,
+            TransportFailure::TlsPeer => Self::TlsPeer,
+        }
+    }
 }
 
 async fn decode_response(mut response: reqwest::Response) -> Result<CredentialResponse, ClientError> {
@@ -523,6 +728,16 @@ pub enum ClientError {
     Endpoint,
     #[error("Connect root CA configuration is invalid")]
     RootCertificate,
+    #[error("Connect proxy configuration is invalid")]
+    ProxyConfiguration(#[from] ProxyConfigError),
+    #[error("Connect proxy authentication failed; verify the configured proxy credentials")]
+    ProxyAuthentication,
+    #[error(
+        "Connect proxy connection failed; verify proxy availability, credentials, the proxy allow-list, and the Connect endpoint"
+    )]
+    ProxyRejected,
+    #[error("Connect TLS peer certificate validation failed; verify the endpoint and configured root CA")]
+    TlsPeer,
     #[error(
         "Connect registration has a pending attempt for a different token; restore the original protected token configuration"
     )]
@@ -547,7 +762,7 @@ pub enum ClientError {
     AccessRevoked { status: StatusCode, reason: Option<String> },
     #[error("Connect rejected the request with HTTP {status}; reason={reason:?}")]
     Rejected { status: StatusCode, reason: Option<String> },
-    #[error("Connect remained unavailable after bounded retries; last_status={status:?}")]
+    #[error("Connect availability check failed after bounded retries; last_status={status:?}")]
     Unavailable { status: Option<StatusCode> },
     #[error("Connect response exceeded the 1 MiB credential-response limit")]
     ResponseTooLarge,
@@ -563,4 +778,35 @@ pub enum ClientError {
     CredentialStore(#[from] CredentialStoreError),
     #[error(transparent)]
     Credential(#[from] CredentialValidationError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status_error(status: StatusCode, url: &str) -> reqwest::Error {
+        reqwest::Response::from(http::Response::builder().status(status).body("").expect("HTTP response"))
+            .error_for_status()
+            .expect_err("error status")
+            .with_url(Url::parse(url).expect("request URL"))
+    }
+
+    #[test]
+    fn request_url_digits_do_not_imply_proxy_authentication() {
+        let error = status_error(StatusCode::SERVICE_UNAVAILABLE, "https://127.0.0.1:40701/upload/407");
+        assert!(error.to_string().contains("407"));
+        for proxy_configured in [false, true] {
+            assert!(classify_transport_failure(&error, proxy_configured).is_none());
+        }
+    }
+
+    #[test]
+    fn proxy_authentication_status_requires_a_configured_proxy() {
+        let error = status_error(StatusCode::PROXY_AUTHENTICATION_REQUIRED, "https://localhost/upload");
+        assert!(matches!(
+            classify_transport_failure(&error, true),
+            Some(TransportFailure::ProxyAuthentication)
+        ));
+        assert!(classify_transport_failure(&error, false).is_none());
+    }
 }

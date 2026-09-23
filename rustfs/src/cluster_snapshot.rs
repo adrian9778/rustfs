@@ -23,9 +23,9 @@ use crate::storage_api::cluster::control_plane::{
     ClusterPeerHealthSnapshot, ClusterPoolStateSnapshot, ClusterRpcBoundarySnapshot,
 };
 use crate::workload_admission::workload_admission_registry_snapshot;
-use rustfs_common::metrics::{ScannerMetricsReport, global_metrics};
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot};
 use rustfs_io_metrics::internode_metrics::{InternodeMetricsSnapshot, global_internode_metrics};
+use rustfs_scanner_metrics::metrics::{ScannerMetricsReport, global_metrics};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterReadOnlySnapshot {
@@ -40,6 +40,7 @@ pub struct ClusterReadOnlySnapshot {
     pub runtime_status: ClusterRuntimeStatusSnapshot,
     pub usage_freshness: ClusterUsageFreshnessSnapshot,
     pub listing_diagnostics: ClusterListingDiagnosticsSnapshot,
+    pub pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +67,14 @@ pub struct ClusterUsageFreshnessSnapshot {
     pub last_usage_save_unix_secs: u64,
     pub last_usage_save_result: String,
     pub last_usage_save_result_code: u64,
+    pub last_durable_success_unix_secs: u64,
+    pub last_publication_unix_secs: u64,
+    pub last_publication_state: String,
+    pub last_publication_reason: String,
+    pub deferred_pending: bool,
+    pub deferred_total: u64,
+    pub last_deferred_unix_secs: u64,
+    pub last_deferred_reason: String,
 }
 
 impl From<&ScannerMetricsReport> for ClusterUsageFreshnessSnapshot {
@@ -79,6 +88,14 @@ impl From<&ScannerMetricsReport> for ClusterUsageFreshnessSnapshot {
             last_usage_save_unix_secs: report.usage_freshness.last_usage_save_unix_secs,
             last_usage_save_result: report.usage_freshness.last_usage_save_result.clone(),
             last_usage_save_result_code: report.usage_freshness.last_usage_save_result_code,
+            last_durable_success_unix_secs: report.usage_freshness.last_durable_success_unix_secs,
+            last_publication_unix_secs: report.usage_freshness.last_publication_unix_secs,
+            last_publication_state: report.usage_freshness.last_publication_state.clone(),
+            last_publication_reason: report.usage_freshness.last_publication_reason.clone(),
+            deferred_pending: report.usage_freshness.deferred_pending,
+            deferred_total: report.usage_freshness.deferred_total,
+            last_deferred_unix_secs: report.usage_freshness.last_deferred_unix_secs,
+            last_deferred_reason: report.usage_freshness.last_deferred_reason.clone(),
         }
     }
 }
@@ -86,6 +103,39 @@ impl From<&ScannerMetricsReport> for ClusterUsageFreshnessSnapshot {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ClusterListingDiagnosticsSnapshot {
     pub internode_stall_timeouts_total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterPoolMetaWriteGateSnapshot {
+    pub writes_ready: bool,
+    pub check_timed_out: bool,
+    pub write_blocked: bool,
+    pub transaction_aborted: bool,
+    pub pool_meta_absent: bool,
+    pub identity_initialized: Option<bool>,
+    pub identity_needs_repair: bool,
+    pub cluster_epoch: Option<u64>,
+    pub reason: Option<&'static str>,
+    pub phase: Option<&'static str>,
+    pub since_unix_secs: Option<i64>,
+}
+
+impl Default for ClusterPoolMetaWriteGateSnapshot {
+    fn default() -> Self {
+        Self {
+            writes_ready: true,
+            check_timed_out: false,
+            write_blocked: false,
+            transaction_aborted: false,
+            pool_meta_absent: false,
+            identity_initialized: None,
+            identity_needs_repair: false,
+            cluster_epoch: None,
+            reason: None,
+            phase: None,
+            since_unix_secs: None,
+        }
+    }
 }
 
 impl From<InternodeMetricsSnapshot> for ClusterListingDiagnosticsSnapshot {
@@ -148,6 +198,7 @@ pub fn cluster_read_only_snapshot_from_control_plane(
         runtime_status,
         usage_freshness: ClusterUsageFreshnessSnapshot::default(),
         listing_diagnostics: ClusterListingDiagnosticsSnapshot::default(),
+        pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot::default(),
     }
 }
 
@@ -156,6 +207,7 @@ pub async fn collect_cluster_read_only_snapshot(endpoint_pools: &EndpointServerP
     let mut snapshot = cluster_read_only_snapshot_from_endpoint_pools(endpoint_pools, runtime_status);
     snapshot.usage_freshness = current_usage_freshness_snapshot().await;
     snapshot.listing_diagnostics = current_listing_diagnostics_snapshot();
+    snapshot.pool_meta_write_gate = current_pool_meta_write_gate_snapshot().await;
     Some(snapshot)
 }
 
@@ -172,8 +224,34 @@ fn current_listing_diagnostics_snapshot() -> ClusterListingDiagnosticsSnapshot {
     ClusterListingDiagnosticsSnapshot::from(metrics.snapshot())
 }
 
+async fn current_pool_meta_write_gate_snapshot() -> ClusterPoolMetaWriteGateSnapshot {
+    match crate::runtime_sources::current_object_store_handle() {
+        Some(store) => {
+            let status = store.pool_meta_write_gate_status().await;
+            ClusterPoolMetaWriteGateSnapshot {
+                writes_ready: status.writes_ready,
+                check_timed_out: status.check_timed_out,
+                write_blocked: status.write_blocked,
+                transaction_aborted: status.transaction_aborted,
+                pool_meta_absent: status.pool_meta_absent,
+                identity_initialized: status.identity_initialized,
+                identity_needs_repair: status.identity_needs_repair,
+                cluster_epoch: status.cluster_epoch,
+                reason: status.reason,
+                phase: status.phase,
+                since_unix_secs: status.since_unix_secs,
+            }
+        }
+        None => ClusterPoolMetaWriteGateSnapshot {
+            writes_ready: false,
+            ..Default::default()
+        },
+    }
+}
+
 pub fn cluster_has_actionable_pressure(snapshot: &ClusterReadOnlySnapshot) -> bool {
     snapshot.runtime_status.state == ClusterRuntimeReadinessState::Degraded
+        || !snapshot.pool_meta_write_gate.writes_ready
         || snapshot
             .workload_admission
             .entries()
@@ -199,6 +277,7 @@ mod tests {
                 peer_health_ready: true,
             },
             degraded_reasons: Vec::new(),
+            storage_details: None,
         });
         assert_eq!(ready.state, ClusterRuntimeReadinessState::Ready);
 
@@ -210,6 +289,7 @@ mod tests {
                 peer_health_ready: true,
             },
             degraded_reasons: vec![ReadinessDegradedReason::StorageQuorumUnavailable],
+            storage_details: None,
         });
         assert_eq!(degraded.state, ClusterRuntimeReadinessState::Degraded);
         assert_eq!(degraded.degraded_reasons, vec![ReadinessDegradedReason::StorageQuorumUnavailable]);
@@ -226,6 +306,7 @@ mod tests {
                 peer_health_ready: true,
             },
             degraded_reasons: vec![ReadinessDegradedReason::StorageAndLockUnavailable],
+            storage_details: None,
         });
 
         let snapshot = cluster_read_only_snapshot_from_endpoint_pools(&endpoint_pools, runtime_status);
@@ -296,6 +377,7 @@ mod tests {
             },
             usage_freshness: ClusterUsageFreshnessSnapshot::default(),
             listing_diagnostics: ClusterListingDiagnosticsSnapshot::default(),
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot::default(),
         };
         assert!(!cluster_has_actionable_pressure(&no_pressure));
 
@@ -319,9 +401,19 @@ mod tests {
                 WorkloadClass::Repair,
                 AdmissionState::Unknown,
             )]),
-            ..no_pressure
+            ..no_pressure.clone()
         };
         assert!(cluster_has_actionable_pressure(&admission_pressure));
+
+        let pool_meta_pressure = ClusterReadOnlySnapshot {
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot {
+                writes_ready: false,
+                write_blocked: true,
+                ..Default::default()
+            },
+            ..no_pressure
+        };
+        assert!(cluster_has_actionable_pressure(&pool_meta_pressure));
     }
 
     #[test]

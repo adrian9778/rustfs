@@ -15,14 +15,9 @@
 use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
-    current_deployment_id, current_endpoints_handle, current_federated_identity_service, current_iam_handle,
-    current_object_store_handle, current_outbound_tls_generation, current_outbound_tls_state, current_region,
-    current_replication_pool_handle, current_replication_stats_handle, current_runtime_port, current_server_config,
-    current_token_signing_key, object_store_from_req,
-};
-use crate::admin::site_replication_identity::{
-    canonical_endpoint, deployment_id_for_endpoint, is_https_endpoint, mark_unknown_peer_sync_enabled,
-    normalize_peer_map_by_identity_with, same_identity_endpoint, site_identity_key,
+    current_deployment_id, current_federated_identity_service, current_iam_handle, current_object_store_handle, current_region,
+    current_replication_pool_handle, current_replication_stats_handle, current_server_config, current_token_signing_key,
+    object_store_from_req,
 };
 use crate::admin::storage_api::bucket::metadata::{
     BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
@@ -32,98 +27,79 @@ use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::quota::BucketQuota;
 use crate::admin::storage_api::bucket::replication;
 use crate::admin::storage_api::bucket::replication::{
-    OperatorRuleContract, assign_site_replication_rule_priorities, is_site_replication_role, merge_incoming_replication_config,
+    OperatorRuleContract, assign_site_replication_rule_priorities, merge_incoming_replication_config,
     replication_target_arn_deployment_id, site_replication_rule_deployment_id,
 };
-use crate::admin::storage_api::bucket::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
-use crate::admin::storage_api::bucket::target_sys::BucketTargetSys;
+use crate::admin::storage_api::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
 use crate::admin::storage_api::bucket::utils::{deserialize, serialize};
-use crate::admin::storage_api::bucket::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
-use crate::admin::storage_api::config::read_admin_config;
-#[cfg(test)]
-use crate::admin::storage_api::config::save_admin_config;
+use crate::admin::storage_api::bucket::{
+    AdminObjectLockConfigExt as _, AdminReplicationConfigExt as _, AdminVersioningConfigExt as _,
+};
+use crate::admin::storage_api::bucket_target_sys::BucketTargetSys;
 use crate::admin::storage_api::contract::bucket::{
     BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp,
 };
 use crate::admin::storage_api::error::{Error as StorageError, is_err_bucket_not_found};
-use crate::admin::storage_api::runtime::ECStore;
-use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
-use crate::auth::constant_time_eq;
-use crate::config::get_config_snapshot;
+use crate::admin::utils::{empty_response, json_response, read_compatible_admin_body};
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
-use crate::storage::storage_api::{
-    delete_config_no_lock, lock_bucket_targets_metadata, read_config_no_lock, save_config_no_lock, with_config_object_read_lock,
-    with_config_object_write_lock,
+use crate::site_replication::identity::{
+    canonical_endpoint, deployment_id_for_endpoint, is_https_endpoint, mark_unknown_peer_sync_enabled, same_identity_endpoint,
+    site_identity_key,
 };
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use crate::storage::storage_api::{lock_bucket_targets_metadata, with_config_object_write_lock};
+use base64_simd::URL_SAFE_NO_PAD;
 use futures::StreamExt;
-use hmac::{Hmac, Mac};
-use http::header::{CONTENT_TYPE, HOST};
-use http::{HeaderMap, HeaderValue, Uri};
+use http::Uri;
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_config::{
-    DEFAULT_CONSOLE_ADDRESS, DEFAULT_DELIMITER, DEFAULT_RUSTFS_TLS_PATH, ENV_RUSTFS_CONSOLE_ADDRESS, ENV_RUSTFS_TLS_PATH,
-    MAX_ADMIN_REQUEST_BODY_SIZE,
-};
+use rustfs_config::{DEFAULT_DELIMITER, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_iam::error::is_err_no_such_service_account;
 use rustfs_iam::federation::OIDC_VIRTUAL_PARENT_CLAIM;
 use rustfs_iam::store::object::ObjectStore;
-use rustfs_iam::store::{MappedPolicy, UserType, sr_wire_user_type, user_type_from_sr_wire};
+use rustfs_iam::store::user_type_from_sr_wire;
 use rustfs_iam::sys::{
     IamSys, NewServiceAccountOpts, SITE_REPLICATOR_SERVICE_ACCOUNT, UpdateServiceAccountOpts, get_claims_from_token_with_secret,
 };
 use rustfs_madmin::{
-    AddOrUpdateUserReq, BucketBandwidth, GroupAddRemove, GroupStatus, IDPSettings, InProgressMetric, InQueueMetric,
-    LDAPConfigSettings, LDAPSettings, OpenIDProviderSettings, PeerInfo, PeerSite, QStat, ReplProxyMetric, ReplicateAddStatus,
+    BucketBandwidth, GroupStatus, IDPSettings, InProgressMetric, InQueueMetric, LDAPConfigSettings, LDAPSettings,
+    OpenIDProviderSettings, OpenIDSettings, PeerInfo, PeerSite, QStat, RStat, ReplProxyMetric, ReplicateAddStatus,
     ReplicateEditStatus, ReplicateRemoveStatus, ResyncBucketStatus, SITE_REPL_API_VERSION, SR_IAM_ITEM_STS_ACC,
     SR_IAM_ITEM_STS_ACC_LEGACY, SRBucketInfo, SRBucketMeta, SRBucketStatsSummary, SRGroupInfo, SRGroupStatsSummary, SRIAMItem,
-    SRIAMPolicy, SRIAMUser, SRILMExpiryStatsSummary, SRInfo, SRMetric, SRMetricsSummary, SRPeerError, SRPeerJoinReq,
-    SRPendingOperation, SRPolicyMapping, SRPolicyStatsSummary, SRRemoveReq, SRResyncOpStatus, SRRetryStats, SRSTSCredential,
-    SRSessionPolicy, SRSiteSummary, SRStateEditReq, SRStateInfo, SRStatusInfo, SRSvcAccChange, SRSvcAccCreate,
-    SRUserStatsSummary, SiteReplicationInfo, SyncStatus, WorkerStat,
+    SRIAMUser, SRILMExpiryStatsSummary, SRInfo, SRMetric, SRMetricsSummary, SRPeerError, SRPeerJoinReq, SRPendingOperation,
+    SRPolicyMapping, SRPolicyStatsSummary, SRRemoveReq, SRResyncOpStatus, SRSTSCredential, SRSiteSummary, SRStateEditReq,
+    SRStateInfo, SRStatusInfo, SRSvcAccChange, SRSvcAccCreate, SRUserStatsSummary, SiteReplicationInfo, SyncStatus,
+    TimedErrStats, WorkerStat,
 };
 use rustfs_policy::policy::{
     Policy,
     action::{Action, AdminAction},
 };
-use rustfs_signer::constants::UNSIGNED_PAYLOAD;
-use rustfs_signer::sign_v4;
-use rustfs_tls_runtime::GlobalPublishedOutboundTlsState;
-use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url};
-use rustfs_utils::http::get_source_scheme;
-use rustls_pki_types::pem::PemObject;
 use s3s::dto::{
-    BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication, DeleteReplicationStatus,
-    Destination, ExistingObjectReplication, ExistingObjectReplicationStatus, ReplicaModifications, ReplicaModificationsStatus,
-    ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, SourceSelectionCriteria, VersioningConfiguration,
+    DeleteMarkerReplicationStatus, DeleteReplicationStatus, ExistingObjectReplicationStatus, ObjectLockConfiguration,
+    ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, VersioningConfiguration,
 };
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Deserialize;
 use serde::Serialize;
-use serde::de::{DeserializeOwned, IgnoredAny};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::sync::{LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 use time::OffsetDateTime;
-use tokio::sync::{Mutex, RwLock};
-use tracing::{info, warn};
-use url::{Url, form_urlencoded};
+use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
+use url::Url;
+use url::form_urlencoded;
 use uuid::Uuid;
 
-const LOG_COMPONENT_ADMIN: &str = "admin";
-const LOG_SUBSYSTEM_SITE_REPLICATION: &str = "site_replication";
-const EVENT_ADMIN_SITE_REPLICATION_STATE: &str = "admin_site_replication_state";
-const SERVICE_ACCOUNT_ENVELOPE_VERSION: u64 = 2;
-use crate::admin::site_replication_state::{SITE_REPLICATION_STATE_PATH, with_site_replication_state_lock};
-const SITE_REPLICATION_REPAIR_STATE_PATH: &str = "config/site-replication/repair-state.json";
-const SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH: &str = "config/site-replication/repair-execution.lock";
+// The site-replication service subsystem (state, peer transport, retry queue,
+// repair state machine, broadcast hooks) lives in `crate::site_replication`
+// (backlog#1840); re-export it so existing `admin::handlers::site_replication`
+// paths keep resolving while this file keeps only the HTTP handlers.
+pub(crate) use crate::site_replication::*;
+
 // Serializes peer-join admission (staleness check -> IAM upsert -> state
 // commit) across every node of this site; see admit_peer_join. Never an
 // actual object — only a namespace-lock key, like the repair execution lock.
@@ -140,50 +116,22 @@ const SITE_REPL_RESYNC_CANCEL: &str = "cancel";
 const SITE_REPL_RESYNC_STATUS: &str = "status";
 const SITE_REPL_RESYNC_DEFAULT_PAGE_SIZE: usize = 100;
 const SITE_REPL_RESYNC_MAX_PAGE_SIZE: usize = 1000;
-const SITE_REPLICATION_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const SITE_REPLICATION_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Bound on waiting for the lifecycle lock (below). 3x the peer request
 /// timeout: outlives one full peer round of a healthy concurrent lifecycle
 /// operation, while converting a holder wedged on unreachable peers into a
 /// retryable 503 for the waiter instead of an unbounded hang.
 const SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
-const SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT: usize = 256;
 const SITE_REPLICATION_INITIAL_SYNC_ERROR_LIMIT: usize = 32;
-const MAX_PEER_CA_CERT_PEM_SIZE: usize = 256 * 1024;
-const ALLOW_LOOPBACK_REPLICATION_TARGET_ENV: &str = "RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET";
-const SITE_REPLICATION_RETRY_QUEUE_LIMIT: usize = 256;
-const SITE_REPLICATION_RETRY_FAILED_AFTER: u32 = 3;
-const SITE_REPLICATION_REPAIR_OPERATION_LIMIT: usize = 32;
-const SITE_REPLICATION_REPAIR_IAM_FAMILY: &str = "iam";
-const SITE_REPLICATION_REPAIR_BUCKET_FAMILY: &str = "bucket";
-const SITE_REPLICATION_REPAIR_BUCKET_METADATA_FAMILY: &str = "bucket-metadata";
-const SITE_REPLICATION_REPAIR_REPLICATION_FAMILY: &str = "replication";
-const SITE_REPLICATION_PEER_BUCKET_OPS_PATH: &str = "/rustfs/admin/v3/site-replication/peer/bucket-ops";
-const SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING: &str = "make-with-versioning";
-const SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION: &str = "configure-replication";
 const IDENTITY_LDAP_SUB_SYS: &str = "identity_ldap";
 const LEGACY_LDAP_SUB_SYS: &str = "ldapserverconfig";
 const SITE_REPLICATION_PEER_JOIN_PATH: &str = "/rustfs/admin/v3/site-replication/peer/join";
-const SITE_REPLICATION_PEER_EDIT_PATH: &str = "/rustfs/admin/v3/site-replication/peer/edit";
 const SITE_REPLICATION_PEER_EDIT_CAPABILITY_PATH: &str =
     "/rustfs/admin/v3/site-replication/peer/edit-capabilities?capability=endpoint-target-refresh";
 const SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH: &str =
     "/rustfs/admin/v3/site-replication/peer/edit-capabilities?capability=peer-tls-settings";
-const SITE_REPLICATION_PEER_DERIVED_RULE_CONTRACT_CAPABILITY_PATH: &str =
-    "/rustfs/admin/v3/site-replication/peer/edit-capabilities?capability=derived-rule-contract";
 const SITE_REPLICATION_PEER_EDIT_REFRESH_PATH: &str = "/rustfs/admin/v3/site-replication/peer/edit?refresh-targets=true";
-/// Peer-edit fencing token, carried as query parameters so a peer that predates
-/// the fence simply ignores them (unknown query keys are dropped) and keeps the
-/// previous last-writer-wins behaviour.
-const SITE_REPLICATION_EDIT_ORIGIN_QUERY: &str = "editOrigin";
-const SITE_REPLICATION_EDIT_GENERATION_QUERY: &str = "editGeneration";
-const SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH: &str = "internal:endpoint-target-refresh";
 const SITE_REPLICATION_PEER_REMOVE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/remove";
 const SITE_REPLICATION_DEVNULL_PATH: &str = "/rustfs/admin/v3/site-replication/devnull";
-const RUSTFS_ADMIN_V3_PREFIX: &str = "/rustfs/admin/v3";
-const MINIO_ADMIN_V3_PREFIX: &str = "/minio/admin/v3";
-const MINIO_SITE_REPLICATION_PEER_JOIN_PATH: &str = "/minio/admin/v3/site-replication/peer/join";
-
 fn site_replicator_service_account_policy() -> S3Result<Policy> {
     Policy::parse_config(
         br#"{
@@ -243,144 +191,14 @@ fn site_replicator_service_account_policy() -> S3Result<Policy> {
     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("parse site replicator policy failed: {e}")))
 }
 
-#[derive(Clone)]
-enum SiteReplicationPeerClientCacheEntry {
-    Ready(reqwest::Client),
-    Failed(String),
-}
-
-#[derive(Clone)]
-struct SiteReplicationPeerClientCache {
-    generation: u64,
-    entry: SiteReplicationPeerClientCacheEntry,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PeerConnection {
-    endpoint: Url,
-    skip_tls_verify: bool,
-    ca_cert_pem: String,
-}
-
-#[derive(Deserialize, Default)]
-struct PeerTlsFieldPresence {
-    #[serde(rename = "skipTlsVerify")]
-    skip_tls_verify: Option<IgnoredAny>,
-    #[serde(rename = "caCertPem")]
-    ca_cert_pem: Option<IgnoredAny>,
-}
-
-impl PeerTlsFieldPresence {
-    fn has_skip_tls_verify(&self) -> bool {
-        self.skip_tls_verify.is_some()
-    }
-
-    fn has_ca_cert_pem(&self) -> bool {
-        self.ca_cert_pem.is_some()
-    }
-}
-
-#[derive(Clone)]
-struct PeerDnsResolver {
-    allow_loopback: bool,
-    #[cfg(test)]
-    overrides: Option<Arc<HashMap<String, Vec<IpAddr>>>>,
-}
-
-impl PeerDnsResolver {
-    fn new(allow_loopback: bool) -> Self {
-        Self {
-            allow_loopback,
-            #[cfg(test)]
-            overrides: None,
-        }
-    }
-
-    #[cfg(test)]
-    fn with_overrides(allow_loopback: bool, overrides: HashMap<String, Vec<IpAddr>>) -> Self {
-        Self {
-            allow_loopback,
-            overrides: Some(Arc::new(overrides)),
-        }
-    }
-}
-
-impl reqwest::dns::Resolve for PeerDnsResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_string();
-        let allow_loopback = self.allow_loopback;
-        #[cfg(test)]
-        let overrides = self.overrides.clone();
-        Box::pin(async move {
-            #[cfg(test)]
-            let overridden = overrides.as_ref().and_then(|entries| entries.get(&host)).cloned();
-            #[cfg(not(test))]
-            let overridden: Option<Vec<IpAddr>> = None;
-
-            let ips = if let Some(ips) = overridden {
-                ips
-            } else {
-                tokio::net::lookup_host((host.as_str(), 0))
-                    .await?
-                    .map(|addr| addr.ip())
-                    .collect()
-            };
-            let addrs = ips
-                .into_iter()
-                .filter(|ip| resolved_peer_ip_allowed(&host, *ip, allow_loopback))
-                .map(|ip| SocketAddr::new(ip, 0))
-                .collect::<Vec<_>>();
-            if addrs.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("site replication DNS resolution for `{host}` returned no allowed addresses"),
-                )
-                .into());
-            }
-            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
-        })
-    }
-}
-
-impl PeerConnection {
-    fn new(endpoint: &str, skip_tls_verify: bool, ca_cert_pem: &str) -> S3Result<Self> {
-        validate_peer_connection_inner(endpoint, skip_tls_verify, ca_cert_pem, loopback_replication_targets_allowed())
-    }
-
-    fn endpoint(&self) -> &str {
-        self.endpoint.as_str().trim_end_matches('/')
-    }
-
-    fn uses_default_tls(&self) -> bool {
-        !self.skip_tls_verify && self.ca_cert_pem.is_empty()
-    }
-}
-
-impl TryFrom<&PeerInfo> for PeerConnection {
-    type Error = S3Error;
-
-    fn try_from(peer: &PeerInfo) -> Result<Self, Self::Error> {
-        Self::new(&peer.endpoint, peer.skip_tls_verify, &peer.ca_cert_pem)
-    }
-}
-
-impl TryFrom<&PeerSite> for PeerConnection {
-    type Error = S3Error;
-
-    fn try_from(site: &PeerSite) -> Result<Self, Self::Error> {
-        Self::new(&site.endpoint, site.skip_tls_verify, &site.ca_cert_pem)
-    }
-}
-
-static SITE_REPLICATION_PEER_CLIENT: LazyLock<Mutex<Option<SiteReplicationPeerClientCache>>> = LazyLock::new(|| Mutex::new(None));
-// Lock order: lifecycle -> bucket operation -> repair admission -> state -> per-bucket metadata.
+// Lock order: lifecycle -> bucket-mutation admission -> per-bucket mutation
+// -> bucket operation -> repair admission -> state -> per-bucket metadata.
 // "state" is the distributed state-object lock in
-// crate::admin::site_replication_state, entered through
+// crate::site_replication::state_lock, entered through
 // update_site_replication_state (P1-15). There is no process-local state
 // mutex any more: it could not order two nodes of one site, and the call
 // sites that needed ordering carry a generation fence instead.
 static SITE_REPLICATION_LIFECYCLE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-static SITE_REPLICATION_BUCKET_OP_LOCK: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new(()));
 static SITE_REPLICATION_ADD_BOOTSTRAP: LazyLock<StdMutex<Option<SiteReplicationAddBootstrap>>> =
     LazyLock::new(|| StdMutex::new(None));
 
@@ -462,254 +280,11 @@ fn bootstrap_peer_bucket_operation_allowed(bucket: &str, operation: &str, bootst
     })
 }
 
-fn site_replication_peer_client_cache_hit(
-    cache: &Option<SiteReplicationPeerClientCache>,
-    generation: u64,
-) -> Option<S3Result<reqwest::Client>> {
-    let cached = cache.as_ref()?;
-    if cached.generation != generation {
-        return None;
-    }
-    Some(match &cached.entry {
-        SiteReplicationPeerClientCacheEntry::Ready(client) => Ok(client.clone()),
-        SiteReplicationPeerClientCacheEntry::Failed(err) => Err(S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("initialize site replication peer client failed: {err}"),
-        )),
-    })
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct SiteReplicationState {
-    name: String,
-    service_account_access_key: String,
-    #[serde(default, skip_serializing)]
-    service_account_secret_key: String,
-    service_account_parent: String,
-    peers: BTreeMap<String, PeerInfo>,
-    updated_at: Option<OffsetDateTime>,
-    resync_status: BTreeMap<String, SRResyncOpStatus>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pending_rotation: Option<PendingRotation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pending_remove: Option<PendingRemove>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pending_endpoint_refresh: Option<PendingEndpointRefresh>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    retry_queue: Vec<SiteReplicationRetryEvent>,
-    #[serde(default)]
-    sync_state_initialized: bool,
-    /// Fencing token for peer-edit delivery, allocated inside the state
-    /// transaction (the distributed state-object lock). Two nodes of THIS
-    /// site that accept admin edits concurrently therefore get strictly
-    /// ordered generations, and a delivery that stalls can be recognised as
-    /// stale by the receiving site.
-    #[serde(default)]
-    edit_generation: u64,
-    /// Per-origin high-water mark of the peer edits already applied here,
-    /// keyed by the origin site's deployment id. A delivery whose generation
-    /// is not above the mark arrived out of order and must not overwrite the
-    /// newer edit that already landed.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    applied_edit_generations: BTreeMap<String, u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct SiteReplicationRepairState {
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    operations: BTreeMap<String, SiteReplicationRepairOperation>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct SiteReplicationRepairOperation {
-    operation_id: String,
-    preflight_token: String,
-    plan_token: String,
-    status: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    sites: BTreeMap<String, SiteReplicationRepairSiteStatus>,
-    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
-    created_at: Option<OffsetDateTime>,
-    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
-    updated_at: Option<OffsetDateTime>,
-    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
-    completed_at: Option<OffsetDateTime>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct SiteReplicationRepairSiteStatus {
-    deployment_id: String,
-    name: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    families: BTreeMap<String, SiteReplicationRepairFamilyStatus>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct SiteReplicationRepairFamilyStatus {
-    planned: usize,
-    succeeded: usize,
-    failed: usize,
-    #[serde(default)]
-    retry_events: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    tasks: Vec<SiteReplicationRepairTaskStatus>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    errors: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct SiteReplicationRepairTaskStatus {
-    task_id: String,
-    status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SiteReplicationRepairRequest {
-    mode: SiteReplicationRepairMode,
-    #[serde(default)]
-    preflight_token: Option<String>,
-    #[serde(default)]
-    operation_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-enum SiteReplicationRepairMode {
-    DryRun,
-    Execute,
-}
-
-struct SiteReplicationRepairExecutionRequest {
-    local_peer: PeerInfo,
-    preflight_token: String,
-    operation_id: String,
-    signing_key: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SiteReplicationRepairPreflight {
-    mode: &'static str,
-    status: &'static str,
-    preflight_token: String,
-    retry_events: usize,
-    sites: BTreeMap<String, SiteReplicationRepairSiteStatus>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SiteReplicationRepairOperationResponse {
-    mode: &'static str,
-    operation_id: String,
-    status: String,
-    sites: BTreeMap<String, SiteReplicationRepairSiteResponse>,
-    #[serde(with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
-    created_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
-    updated_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
-    completed_at: Option<OffsetDateTime>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SiteReplicationRepairSiteResponse {
-    deployment_id: String,
-    name: String,
-    families: BTreeMap<String, SiteReplicationRepairFamilyResponse>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SiteReplicationRepairFamilyResponse {
-    planned: usize,
-    succeeded: usize,
-    failed: usize,
-    retry_events: usize,
-    tasks: Vec<SiteReplicationRepairTaskStatus>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    errors: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct SiteReplicationRetryEvent {
-    id: String,
-    peer_deployment_id: String,
-    peer_endpoint: String,
-    path: String,
-    retry_count: u32,
-    failed: bool,
-    last_error: String,
-    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
-    updated_at: Option<OffsetDateTime>,
-    /// Peer-edit generation whose delivery failed, when the failing send
-    /// carried one. Settling a *later* success for the same (peer, path) must
-    /// not erase a failure recorded for a NEWER generation — see
-    /// [`settle_site_replication_retry_events`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    edit_generation: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct PendingEndpointRefresh {
-    id: String,
-    peer: PeerInfo,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    remote_peers: BTreeMap<String, PeerInfo>,
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    acked_deployment_ids: BTreeSet<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EndpointRefreshRequest {
     id: String,
     peer: PeerInfo,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct PendingRotation {
-    id: String,
-    access_key: String,
-    parent: String,
-    new_secret_key: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    secret_candidates: Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    peers: BTreeMap<String, PeerInfo>,
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    acked_deployment_ids: BTreeSet<String>,
-    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
-    updated_at: Option<OffsetDateTime>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct PendingRemove {
-    id: String,
-    req: SRRemoveReq,
-    service_account_access_key: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    secret_candidates: Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    original_peers: BTreeMap<String, PeerInfo>,
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    acked_deployment_ids: BTreeSet<String>,
-    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
-    updated_at: Option<OffsetDateTime>,
-}
-
-struct SiteReplicationRuntime {
-    state: SiteReplicationState,
-    local_peer: PeerInfo,
-    service_account_secret_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -718,18 +293,19 @@ struct SiteReplicationAddPreflightInfo {
     endpoint: String,
     deployment_id: String,
     enabled: bool,
-    bucket_count: usize,
-    bucket_names: HashSet<String>,
+    buckets: BTreeMap<String, AddPreflightBucketCompat>,
     peer_deployment_ids: BTreeSet<String>,
     idp_settings: serde_json::Value,
 }
 
-#[derive(Debug, Default)]
-struct SiteReplicationBootstrapPlan {
-    iam_items: Vec<SRIAMItem>,
-    bucket_make_ops: Vec<String>,
-    bucket_items: Vec<SRBucketMeta>,
-    bucket_configure_ops: Vec<String>,
+/// The per-bucket facts the add preflight compares across sites when more
+/// than one requested site holds data (rustfs/backlog#2070). Only properties
+/// that cannot converge after the add belong here — everything else is
+/// reconciled by the bucket-metadata sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AddPreflightBucketCompat {
+    versioning_enabled: bool,
+    object_lock_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -737,6 +313,8 @@ struct SRPeerJoinResponse {
     peer: PeerInfo,
     #[serde(rename = "initialSyncErrorMessage", default, skip_serializing_if = "String::is_empty")]
     initial_sync_error_message: String,
+    #[serde(rename = "initialSyncDeferred", default, skip_serializing_if = "std::ops::Not::not")]
+    initial_sync_deferred: bool,
     /// Whether the receiving site actually applied this join.
     ///
     /// Three-valued on purpose. `None` means the peer did not report — MinIO
@@ -755,6 +333,8 @@ struct SRPeerJoinEnvelope {
     request: SRPeerJoinReq,
     #[serde(rename = "deferSyncStateEnable", default, skip_serializing_if = "std::ops::Not::not")]
     defer_sync_state_enable: bool,
+    #[serde(rename = "deferInitialSync", default, skip_serializing_if = "std::ops::Not::not")]
+    defer_initial_sync: bool,
 }
 
 #[derive(Debug, Default)]
@@ -818,12 +398,6 @@ struct SiteNetPerfNodeResult {
     error: String,
 }
 
-impl SiteReplicationState {
-    fn enabled(&self) -> bool {
-        self.peers.len() > 1
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum SREntityType {
     #[default]
@@ -866,6 +440,7 @@ pub fn register_site_replication_route(r: &mut S3Router<AdminOperation>) -> std:
     // into this module: startup sits below this layer and must not depend upwards. The admin
     // router is built before startup reconciles, so the hook is always installed in time.
     crate::site_replication_reconcile::register_site_replication_reconciler(reconcile_site_replication_wiring);
+    crate::site_replication_reconcile::register_site_replication_retry_drainer(reconcile_site_replication_retry_drain);
 
     for (method, path, operation) in [
         (Method::PUT, "/v3/site-replication/add", AdminOperation(&SiteReplicationAddHandler {})),
@@ -970,14 +545,6 @@ fn reject_site_replicator_on_public_admin(cred: &rustfs_credentials::Credentials
     Ok(())
 }
 
-fn json_response<T: Serialize>(value: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let data = serde_json::to_vec(value)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(s3s::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
-}
-
 fn go_gob_site_netperf_response(value: &SiteNetPerfNodeResult) -> S3Response<(StatusCode, Body)> {
     let data = encode_go_gob_site_netperf_node_result(value);
     S3Response::new((StatusCode::OK, Body::from(data)))
@@ -1059,10 +626,6 @@ fn write_go_gob_uint(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(used);
 }
 
-fn empty_response(status: StatusCode) -> S3Response<(StatusCode, Body)> {
-    S3Response::new((status, Body::empty()))
-}
-
 async fn read_plain_admin_body(mut input: Body) -> S3Result<Vec<u8>> {
     let body = input
         .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
@@ -1095,489 +658,6 @@ fn parse_site_replication_json<T: DeserializeOwned>(body: &[u8]) -> S3Result<T> 
 
 fn parse_public_peer_edit(body: &[u8]) -> S3Result<(PeerInfo, PeerTlsFieldPresence)> {
     Ok((parse_site_replication_json(body)?, parse_site_replication_json(body)?))
-}
-
-fn parse_site_replication_state(data: &[u8]) -> S3Result<SiteReplicationState> {
-    let mut state: SiteReplicationState = serde_json::from_slice(data)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid site replication state: {e}")))?;
-    state.peers = normalize_peer_map_by_identity(state.peers);
-    // A peer-edit high-water mark only fences a CURRENT peer. A site that
-    // leaves drops below two peers, which clears its own state object and
-    // restarts its generation counter — a mark left over from the previous
-    // membership must not reject the edits it sends after it rejoins. This
-    // pruning covers departures THIS site observed; an origin removed
-    // unilaterally elsewhere stays in this peer map with its mark, and the
-    // wall-clock floor in `next_peer_edit_generation` is what lifts its
-    // restarted counter over that mark. Dropping departed origins on load
-    // also keeps the map bounded.
-    state
-        .applied_edit_generations
-        .retain(|origin, _| state.peers.contains_key(origin));
-    if !state.sync_state_initialized {
-        if state.enabled() {
-            mark_unknown_peer_sync_enabled(&mut state.peers);
-        }
-        state.sync_state_initialized = true;
-    }
-    Ok(state)
-}
-
-async fn load_site_replication_state() -> S3Result<SiteReplicationState> {
-    let Some(store) = current_object_store_handle() else {
-        return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-    };
-
-    match read_admin_config(store, SITE_REPLICATION_STATE_PATH).await {
-        Ok(data) => parse_site_replication_state(&data),
-        Err(StorageError::ConfigNotFound) => Ok(SiteReplicationState::default()),
-        Err(err) => Err(S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("failed to load site replication state: {err}"),
-        )),
-    }
-}
-
-/// Whether this deployment participates in site replication (two or more
-/// peers in the persisted state). Read by the S3 interface layer to gate
-/// replication-config edits (MinIO `ErrReplicationDenyEditError` semantics,
-/// issue #1948); a state-read failure propagates so the gate fails closed.
-pub(crate) async fn site_replication_enabled() -> S3Result<bool> {
-    Ok(load_site_replication_state().await?.enabled())
-}
-
-/// Deployment ids of the remote peers the reconciler derives a
-/// `site-repl-<id>` rule for on every bucket (the same peer filter as
-/// `build_site_replication_config`); empty when site replication is not
-/// enabled. Read by the bucket usecase so an S3 replication-config edit keeps
-/// exactly the reconciler-owned rules (issue #1948); a state-read failure
-/// propagates so the edit fails closed.
-pub(crate) async fn site_replication_edit_context() -> S3Result<(HashSet<String>, OperatorRuleContract)> {
-    let Some(runtime) = runtime_site_replication_targets().await? else {
-        // Enabled without a service account is a state this site cannot
-        // broadcast from either; the peers are still the reconciler's.
-        let state = load_site_replication_state().await?;
-        if !state.enabled() {
-            return Ok((HashSet::new(), OperatorRuleContract::Derived));
-        }
-        let peers = remote_peer_deployment_ids(&state, &current_local_runtime_peer(&state));
-        return Ok((peers, OperatorRuleContract::Legacy));
-    };
-    let peers = remote_peer_deployment_ids(&runtime.state, &runtime.local_peer);
-    let contract = site_replication_operator_rule_contract(&runtime).await;
-    Ok((peers, contract))
-}
-
-/// Whether every remote peer merges replication configs under the derived
-/// contract, probed through the peer capability endpoint. A peer that does
-/// not (or cannot be asked) pins the cluster to [`OperatorRuleContract::Legacy`]
-/// for this edit: consistency across sites wins over keeping the operator's
-/// priority values, and the legacy merge keeps their order anyway.
-async fn site_replication_operator_rule_contract(runtime: &SiteReplicationRuntime) -> OperatorRuleContract {
-    let remote_peers: Vec<&PeerInfo> = runtime
-        .state
-        .peers
-        .values()
-        .filter(|peer| {
-            peer.deployment_id != runtime.local_peer.deployment_id
-                && !same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
-        })
-        .collect();
-    let probes = futures::future::join_all(remote_peers.iter().map(|peer| async move {
-        let transport = PeerTransport::for_runtime_peer(peer).await?;
-        let (status, body) = send_peer_admin_request_raw_with_client(
-            &transport.client,
-            &transport.connection,
-            SITE_REPLICATION_PEER_DERIVED_RULE_CONTRACT_CAPABILITY_PATH,
-            &runtime.state.service_account_access_key,
-            &runtime.service_account_secret_key,
-            &(),
-        )
-        .await?;
-        peer_capability_response_supported(peer, status, &body)
-    }))
-    .await;
-    operator_rule_contract_from_probes(remote_peers.into_iter().zip(probes))
-}
-
-fn operator_rule_contract_from_probes<'a>(
-    probes: impl IntoIterator<Item = (&'a PeerInfo, S3Result<bool>)>,
-) -> OperatorRuleContract {
-    for (peer, probe) in probes {
-        match probe {
-            Ok(true) => {}
-            Ok(false) => return OperatorRuleContract::Legacy,
-            Err(err) => {
-                warn!(
-                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                    result = "derived_rule_contract_probe_failed",
-                    peer = %peer.endpoint,
-                    error = %err,
-                    "admin site replication state"
-                );
-                return OperatorRuleContract::Legacy;
-            }
-        }
-    }
-    OperatorRuleContract::Derived
-}
-
-fn remote_peer_deployment_ids(state: &SiteReplicationState, local_peer: &PeerInfo) -> HashSet<String> {
-    state
-        .peers
-        .values()
-        .filter(|peer| {
-            peer.deployment_id != local_peer.deployment_id && !same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
-        })
-        .map(|peer| peer.deployment_id.clone())
-        .collect()
-}
-
-/// Deployment ids of every site in the cluster, this one included: the set
-/// a peer's derived rules can name (its rule towards this site carries this
-/// site's id). Empty when site replication is not enabled.
-async fn site_replication_deployment_ids() -> S3Result<HashSet<String>> {
-    let state = load_site_replication_state().await?;
-    if !state.enabled() {
-        return Ok(HashSet::new());
-    }
-    Ok(state.peers.values().map(|peer| peer.deployment_id.clone()).collect())
-}
-
-async fn load_site_replication_state_no_lock(store: Arc<ECStore>) -> S3Result<SiteReplicationState> {
-    match read_config_no_lock(store, SITE_REPLICATION_STATE_PATH).await {
-        Ok(data) => parse_site_replication_state(&data),
-        Err(StorageError::ConfigNotFound) => Ok(SiteReplicationState::default()),
-        Err(err) => Err(S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("failed to load site replication state: {err}"),
-        )),
-    }
-}
-
-/// Persist-or-clear under an already-held state object lock. Normalizes the
-/// peer map exactly once (the historical persist path normalized twice with
-/// two full clones — P2-22).
-async fn persist_site_replication_state_no_lock(store: Arc<ECStore>, mut state: SiteReplicationState) -> S3Result<()> {
-    state.peers = normalize_peer_map_by_identity(state.peers);
-    if state.peers.len() <= 1 && state.pending_rotation.is_none() && state.pending_remove.is_none() {
-        match delete_config_no_lock(store, SITE_REPLICATION_STATE_PATH).await {
-            Ok(()) | Err(StorageError::ConfigNotFound) => Ok(()),
-            Err(err) => Err(S3Error::with_message(S3ErrorCode::InternalError, format!("clear state failed: {err}"))),
-        }
-    } else {
-        let data = serde_json::to_vec(&state)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize state failed: {e}")))?;
-        save_config_no_lock(store, SITE_REPLICATION_STATE_PATH, data)
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("save state failed: {e}")))
-    }
-}
-
-/// What a state transaction closure decided to do with the state it was
-/// handed. `Unchanged` skips the write entirely: the ack markers and the
-/// pending-clearing paths run on every retry and mostly find their pending id
-/// already gone, and the retry queue shares this object — rewriting it byte
-/// for byte only makes those misses contend with the writers that do have
-/// something to say.
-enum StateCommit<T> {
-    Changed(T),
-    Unchanged(T),
-}
-
-/// The site-replication state RMW transaction: load, mutate, persist — all
-/// under the distributed state-object write lock (see
-/// crate::admin::site_replication_state). No peer network calls and no other
-/// config locks inside `update`; anything that has to talk to a peer belongs
-/// between two transactions, with the precondition re-checked inside the
-/// second one.
-async fn update_site_replication_state<T, F>(update: F) -> S3Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce(&mut SiteReplicationState) -> S3Result<T> + Send + 'static,
-{
-    update_site_replication_state_when_changed(move |state| update(state).map(StateCommit::Changed)).await
-}
-
-/// [`update_site_replication_state`] for closures that may find nothing to
-/// do — see [`StateCommit`].
-async fn update_site_replication_state_when_changed<T, F>(update: F) -> S3Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce(&mut SiteReplicationState) -> S3Result<StateCommit<T>> + Send + 'static,
-{
-    with_site_replication_state_lock(move || async move {
-        let store = current_object_store_handle()
-            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
-        let mut state = load_site_replication_state_no_lock(store.clone()).await?;
-        match update(&mut state)? {
-            StateCommit::Changed(result) => {
-                persist_site_replication_state_no_lock(store, state).await?;
-                Ok(result)
-            }
-            StateCommit::Unchanged(result) => Ok(result),
-        }
-    })
-    .await
-}
-
-async fn load_site_replication_repair_state_from_store(store: Arc<ECStore>) -> S3Result<SiteReplicationRepairState> {
-    match read_config_no_lock(store, SITE_REPLICATION_REPAIR_STATE_PATH).await {
-        Ok(data) => serde_json::from_slice(&data).map_err(|e| {
-            S3Error::with_message(S3ErrorCode::InternalError, format!("invalid site replication repair state: {e}"))
-        }),
-        Err(StorageError::ConfigNotFound) => Ok(SiteReplicationRepairState::default()),
-        Err(err) => Err(S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("failed to load site replication repair state: {err}"),
-        )),
-    }
-}
-
-async fn save_site_replication_repair_state_to_store(store: Arc<ECStore>, state: &SiteReplicationRepairState) -> S3Result<()> {
-    let data = serde_json::to_vec(state)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize repair state failed: {e}")))?;
-    save_config_no_lock(store, SITE_REPLICATION_REPAIR_STATE_PATH, data)
-        .await
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("save repair state failed: {e}")))
-}
-
-async fn read_site_replication_repair_state() -> S3Result<SiteReplicationRepairState> {
-    let store =
-        current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
-    let read_store = store.clone();
-    with_config_object_read_lock(store, SITE_REPLICATION_REPAIR_STATE_PATH.to_string(), move || async move {
-        load_site_replication_repair_state_from_store(read_store).await
-    })
-    .await
-    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("lock repair state failed: {e}")))?
-}
-
-async fn update_site_replication_repair_state<T, F>(update: F) -> S3Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce(&mut SiteReplicationRepairState) -> S3Result<T> + Send + 'static,
-{
-    let store =
-        current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
-    let read_store = store.clone();
-    let save_store = store.clone();
-    with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_STATE_PATH.to_string(), move || async move {
-        let mut state = load_site_replication_repair_state_from_store(read_store).await?;
-        let result = update(&mut state)?;
-        save_site_replication_repair_state_to_store(save_store, &state).await?;
-        Ok(result)
-    })
-    .await
-    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("lock repair state failed: {e}")))?
-}
-
-/// Test-only seeding of the state object. Every production write goes through
-/// [`update_site_replication_state`] — this helper is `cfg(test)` so a new
-/// call site cannot reintroduce the pre-P1-15 shape (load through one object
-/// lock, save through another, with the mutation in between unprotected).
-#[cfg(test)]
-async fn save_site_replication_state(state: &SiteReplicationState) -> S3Result<()> {
-    let Some(store) = current_object_store_handle() else {
-        return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-    };
-
-    let mut normalized = state.clone();
-    normalized.peers = normalize_peer_map_by_identity(normalized.peers);
-
-    let data = serde_json::to_vec(&normalized)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize state failed: {e}")))?;
-    save_admin_config(store, SITE_REPLICATION_STATE_PATH, data)
-        .await
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("save state failed: {e}")))?;
-    Ok(())
-}
-
-fn build_site_replication_peer_client(outbound_tls: &GlobalPublishedOutboundTlsState) -> S3Result<reqwest::Client> {
-    build_site_replication_peer_client_with_resolver(outbound_tls, PeerDnsResolver::new(loopback_replication_targets_allowed()))
-}
-
-fn build_site_replication_peer_client_with_resolver(
-    outbound_tls: &GlobalPublishedOutboundTlsState,
-    resolver: PeerDnsResolver,
-) -> S3Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(SITE_REPLICATION_PEER_REQUEST_TIMEOUT)
-        .connect_timeout(SITE_REPLICATION_PEER_CONNECT_TIMEOUT)
-        .pool_idle_timeout(Some(Duration::from_secs(60)))
-        .redirect(reqwest::redirect::Policy::none())
-        .dns_resolver(resolver);
-
-    if let Some(root_ca_pem) = outbound_tls.root_ca_pem.as_ref() {
-        let mut reader = std::io::BufReader::new(root_ca_pem.as_slice());
-        let certs_der = rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    format!("failed to parse published site-replication CA certs: {e}"),
-                )
-            })?;
-
-        for cert_der in certs_der {
-            let cert = reqwest::Certificate::from_der(cert_der.as_ref()).map_err(|e| {
-                S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    format!("failed to load published site-replication CA cert: {e}"),
-                )
-            })?;
-            builder = builder.add_root_certificate(cert);
-        }
-    }
-
-    builder
-        .build()
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("build site replication peer client failed: {e}")))
-}
-
-fn build_custom_site_replication_peer_client(
-    outbound_tls: &GlobalPublishedOutboundTlsState,
-    connection: &PeerConnection,
-) -> S3Result<reqwest::Client> {
-    build_custom_site_replication_peer_client_with_resolver(
-        outbound_tls,
-        connection,
-        PeerDnsResolver::new(loopback_replication_targets_allowed()),
-    )
-}
-
-fn build_custom_site_replication_peer_client_with_resolver(
-    outbound_tls: &GlobalPublishedOutboundTlsState,
-    connection: &PeerConnection,
-    resolver: PeerDnsResolver,
-) -> S3Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(SITE_REPLICATION_PEER_REQUEST_TIMEOUT)
-        .connect_timeout(SITE_REPLICATION_PEER_CONNECT_TIMEOUT)
-        .pool_idle_timeout(Some(Duration::from_secs(60)))
-        .redirect(reqwest::redirect::Policy::none())
-        .dns_resolver(resolver)
-        .danger_accept_invalid_certs(connection.skip_tls_verify);
-
-    if let Some(root_ca_pem) = outbound_tls.root_ca_pem.as_ref() {
-        let mut reader = std::io::BufReader::new(root_ca_pem.as_slice());
-        let certs_der = rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    format!("failed to parse published site-replication CA certs: {e}"),
-                )
-            })?;
-        for cert_der in certs_der {
-            let cert = reqwest::Certificate::from_der(cert_der.as_ref()).map_err(|e| {
-                S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    format!("failed to load published site-replication CA cert: {e}"),
-                )
-            })?;
-            builder = builder.add_root_certificate(cert);
-        }
-    }
-    if !connection.ca_cert_pem.is_empty() {
-        for cert in parse_peer_ca_certificates(&connection.ca_cert_pem)? {
-            builder = builder.add_root_certificate(cert);
-        }
-    }
-
-    builder
-        .build()
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("build site replication peer client failed: {e}")))
-}
-
-async fn site_replication_peer_client() -> S3Result<reqwest::Client> {
-    let generation = current_outbound_tls_generation().0;
-    let cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
-    if let Some(hit) = site_replication_peer_client_cache_hit(&cache, generation) {
-        return hit;
-    }
-    drop(cache);
-
-    let outbound_tls = current_outbound_tls_state().await;
-    let built = build_site_replication_peer_client(&outbound_tls);
-    let cache_entry = match &built {
-        Ok(client) => SiteReplicationPeerClientCacheEntry::Ready(client.clone()),
-        Err(err) => SiteReplicationPeerClientCacheEntry::Failed(err.to_string()),
-    };
-
-    let mut cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
-    if cache.as_ref().is_none_or(|cached| cached.generation <= generation) {
-        *cache = Some(SiteReplicationPeerClientCache {
-            generation,
-            entry: cache_entry,
-        });
-    }
-
-    built
-}
-
-async fn site_replication_client_for(connection: &PeerConnection) -> S3Result<reqwest::Client> {
-    // Revalidate at the client boundary so callers cannot bypass endpoint/TLS policy.
-    let connection = PeerConnection::new(connection.endpoint(), connection.skip_tls_verify, &connection.ca_cert_pem)?;
-    if connection.uses_default_tls() {
-        return site_replication_peer_client().await;
-    }
-    let outbound_tls = current_outbound_tls_state().await;
-    build_custom_site_replication_peer_client(&outbound_tls, &connection)
-}
-
-fn runtime_peer_connection(peer: &PeerInfo) -> S3Result<PeerConnection> {
-    PeerConnection::try_from(peer).map_err(|err| {
-        S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("invalid persisted site replication peer `{}`: {err}", peer.endpoint),
-        )
-    })
-}
-
-struct PeerTransport {
-    connection: PeerConnection,
-    client: reqwest::Client,
-}
-
-impl PeerTransport {
-    async fn for_runtime_peer(peer: &PeerInfo) -> S3Result<Self> {
-        let connection = runtime_peer_connection(peer)?;
-        let client = site_replication_client_for(&connection).await.map_err(|err| {
-            S3Error::with_message(
-                S3ErrorCode::InternalError,
-                format!("initialize persisted site replication peer `{}` transport failed: {err}", peer.endpoint),
-            )
-        })?;
-        Ok(Self { connection, client })
-    }
-}
-
-fn runtime_tls_enabled_with(endpoints: Option<&crate::admin::storage_api::runtime::EndpointServerPools>) -> bool {
-    if !rustfs_utils::get_env_str(ENV_RUSTFS_TLS_PATH, DEFAULT_RUSTFS_TLS_PATH).is_empty() {
-        return true;
-    }
-
-    if let Some(tls_enabled) = endpoints.and_then(|endpoints| {
-        endpoints
-            .as_ref()
-            .iter()
-            .flat_map(|pool| pool.endpoints.as_ref().iter())
-            .find(|endpoint| endpoint.is_local)
-            .map(|endpoint| endpoint.url.scheme().eq_ignore_ascii_case("https"))
-    }) {
-        return tls_enabled;
-    }
-
-    false
-}
-
-fn runtime_tls_enabled() -> bool {
-    let endpoints = current_endpoints_handle();
-    runtime_tls_enabled_with(endpoints.as_ref())
 }
 
 fn query_pairs(uri: &Uri) -> HashMap<String, String> {
@@ -1638,16 +718,6 @@ fn sr_edit_ilm_expiry_override(uri: &Uri) -> Option<bool> {
     }
 }
 
-fn hash_client_secret(secret: Option<&str>) -> String {
-    let Some(secret) = secret.filter(|secret| !secret.is_empty()) else {
-        return String::new();
-    };
-
-    let mut hasher = Sha256::new();
-    hasher.update(secret.as_bytes());
-    URL_SAFE_NO_PAD.encode(hasher.finalize())
-}
-
 fn config_enabled(value: Option<String>) -> bool {
     matches!(value.as_deref(), Some("on" | "true" | "enabled"))
 }
@@ -1701,96 +771,6 @@ fn load_ldap_idp_settings() -> (LDAPSettings, LDAPConfigSettings) {
         .unwrap_or_else(|| (LDAPSettings::default(), LDAPConfigSettings::default()))
 }
 
-fn request_endpoint(uri: &Uri, headers: &HeaderMap) -> String {
-    let scheme = get_source_scheme(headers)
-        .and_then(|value| {
-            value
-                .split(',')
-                .next()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_ascii_lowercase)
-        })
-        .or_else(|| uri.scheme_str().map(str::to_ascii_lowercase))
-        .unwrap_or_else(|| {
-            if runtime_tls_enabled() {
-                "https".to_string()
-            } else {
-                "http".to_string()
-            }
-        });
-
-    let host = headers
-        .get(http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| uri.authority().map(|value| value.as_str().to_string()))
-        .or_else(|| {
-            current_endpoints_handle().and_then(|endpoints| {
-                endpoints
-                    .as_ref()
-                    .iter()
-                    .flat_map(|pool| pool.endpoints.as_ref().iter())
-                    .find(|endpoint| endpoint.is_local)
-                    .map(|endpoint| endpoint.host_port())
-            })
-        })
-        .unwrap_or_else(|| format!("127.0.0.1:{}", current_runtime_port()));
-
-    format!("{scheme}://{host}")
-}
-
-fn runtime_console_port() -> Option<u16> {
-    let console_address = get_config_snapshot()
-        .map(|snapshot| snapshot.console_address.clone())
-        .unwrap_or_else(|| rustfs_utils::get_env_str(ENV_RUSTFS_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ADDRESS));
-
-    let parse_target = if console_address.starts_with(':') {
-        format!("127.0.0.1{console_address}")
-    } else {
-        console_address
-    };
-
-    Url::parse(&format!("http://{parse_target}"))
-        .ok()
-        .and_then(|parsed| parsed.port_or_known_default())
-}
-
-fn site_replication_local_endpoint(uri: &Uri, headers: &HeaderMap) -> String {
-    let endpoint = request_endpoint(uri, headers);
-    match Url::parse(&endpoint) {
-        Ok(mut parsed) => {
-            if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-                return request_endpoint(&Uri::from_static("/"), &HeaderMap::new());
-            }
-            if parsed.port_or_known_default() == runtime_console_port() && parsed.set_port(Some(current_runtime_port())).is_ok() {
-                parsed.to_string().trim_end_matches('/').to_string()
-            } else {
-                endpoint
-            }
-        }
-        Err(_) => request_endpoint(&Uri::from_static("/"), &HeaderMap::new()),
-    }
-}
-
-fn current_local_runtime_endpoint() -> String {
-    site_replication_local_endpoint(&Uri::from_static("/"), &HeaderMap::new())
-}
-
-fn infer_site_name(endpoint: &str) -> String {
-    endpoint
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split('/')
-        .next()
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .to_string()
-}
-
 fn qstat(count: i64, bytes: i64) -> QStat {
     QStat {
         count: count as f64,
@@ -1802,52 +782,8 @@ fn non_negative_u64(value: i64) -> u64 {
     value.max(0) as u64
 }
 
-fn stored_peer_tls_settings(stored_peer: Option<&PeerInfo>) -> (bool, String) {
-    stored_peer
-        .map(|peer| (peer.skip_tls_verify, peer.ca_cert_pem.clone()))
-        .unwrap_or_default()
-}
-
 fn current_local_peer(req: &S3Request<Body>, state: &SiteReplicationState) -> PeerInfo {
     local_peer_at_endpoint(site_replication_local_endpoint(&req.uri, &req.headers), state)
-}
-
-/// The local peer record as the given state describes it. Split out of
-/// [`current_local_peer`] so a state transaction can rebuild it against the
-/// state it just loaded: the request the endpoint came from cannot cross into
-/// the transaction closure, but the endpoint itself can.
-fn local_peer_at_endpoint(endpoint: String, state: &SiteReplicationState) -> PeerInfo {
-    let deployment_id = current_deployment_id().unwrap_or_else(|| deployment_id_for_endpoint(&endpoint));
-    let stored_peer = state.peers.get(&deployment_id);
-    let (skip_tls_verify, ca_cert_pem) = stored_peer_tls_settings(stored_peer);
-
-    PeerInfo {
-        endpoint: endpoint.clone(),
-        name: if state.name.is_empty() {
-            stored_peer
-                .map(|peer| peer.name.clone())
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| infer_site_name(&endpoint))
-        } else {
-            state.name.clone()
-        },
-        deployment_id,
-        sync_state: stored_peer.map(|peer| peer.sync_state.clone()).unwrap_or(SyncStatus::Unknown),
-        default_bandwidth: stored_peer.map(|peer| peer.default_bandwidth.clone()).unwrap_or_default(),
-        replicate_ilm_expiry: stored_peer.is_some_and(|peer| peer.replicate_ilm_expiry),
-        object_naming_mode: stored_peer.map(|peer| peer.object_naming_mode.clone()).unwrap_or_default(),
-        skip_tls_verify,
-        ca_cert_pem,
-        api_version: Some(SITE_REPL_API_VERSION.to_string()),
-    }
-}
-
-fn current_local_runtime_peer(state: &SiteReplicationState) -> PeerInfo {
-    local_peer_at_endpoint(current_local_runtime_endpoint(), state)
-}
-
-fn normalize_peer_map_by_identity(peers: BTreeMap<String, PeerInfo>) -> BTreeMap<String, PeerInfo> {
-    normalize_peer_map_by_identity_with(peers, normalize_peer_info)
 }
 
 fn existing_peer_for_endpoint(state: &SiteReplicationState, endpoint: &str) -> Option<PeerInfo> {
@@ -1886,19 +822,6 @@ fn peer_deployment_id_for_endpoint(state: &SiteReplicationState, endpoint: &str)
         .filter(|deployment_id| !deployment_id.is_empty())
 }
 
-fn normalize_peer_info(mut peer: PeerInfo) -> PeerInfo {
-    if peer.deployment_id.is_empty() {
-        peer.deployment_id = deployment_id_for_endpoint(&peer.endpoint);
-    }
-    if peer.name.is_empty() {
-        peer.name = infer_site_name(&peer.endpoint);
-    }
-    if peer.api_version.is_none() {
-        peer.api_version = Some(SITE_REPL_API_VERSION.to_string());
-    }
-    peer
-}
-
 fn normalize_peer_site(site: PeerSite, replicate_ilm_expiry: bool) -> PeerInfo {
     normalize_peer_info(PeerInfo {
         endpoint: site.endpoint,
@@ -1911,155 +834,6 @@ fn normalize_peer_site(site: PeerSite, replicate_ilm_expiry: bool) -> PeerInfo {
         skip_tls_verify: site.skip_tls_verify,
         ca_cert_pem: site.ca_cert_pem,
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
-    })
-}
-
-fn loopback_replication_targets_allowed() -> bool {
-    std::env::var(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV)
-        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
-        .unwrap_or(false)
-}
-
-fn validate_peer_egress(url: &Url, allow_loopback: bool) -> Result<(), OutboundUrlError> {
-    match validate_outbound_url(url) {
-        Ok(()) => Ok(()),
-        Err(OutboundUrlError::ForbiddenHost {
-            reason: "private address",
-            ..
-        }) => Ok(()),
-        Err(OutboundUrlError::ForbiddenHost {
-            reason: "loopback address" | "loopback host",
-            ..
-        }) if allow_loopback && peer_url_has_canonical_loopback_host(url) => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
-fn peer_url_has_canonical_loopback_host(url: &Url) -> bool {
-    match url.host() {
-        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip == std::net::Ipv4Addr::LOCALHOST,
-        Some(url::Host::Ipv6(ip)) => ip == std::net::Ipv6Addr::LOCALHOST,
-        None => false,
-    }
-}
-
-fn resolved_peer_ip_allowed(host: &str, ip: IpAddr, allow_loopback: bool) -> bool {
-    let Ok(ip_url) = (match ip {
-        IpAddr::V4(ip) => Url::parse(&format!("http://{ip}")),
-        IpAddr::V6(ip) => Url::parse(&format!("http://[{ip}]")),
-    }) else {
-        return false;
-    };
-    match validate_outbound_url(&ip_url) {
-        Ok(()) => true,
-        Err(OutboundUrlError::ForbiddenHost {
-            reason: "private address",
-            ..
-        }) => true,
-        Err(OutboundUrlError::ForbiddenHost {
-            reason: "loopback address",
-            ..
-        }) => {
-            allow_loopback
-                && host.eq_ignore_ascii_case("localhost")
-                && matches!(ip, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) | IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
-        }
-        Err(_) => false,
-    }
-}
-
-fn parse_peer_ca_certificates(ca_cert_pem: &str) -> S3Result<Vec<reqwest::Certificate>> {
-    if ca_cert_pem.len() > MAX_PEER_CA_CERT_PEM_SIZE {
-        return Err(s3_error!(InvalidRequest, "site replication CA certificate exceeds 256 KiB"));
-    }
-    if ca_cert_pem.contains("PRIVATE KEY-----") {
-        return Err(s3_error!(
-            InvalidRequest,
-            "site replication CA certificate must not contain a private key"
-        ));
-    }
-
-    let mut reader = std::io::BufReader::new(ca_cert_pem.as_bytes());
-    let certs_der = rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid site replication CA certificate: {e}"))
-        })?;
-    if certs_der.is_empty() {
-        return Err(s3_error!(
-            InvalidRequest,
-            "site replication CA certificate must contain at least one certificate"
-        ));
-    }
-
-    let mut root_store = rustls::RootCertStore::empty();
-    certs_der
-        .into_iter()
-        .map(|cert| {
-            root_store.add(cert.clone()).map_err(|e| {
-                S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid site replication CA certificate: {e}"))
-            })?;
-            reqwest::Certificate::from_der(cert.as_ref()).map_err(|e| {
-                S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid site replication CA certificate: {e}"))
-            })
-        })
-        .collect()
-}
-
-fn validate_peer_connection_inner(
-    endpoint: &str,
-    skip_tls_verify: bool,
-    ca_cert_pem: &str,
-    allow_loopback: bool,
-) -> S3Result<PeerConnection> {
-    let parsed = Url::parse(endpoint)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid site endpoint `{endpoint}`: {e}")))?;
-    match parsed.scheme() {
-        "http" | "https" => {}
-        scheme => {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InvalidRequest,
-                format!("invalid site endpoint `{endpoint}`: unsupported scheme `{scheme}`"),
-            ));
-        }
-    }
-    if parsed.host_str().is_none() {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("invalid site endpoint `{endpoint}`: missing host"),
-        ));
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(s3_error!(InvalidRequest, "invalid site endpoint `{endpoint}`: userinfo is not allowed"));
-    }
-    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
-        return Err(s3_error!(
-            InvalidRequest,
-            "invalid site endpoint `{endpoint}`: endpoint must be an origin"
-        ));
-    }
-    validate_peer_egress(&parsed, allow_loopback)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid site endpoint `{endpoint}`: {e}")))?;
-
-    if ca_cert_pem.len() > MAX_PEER_CA_CERT_PEM_SIZE {
-        return Err(s3_error!(InvalidRequest, "site replication CA certificate exceeds 256 KiB"));
-    }
-    let ca_cert_pem = ca_cert_pem.trim();
-    if parsed.scheme() != "https" && (skip_tls_verify || !ca_cert_pem.is_empty()) {
-        return Err(s3_error!(InvalidRequest, "site replication TLS settings require an HTTPS endpoint"));
-    }
-    if skip_tls_verify && !ca_cert_pem.is_empty() {
-        return Err(s3_error!(InvalidRequest, "skipTLSVerify and caCertPem are mutually exclusive"));
-    }
-    if !ca_cert_pem.is_empty() {
-        parse_peer_ca_certificates(ca_cert_pem)?;
-    }
-
-    Ok(PeerConnection {
-        endpoint: parsed,
-        skip_tls_verify,
-        ca_cert_pem: ca_cert_pem.to_string(),
     })
 }
 
@@ -2181,19 +955,65 @@ fn idp_settings_value(settings: &IDPSettings) -> S3Result<serde_json::Value> {
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize IDP settings failed: {e}")))
 }
 
+/// The merge-critical facts of one bucket a site reported in its add
+/// preflight metainfo. The configs arrive as the `build_sr_info` wire form
+/// (base64-encoded XML); an undecodable config fails the preflight instead of
+/// defaulting, so corruption cannot admit an unsafe merge.
+fn add_preflight_bucket_compat(endpoint: &str, bucket: &str, info: &SRBucketInfo) -> S3Result<AddPreflightBucketCompat> {
+    let versioning_enabled = info
+        .versioning
+        .as_deref()
+        .map(|raw| {
+            deserialize::<VersioningConfiguration>(&decode_bucket_meta_wire_value(raw))
+                .map(|config| config.enabled())
+                .map_err(|e| {
+                    s3_error!(
+                        InvalidRequest,
+                        "site `{endpoint}` reported an unreadable versioning config for bucket `{bucket}`: {e}"
+                    )
+                })
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let object_lock_enabled = info
+        .object_lock_config
+        .as_deref()
+        .map(|raw| {
+            deserialize::<ObjectLockConfiguration>(&decode_bucket_meta_wire_value(raw))
+                .map(|config| config.enabled())
+                .map_err(|e| {
+                    s3_error!(
+                        InvalidRequest,
+                        "site `{endpoint}` reported an unreadable object-lock config for bucket `{bucket}`: {e}"
+                    )
+                })
+        })
+        .transpose()?
+        .unwrap_or(false);
+    Ok(AddPreflightBucketCompat {
+        versioning_enabled,
+        object_lock_enabled,
+    })
+}
+
 fn add_preflight_info_from_sr_info(
     site: &PeerSite,
     info: SRInfo,
     idp_settings: IDPSettings,
 ) -> S3Result<SiteReplicationAddPreflightInfo> {
-    let bucket_names = info.buckets.keys().cloned().collect();
+    let buckets = info
+        .buckets
+        .iter()
+        .map(|(bucket, bucket_info)| {
+            add_preflight_bucket_compat(&site.endpoint, bucket, bucket_info).map(|compat| (bucket.clone(), compat))
+        })
+        .collect::<S3Result<BTreeMap<_, _>>>()?;
     Ok(SiteReplicationAddPreflightInfo {
         name: if info.name.is_empty() { site.name.clone() } else { info.name },
         endpoint: site.endpoint.clone(),
         deployment_id: info.deployment_id,
         enabled: info.enabled,
-        bucket_count: info.buckets.len(),
-        bucket_names,
+        buckets,
         peer_deployment_ids: info.state.peers.keys().cloned().collect(),
         idp_settings: idp_settings_value(&idp_settings)?,
     })
@@ -2210,14 +1030,10 @@ async fn local_add_preflight_info(
 async fn remote_add_preflight_info(site: &PeerSite) -> S3Result<SiteReplicationAddPreflightInfo> {
     let connection = PeerConnection::try_from(site)?;
     let client = site_replication_client_for(&connection).await?;
-    let info_body = send_peer_admin_get_request_with_client(
-        &client,
-        &connection,
-        "/rustfs/admin/v3/site-replication/metainfo",
-        &site.access_key,
-        &site.secret_key,
-    )
-    .await?;
+    let info_body = PeerAdminRequest::get(&connection, "/rustfs/admin/v3/site-replication/metainfo", &site.access_key)
+        .with_client(&client)
+        .send_get(&site.secret_key)
+        .await?;
     let info: SRInfo = serde_json::from_slice(&info_body).map_err(|e| {
         S3Error::with_message(
             S3ErrorCode::InvalidRequest,
@@ -2237,14 +1053,10 @@ async fn remote_add_preflight_info(site: &PeerSite) -> S3Result<SiteReplicationA
         );
     }
 
-    let idp_body = send_peer_admin_get_request_with_client(
-        &client,
-        &connection,
-        "/rustfs/admin/v3/site-replication/peer/idp-settings",
-        &site.access_key,
-        &site.secret_key,
-    )
-    .await?;
+    let idp_body = PeerAdminRequest::get(&connection, "/rustfs/admin/v3/site-replication/peer/idp-settings", &site.access_key)
+        .with_client(&client)
+        .send_get(&site.secret_key)
+        .await?;
     let idp_settings: IDPSettings = serde_json::from_slice(&idp_body).map_err(|e| {
         S3Error::with_message(
             S3ErrorCode::InvalidRequest,
@@ -2276,6 +1088,62 @@ async fn add_preflight_infos(
     .collect()
 }
 
+/// The first field at which a peer's reported IDP settings diverge from the
+/// local ones, named so an operator can act on the rejection instead of
+/// re-deriving the comparison (rustfs#7003). Values are reported except for
+/// credential-derived leaves, which are named but never echoed.
+fn idp_settings_difference(local: &serde_json::Value, peer: &serde_json::Value) -> Option<String> {
+    // Only scalars are echoed: a nested object may carry credential-derived
+    // leaves whose own field name never reaches `path`.
+    fn scalar(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(text) => Some(text.clone()),
+            serde_json::Value::Object(_) | serde_json::Value::Array(_) => None,
+            other => Some(other.to_string()),
+        }
+    }
+
+    fn presence(value: &serde_json::Value) -> &'static str {
+        if value.is_null() { "absent" } else { "set" }
+    }
+
+    fn walk(path: &str, local: &serde_json::Value, peer: &serde_json::Value) -> Option<String> {
+        if local == peer {
+            return None;
+        }
+
+        if let (serde_json::Value::Object(local_fields), serde_json::Value::Object(peer_fields)) = (local, peer) {
+            let keys: BTreeSet<&String> = local_fields.keys().chain(peer_fields.keys()).collect();
+            for key in keys {
+                let child_path = if path.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{path}.{key}")
+                };
+                let difference = walk(
+                    &child_path,
+                    local_fields.get(key).unwrap_or(&serde_json::Value::Null),
+                    peer_fields.get(key).unwrap_or(&serde_json::Value::Null),
+                );
+                if difference.is_some() {
+                    return difference;
+                }
+            }
+        }
+
+        let field = if path.is_empty() { "<root>" } else { path };
+        if field.to_ascii_lowercase().contains("secret") {
+            return Some(format!("`{field}` differs (values redacted)"));
+        }
+        match (scalar(local), scalar(peer)) {
+            (Some(local), Some(peer)) => Some(format!("`{field}` differs (local `{local}`, peer `{peer}`)")),
+            _ => Some(format!("`{field}` differs (local {}, peer {})", presence(local), presence(peer))),
+        }
+    }
+
+    walk("", local, peer)
+}
+
 fn validate_add_preflight_topology(infos: &[SiteReplicationAddPreflightInfo], local_peer: &PeerInfo) -> S3Result<()> {
     let mut deployment_ids = HashSet::new();
     let mut local_seen = false;
@@ -2299,7 +1167,7 @@ fn validate_add_preflight_topology(infos: &[SiteReplicationAddPreflightInfo], lo
         if info.deployment_id == local_peer.deployment_id {
             local_seen = true;
         }
-        if info.bucket_count > 0 {
+        if !info.buckets.is_empty() {
             non_empty_sites.push(info.name.clone());
         }
     }
@@ -2318,17 +1186,25 @@ fn validate_add_preflight_topology(infos: &[SiteReplicationAddPreflightInfo], lo
         ));
     };
     for info in infos {
-        if &info.idp_settings != local_idp {
-            return Err(s3_error!(InvalidRequest, "IDP settings mismatch for site `{}`", info.endpoint));
+        if let Some(difference) = idp_settings_difference(local_idp, &info.idp_settings) {
+            return Err(s3_error!(
+                InvalidRequest,
+                "IDP settings mismatch for site `{}`: {difference}",
+                info.endpoint
+            ));
         }
     }
 
     if non_empty_sites.len() > 1 {
-        return Err(s3_error!(
-            InvalidRequest,
-            "site replication can be initialized with data on only one site; non-empty sites: {}",
-            non_empty_sites.join(", ")
-        ));
+        validate_nonempty_add_bucket_compatibility(infos)?;
+        info!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "nonempty_sites_admitted",
+            non_empty_sites = %non_empty_sites.join(", "),
+            "admin site replication state"
+        );
     }
 
     let requested: BTreeSet<String> = infos.iter().map(|info| info.deployment_id.clone()).collect();
@@ -2345,303 +1221,78 @@ fn validate_add_preflight_topology(infos: &[SiteReplicationAddPreflightInfo], lo
     Ok(())
 }
 
-fn bootstrap_bucket_op_path(bucket: &str, operation: &str) -> String {
-    format!(
-        "/rustfs/admin/v3/site-replication/peer/bucket-ops?{}",
-        form_urlencoded::Serializer::new(String::new())
-            .append_pair("bucket", bucket)
-            .append_pair("operation", operation)
-            .finish()
-    )
-}
+/// Operator recovery guidance for a rejected add between sites that both hold
+/// data — the only supported path is to empty one side and let a resync copy
+/// the objects back (rustfs/backlog#2070).
+const NONEMPTY_ADD_RECOVERY_HINT: &str = "to pair these sites, delete the conflicting bucket (or its data) on all but one \
+     site, re-run `replicate add`, then run `replicate resync` from the surviving site to restore the objects";
 
-fn with_site_replication_bootstrap_token(path: &str, token: &str) -> String {
-    let separator = if path.contains('?') { '&' } else { '?' };
-    let query = form_urlencoded::Serializer::new(String::new())
-        .append_pair("bootstrapToken", token)
-        .finish();
-    format!("{path}{separator}{query}")
+/// Admission check for an add in which more than one requested site holds
+/// data — the DR re-pair case: two sites that were unpaired (or never
+/// finished a removal) both keep their buckets, and the historical
+/// unconditional "only one site may hold data" rejection made `replicate
+/// remove` a one-way door (rustfs/backlog#2070).
+///
+/// The add is admitted when every bucket name held by MORE than one requested
+/// site is provably safe to merge through the existing backfill/resync
+/// convergence:
+///
+/// - versioning must be Enabled on every holder: replication into a versioned
+///   bucket lands as another version, so a same-key object from the peer
+///   never destroys the local copy — while on an unversioned holder it would
+///   silently replace the only copy;
+/// - object-lock enablement must match across holders: lock cannot be toggled
+///   after bucket creation, so a mismatch never converges, and replicating
+///   locked objects into a lock-less bucket would strip their WORM guarantee.
+///
+/// A bucket held by a single site carries no merge risk — the post-add
+/// backfill creates it on the peers exactly as the historical
+/// one-non-empty-site path always has.
+fn validate_nonempty_add_bucket_compatibility(infos: &[SiteReplicationAddPreflightInfo]) -> S3Result<()> {
+    let mut holders: BTreeMap<&str, Vec<(&SiteReplicationAddPreflightInfo, AddPreflightBucketCompat)>> = BTreeMap::new();
+    for info in infos {
+        for (bucket, compat) in &info.buckets {
+            holders.entry(bucket.as_str()).or_default().push((info, *compat));
+        }
+    }
+
+    for (bucket, holders) in holders {
+        let [(first, first_compat), rest @ ..] = holders.as_slice() else {
+            continue;
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        if let Some((conflicting, _)) = rest
+            .iter()
+            .find(|(_, compat)| compat.object_lock_enabled != first_compat.object_lock_enabled)
+        {
+            let (enabled_on, disabled_on) = if first_compat.object_lock_enabled {
+                (&first.name, &conflicting.name)
+            } else {
+                (&conflicting.name, &first.name)
+            };
+            return Err(s3_error!(
+                InvalidRequest,
+                "bucket `{bucket}` has object lock enabled on site `{enabled_on}` but not on site `{disabled_on}`, and \
+                 object lock cannot be changed after bucket creation; {NONEMPTY_ADD_RECOVERY_HINT}"
+            ));
+        }
+        if let Some((unversioned, _)) = holders.iter().find(|(_, compat)| !compat.versioning_enabled) {
+            return Err(s3_error!(
+                InvalidRequest,
+                "bucket `{bucket}` exists on more than one site but does not have versioning enabled on site `{}`, so \
+                 merging could silently overwrite objects; enable versioning on every site holding it, or {NONEMPTY_ADD_RECOVERY_HINT}",
+                unversioned.name
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn site_replication_bootstrap_token(uri: &Uri) -> Option<String> {
     query_pairs(uri).get("bootstrapToken").cloned()
-}
-
-/// Query for a peer `make-with-versioning` bucket op. `versioningEnabled`
-/// always travels so the outbound query matches MinIO's site-replication
-/// make-bucket wire contract: MinIO's own create-bucket hook sends
-/// `versioningEnabled=true` on this op. RustFS's inbound handler
-/// force-enables versioning either way.
-fn make_with_versioning_bucket_op_path(bucket: &str, created_at: Option<&str>, lock_enabled: bool) -> String {
-    let mut query = form_urlencoded::Serializer::new(String::new());
-    query.append_pair("bucket", bucket);
-    query.append_pair("operation", SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING);
-    query.append_pair("versioningEnabled", "true");
-    if let Some(created_at) = created_at {
-        query.append_pair("createdAt", created_at);
-    }
-    if lock_enabled {
-        query.append_pair("lockEnabled", "true");
-    }
-    format!("{SITE_REPLICATION_PEER_BUCKET_OPS_PATH}?{}", query.finish())
-}
-
-fn bootstrap_bucket_make_op_path(bucket: &SRBucketInfo) -> String {
-    let created_at = bucket
-        .created_at
-        .and_then(|value| value.format(&time::format_description::well_known::Rfc3339).ok());
-    make_with_versioning_bucket_op_path(&bucket.bucket, created_at.as_deref(), bucket.object_lock_config.is_some())
-}
-
-fn bootstrap_bucket_meta_item(bucket: &SRBucketInfo, item_type: &str, updated_at: Option<OffsetDateTime>) -> SRBucketMeta {
-    SRBucketMeta {
-        bucket: bucket.bucket.clone(),
-        r#type: item_type.to_string(),
-        updated_at,
-        api_version: Some(SITE_REPL_API_VERSION.to_string()),
-        derived_rule_contract: true,
-        ..Default::default()
-    }
-}
-
-fn bootstrap_bucket_quota_value(bucket: &str, raw: &str) -> S3Result<Value> {
-    serde_json::from_slice(&decode_bucket_meta_wire_value(raw))
-        .map_err(|e| s3_error!(InvalidRequest, "invalid quota metadata for bootstrap bucket `{bucket}`: {e}"))
-}
-
-fn append_bootstrap_bucket_item(
-    items: &mut Vec<SRBucketMeta>,
-    bucket: &SRBucketInfo,
-    item_type: &str,
-    value: Option<String>,
-    updated_at: Option<OffsetDateTime>,
-    apply: impl FnOnce(&mut SRBucketMeta, String) -> S3Result<()>,
-) -> S3Result<()> {
-    if let Some(value) = value {
-        let mut item = bootstrap_bucket_meta_item(bucket, item_type, updated_at);
-        apply(&mut item, value)?;
-        items.push(item);
-    }
-    Ok(())
-}
-
-fn append_bootstrap_bucket_items(
-    plan: &mut SiteReplicationBootstrapPlan,
-    bucket: &SRBucketInfo,
-    replicate_ilm_expiry: bool,
-) -> S3Result<()> {
-    append_bootstrap_bucket_item(
-        &mut plan.bucket_items,
-        bucket,
-        "policy",
-        bucket.policy.clone().map(|value| value.to_string()),
-        bucket.policy_updated_at,
-        |item, value| {
-            item.policy =
-                Some(serde_json::from_str(&value).map_err(|e| {
-                    s3_error!(InvalidRequest, "invalid bucket policy for bootstrap bucket `{}`: {e}", item.bucket)
-                })?);
-            Ok(())
-        },
-    )?;
-    append_bootstrap_bucket_item(
-        &mut plan.bucket_items,
-        bucket,
-        "version-config",
-        bucket.versioning.clone(),
-        bucket.versioning_config_updated_at,
-        |item, value| {
-            item.versioning = Some(value);
-            Ok(())
-        },
-    )?;
-    append_bootstrap_bucket_item(
-        &mut plan.bucket_items,
-        bucket,
-        "tags",
-        bucket.tags.clone(),
-        bucket.tag_config_updated_at,
-        |item, value| {
-            item.tags = Some(value);
-            Ok(())
-        },
-    )?;
-    append_bootstrap_bucket_item(
-        &mut plan.bucket_items,
-        bucket,
-        "object-lock-config",
-        bucket.object_lock_config.clone(),
-        bucket.object_lock_config_updated_at,
-        |item, value| {
-            item.object_lock_config = Some(value);
-            Ok(())
-        },
-    )?;
-    append_bootstrap_bucket_item(
-        &mut plan.bucket_items,
-        bucket,
-        "sse-config",
-        bucket.sse_config.clone(),
-        bucket.sse_config_updated_at,
-        |item, value| {
-            item.sse_config = Some(value);
-            Ok(())
-        },
-    )?;
-    append_bootstrap_bucket_item(
-        &mut plan.bucket_items,
-        bucket,
-        "replication-config",
-        bucket.replication_config.clone(),
-        bucket.replication_config_updated_at,
-        |item, value| {
-            item.replication_config = Some(value);
-            Ok(())
-        },
-    )?;
-    append_bootstrap_bucket_item(
-        &mut plan.bucket_items,
-        bucket,
-        "quota-config",
-        bucket.quota_config.clone(),
-        bucket.quota_config_updated_at,
-        |item, value| {
-            item.quota = Some(bootstrap_bucket_quota_value(&item.bucket, &value)?);
-            Ok(())
-        },
-    )?;
-    if replicate_ilm_expiry {
-        if bucket.expiry_lc_config.is_some() {
-            append_bootstrap_bucket_item(
-                &mut plan.bucket_items,
-                bucket,
-                "lc-config",
-                bucket.expiry_lc_config.clone(),
-                bucket.expiry_lc_config_updated_at,
-                |item, value| {
-                    item.expiry_lc_config = Some(value);
-                    // `updated_at` here is the entry's expiry axis (see the
-                    // SRBucketInfo construction), not the wall clock.
-                    item.expiry_updated_at = item.updated_at;
-                    Ok(())
-                },
-            )?;
-        } else if bucket.expiry_lc_config_updated_at.is_some() {
-            // Expiry rules were removed at this axis (lifecycle_expiry_statement):
-            // an explicit timestamped delete item, so a peer that missed the
-            // live delete converges on bootstrap/repair instead of keeping
-            // stale expiry rules. The receiver's staleness guard protects a
-            // peer whose expiry state is newer.
-            let mut item = bootstrap_bucket_meta_item(bucket, "lc-config", bucket.expiry_lc_config_updated_at);
-            item.expiry_updated_at = item.updated_at;
-            plan.bucket_items.push(item);
-        }
-    }
-    append_bootstrap_bucket_item(
-        &mut plan.bucket_items,
-        bucket,
-        "cors-config",
-        bucket.cors_config.clone(),
-        bucket.cors_config_updated_at,
-        |item, value| {
-            item.cors = Some(value);
-            Ok(())
-        },
-    )
-}
-
-fn group_status_from_desc(status: &str) -> GroupStatus {
-    if status.eq_ignore_ascii_case("disabled") {
-        GroupStatus::Disabled
-    } else {
-        GroupStatus::Enabled
-    }
-}
-
-fn site_replication_info_replicates_ilm_expiry(info: &SRInfo) -> bool {
-    info.state.peers.values().any(|peer| peer.replicate_ilm_expiry)
-}
-
-fn site_replication_state_replicates_ilm_expiry(state: &SiteReplicationState) -> bool {
-    state.peers.values().any(|peer| peer.replicate_ilm_expiry)
-}
-
-fn site_replication_bootstrap_plan(info: &SRInfo) -> S3Result<SiteReplicationBootstrapPlan> {
-    let mut plan = SiteReplicationBootstrapPlan::default();
-    let replicate_ilm_expiry = site_replication_info_replicates_ilm_expiry(info);
-
-    for (name, policy) in &info.policies {
-        plan.iam_items.push(SRIAMItem {
-            r#type: "policy".to_string(),
-            name: name.clone(),
-            policy: policy.policy.clone(),
-            updated_at: policy.updated_at,
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        });
-    }
-
-    for (access_key, user) in &info.user_info_map {
-        if let Some(secret_key) = &user.secret_key {
-            plan.iam_items.push(SRIAMItem {
-                r#type: "iam-user".to_string(),
-                iam_user: Some(rustfs_madmin::SRIAMUser {
-                    access_key: access_key.clone(),
-                    is_delete_req: false,
-                    user_req: Some(AddOrUpdateUserReq {
-                        secret_key: secret_key.clone(),
-                        policy: user.policy_name.clone(),
-                        status: user.status.clone(),
-                    }),
-                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                }),
-                updated_at: user.updated_at,
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                ..Default::default()
-            });
-        }
-    }
-
-    for (name, desc) in &info.group_desc_map {
-        plan.iam_items.push(SRIAMItem {
-            r#type: "group-info".to_string(),
-            group_info: Some(SRGroupInfo {
-                update_req: GroupAddRemove {
-                    group: if desc.name.is_empty() {
-                        name.clone()
-                    } else {
-                        desc.name.clone()
-                    },
-                    members: desc.members.clone(),
-                    status: group_status_from_desc(&desc.status),
-                    is_remove: false,
-                },
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            }),
-            updated_at: desc.updated_at,
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        });
-    }
-
-    for mapping in info.user_policies.values().chain(info.group_policies.values()) {
-        plan.iam_items.push(SRIAMItem {
-            r#type: "policy-mapping".to_string(),
-            policy_mapping: Some(mapping.clone()),
-            updated_at: mapping.updated_at,
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        });
-    }
-
-    for bucket in info.buckets.values() {
-        plan.bucket_make_ops.push(bootstrap_bucket_make_op_path(bucket));
-        append_bootstrap_bucket_items(&mut plan, bucket, replicate_ilm_expiry)?;
-        plan.bucket_configure_ops
-            .push(bootstrap_bucket_op_path(&bucket.bucket, "configure-replication"));
-    }
-
-    Ok(plan)
 }
 
 fn build_join_peers(
@@ -2795,23 +1446,6 @@ fn reconcile_peer_with_actual_identity(mut state: SiteReplicationState, actual_p
     state
 }
 
-async fn site_replicator_service_account_secret(access_key: &str) -> S3Result<String> {
-    let Some(iam_sys) = current_iam_handle() else {
-        return Err(s3_error!(InvalidRequest, "iam not init"));
-    };
-
-    iam_sys
-        .get_site_replicator_service_account_secret(access_key)
-        .await
-        .map_err(ApiError::from)
-        .map_err(Into::into)
-}
-
-fn legacy_site_replicator_state_secret(state: &SiteReplicationState) -> Option<String> {
-    (state.service_account_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT && !state.service_account_secret_key.is_empty())
-        .then(|| state.service_account_secret_key.clone())
-}
-
 async fn set_site_replicator_service_account_secret(parent_user: &str, secret_key: String) -> S3Result<String> {
     let Some(iam_sys) = current_iam_handle() else {
         return Err(s3_error!(InvalidRequest, "iam not init"));
@@ -2850,6 +1484,7 @@ async fn set_site_replicator_service_account_secret(parent_user: &str, secret_ke
                     expiration: None,
                     allow_site_replicator_account: true,
                     claims: None,
+                    status: None,
                 },
             )
             .await
@@ -3092,6 +1727,7 @@ async fn reconcile_site_replicator_service_account() -> S3Result<()> {
                         expiration: None,
                         allow_site_replicator_account: true,
                         claims: None,
+                        status: None,
                     },
                 )
                 .await
@@ -3176,34 +1812,87 @@ async fn reconcile_site_replication_buckets() -> S3Result<()> {
 /// (`SiteReplicationEditHandler`), so a tick landing between them would rewrite the targets
 /// from the stale endpoint. The pending marker in the persisted state closes that window.
 /// Skipping costs nothing — the timer comes back.
+async fn site_replication_reconcile_prerequisites_ready() -> bool {
+    if current_iam_handle().is_none() || current_object_store_handle().is_none() {
+        return false;
+    }
+    if let Err(err) = migrate_collapsed_retry_queue_paths().await {
+        warn!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "retry_queue_migration_failed",
+            error = ?err,
+            "admin site replication state"
+        );
+        return false;
+    }
+    true
+}
+
+fn reconcile_site_replication_retry_drain() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async {
+        let Some(lifecycle) = SiteReplicationLifecycleGuard::try_acquire() else {
+            return;
+        };
+        if !site_replication_reconcile_prerequisites_ready().await {
+            return;
+        }
+        match load_site_replication_state().await {
+            Ok(state) => {
+                if state.pending_endpoint_refresh.is_some() || state.pending_rotation.is_some() || state.pending_remove.is_some()
+                {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+        // Admission above observes a lifecycle-stable state. The lightweight
+        // drain itself handles only idempotent bucket setup, reloads state
+        // under the distributed repair lock, and shares that lock with bucket
+        // deletion. Do not hold this process-local guard across peer I/O: an
+        // outage recovery must not make admin add/edit/remove time out.
+        drop(lifecycle);
+        drain_site_replication_retry_queue_lightweight().await;
+    })
+}
+
 fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     Box::pin(async {
         // The scheduler starts before IAM and the object store are guaranteed ready (IAM
         // bootstrap may still be recovering), so an early tick returns quietly instead of
         // logging a failure for every reconciler.
-        if current_iam_handle().is_none() || current_object_store_handle().is_none() {
-            return;
-        }
-
-        let Some(_lifecycle) = SiteReplicationLifecycleGuard::try_acquire() else {
+        let Some(lifecycle) = SiteReplicationLifecycleGuard::try_acquire() else {
             return;
         };
 
-        if let Err(err) = migrate_collapsed_retry_queue_paths().await {
-            warn!(
-                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                result = "retry_queue_migration_failed",
-                error = ?err,
-                "admin site replication state"
-            );
+        if !site_replication_reconcile_prerequisites_ready().await {
             return;
         }
 
         match load_site_replication_state().await {
             Ok(state) => {
-                if state.pending_endpoint_refresh.is_some() || state.pending_rotation.is_some() {
+                if let Some(pending_endpoint_refresh) = state.pending_endpoint_refresh.clone() {
+                    resume_pending_endpoint_refresh(&state, &pending_endpoint_refresh).await;
+                    // The bucket reconciler below rewrites targets from the
+                    // topology, which is exactly what this refresh is in the
+                    // middle of changing, so it still waits for the next pass.
+                    // The retry queue does not: it replays per-peer deliveries
+                    // against the endpoints currently committed in state, and a
+                    // refresh that cannot finish - a peer that never comes back
+                    // - must not also stall replay to the healthy peers.
+                    drop(lifecycle);
+                    drain_site_replication_retry_queue().await;
+                    return;
+                }
+                // A wedged rotation is worse than a wedged removal: the local
+                // secret is already switched, so until the join lands every
+                // outbound peer push signs with a secret the peers reject and
+                // every inbound peer request carries a secret this site
+                // rejects — both replication directions are dead. Nothing
+                // else re-drives it; push it forward like the removal below.
+                if let Some(pending_rotation) = state.pending_rotation.clone() {
+                    resume_pending_rotation(&state, &pending_rotation).await;
                     return;
                 }
                 // A removal whose peers were unreachable is the one pending
@@ -3241,394 +1930,11 @@ fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Fut
                 "admin site replication state"
             );
         }
-        // Failed peer deliveries recorded in the retry queue; runs behind the
-        // same lifecycle guard and pending_* gates as the reconcilers above.
+        // The retry path re-checks membership from distributed state before
+        // each request; release lifecycle before a potentially large replay.
+        drop(lifecycle);
         drain_site_replication_retry_queue().await;
     })
-}
-
-fn site_replication_peer_wire_path(path: &str) -> String {
-    let (path_only, query) = path
-        .split_once('?')
-        .map(|(path, query)| (path, Some(query)))
-        .unwrap_or((path, None));
-    let wire_path = if let Some(suffix) = path_only.strip_prefix(RUSTFS_ADMIN_V3_PREFIX) {
-        format!("{MINIO_ADMIN_V3_PREFIX}{suffix}")
-    } else {
-        path_only.to_string()
-    };
-
-    match query {
-        Some(query) => format!("{wire_path}?{query}"),
-        None => wire_path,
-    }
-}
-
-fn site_replication_peer_payload_encrypted(wire_path: &str) -> bool {
-    // MinIO's SRPeerJoin handler force-decrypts the request body, so the
-    // peer/join payload must always travel encrypted.
-    wire_path.split_once('?').map(|(path, _)| path).unwrap_or(wire_path) == MINIO_SITE_REPLICATION_PEER_JOIN_PATH
-}
-
-fn site_replication_peer_payload(path: &str, secret_key: &str, payload: Vec<u8>) -> S3Result<(Vec<u8>, &'static str)> {
-    if site_replication_peer_payload_encrypted(path) {
-        encode_compatible_admin_payload(path, secret_key, payload)
-    } else {
-        Ok((payload, "application/json"))
-    }
-}
-
-fn site_replication_peer_url(connection: &PeerConnection, wire_path: &str) -> S3Result<Url> {
-    let path = wire_path.split_once('?').map_or(wire_path, |(path, _)| path);
-    if !path.starts_with('/') || path.starts_with("//") {
-        return Err(s3_error!(InvalidRequest, "invalid site replication peer path"));
-    }
-    connection
-        .endpoint
-        .join(wire_path)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid site replication peer path: {e}")))
-}
-
-#[cfg(test)]
-async fn send_peer_admin_request_raw<T: Serialize>(
-    connection: &PeerConnection,
-    path: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: &T,
-) -> S3Result<(StatusCode, Vec<u8>)> {
-    let client = site_replication_client_for(connection).await?;
-    send_peer_admin_request_raw_with_client(&client, connection, path, access_key, secret_key, body).await
-}
-
-async fn send_peer_admin_request_raw_with_client<T: Serialize>(
-    client: &reqwest::Client,
-    connection: &PeerConnection,
-    path: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: &T,
-) -> S3Result<(StatusCode, Vec<u8>)> {
-    let path = site_replication_peer_wire_path(path);
-    let url = site_replication_peer_url(connection, &path)?;
-    let uri = url
-        .as_str()
-        .parse::<Uri>()
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid peer endpoint: {e}")))?;
-    let authority = uri
-        .authority()
-        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "peer endpoint missing authority".to_string()))?
-        .to_string();
-    let payload = serde_json::to_vec(body)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize peer request failed: {e}")))?;
-    let (payload, content_type) = site_replication_peer_payload(&path, secret_key, payload)?;
-
-    let signed = sign_v4(
-        http::Request::builder()
-            .method(Method::PUT)
-            .uri(uri)
-            .header(HOST, authority)
-            .header("x-amz-content-sha256", UNSIGNED_PAYLOAD)
-            .header(CONTENT_TYPE, content_type)
-            .body(Body::empty())
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("build peer request failed: {e}")))?,
-        payload.len() as i64,
-        access_key,
-        secret_key,
-        "",
-        current_region()
-            .map(|region| region.to_string())
-            .as_deref()
-            .unwrap_or("us-east-1"),
-    );
-
-    let mut req = client.request(reqwest::Method::PUT, url.clone());
-    for (name, value) in signed.headers() {
-        req = req.header(name, value);
-    }
-
-    let response = req.body(payload).send().await.map_err(|e| {
-        let classify = if e.is_timeout() {
-            "timeout"
-        } else if e.is_connect() && e.to_string().to_ascii_lowercase().contains("dns") {
-            "dns resolution"
-        } else if e.to_string().to_ascii_lowercase().contains("certificate") || e.to_string().to_ascii_lowercase().contains("tls")
-        {
-            "tls handshake"
-        } else if e.is_connect() {
-            "connect"
-        } else {
-            "request"
-        };
-        S3Error::with_message(S3ErrorCode::InternalError, format!("peer request to {url} failed ({classify}): {e}"))
-    })?;
-
-    let status = response.status();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("read peer response failed: {e}")))?;
-
-    Ok((status, body.to_vec()))
-}
-
-async fn send_peer_admin_request<T: Serialize>(
-    connection: &PeerConnection,
-    path: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: &T,
-) -> S3Result<Vec<u8>> {
-    let client = site_replication_client_for(connection).await?;
-    send_peer_admin_request_with_client(&client, connection, path, access_key, secret_key, body).await
-}
-
-async fn send_peer_admin_request_with_client<T: Serialize>(
-    client: &reqwest::Client,
-    connection: &PeerConnection,
-    path: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: &T,
-) -> S3Result<Vec<u8>> {
-    let (status, body) = send_peer_admin_request_raw_with_client(client, connection, path, access_key, secret_key, body).await?;
-    if status.is_success() {
-        return Ok(body);
-    }
-
-    let detail = String::from_utf8_lossy(&body).into_owned();
-    Err(S3Error::with_message(
-        S3ErrorCode::InternalError,
-        format!("peer request to {}{path} failed with {status}: {detail}", connection.endpoint()),
-    ))
-}
-
-async fn send_peer_admin_request_with_secret_candidates<T: Serialize>(
-    connection: &PeerConnection,
-    path: &str,
-    access_key: &str,
-    secret_candidates: &[String],
-    body: &T,
-) -> S3Result<Vec<u8>> {
-    let client = site_replication_client_for(connection).await?;
-    let mut tried = HashSet::new();
-    let mut errors = Vec::new();
-
-    for secret_key in secret_candidates.iter().filter(|secret_key| !secret_key.is_empty()) {
-        if !tried.insert(secret_key.as_str()) {
-            continue;
-        }
-
-        match send_peer_admin_request_with_client(&client, connection, path, access_key, secret_key, body).await {
-            Ok(body) => return Ok(body),
-            Err(err) => {
-                let detail = format!("{err}");
-                let may_retry_with_next_secret = peer_error_may_be_secret_mismatch(&detail);
-                errors.push(summarize_peer_error_detail(&detail));
-                if !may_retry_with_next_secret {
-                    break;
-                }
-            }
-        }
-    }
-
-    Err(S3Error::with_message(
-        S3ErrorCode::InternalError,
-        format!(
-            "peer request to {}{path} failed with all service-account secrets: {}",
-            connection.endpoint(),
-            errors.join("; ")
-        ),
-    ))
-}
-
-fn peer_error_may_be_secret_mismatch(detail: &str) -> bool {
-    let detail = detail.to_ascii_lowercase();
-    detail.contains("signaturedoesnotmatch")
-        || detail.contains("accessdenied")
-        || detail.contains("forbidden")
-        || detail.contains("401")
-        || detail.contains("403")
-}
-
-async fn send_peer_admin_get_request(
-    connection: &PeerConnection,
-    path: &str,
-    access_key: &str,
-    secret_key: &str,
-) -> S3Result<Vec<u8>> {
-    let client = site_replication_client_for(connection).await?;
-    send_peer_admin_get_request_with_client(&client, connection, path, access_key, secret_key).await
-}
-
-async fn send_peer_admin_get_request_with_client(
-    client: &reqwest::Client,
-    connection: &PeerConnection,
-    path: &str,
-    access_key: &str,
-    secret_key: &str,
-) -> S3Result<Vec<u8>> {
-    let path = site_replication_peer_wire_path(path);
-    let url = site_replication_peer_url(connection, &path)?;
-    let uri = url
-        .as_str()
-        .parse::<Uri>()
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid peer endpoint: {e}")))?;
-    let authority = uri
-        .authority()
-        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "peer endpoint missing authority".to_string()))?
-        .to_string();
-
-    let signed = sign_v4(
-        http::Request::builder()
-            .method(Method::GET)
-            .uri(uri)
-            .header(HOST, authority)
-            .header("x-amz-content-sha256", UNSIGNED_PAYLOAD)
-            .body(Body::empty())
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("build peer request failed: {e}")))?,
-        0,
-        access_key,
-        secret_key,
-        "",
-        current_region()
-            .map(|region| region.to_string())
-            .as_deref()
-            .unwrap_or("us-east-1"),
-    );
-
-    let mut req = client.request(reqwest::Method::GET, url.clone());
-    for (name, value) in signed.headers() {
-        req = req.header(name, value);
-    }
-
-    let response = req.send().await.map_err(|e| {
-        let classify = if e.is_timeout() {
-            "timeout"
-        } else if e.is_connect() && e.to_string().to_ascii_lowercase().contains("dns") {
-            "dns resolution"
-        } else if e.to_string().to_ascii_lowercase().contains("certificate") || e.to_string().to_ascii_lowercase().contains("tls")
-        {
-            "tls handshake"
-        } else if e.is_connect() {
-            "connect"
-        } else {
-            "request"
-        };
-        S3Error::with_message(S3ErrorCode::InternalError, format!("peer request to {url} failed ({classify}): {e}"))
-    })?;
-
-    let status = response.status();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("read peer response failed: {e}")))?;
-
-    if !status.is_success() {
-        let detail = String::from_utf8_lossy(&body).into_owned();
-        return Err(S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("peer request to {url} failed with {status}: {detail}"),
-        ));
-    }
-
-    Ok(body.to_vec())
-}
-
-async fn runtime_site_replication_targets() -> S3Result<Option<SiteReplicationRuntime>> {
-    let state = load_site_replication_state().await?;
-    if !state.enabled() || state.service_account_access_key.is_empty() {
-        return Ok(None);
-    }
-
-    let service_account_secret_key = match site_replicator_service_account_secret(&state.service_account_access_key).await {
-        Ok(secret) => secret,
-        Err(err) => {
-            let Some(secret) = legacy_site_replicator_state_secret(&state) else {
-                return Err(err);
-            };
-            warn!(
-                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                result = "legacy_state_service_account_secret_fallback",
-                error = ?err,
-                "admin site replication state"
-            );
-            secret
-        }
-    };
-    let local_peer = current_local_runtime_peer(&state);
-    Ok(Some(SiteReplicationRuntime {
-        state,
-        local_peer,
-        service_account_secret_key,
-    }))
-}
-
-async fn broadcast_site_replication_json<T: Serialize>(path: &str, body: &T) -> S3Result<()> {
-    let Some(runtime) = runtime_site_replication_targets().await? else {
-        return Ok(());
-    };
-    broadcast_site_replication_json_with_runtime(&runtime, path, body).await
-}
-
-async fn broadcast_site_replication_json_with_runtime<T: Serialize>(
-    runtime: &SiteReplicationRuntime,
-    path: &str,
-    body: &T,
-) -> S3Result<()> {
-    let state = &runtime.state;
-    let local_peer = &runtime.local_peer;
-
-    for peer in state.peers.values() {
-        if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
-            continue;
-        }
-
-        send_peer_admin_request_with_retry_event(
-            peer,
-            path,
-            &state.service_account_access_key,
-            &runtime.service_account_secret_key,
-            body,
-        )
-        .await?;
-    }
-
-    Ok(())
-}
-
-async fn send_peer_admin_request_with_retry_event<T: Serialize>(
-    peer: &PeerInfo,
-    path: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: &T,
-) -> S3Result<Vec<u8>> {
-    let transport = PeerTransport::for_runtime_peer(peer).await?;
-    send_peer_admin_request_with_retry_event_transport(peer, &transport, path, access_key, secret_key, body).await
-}
-
-async fn send_peer_admin_request_with_retry_event_transport<T: Serialize>(
-    peer: &PeerInfo,
-    transport: &PeerTransport,
-    path: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: &T,
-) -> S3Result<Vec<u8>> {
-    match send_peer_admin_request_with_client(&transport.client, &transport.connection, path, access_key, secret_key, body).await
-    {
-        Ok(body) => {
-            dequeue_site_replication_retry_event(peer, path).await;
-            Ok(body)
-        }
-        Err(err) => {
-            enqueue_site_replication_retry_event(peer, path, &err).await;
-            Err(err)
-        }
-    }
 }
 
 async fn send_site_replication_bootstrap_plan(
@@ -3639,52 +1945,40 @@ async fn send_site_replication_bootstrap_plan(
 ) -> S3Result<()> {
     let transport = PeerTransport::for_runtime_peer(peer).await?;
     for item in &plan.iam_items {
-        send_peer_admin_request_with_retry_event_transport(
-            peer,
-            &transport,
+        PeerAdminRequest::put(
+            &transport.connection,
             "/rustfs/admin/v3/site-replication/peer/iam-item",
             service_account_access_key,
-            service_account_secret_key,
-            item,
         )
+        .with_client(&transport.client)
+        .send_with_retry_event(peer, service_account_secret_key, item)
         .await?;
     }
 
     let empty = serde_json::json!({});
     for path in &plan.bucket_make_ops {
-        send_peer_admin_request_with_retry_event_transport(
-            peer,
-            &transport,
-            path,
-            service_account_access_key,
-            service_account_secret_key,
-            &empty,
-        )
-        .await?;
+        PeerAdminRequest::put(&transport.connection, path, service_account_access_key)
+            .with_client(&transport.client)
+            .send_with_retry_event(peer, service_account_secret_key, &empty)
+            .await?;
     }
 
     for item in &plan.bucket_items {
-        send_peer_admin_request_with_retry_event_transport(
-            peer,
-            &transport,
+        PeerAdminRequest::put(
+            &transport.connection,
             "/rustfs/admin/v3/site-replication/peer/bucket-meta",
             service_account_access_key,
-            service_account_secret_key,
-            item,
         )
+        .with_client(&transport.client)
+        .send_with_retry_event(peer, service_account_secret_key, item)
         .await?;
     }
 
     for path in &plan.bucket_configure_ops {
-        send_peer_admin_request_with_retry_event_transport(
-            peer,
-            &transport,
-            path,
-            service_account_access_key,
-            service_account_secret_key,
-            &empty,
-        )
-        .await?;
+        PeerAdminRequest::put(&transport.connection, path, service_account_access_key)
+            .with_client(&transport.client)
+            .send_with_retry_event(peer, service_account_secret_key, &empty)
+            .await?;
     }
 
     Ok(())
@@ -3703,7 +1997,7 @@ async fn bootstrap_existing_metadata_after_add(
             return errors;
         }
     };
-    let plan = match site_replication_bootstrap_plan(&info) {
+    let plan = match build_site_replication_bootstrap_plan(&info).await {
         Ok(plan) => plan,
         Err(err) => {
             let mut errors = SiteReplicationErrorSummary::default();
@@ -3737,963 +2031,70 @@ async fn bootstrap_existing_metadata_after_add(
     errors
 }
 
-enum SiteReplicationRepairTask<'a> {
-    Iam(&'a SRIAMItem),
-    BucketMake(&'a str),
-    BucketMetadata(&'a SRBucketMeta),
-    Replication(&'a str),
-}
-
-impl SiteReplicationRepairTask<'_> {
-    fn family(&self) -> &'static str {
-        match self {
-            Self::Iam(_) => SITE_REPLICATION_REPAIR_IAM_FAMILY,
-            Self::BucketMake(_) => SITE_REPLICATION_REPAIR_BUCKET_FAMILY,
-            Self::BucketMetadata(_) => SITE_REPLICATION_REPAIR_BUCKET_METADATA_FAMILY,
-            Self::Replication(_) => SITE_REPLICATION_REPAIR_REPLICATION_FAMILY,
-        }
+/// The OpenID half of the IDP settings a site reports to its site-replication
+/// peers, built from the providers this site has configured (in
+/// `list_providers` order) and the site's own region.
+fn open_id_settings(providers: Vec<(String, OpenIDProviderSettings)>, region: String) -> OpenIDSettings {
+    // `region` qualifies the provider identities, not the site: a site
+    // without OpenID must report the empty settings in every region, or the
+    // peer comparison in `validate_add_preflight_topology` would reject two
+    // sites whose IDP configuration is identically absent (rustfs#7003).
+    if providers.is_empty() {
+        return OpenIDSettings::default();
     }
 
-    fn path(&self) -> &str {
-        match self {
-            Self::Iam(_) => "/rustfs/admin/v3/site-replication/peer/iam-item",
-            Self::BucketMake(path) | Self::Replication(path) => path,
-            Self::BucketMetadata(_) => "/rustfs/admin/v3/site-replication/peer/bucket-meta",
-        }
-    }
-
-    fn id(&self) -> S3Result<String> {
-        let payload = match self {
-            Self::Iam(item) => serde_json::to_vec(item),
-            Self::BucketMake(_) | Self::Replication(_) => serde_json::to_vec(&serde_json::json!({})),
-            Self::BucketMetadata(item) => serde_json::to_vec(item),
-        }
-        .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize repair task failed: {err}")))?;
-        let mut digest = Sha256::new();
-        digest.update(self.family().as_bytes());
-        digest.update([0]);
-        digest.update(self.path().as_bytes());
-        digest.update([0]);
-        digest.update(payload);
-        Ok(URL_SAFE_NO_PAD.encode(digest.finalize()))
-    }
-
-    async fn send(&self, transport: &PeerTransport, access_key: &str, secret_key: &str) -> S3Result<Vec<u8>> {
-        match self {
-            Self::Iam(item) => {
-                send_peer_admin_request_with_client(
-                    &transport.client,
-                    &transport.connection,
-                    self.path(),
-                    access_key,
-                    secret_key,
-                    item,
-                )
-                .await
-            }
-            Self::BucketMetadata(item) => {
-                send_peer_admin_request_with_client(
-                    &transport.client,
-                    &transport.connection,
-                    self.path(),
-                    access_key,
-                    secret_key,
-                    item,
-                )
-                .await
-            }
-            Self::BucketMake(_) | Self::Replication(_) => {
-                send_peer_admin_request_with_client(
-                    &transport.client,
-                    &transport.connection,
-                    self.path(),
-                    access_key,
-                    secret_key,
-                    &serde_json::json!({}),
-                )
-                .await
-            }
-        }
-    }
-}
-
-fn site_replication_repair_tasks(plan: &SiteReplicationBootstrapPlan) -> Vec<(usize, SiteReplicationRepairTask<'_>)> {
-    let mut tasks = Vec::with_capacity(
-        plan.iam_items.len() + plan.bucket_make_ops.len() + plan.bucket_items.len() + plan.bucket_configure_ops.len(),
-    );
-    tasks.extend(
-        plan.iam_items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| (index, SiteReplicationRepairTask::Iam(item))),
-    );
-    tasks.extend(
-        plan.bucket_make_ops
-            .iter()
-            .enumerate()
-            .map(|(index, path)| (index, SiteReplicationRepairTask::BucketMake(path))),
-    );
-    tasks.extend(
-        plan.bucket_items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| (index, SiteReplicationRepairTask::BucketMetadata(item))),
-    );
-    tasks.extend(
-        plan.bucket_configure_ops
-            .iter()
-            .enumerate()
-            .map(|(index, path)| (index, SiteReplicationRepairTask::Replication(path))),
-    );
-    tasks
-}
-
-fn site_replication_repair_plan_token(state: &SiteReplicationState, plan: &SiteReplicationBootstrapPlan) -> S3Result<String> {
-    let mut digest = Sha256::new();
-    let snapshot = serde_json::to_vec(&(
-        &state.name,
-        &state.service_account_access_key,
-        &state.peers,
-        state.updated_at,
-        state.sync_state_initialized,
-    ))
-    .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize repair snapshot failed: {err}")))?;
-    digest.update(snapshot);
-    for (_, task) in site_replication_repair_tasks(plan) {
-        digest.update(task.id()?.as_bytes());
-    }
-    Ok(URL_SAFE_NO_PAD.encode(digest.finalize()))
-}
-
-fn site_replication_repair_preflight_token(
-    state: &SiteReplicationState,
-    plan: &SiteReplicationBootstrapPlan,
-    signing_key: &[u8],
-) -> S3Result<String> {
-    if signing_key.is_empty() {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InternalError,
-            "repair signing key is empty".to_string(),
-        ));
-    }
-    let mut digest = <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(signing_key)
-        .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "invalid repair signing key".to_string()))?;
-    digest.update(b"rustfs:site-replication:repair-preflight:v1\0");
-    digest.update(site_replication_repair_plan_token(state, plan)?.as_bytes());
-    for event in state
-        .retry_queue
-        .iter()
-        .filter(|event| retry_event_replayed_by_bootstrap(event))
-    {
-        digest.update(event.id.as_bytes());
-        digest.update(&[0]);
-        digest.update(event.peer_deployment_id.as_bytes());
-        digest.update(&[0]);
-        digest.update(event.path.as_bytes());
-        digest.update(&[0]);
-    }
-    Ok(URL_SAFE_NO_PAD.encode(digest.finalize().into_bytes()))
-}
-
-fn site_replication_repair_task_checkpoint_id(
-    signing_key: &[u8],
-    peer_deployment_id: &str,
-    task: &SiteReplicationRepairTask<'_>,
-) -> S3Result<String> {
-    let mut digest = <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(signing_key)
-        .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "invalid repair signing key".to_string()))?;
-    digest.update(b"rustfs:site-replication:repair-task:v1\0");
-    digest.update(peer_deployment_id.as_bytes());
-    digest.update(&[0]);
-    digest.update(task.id()?.as_bytes());
-    Ok(URL_SAFE_NO_PAD.encode(digest.finalize().into_bytes()))
-}
-
-fn site_replication_repair_sites(
-    state: &SiteReplicationState,
-    local_peer: &PeerInfo,
-    plan: &SiteReplicationBootstrapPlan,
-    signing_key: &[u8],
-) -> S3Result<BTreeMap<String, SiteReplicationRepairSiteStatus>> {
-    let mut planned = BTreeMap::new();
-    let mut family_paths = BTreeMap::<String, BTreeSet<String>>::new();
-    for (_, task) in site_replication_repair_tasks(plan) {
-        let family = task.family().to_string();
-        let family_status = planned
-            .entry(task.family().to_string())
-            .or_insert_with(SiteReplicationRepairFamilyStatus::default);
-        family_status.planned += 1;
-        family_paths.entry(family).or_default().insert(task.path().to_string());
-    }
-
-    let mut sites = BTreeMap::new();
-    for peer in state.peers.values().filter(|peer| {
-        peer.deployment_id != local_peer.deployment_id && !same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
-    }) {
-        let mut families = planned.clone();
-        for (_, task) in site_replication_repair_tasks(plan) {
-            let family = families
-                .get_mut(task.family())
-                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "repair task family is missing".to_string()))?;
-            family.tasks.push(SiteReplicationRepairTaskStatus {
-                task_id: site_replication_repair_task_checkpoint_id(signing_key, &peer.deployment_id, &task)?,
-                status: "planned".to_string(),
-                error: None,
-            });
-        }
-        for (family, status) in &mut families {
-            status.retry_events = state
-                .retry_queue
-                .iter()
-                .filter(|event| {
-                    event.peer_deployment_id == peer.deployment_id
-                        && retry_event_replayed_by_bootstrap(event)
-                        && family_paths.get(family).is_some_and(|paths| paths.contains(&event.path))
-                })
-                .count();
-        }
-        sites.insert(
-            peer.deployment_id.clone(),
-            SiteReplicationRepairSiteStatus {
-                deployment_id: peer.deployment_id.clone(),
-                name: peer.name.clone(),
-                families,
-            },
-        );
-    }
-    Ok(sites)
-}
-
-fn update_site_replication_repair_task(
-    operation: &mut SiteReplicationRepairOperation,
-    deployment_id: &str,
-    family: &str,
-    family_index: usize,
-    result: Result<(), &str>,
-) -> S3Result<()> {
-    let site = operation
-        .sites
-        .get_mut(deployment_id)
-        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "repair operation site is missing".to_string()))?;
-    let family_status = site
-        .families
-        .get_mut(family)
-        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "repair operation family is missing".to_string()))?;
-    if family_status.succeeded != family_index {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InternalError,
-            "repair operation task checkpoint is invalid".to_string(),
-        ));
-    }
-    let task_status = family_status.tasks.get_mut(family_index).ok_or_else(|| {
-        S3Error::with_message(S3ErrorCode::InternalError, "repair operation task checkpoint is missing".to_string())
-    })?;
-    family_status.failed = 0;
-    family_status.errors.clear();
-    match result {
-        Ok(()) => {
-            family_status.succeeded = family_status.succeeded.saturating_add(1);
-            task_status.status = "succeeded".to_string();
-            task_status.error = None;
-        }
-        Err(error) => {
-            let error = classify_site_replication_repair_error(error).to_string();
-            family_status.failed = 1;
-            family_status.errors.push(error.clone());
-            task_status.status = "failed".to_string();
-            task_status.error = Some(error);
-        }
-    }
-    Ok(())
-}
-
-fn site_replication_repair_task_pending(
-    operation: &SiteReplicationRepairOperation,
-    deployment_id: &str,
-    family: &str,
-    family_index: usize,
-) -> S3Result<bool> {
-    let site = operation
-        .sites
-        .get(deployment_id)
-        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "repair operation site is missing".to_string()))?;
-    let family = site
-        .families
-        .get(family)
-        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "repair operation family is missing".to_string()))?;
-    if family.succeeded > family_index {
-        return Ok(false);
-    }
-    if family.succeeded < family_index {
-        return Ok(false);
-    }
-    Ok(family.failed == 0)
-}
-
-fn prepare_site_replication_repair_retry(operation: &mut SiteReplicationRepairOperation) {
-    for family in operation.sites.values_mut().flat_map(|site| site.families.values_mut()) {
-        family.failed = 0;
-        family.errors.clear();
-        for task in &mut family.tasks {
-            match task.status.as_str() {
-                "succeeded" => task.status = "skipped".to_string(),
-                "failed" => {
-                    task.status = "planned".to_string();
-                    task.error = None;
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-fn classify_site_replication_repair_error(error: &str) -> &'static str {
-    let error = error.to_ascii_lowercase();
-    if error.contains("accessdenied")
-        || error.contains("signaturedoesnotmatch")
-        || error.contains("unauthorized")
-        || error.contains("forbidden")
-        || error.contains("401")
-        || error.contains("403")
-    {
-        "authorization-failed"
-    } else if error.contains("timeout") {
-        "remote-timeout"
-    } else if error.contains("dns") {
-        "remote-dns-failed"
-    } else if error.contains("tls") || error.contains("certificate") {
-        "remote-tls-failed"
-    } else if error.contains("connect") {
-        "remote-connect-failed"
-    } else {
-        "remote-operation-failed"
-    }
-}
-
-fn summarize_site_replication_repair_operation(operation: &mut SiteReplicationRepairOperation) {
-    let failed = operation
-        .sites
-        .values()
-        .flat_map(|site| site.families.values())
-        .any(|family| family.failed > 0);
-    let complete = operation
-        .sites
-        .values()
-        .all(|site| site.families.values().all(|family| family.succeeded == family.planned));
-    operation.status = if complete {
-        "success"
-    } else if failed {
-        "partial"
-    } else {
-        "running"
-    }
-    .to_string();
-    operation.updated_at = Some(OffsetDateTime::now_utc());
-    operation.completed_at = complete.then_some(OffsetDateTime::now_utc());
-}
-
-fn site_replication_repair_operation_response(
-    operation: &SiteReplicationRepairOperation,
-) -> SiteReplicationRepairOperationResponse {
-    SiteReplicationRepairOperationResponse {
-        mode: "execute",
-        operation_id: operation.operation_id.clone(),
-        status: operation.status.clone(),
-        sites: operation
-            .sites
-            .iter()
-            .map(|(deployment_id, site)| {
-                (
-                    deployment_id.clone(),
-                    SiteReplicationRepairSiteResponse {
-                        deployment_id: site.deployment_id.clone(),
-                        name: site.name.clone(),
-                        families: site
-                            .families
-                            .iter()
-                            .map(|(family, status)| {
-                                (
-                                    family.clone(),
-                                    SiteReplicationRepairFamilyResponse {
-                                        planned: status.planned,
-                                        succeeded: status.succeeded,
-                                        failed: status.failed,
-                                        retry_events: status.retry_events,
-                                        tasks: status.tasks.clone(),
-                                        errors: status.errors.clone(),
-                                    },
-                                )
-                            })
-                            .collect(),
-                    },
-                )
-            })
-            .collect(),
-        created_at: operation.created_at,
-        updated_at: operation.updated_at,
-        completed_at: operation.completed_at,
-    }
-}
-
-fn prune_site_replication_repair_operations(operations: &mut BTreeMap<String, SiteReplicationRepairOperation>) {
-    while operations.len() > SITE_REPLICATION_REPAIR_OPERATION_LIMIT {
-        let Some(oldest) = operations
-            .iter()
-            .filter(|(_, operation)| operation.status == "success")
-            .min_by_key(|(_, operation)| operation.created_at)
-            .map(|(id, _)| id.clone())
-        else {
-            break;
-        };
-        operations.remove(&oldest);
-    }
-}
-
-async fn persist_site_replication_repair_operation(operation: &SiteReplicationRepairOperation) -> S3Result<()> {
-    let operation = operation.clone();
-    update_site_replication_repair_state(move |state| {
-        if let Some(existing) = state.operations.get(&operation.operation_id)
-            && !constant_time_eq(&existing.preflight_token, &operation.preflight_token)
-        {
-            return Err(S3Error::with_message(
-                S3ErrorCode::ClientTokenConflict,
-                "repair operation ID is already bound to a different preflight".to_string(),
-            ));
-        }
-        state.operations.insert(operation.operation_id.clone(), operation);
-        prune_site_replication_repair_operations(&mut state.operations);
-        Ok(())
-    })
-    .await
-}
-
-async fn persist_site_replication_repair_task(
-    operation: &SiteReplicationRepairOperation,
-    peer: &PeerInfo,
-    family: &str,
-    path: &str,
-) -> S3Result<()> {
-    persist_site_replication_repair_operation(operation).await?;
-
-    let family_status = operation
-        .sites
-        .get(&peer.deployment_id)
-        .and_then(|site| site.families.get(family))
-        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "repair task status is missing".to_string()))?;
-    let failure = (family_status.failed > 0).then(|| {
-        family_status
-            .errors
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "remote-operation-failed".to_string())
-    });
-    let peer = peer.clone();
-    let path = path.to_string();
-    update_site_replication_state(move |state| {
-        match failure.as_deref() {
-            Some(error) => upsert_site_replication_retry_event(&mut state.retry_queue, &peer, &path, error, None),
-            None => {
-                dequeue_site_replication_retry_events_including_escalated(&mut state.retry_queue, &peer, &path);
-            }
-        }
-        Ok(())
-    })
-    .await
-}
-
-fn admit_site_replication_repair_operation(
-    repair_state: &mut SiteReplicationRepairState,
-    operation_id: String,
-    supplied_token: &str,
-    candidate: SiteReplicationRepairOperation,
-) -> S3Result<SiteReplicationRepairOperation> {
-    if let Some(existing) = repair_state.operations.get(&operation_id) {
-        if !constant_time_eq(&existing.preflight_token, supplied_token) {
-            return Err(S3Error::with_message(
-                S3ErrorCode::ClientTokenConflict,
-                "repair operation ID is already bound to a different preflight".to_string(),
-            ));
-        }
-        if !constant_time_eq(&existing.plan_token, &candidate.plan_token) {
-            return Err(S3Error::with_message(
-                S3ErrorCode::PreconditionFailed,
-                "site replication repair plan changed after partial execution".to_string(),
-            ));
-        }
-        return Ok(existing.clone());
-    }
-    if repair_state
-        .operations
-        .values()
-        .any(|operation| operation.status == "running")
-    {
-        return Err(S3Error::with_message(
-            S3ErrorCode::ClientTokenConflict,
-            "another site replication repair is active".to_string(),
-        ));
-    }
-    repair_state.operations.insert(operation_id, candidate.clone());
-    prune_site_replication_repair_operations(&mut repair_state.operations);
-    Ok(candidate)
-}
-
-async fn execute_site_replication_repair(
-    request: SiteReplicationRepairExecutionRequest,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let store =
-        current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
-    with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
-        execute_site_replication_repair_locked(request).await
-    })
-    .await
-    .map_err(|_| {
-        S3Error::with_message(S3ErrorCode::ClientTokenConflict, "another site replication repair is active".to_string())
-    })?
-}
-
-async fn execute_site_replication_repair_locked(
-    request: SiteReplicationRepairExecutionRequest,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let state = load_site_replication_state().await?;
-    if !state.enabled() || state.service_account_access_key.is_empty() {
-        return Err(s3_error!(InvalidRequest, "site replication is not configured"));
-    }
-    let info = build_sr_info(&state, &request.local_peer).await?;
-    let plan = site_replication_bootstrap_plan(&info)?;
-    let plan_token = site_replication_repair_plan_token(&state, &plan)?;
-    let preflight_token = site_replication_repair_preflight_token(&state, &plan, request.signing_key.as_bytes())?;
-    let sites = site_replication_repair_sites(&state, &request.local_peer, &plan, request.signing_key.as_bytes())?;
-
-    let repair_state = read_site_replication_repair_state().await?;
-    if let Some(existing) = repair_state.operations.get(&request.operation_id) {
-        if !constant_time_eq(&existing.preflight_token, &request.preflight_token) {
-            return Err(S3Error::with_message(
-                S3ErrorCode::ClientTokenConflict,
-                "repair operation ID is already bound to a different preflight".to_string(),
-            ));
-        }
-        if existing.status == "success" {
-            return json_response(&site_replication_repair_operation_response(existing));
-        }
-        if !constant_time_eq(&existing.plan_token, &plan_token) {
-            return Err(S3Error::with_message(
-                S3ErrorCode::PreconditionFailed,
-                "site replication repair plan changed after partial execution".to_string(),
-            ));
-        }
-    } else if !constant_time_eq(&request.preflight_token, &preflight_token) {
-        return Err(S3Error::with_message(
-            S3ErrorCode::PreconditionFailed,
-            "site replication repair preflight is stale".to_string(),
-        ));
-    }
-
-    let now = OffsetDateTime::now_utc();
-    let candidate = SiteReplicationRepairOperation {
-        operation_id: request.operation_id.clone(),
-        preflight_token,
-        plan_token,
-        status: "running".to_string(),
-        sites,
-        created_at: Some(now),
-        updated_at: Some(now),
-        completed_at: None,
-    };
-    let supplied_token = request.preflight_token;
-    let operation_id = request.operation_id;
-    let mut operation = update_site_replication_repair_state(move |repair_state| {
-        admit_site_replication_repair_operation(repair_state, operation_id, &supplied_token, candidate)
-    })
-    .await?;
-    if operation.status == "success" {
-        return json_response(&site_replication_repair_operation_response(&operation));
-    }
-
-    let service_account_secret_key = site_replicator_service_account_secret(&state.service_account_access_key).await?;
-    prepare_site_replication_repair_retry(&mut operation);
-    operation.status = "running".to_string();
-    operation.completed_at = None;
-    operation.updated_at = Some(OffsetDateTime::now_utc());
-    persist_site_replication_repair_operation(&operation).await?;
-
-    let tasks = site_replication_repair_tasks(&plan);
-    for peer in state.peers.values().filter(|peer| {
-        peer.deployment_id != request.local_peer.deployment_id
-            && !same_identity_endpoint(&peer.endpoint, &request.local_peer.endpoint)
-    }) {
-        let transport = match PeerTransport::for_runtime_peer(peer).await {
-            Ok(transport) => transport,
-            Err(err) => {
-                let error = err.to_string();
-                for (family_index, task) in &tasks {
-                    if !site_replication_repair_task_pending(&operation, &peer.deployment_id, task.family(), *family_index)? {
-                        continue;
-                    }
-                    update_site_replication_repair_task(
-                        &mut operation,
-                        &peer.deployment_id,
-                        task.family(),
-                        *family_index,
-                        Err(&error),
-                    )?;
-                    summarize_site_replication_repair_operation(&mut operation);
-                    persist_site_replication_repair_task(&operation, peer, task.family(), task.path()).await?;
-                }
-                continue;
-            }
-        };
-
-        for (family_index, task) in &tasks {
-            if !site_replication_repair_task_pending(&operation, &peer.deployment_id, task.family(), *family_index)? {
-                continue;
-            }
-            let result = task
-                .send(&transport, &state.service_account_access_key, &service_account_secret_key)
-                .await;
-            let error = result.err().map(|err| err.to_string());
-            update_site_replication_repair_task(
-                &mut operation,
-                &peer.deployment_id,
-                task.family(),
-                *family_index,
-                match error.as_deref() {
-                    Some(error) => Err(error),
-                    None => Ok(()),
-                },
-            )?;
-            summarize_site_replication_repair_operation(&mut operation);
-            persist_site_replication_repair_task(&operation, peer, task.family(), task.path()).await?;
-        }
-    }
-
-    summarize_site_replication_repair_operation(&mut operation);
-    persist_site_replication_repair_operation(&operation).await?;
-    json_response(&site_replication_repair_operation_response(&operation))
-}
-
-pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool) -> S3Result<()> {
-    let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
-    let runtime = {
-        // The bucket-op lock is what orders this against add/remove. The
-        // state is only read here (through the runtime snapshot), and the
-        // bucket setup below writes bucket metadata, never the state object —
-        // holding the state transaction across it would put local metadata
-        // IO inside a distributed lock for nothing.
-        let Some(runtime) = runtime_site_replication_targets().await? else {
-            return Ok(());
-        };
-
-        ensure_site_replication_bucket_versioning(bucket).await?;
-        ensure_site_replication_bucket_setup_with_runtime(bucket, &runtime).await?;
-        runtime
-    };
-
-    broadcast_site_replication_make_bucket(bucket, lock_enabled, Some(&runtime), None).await
-}
-
-async fn broadcast_site_replication_json_using_runtime<T: Serialize>(
-    runtime: Option<&SiteReplicationRuntime>,
-    path: &str,
-    body: &T,
-) -> S3Result<()> {
-    match runtime {
-        Some(runtime) => broadcast_site_replication_json_with_runtime(runtime, path, body).await,
-        None => broadcast_site_replication_json(path, body).await,
-    }
-}
-
-async fn broadcast_site_replication_make_bucket(
-    bucket: &str,
-    lock_enabled: bool,
-    runtime: Option<&SiteReplicationRuntime>,
-    bootstrap_token: Option<&str>,
-) -> S3Result<()> {
-    let created_at = current_object_store_handle()
-        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?
-        .get_bucket_info(bucket, &BucketOptions::default())
-        .await
-        .map_err(ApiError::from)?
-        .created
-        .unwrap_or_else(OffsetDateTime::now_utc)
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default();
-
-    let path = make_with_versioning_bucket_op_path(bucket, Some(&created_at), lock_enabled);
-    let path = if let Some(token) = bootstrap_token {
-        with_site_replication_bootstrap_token(&path, token)
-    } else {
-        path
-    };
-    broadcast_site_replication_json_using_runtime(runtime, &path, &serde_json::json!({})).await?;
-
-    let configure_path = bootstrap_bucket_op_path(bucket, "configure-replication");
-    let configure_path = if let Some(token) = bootstrap_token {
-        with_site_replication_bootstrap_token(&configure_path, token)
-    } else {
-        configure_path
-    };
-    broadcast_site_replication_json_using_runtime(runtime, &configure_path, &serde_json::json!({})).await
-}
-
-pub async fn site_replication_delete_bucket_hook(bucket: &str, force_delete: bool) -> S3Result<()> {
-    let operation = if force_delete {
-        "force-delete-bucket"
-    } else {
-        "delete-bucket"
-    };
-    let path = format!(
-        "/rustfs/admin/v3/site-replication/peer/bucket-ops?{}",
-        form_urlencoded::Serializer::new(String::new())
-            .append_pair("bucket", bucket)
-            .append_pair("operation", operation)
-            .finish()
-    );
-    broadcast_site_replication_json(&path, &serde_json::json!({})).await
-}
-
-pub async fn site_replication_bucket_meta_hook(mut item: SRBucketMeta) -> S3Result<()> {
-    let Some(runtime) = runtime_site_replication_targets().await? else {
-        return Ok(());
-    };
-    if item.r#type == "lc-config" && !site_replication_state_replicates_ilm_expiry(&runtime.state) {
-        return Ok(());
-    }
-    if item.r#type == "lc-config" {
-        // Only the expiry subset travels (MinIO peers install incoming rules
-        // verbatim, so transition rules must never leave this site). An empty
-        // subset becomes a delete, which the receiver merges with the empty
-        // set — local transition rules there survive.
-        item.expiry_lc_config = item
-            .expiry_lc_config
-            .and_then(|raw| lifecycle_expiry_subset_xml(raw.as_bytes()))
-            .map(|data| String::from_utf8_lossy(&data).into_owned());
-    }
-    broadcast_site_replication_json_with_runtime(
-        &runtime,
-        "/rustfs/admin/v3/site-replication/peer/bucket-meta",
-        &encode_bucket_meta_wire_item(item),
-    )
-    .await
-}
-
-pub async fn site_replication_iam_change_hook(item: SRIAMItem) -> S3Result<()> {
-    broadcast_site_replication_json("/rustfs/admin/v3/site-replication/peer/iam-item", &item).await
-}
-
-fn raw_config_to_string(raw: &[u8]) -> Option<String> {
-    if raw.is_empty() {
-        return None;
-    }
-    String::from_utf8(raw.to_vec()).ok()
-}
-
-fn raw_config_to_base64(raw: &[u8]) -> Option<String> {
-    (!raw.is_empty()).then(|| BASE64_STANDARD.encode(raw))
-}
-
-fn encode_bucket_meta_wire_value(value: Option<String>) -> Option<String> {
-    value.map(|raw| BASE64_STANDARD.encode(raw.as_bytes()))
-}
-
-fn encode_bucket_meta_wire_item(mut item: SRBucketMeta) -> SRBucketMeta {
-    item.versioning = encode_bucket_meta_wire_value(item.versioning);
-    item.tags = encode_bucket_meta_wire_value(item.tags);
-    item.object_lock_config = encode_bucket_meta_wire_value(item.object_lock_config);
-    item.sse_config = encode_bucket_meta_wire_value(item.sse_config);
-    item.replication_config = encode_bucket_meta_wire_value(item.replication_config);
-    item.expiry_lc_config = encode_bucket_meta_wire_value(item.expiry_lc_config);
-    item.cors = encode_bucket_meta_wire_value(item.cors);
-    item
-}
-
-fn decode_bucket_meta_wire_value(raw: &str) -> Vec<u8> {
-    BASE64_STANDARD
-        .decode(raw.as_bytes())
-        .ok()
-        .filter(|decoded| std::str::from_utf8(decoded).is_ok())
-        .unwrap_or_else(|| raw.as_bytes().to_vec())
-}
-
-fn decode_bucket_meta_wire_option(value: Option<String>) -> Option<Vec<u8>> {
-    value.map(|raw| decode_bucket_meta_wire_value(&raw))
-}
-
-fn maybe_time(value: OffsetDateTime) -> Option<OffsetDateTime> {
-    (value != OffsetDateTime::UNIX_EPOCH).then_some(value)
-}
-
-async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S3Result<SRInfo> {
-    let Some(store) = current_object_store_handle() else {
-        return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-    };
-
-    let mut info = SRInfo {
-        enabled: state.enabled(),
-        name: local_peer.name.clone(),
-        deployment_id: local_peer.deployment_id.clone(),
-        state: SRStateInfo {
-            name: local_peer.name.clone(),
-            peers: state.peers.clone(),
-            updated_at: state.updated_at,
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-        },
-        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+    let mut settings = OpenIDSettings {
+        enabled: true,
+        region,
         ..Default::default()
     };
 
-    let buckets = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
-    for bucket in buckets {
-        let metadata = metadata_sys::get(&bucket.name).await.ok();
-        let mut entry = SRBucketInfo {
-            bucket: bucket.name.clone(),
-            created_at: bucket.created,
-            location: current_region().map(|region| region.to_string()).unwrap_or_default(),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        };
+    for (provider_id, provider_settings) in providers {
+        let claim_provider_unset = settings.claim_provider.client_id.is_empty()
+            && settings.claim_provider.claim_name.is_empty()
+            && settings.claim_provider.role_policy.is_empty()
+            && settings.claim_provider.hashed_client_secret.is_empty();
 
-        if let Some(metadata) = metadata {
-            entry.policy = raw_config_to_string(&metadata.policy_config_json).and_then(|raw| serde_json::from_str(&raw).ok());
-            entry.versioning = raw_config_to_base64(&metadata.versioning_config_xml);
-            entry.tags = raw_config_to_base64(&metadata.tagging_config_xml);
-            entry.object_lock_config = raw_config_to_base64(&metadata.object_lock_config_xml);
-            entry.sse_config = raw_config_to_base64(&metadata.encryption_config_xml);
-            entry.replication_config = raw_config_to_base64(&metadata.replication_config_xml);
-            entry.quota_config = raw_config_to_base64(&metadata.quota_config_json);
-            // Expiry subset only: this entry feeds both the bootstrap/repair
-            // plan (peers must not receive transition rules) and cross-site
-            // consistency views (transition rules are site-local and would
-            // read as false mismatches). A deleted expiry state is a `None`
-            // value with the deletion's axis so repair can converge peers
-            // that missed the live delete.
-            let expiry_statement = lifecycle_expiry_statement(&metadata);
-            entry.expiry_lc_config = expiry_statement.as_ref().and_then(|(subset, _)| subset.clone());
-            entry.cors_config = raw_config_to_base64(&metadata.cors_config_xml);
-            entry.policy_updated_at = maybe_time(metadata.policy_config_updated_at);
-            entry.tag_config_updated_at = maybe_time(metadata.tagging_config_updated_at);
-            entry.object_lock_config_updated_at = maybe_time(metadata.object_lock_config_updated_at);
-            entry.sse_config_updated_at = maybe_time(metadata.encryption_config_updated_at);
-            entry.versioning_config_updated_at = maybe_time(metadata.versioning_config_updated_at);
-            entry.replication_config_updated_at = maybe_time(metadata.replication_config_updated_at);
-            entry.quota_config_updated_at = maybe_time(metadata.quota_config_updated_at);
-            // The expiry axis, not the whole-config write time: local
-            // transition-only edits inflate the latter, and a repair item
-            // stamped with it could out-rank a newer real expiry edit on a
-            // third site.
-            entry.expiry_lc_config_updated_at = expiry_statement.map(|(_, axis)| axis);
-            entry.cors_config_updated_at = maybe_time(metadata.cors_config_updated_at);
-            entry.replication_targets_online =
-                Some(site_replication_targets_online(&bucket.name, &metadata.replication_config_xml).await);
-        }
-
-        info.buckets.insert(bucket.name, entry);
-    }
-
-    if let Some(iam_sys) = current_iam_handle() {
-        for (name, policy_doc) in iam_sys.list_policy_docs("").await.map_err(ApiError::from)? {
-            info.policies.insert(
-                name,
-                SRIAMPolicy {
-                    policy: serde_json::to_value(policy_doc.policy).ok(),
-                    updated_at: policy_doc.update_date,
-                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                },
-            );
-        }
-
-        let users = iam_sys.list_users().await.map_err(ApiError::from)?;
-        for (name, user) in users {
-            info.user_info_map.insert(name, user);
-        }
-
-        let groups = iam_sys.list_groups_load().await.map_err(ApiError::from)?;
-        for group in groups {
-            let desc = iam_sys.get_group_description(&group).await.map_err(ApiError::from)?;
-            info.group_desc_map.insert(group.clone(), desc);
-        }
-
-        let mut user_policies = HashMap::<String, MappedPolicy>::new();
-        iam_sys
-            .load_mapped_policies(UserType::Reg, false, &mut user_policies)
-            .await
-            .map_err(ApiError::from)?;
-        for (name, mapping) in user_policies {
-            info.user_policies
-                .insert(name.clone(), mapped_policy_to_sr_mapping(name, false, UserType::Reg, mapping));
-        }
-
-        let mut group_policies = HashMap::<String, MappedPolicy>::new();
-        iam_sys
-            .load_mapped_policies(UserType::None, true, &mut group_policies)
-            .await
-            .map_err(ApiError::from)?;
-        for (name, mapping) in group_policies {
-            info.group_policies
-                .insert(name.clone(), mapped_policy_to_sr_mapping(name, true, UserType::None, mapping));
+        if provider_id == "default" || claim_provider_unset {
+            settings.claim_provider = provider_settings;
+        } else {
+            settings.roles.insert(provider_id, provider_settings);
         }
     }
 
-    for (name, bucket_info) in &info.buckets {
-        if let Some(raw) = bucket_info
-            .replication_config
-            .as_ref()
-            .and_then(|value| serde_json::from_str::<Value>(value).ok())
-        {
-            info.replication_cfg.insert(name.clone(), raw);
-        }
-    }
-
-    Ok(info)
+    settings
 }
 
 fn local_idp_settings() -> IDPSettings {
     let mut settings = IDPSettings::default();
     if let Some(federation) = current_federated_identity_service() {
-        let providers = federation.list_providers();
-        settings.open_id.enabled = !providers.is_empty();
-        settings.open_id.region = current_region().map(|region| region.to_string()).unwrap_or_default();
-
-        for provider in providers {
-            let Some(config) = federation.get_provider_config(&provider.provider_id) else {
-                continue;
-            };
-            let provider_settings = OpenIDProviderSettings {
-                claim_name: config.claim_name.clone(),
-                claim_userinfo_enabled: false,
-                role_policy: config.role_policy.clone(),
-                client_id: config.client_id.clone(),
-                hashed_client_secret: hash_client_secret(config.client_secret.as_deref()),
-            };
-
-            let claim_provider_unset = settings.open_id.claim_provider.client_id.is_empty()
-                && settings.open_id.claim_provider.claim_name.is_empty()
-                && settings.open_id.claim_provider.role_policy.is_empty()
-                && settings.open_id.claim_provider.hashed_client_secret.is_empty();
-
-            if provider.provider_id == "default" || claim_provider_unset {
-                settings.open_id.claim_provider = provider_settings.clone();
-            } else {
-                settings.open_id.roles.insert(provider.provider_id.clone(), provider_settings);
-            }
-        }
+        // A listed provider whose config cannot be resolved contributes
+        // nothing to the peer comparison, so it is dropped here rather than
+        // inside the settings builder.
+        let providers = federation
+            .list_providers()
+            .into_iter()
+            .filter_map(|provider| {
+                let config = federation.get_provider_config(&provider.provider_id)?;
+                Some((
+                    provider.provider_id.clone(),
+                    OpenIDProviderSettings {
+                        claim_name: config.claim_name.clone(),
+                        claim_userinfo_enabled: false,
+                        role_policy: config.role_policy.clone(),
+                        client_id: config.client_id.clone(),
+                        hashed_client_secret: hash_client_secret(config.client_secret.as_deref()),
+                    },
+                ))
+            })
+            .collect();
+        settings.open_id = open_id_settings(providers, current_region().map(|region| region.to_string()).unwrap_or_default());
     }
 
     let (ldap, ldap_configs) = load_ldap_idp_settings();
     settings.ldap = ldap;
     settings.ldap_configs = ldap_configs;
     settings
-}
-
-fn mapped_policy_to_sr_mapping(name: String, is_group: bool, user_type: UserType, mapping: MappedPolicy) -> SRPolicyMapping {
-    SRPolicyMapping {
-        user_or_group: name,
-        user_type: sr_wire_user_type(user_type, is_group),
-        is_group,
-        policy: mapping.policies,
-        updated_at: Some(mapping.update_at),
-        api_version: Some(SITE_REPL_API_VERSION.to_string()),
-        ..Default::default()
-    }
 }
 
 fn filter_sr_info(mut info: SRInfo, opts: &SRStatusOptions) -> SRInfo {
@@ -4746,25 +2147,134 @@ fn filter_sr_info(mut info: SRInfo, opts: &SRStatusOptions) -> SRInfo {
     info
 }
 
-async fn build_metrics_summary(local_peer: &PeerInfo) -> SRMetricsSummary {
+/// Resolve one peer's downtime and last-seen from the replication heartbeat.
+///
+/// The heartbeat already tracks every remote endpoint it replicates to
+/// (`EpHealth`, refreshed every `RUSTFS_REPL_HEALTH_CHECK_INTERVAL_MS`), so
+/// these come from real observations instead of being synthesized per request.
+/// `reachable` is the caller's live probe for this status call and wins over
+/// the heartbeat's cached flag, which can lag by up to one probe interval.
+///
+/// An endpoint the heartbeat has never seen (no replication target points at
+/// it yet) yields zero downtime rather than a fabricated outage.
+async fn peer_health_metric(endpoint: &str, reachable: bool) -> (i64, Option<OffsetDateTime>) {
+    let fallback = (0, reachable.then(OffsetDateTime::now_utc));
+
+    let Ok(url) = Url::parse(endpoint) else {
+        return fallback;
+    };
+    let Some(health) = BucketTargetSys::get().endpoint_health(&url).await else {
+        return fallback;
+    };
+
+    let total_downtime_ns = i64::try_from(health.offline_duration.as_nanos()).unwrap_or(i64::MAX);
+    let last_online = if reachable {
+        Some(OffsetDateTime::now_utc())
+    } else {
+        health.last_online
+    };
+
+    (total_downtime_ns, last_online)
+}
+
+/// Assemble one peer's metric entry from already-resolved inputs.
+///
+/// Split out of [`build_metrics_summary`] so the local/remote and
+/// reachable/unreachable matrix stays unit-testable without a live replication
+/// stats handle or a populated heartbeat map.
+fn peer_metric_entry(
+    deployment_id: &str,
+    endpoint: &str,
+    is_local: bool,
+    reachable: bool,
+    (total_downtime_ns, last_online): (i64, Option<OffsetDateTime>),
+    local_counters: (i64, i64),
+    local_failures: TimedErrStats,
+) -> SRMetric {
+    let (replica_size, replica_count) = local_counters;
+
+    SRMetric {
+        deployment_id: deployment_id.to_string(),
+        endpoint: endpoint.to_string(),
+        online: reachable,
+        total_downtime_ns,
+        last_online,
+        // Replication counters are node-local: they describe traffic this node
+        // handled, so they belong only on the local entry. Copying them onto
+        // remote entries would double-count them cluster-wide.
+        replicated_size: if is_local { replica_size } else { 0 },
+        replicated_count: if is_local { replica_count } else { 0 },
+        failed: if is_local { local_failures } else { TimedErrStats::default() },
+        ..Default::default()
+    }
+}
+
+fn site_failure_stats(node: &crate::storage::storage_api::ReplicationSiteMetricsSnapshot) -> TimedErrStats {
+    TimedErrStats {
+        last_minute: RStat {
+            count: node.failed_last_minute_count as f64,
+            bytes: node.failed_last_minute_bytes,
+        },
+        last_hour: RStat {
+            count: node.failed_last_hour_count as f64,
+            bytes: node.failed_last_hour_bytes,
+        },
+        totals: RStat {
+            count: node.failed_count as f64,
+            bytes: node.failed_bytes,
+        },
+        ..Default::default()
+    }
+}
+
+async fn build_metrics_summary(
+    local_peer: &PeerInfo,
+    peers: &BTreeMap<String, PeerInfo>,
+    reachable_peers: &HashSet<String>,
+) -> SRMetricsSummary {
     let Some(stats) = current_replication_stats_handle() else {
         return SRMetricsSummary::default();
     };
 
     let node = stats.site_metrics_snapshot().await;
+    let failures = site_failure_stats(&node);
     let mut metrics = BTreeMap::new();
-    metrics.insert(
-        local_peer.deployment_id.clone(),
-        SRMetric {
-            deployment_id: local_peer.deployment_id.clone(),
-            endpoint: local_peer.endpoint.clone(),
-            online: true,
-            replicated_size: node.replica_size,
-            replicated_count: node.replica_count,
-            last_online: Some(OffsetDateTime::now_utc()),
-            ..Default::default()
-        },
-    );
+
+    // Emit an entry for every peer, not just the local one. An operator reading
+    // this page needs to know whether the *remote* site is reachable; reporting
+    // only "I am online" made a peer outage invisible here, so a site could be
+    // down for minutes while the status page stayed green.
+    for (deployment_id, peer) in peers {
+        let is_local = deployment_id == &local_peer.deployment_id;
+        let reachable = is_local || reachable_peers.contains(deployment_id);
+        let health = peer_health_metric(&peer.endpoint, reachable).await;
+
+        metrics.insert(
+            deployment_id.clone(),
+            peer_metric_entry(
+                deployment_id,
+                &peer.endpoint,
+                is_local,
+                reachable,
+                health,
+                (node.replica_size, node.replica_count),
+                failures.clone(),
+            ),
+        );
+    }
+
+    // A peer map that somehow omits the local deployment must still report the
+    // local counters rather than silently dropping them.
+    metrics.entry(local_peer.deployment_id.clone()).or_insert_with(|| SRMetric {
+        deployment_id: local_peer.deployment_id.clone(),
+        endpoint: local_peer.endpoint.clone(),
+        online: true,
+        last_online: Some(OffsetDateTime::now_utc()),
+        replicated_size: node.replica_size,
+        replicated_count: node.replica_count,
+        failed: failures,
+        ..Default::default()
+    });
 
     SRMetricsSummary {
         active_workers: WorkerStat {
@@ -4814,13 +2324,9 @@ async fn fetch_peer_sr_info(
         return Err(s3_error!(InvalidRequest, "site replication service account is not configured"));
     }
 
-    let body = send_peer_admin_get_request(
-        &runtime_peer_connection(peer)?,
-        &sr_metainfo_path(uri),
-        &state.service_account_access_key,
-        service_account_secret_key,
-    )
-    .await?;
+    let body = PeerAdminRequest::get(&runtime_peer_connection(peer)?, &sr_metainfo_path(uri), &state.service_account_access_key)
+        .send_get(service_account_secret_key)
+        .await?;
 
     serde_json::from_slice(&body).map_err(|e| {
         S3Error::with_message(
@@ -5291,6 +2797,19 @@ fn prune_in_sync_status_details(status: &mut SRStatusInfo, opts: &SRStatusOption
     }
 }
 
+fn peer_states_from_infos(
+    site_infos: BTreeMap<String, SRInfo>,
+    reachable_peers: &HashSet<String>,
+) -> BTreeMap<String, SRStateInfo> {
+    // Failed metainfo fetches leave default entries in site_infos for comparison;
+    // they must not become fabricated peer state. PeerErrors describes the failure.
+    site_infos
+        .into_iter()
+        .filter(|(deployment_id, _)| reachable_peers.contains(deployment_id))
+        .map(|(deployment_id, info)| (deployment_id, info.state))
+        .collect()
+}
+
 async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, uri: &Uri) -> S3Result<SRStatusInfo> {
     let opts = sr_status_options(uri);
     let mut local_info = Some(filter_sr_info(build_sr_info(state, local_peer).await?, &opts));
@@ -5415,21 +2934,11 @@ async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, 
     }
 
     if metrics_requested {
-        status.metrics = build_metrics_summary(local_peer).await;
+        status.metrics = build_metrics_summary(local_peer, &state.peers, &reachable_peers).await;
     }
 
     if opts.peer_state {
-        for (deployment_id, peer) in &state.peers {
-            status.peer_states.insert(
-                deployment_id.clone(),
-                SRStateInfo {
-                    name: peer.name.clone(),
-                    peers: state.peers.clone(),
-                    updated_at: state.updated_at,
-                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                },
-            );
-        }
+        status.peer_states = peer_states_from_infos(site_infos, &reachable_peers);
     }
 
     Ok(status)
@@ -5439,6 +2948,7 @@ fn merge_add_sites(
     mut state: SiteReplicationState,
     local_peer: PeerInfo,
     sites: Vec<PeerSite>,
+    preflight_infos: &[SiteReplicationAddPreflightInfo],
     service_account_access_key: String,
     service_account_parent: String,
     replicate_ilm_expiry: bool,
@@ -5448,11 +2958,36 @@ fn merge_add_sites(
     state.service_account_parent = service_account_parent;
     state.updated_at = Some(OffsetDateTime::now_utc());
     state.peers = build_join_peers(&state, &local_peer, sites, replicate_ilm_expiry);
+    // Every join must carry the verified identities, including peers that
+    // have not joined yet. Fixing only the coordinator after each reply
+    // leaves the other sites holding endpoint-derived placeholders.
+    for info in preflight_infos {
+        if let Some(mut peer) = existing_peer_for_endpoint(&state, &info.endpoint) {
+            peer.deployment_id = info.deployment_id.clone();
+            state = reconcile_peer_with_actual_identity(state, peer);
+        }
+    }
     state
 }
 
 fn update_peer(mut state: SiteReplicationState, incoming: PeerInfo, ilm_expiry_override: Option<bool>) -> SiteReplicationState {
     let mut peer = normalize_peer_info(incoming);
+    // An older sender may still hold a placeholder after this site has
+    // learned the real ID. Do not let that delivery downgrade the identity.
+    if peer.deployment_id == deployment_id_for_endpoint(&peer.endpoint)
+        && let Some(existing) = state.peers.values().find(|existing| {
+            same_identity_endpoint(&existing.endpoint, &peer.endpoint)
+                && existing.deployment_id != deployment_id_for_endpoint(&existing.endpoint)
+        })
+    {
+        peer.deployment_id = existing.deployment_id.clone();
+    }
+    // Remove the placeholder before persistence normalizes duplicate
+    // endpoints; otherwise map ordering can discard the real identity.
+    state.peers.retain(|_, existing| {
+        !same_identity_endpoint(&existing.endpoint, &peer.endpoint)
+            || existing.deployment_id != deployment_id_for_endpoint(&existing.endpoint)
+    });
     if let Some(enabled) = ilm_expiry_override {
         peer.replicate_ilm_expiry = enabled;
     }
@@ -5548,14 +3083,20 @@ fn peer_endpoint_refresh_requested(state: &SiteReplicationState, incoming: &Peer
         .is_some_and(|peer| !peer_connection_settings_match(peer, incoming))
 }
 
-fn pending_endpoint_refresh(state: &SiteReplicationState) -> Option<PendingEndpointRefresh> {
-    state.pending_endpoint_refresh.clone().or_else(|| {
-        state
-            .retry_queue
-            .iter()
-            .find(|event| event.path == SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH)
-            .and_then(|event| serde_json::from_str(&event.last_error).ok())
-    })
+/// A persisted refresh journal pins the edit's payload: the commit reads the
+/// peer and the ilm-expiry override back out of it, so a re-run cannot change
+/// them. Re-running without the flag keeps the pinned value - that is the
+/// documented way to redrive a stuck refresh - but a re-run that asks for a
+/// different value must be rejected rather than accepted and ignored.
+/// The one construction of the concurrent-change error: every writer of a
+/// pending refresh re-checks the journal inside its own transaction and
+/// reports the same condition when it no longer owns it.
+fn endpoint_refresh_state_changed() -> S3Error {
+    s3_error!(InvalidRequest, "endpoint target refresh state changed during update")
+}
+
+fn endpoint_refresh_ilm_override_conflicts(persisted: &PendingEndpointRefresh, requested: Option<bool>) -> bool {
+    requested.is_some() && requested != persisted.ilm_expiry_override
 }
 
 fn merge_pending_endpoint_refresh(
@@ -5568,7 +3109,7 @@ fn merge_pending_endpoint_refresh(
             || latest.peer.deployment_id != candidate.peer.deployment_id
             || !peer_connection_settings_match(&latest.peer, &candidate.peer)
         {
-            return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
+            return Err(endpoint_refresh_state_changed());
         }
         latest
     } else {
@@ -5626,6 +3167,8 @@ fn set_pending_endpoint_refresh(state: &mut SiteReplicationState, pending: Pendi
         last_error: "endpoint target refresh pending".to_string(),
         updated_at: Some(OffsetDateTime::now_utc()),
         edit_generation: None,
+        peer_unreachable: false,
+        deletions_recorded: false,
     });
     state.pending_endpoint_refresh = Some(pending);
     Ok(())
@@ -5645,39 +3188,8 @@ fn endpoint_refresh_target_state(state: &SiteReplicationState, pending: &Pending
     target_state
 }
 
-fn parse_endpoint_refresh_status(peer: &PeerInfo, body: &[u8]) -> S3Result<()> {
-    let status: ReplicateEditStatus = serde_json::from_slice(body).map_err(|_| {
-        S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("peer {} does not support endpoint target refresh", peer.endpoint),
-        )
-    })?;
-    if status.success {
-        Ok(())
-    } else {
-        Err(S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("peer {} failed endpoint target refresh: {}", peer.endpoint, status.err_detail),
-        ))
-    }
-}
-
 fn endpoint_refresh_capability_supported(peer: &PeerInfo, status: StatusCode, body: &[u8]) -> S3Result<bool> {
     peer_capability_response_supported(peer, status, body)
-}
-
-fn peer_capability_response_supported(peer: &PeerInfo, status: StatusCode, body: &[u8]) -> S3Result<bool> {
-    if status.is_success() {
-        return Ok(parse_endpoint_refresh_status(peer, body).is_ok());
-    }
-    if matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED) {
-        return Ok(false);
-    }
-
-    Err(S3Error::with_message(
-        S3ErrorCode::InternalError,
-        format!("probe site replication capability on peer {} failed with {status}", peer.endpoint),
-    ))
 }
 
 async fn require_add_peer_tls_capability(sites: &[PeerSite], local_peer: &PeerInfo) -> S3Result<()> {
@@ -5692,15 +3204,10 @@ async fn require_add_peer_tls_capability(sites: &[PeerSite], local_peer: &PeerIn
     let probes = futures::future::join_all(remote_sites.iter().map(|site| async move {
         let connection = PeerConnection::try_from(*site)?;
         let client = site_replication_client_for(&connection).await?;
-        send_peer_admin_request_raw_with_client(
-            &client,
-            &connection,
-            SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH,
-            &site.access_key,
-            &site.secret_key,
-            &(),
-        )
-        .await
+        PeerAdminRequest::put(&connection, SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH, &site.access_key)
+            .with_client(&client)
+            .send_raw(&site.secret_key, Some(&()))
+            .await
     }))
     .await;
     for (site, probe) in remote_sites.into_iter().zip(probes) {
@@ -5771,15 +3278,10 @@ async fn require_edit_peer_tls_capability(
 async fn probe_proposed_peer_tls_transport(peer: &PeerInfo, access_key: &str, secret_key: &str) -> S3Result<()> {
     let connection = PeerConnection::try_from(peer)?;
     let client = site_replication_client_for(&connection).await?;
-    let (status, body) = send_peer_admin_request_raw_with_client(
-        &client,
-        &connection,
-        SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH,
-        access_key,
-        secret_key,
-        &(),
-    )
-    .await?;
+    let (status, body) = PeerAdminRequest::put(&connection, SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH, access_key)
+        .with_client(&client)
+        .send_raw(secret_key, Some(&()))
+        .await?;
     if peer_capability_response_supported(peer, status, &body)? {
         Ok(())
     } else {
@@ -5920,15 +3422,10 @@ async fn send_endpoint_refresh_admin_request_raw_with_transports<T: Serialize>(
     let mut last_error = None;
     let mut last_response = None;
     for transport in transports {
-        match send_peer_admin_request_raw_with_client(
-            &transport.client,
-            &transport.connection,
-            path,
-            access_key,
-            secret_key,
-            body,
-        )
-        .await
+        match PeerAdminRequest::put(&transport.connection, path, access_key)
+            .with_client(&transport.client)
+            .send_raw(secret_key, Some(body))
+            .await
         {
             Ok((status, response))
                 if matches!(status, StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::GONE)
@@ -5960,13 +3457,13 @@ async fn legacy_peer_bucket_names_with_transports(
 ) -> S3Result<Vec<String>> {
     let mut last_error = None;
     for transport in transports {
-        match send_peer_admin_get_request_with_client(
-            &transport.client,
+        match PeerAdminRequest::get(
             &transport.connection,
             "/rustfs/admin/v3/site-replication/metainfo?buckets=true",
             access_key,
-            secret_key,
         )
+        .with_client(&transport.client)
+        .send_get(secret_key)
         .await
         {
             Ok(body) => return peer_bucket_names_from_metainfo(transport.connection.endpoint(), &body),
@@ -6076,6 +3573,13 @@ fn align_peer_edit_deployment_id(state: &SiteReplicationState, incoming: &mut Pe
         return;
     };
     if matches.next().is_none() {
+        if same_identity_endpoint(&peer.endpoint, &incoming.endpoint)
+            && peer.deployment_id == deployment_id_for_endpoint(&peer.endpoint)
+            && !incoming.deployment_id.is_empty()
+            && incoming.deployment_id != deployment_id_for_endpoint(&incoming.endpoint)
+        {
+            return;
+        }
         incoming.deployment_id = peer.deployment_id.clone();
     }
 }
@@ -6085,6 +3589,8 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
         state.peers.clear();
         state.resync_status.clear();
         state.retry_queue.clear();
+        state.iam_deletion_replays.clear();
+        state.iam_deletion_marks.clear();
         state.pending_endpoint_refresh = None;
         state.updated_at = Some(OffsetDateTime::now_utc());
         return state;
@@ -6095,6 +3601,8 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
         state.peers.clear();
         state.resync_status.clear();
         state.retry_queue.clear();
+        state.iam_deletion_replays.clear();
+        state.iam_deletion_marks.clear();
         state.pending_endpoint_refresh = None;
         state.updated_at = Some(OffsetDateTime::now_utc());
         return state;
@@ -6114,6 +3622,11 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
         !removed_peers
             .iter()
             .any(|(deployment_id, endpoint)| &event.peer_deployment_id == deployment_id || &event.peer_endpoint == endpoint)
+    });
+    state.iam_deletion_replays.retain(|record| {
+        !removed_peers
+            .iter()
+            .any(|(deployment_id, endpoint)| &record.peer_deployment_id == deployment_id || &record.peer_endpoint == endpoint)
     });
     state
         .resync_status
@@ -6180,87 +3693,6 @@ fn validate_remove_sites_req(state: &SiteReplicationState, req: &SRRemoveReq) ->
     Ok(())
 }
 
-fn summarize_peer_error_detail(detail: &str) -> String {
-    let detail = detail.trim();
-    let detail_chars = detail.chars().count();
-    if detail_chars <= SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT {
-        return detail.to_string();
-    }
-
-    let suffix = "... (truncated)";
-    let take_chars = SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT.saturating_sub(suffix.chars().count());
-    let mut summary: String = detail.chars().take(take_chars).collect();
-    summary.push_str(suffix);
-    summary
-}
-
-/// The wall clock in unix nanoseconds, clamped into u64. A pre-1970 (or
-/// post-2554) clock yields 0, which makes the hybrid allocation below
-/// degrade to the plain `previous + 1` counter — monotone, never panicking.
-fn edit_generation_wall_clock() -> u64 {
-    u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap_or(0)
-}
-
-/// Allocate the next peer-edit generation as a hybrid logical clock:
-/// `max(wall clock in unix nanoseconds, previous + 1)`. Called inside the
-/// state transaction, so the value is handed out under the distributed
-/// state-object lock and two nodes of this site can never take the same one
-/// (`previous + 1` keeps the sequence strictly increasing even when two
-/// allocations land in one clock tick, and keeps it monotone on a node
-/// whose clock stepped backwards mid-lifetime).
-///
-/// The wall-clock floor is what survives the counter's death. A site
-/// removed while unreachable — the receiver never dropped it from its peer
-/// map, so the load-time mark pruning in `parse_site_replication_state`
-/// never fired — that later rejoins recreates its state object with the
-/// counter back at zero. A plain counter would then hand out generations
-/// below the receiver's stale high-water mark and every delivery would be
-/// silently fenced until the counter caught up. Jumping to wall time clears
-/// that mark: every value the deleted lifetime handed out was capped by the
-/// wall clock at its own allocation (or by a prior lifetime's cap, applied
-/// inductively), so the recreated lifetime's first allocation exceeds them
-/// all — while a pre-removal delivery still in flight stays below the new
-/// floor and remains correctly fenced. Marks recorded by pre-hybrid
-/// receivers (small plain-counter values) sit far below any wall-clock
-/// value, so a restarted origin passes those too — the fix needs only the
-/// sender upgraded, nothing on the wire or in the receiver changed.
-///
-/// A wall clock that regresses across a delete/recreate (the recreating
-/// node's clock behind the clock that fed the previous lifetime) mints
-/// below the stale mark and the origin stays fenced — but only until real
-/// time passes the previous lifetime's last allocation, because every later
-/// allocation takes the wall-clock floor again (and never longer than
-/// [`PEER_EDIT_FENCE_STALENESS_WINDOW_NANOS`]: a regression past the window
-/// leaves the mark implausibly distant and the origin runs unfenced
-/// immediately). Bounded by the skew,
-/// self-healing, and no rollback window beyond the plain counter's: a
-/// delivery applies only at or above the receiver's mark, so the one
-/// cross-lifetime interleaving that can apply stale content — a
-/// pre-removal delivery whose generation lands above everything the
-/// regressed new lifetime has minted — required the same straggler landing
-/// above the mark under the plain counter, where the recreated counter's
-/// low restart made it strictly easier to hit.
-fn next_peer_edit_generation(state: &mut SiteReplicationState) -> u64 {
-    state.edit_generation = edit_generation_wall_clock().max(state.edit_generation.saturating_add(1));
-    state.edit_generation
-}
-
-/// Build the peer-edit request path carrying the fencing token. The bare
-/// constant stays the retry-queue key: the query only fences the wire
-/// delivery, and a per-generation key would make every retry event unique.
-/// Without a local deployment id there is nothing to fence against, so the
-/// unstamped path is sent and the receiver keeps its pre-fence behaviour.
-fn peer_edit_path_with_fence(origin: Option<&str>, generation: u64) -> String {
-    let Some(origin) = origin.filter(|origin| !origin.is_empty()) else {
-        return SITE_REPLICATION_PEER_EDIT_PATH.to_string();
-    };
-    let query = form_urlencoded::Serializer::new(String::new())
-        .append_pair(SITE_REPLICATION_EDIT_ORIGIN_QUERY, origin)
-        .append_pair(SITE_REPLICATION_EDIT_GENERATION_QUERY, &generation.to_string())
-        .finish();
-    format!("{SITE_REPLICATION_PEER_EDIT_PATH}?{query}")
-}
-
 /// The (origin site, generation) fence an incoming peer edit carries, when the
 /// sender stamped one. An unstamped edit (older peer) has no fence and is
 /// applied as before.
@@ -6291,16 +3723,15 @@ const PEER_EDIT_FENCE_STALENESS_WINDOW_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000
 /// must be a site this state currently replicates with — the same membership
 /// rule the load-time mark pruning applies, so every mark recorded behind
 /// this check is one a reload would keep — and not this site itself, which
-/// never delivers edits to itself. The caller IGNORES an inadmissible fence
-/// rather than failing the request: the delivery applies exactly as an
-/// unstamped (pre-fence) delivery would, no high-water mark is read or
-/// written, and the worst a forged fence achieves is forfeiting an ordering
-/// guarantee its sender was never owed. The generation itself is NOT
-/// bounded here: a genuine origin whose hybrid clock persisted a wall-clock
-/// excursion allocates arbitrarily far in the future, and refusing to
-/// record its marks would strip the ordering fence from exactly the
-/// deliveries that still race — the staleness window on the read side is
-/// what defuses forged marks instead.
+/// never delivers edits to itself. The caller acknowledges an inadmissible
+/// fenced request without applying it: after a remove commits, an older
+/// in-flight retry from the departed origin must not recreate topology. Old
+/// peers remain compatible because their unstamped edits still follow the
+/// pre-fence path. The generation itself is NOT bounded here: a genuine
+/// origin whose hybrid clock persisted a wall-clock excursion allocates
+/// arbitrarily far in the future, and refusing to record its marks would
+/// strip the ordering fence from exactly the deliveries that still race —
+/// the staleness window on the read side is what defuses forged marks instead.
 fn peer_edit_fence_is_admissible(state: &SiteReplicationState, local_deployment_id: &str, fence: &(String, u64)) -> bool {
     let (origin, generation) = fence;
     if origin != local_deployment_id && state.peers.contains_key(origin) {
@@ -6368,881 +3799,6 @@ fn record_applied_peer_edit_generation(state: &mut SiteReplicationState, origin:
     *applied = (*applied).max(generation);
 }
 
-fn retry_event_matches(event: &SiteReplicationRetryEvent, peer: &PeerInfo, path: &str) -> bool {
-    (event.peer_deployment_id == peer.deployment_id || event.peer_endpoint == peer.endpoint) && event.path == path
-}
-
-const SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH: &str = "internal:retry-snapshot:iam";
-const SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH: &str = "internal:retry-snapshot:bucket-metadata";
-
-fn collapsed_retry_queue_path(path: &str) -> Option<&'static str> {
-    let base_path = path.split_once('?').map(|(base, _)| base).unwrap_or(path);
-    match base_path {
-        "/rustfs/admin/v3/site-replication/peer/iam-item" | SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH => {
-            Some(SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH)
-        }
-        "/rustfs/admin/v3/site-replication/peer/bucket-meta" | SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH => {
-            Some(SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH)
-        }
-        _ => None,
-    }
-}
-
-fn normalize_collapsed_retry_queue_paths(queue: &mut Vec<SiteReplicationRetryEvent>) -> bool {
-    let mut changed = false;
-    let mut normalized: Vec<SiteReplicationRetryEvent> = Vec::with_capacity(queue.len());
-    for mut event in queue.drain(..) {
-        if let Some(path) = collapsed_retry_queue_path(&event.path)
-            && event.path != path
-        {
-            event.path = path.to_string();
-            changed = true;
-        }
-
-        let duplicate = normalized.iter().position(|existing| {
-            existing.path == event.path
-                && (existing.peer_deployment_id == event.peer_deployment_id || existing.peer_endpoint == event.peer_endpoint)
-        });
-        let Some(index) = duplicate else {
-            normalized.push(event);
-            continue;
-        };
-
-        changed = true;
-        let existing = &mut normalized[index];
-        let event_is_newer = match (event.updated_at, existing.updated_at) {
-            (Some(event), Some(existing)) => event >= existing,
-            (Some(_), None) => true,
-            _ => false,
-        };
-        if event_is_newer {
-            let retry_count = existing.retry_count.max(event.retry_count);
-            *existing = event;
-            existing.retry_count = retry_count;
-        } else {
-            existing.retry_count = existing.retry_count.max(event.retry_count);
-        }
-        existing.failed = existing.retry_count >= SITE_REPLICATION_RETRY_FAILED_AFTER;
-    }
-    *queue = normalized;
-    changed
-}
-
-async fn migrate_collapsed_retry_queue_paths() -> S3Result<()> {
-    update_site_replication_state_when_changed(|state| {
-        Ok(if normalize_collapsed_retry_queue_paths(&mut state.retry_queue) {
-            StateCommit::Changed(())
-        } else {
-            StateCommit::Unchanged(())
-        })
-    })
-    .await
-}
-
-#[cfg(test)]
-fn dequeue_site_replication_retry_events(queue: &mut Vec<SiteReplicationRetryEvent>, peer: &PeerInfo, path: &str) -> usize {
-    settle_site_replication_retry_events(queue, peer, path, None)
-}
-
-/// Repair-path settlement: also clears snapshot-escalated entries. Running a
-/// repair is the operator's explicit accountability transfer for the
-/// possibly-unreplayed deletion the marker records; ordinary delivery
-/// successes must not clear it (see [`settle_site_replication_retry_events`]).
-fn dequeue_site_replication_retry_events_including_escalated(
-    queue: &mut Vec<SiteReplicationRetryEvent>,
-    peer: &PeerInfo,
-    path: &str,
-) -> usize {
-    let before = queue.len();
-    let collapsed_path = collapsed_retry_queue_path(path);
-    queue.retain(|event| {
-        !retry_event_matches(event, peer, path)
-            && !collapsed_path.is_some_and(|collapsed_path| retry_event_matches(event, peer, collapsed_path))
-    });
-    before.saturating_sub(queue.len())
-}
-
-/// Remove the retry events for (peer, path) that `generation` is entitled to
-/// settle. A successful delivery only proves the peer reached the state the
-/// delivery carried: while it was in flight another edit can commit, fail its
-/// own delivery, and enqueue for the same (peer, path). Erasing that event
-/// would leave the peer on the older edit with no retry left, so an event
-/// stamped with a NEWER generation survives. `None` settles unconditionally —
-/// the broadcast paths that carry no generation, whose retry events live under
-/// their own paths and never collide with peer-edit deliveries.
-fn settle_site_replication_retry_events(
-    queue: &mut Vec<SiteReplicationRetryEvent>,
-    peer: &PeerInfo,
-    path: &str,
-    generation: Option<u64>,
-) -> usize {
-    let before = queue.len();
-    let collapsed_path = collapsed_retry_queue_path(path);
-    queue.retain(|event| {
-        if !retry_event_matches(event, peer, path) {
-            return true;
-        }
-        // A wire-path success identifies no IAM or bucket-metadata entity.
-        // This also protects legacy rows until the startup migration moves
-        // them under their internal snapshot path.
-        if collapsed_path.is_some() {
-            return true;
-        }
-        // A snapshot-escalated entry records a possibly-unreplayed deletion.
-        // Collapsed paths are shared by every entity, so a later successful
-        // delivery of a DIFFERENT item proves nothing about the deleted one —
-        // only a repair settles it (dequeue_..._including_escalated).
-        if event.last_error == SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER {
-            return true;
-        }
-        match (generation, event.edit_generation) {
-            (Some(settled), Some(failed)) => failed > settled,
-            _ => false,
-        }
-    });
-    before.saturating_sub(queue.len())
-}
-
-fn upsert_site_replication_retry_event(
-    queue: &mut Vec<SiteReplicationRetryEvent>,
-    peer: &PeerInfo,
-    path: &str,
-    error: &str,
-    generation: Option<u64>,
-) {
-    let path = collapsed_retry_queue_path(path).unwrap_or(path);
-    let now = OffsetDateTime::now_utc();
-    let detail = summarize_peer_error_detail(error);
-    if let Some(event) = queue.iter_mut().find(|event| retry_event_matches(event, peer, path)) {
-        event.retry_count = event.retry_count.saturating_add(1);
-        event.failed = event.retry_count >= SITE_REPLICATION_RETRY_FAILED_AFTER;
-        event.last_error = detail;
-        event.updated_at = Some(now);
-        // Keep the newest generation: an older delivery that fails afterwards
-        // must not lower the fence and let its own success settle the event.
-        event.edit_generation = event.edit_generation.max(generation);
-        return;
-    }
-
-    queue.push(SiteReplicationRetryEvent {
-        id: Uuid::new_v4().to_string(),
-        peer_deployment_id: peer.deployment_id.clone(),
-        peer_endpoint: peer.endpoint.clone(),
-        path: path.to_string(),
-        retry_count: 1,
-        failed: false,
-        last_error: detail,
-        updated_at: Some(now),
-        edit_generation: generation,
-    });
-    if queue.len() > SITE_REPLICATION_RETRY_QUEUE_LIMIT {
-        let overflow = queue.len() - SITE_REPLICATION_RETRY_QUEUE_LIMIT;
-        queue.drain(0..overflow);
-    }
-}
-
-fn retry_stats_for_state(state: &SiteReplicationState) -> Option<SRRetryStats> {
-    if state.retry_queue.is_empty() {
-        return None;
-    }
-
-    Some(SRRetryStats {
-        pending: state.retry_queue.iter().filter(|event| !event.failed).count(),
-        failed: state.retry_queue.iter().filter(|event| event.failed).count(),
-        last_error: state
-            .retry_queue
-            .iter()
-            .rev()
-            .find_map(|event| (!event.last_error.is_empty()).then(|| event.last_error.clone()))
-            .unwrap_or_default(),
-        api_version: Some(SITE_REPL_API_VERSION.to_string()),
-    })
-}
-
-async fn enqueue_site_replication_retry_event(peer: &PeerInfo, path: &str, error: &S3Error) {
-    enqueue_site_replication_retry_event_for_generation(peer, path, error, None).await
-}
-
-async fn enqueue_site_replication_retry_event_for_generation(
-    peer: &PeerInfo,
-    path: &str,
-    error: &S3Error,
-    generation: Option<u64>,
-) {
-    let peer_owned = peer.clone();
-    let path_owned = path.to_string();
-    let error_text = error.to_string();
-    let result = update_site_replication_state(move |state| {
-        // A peer that left the state can never drain its entries again
-        // (remove_sites already pruned them); recording a late failure for it
-        // would only pollute retry_stats until the queue cap evicts it.
-        if state.peers.contains_key(&peer_owned.deployment_id) {
-            upsert_site_replication_retry_event(&mut state.retry_queue, &peer_owned, &path_owned, &error_text, generation);
-        }
-        Ok(())
-    })
-    .await;
-
-    if let Err(err) = result {
-        warn!(
-            component = LOG_COMPONENT_ADMIN,
-            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-            peer = %peer.endpoint,
-            path,
-            error = ?err,
-            "failed to persist site replication retry event"
-        );
-    }
-}
-
-fn retry_bucket_operation(path: &str) -> Option<String> {
-    let (base_path, query) = path.split_once('?')?;
-    if base_path != SITE_REPLICATION_PEER_BUCKET_OPS_PATH {
-        return None;
-    }
-
-    form_urlencoded::parse(query.as_bytes()).find_map(|(key, value)| (key == "operation").then(|| value.into_owned()))
-}
-
-fn retry_event_replayed_by_bootstrap(event: &SiteReplicationRetryEvent) -> bool {
-    matches!(
-        retry_bucket_operation(&event.path).as_deref(),
-        Some(SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING | SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION)
-    )
-}
-
-/// Exponential backoff base for the background retry drain, aligned with the
-/// reconcile cadence (`site_replication_reconcile::RECONCILE_INTERVAL`).
-const SITE_REPLICATION_RETRY_DRAIN_BASE_BACKOFF_SECS: i64 = 600;
-/// Backoff ceiling: a permanently failed peer is still probed daily.
-const SITE_REPLICATION_RETRY_DRAIN_MAX_BACKOFF_SECS: i64 = 86_400;
-
-/// What the background drain may do for one retry event. Everything not
-/// representable here is operator territory (manual repair).
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RetryDrainAction {
-    /// Constant-path IAM item deliveries collapse into one queue entry per
-    /// peer and their bodies are not persisted; the only faithful replay is
-    /// the current IAM snapshot from the bootstrap plan.
-    IamSnapshot,
-    /// Same collapse for bucket-meta deliveries: replay the bucket metadata
-    /// snapshot from the bootstrap plan.
-    BucketMetadataSnapshot,
-    /// A self-contained bucket op the bootstrap plan can re-derive for its
-    /// bucket (`make-with-versioning` / `configure-replication`).
-    BucketOpReplay { operation: String, bucket: String },
-    /// Re-send the current peer records under a fresh edit generation.
-    PeerEdit,
-}
-
-#[derive(Clone)]
-enum RetrySnapshot {
-    Iam(Vec<SRIAMItem>),
-    BucketMetadata(Vec<SRBucketMeta>),
-}
-
-impl RetrySnapshot {
-    fn from_plan(action: &RetryDrainAction, plan: &SiteReplicationBootstrapPlan) -> Option<Self> {
-        match action {
-            RetryDrainAction::IamSnapshot => Some(Self::Iam(plan.iam_items.clone())),
-            RetryDrainAction::BucketMetadataSnapshot => Some(Self::BucketMetadata(plan.bucket_items.clone())),
-            _ => None,
-        }
-    }
-
-    fn fingerprint(&self) -> S3Result<Vec<Vec<u8>>> {
-        let mut payloads = match self {
-            Self::Iam(items) => items.iter().map(serde_json::to_vec).collect::<Result<Vec<_>, _>>(),
-            Self::BucketMetadata(items) => items.iter().map(serde_json::to_vec).collect::<Result<Vec<_>, _>>(),
-        }
-        .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize retry snapshot failed: {err}")))?;
-        payloads.sort_unstable();
-        Ok(payloads)
-    }
-
-    fn replay_after_change(previous: &Self, fresh: &Self, observed_at: OffsetDateTime) -> Self {
-        match (previous, fresh) {
-            (Self::Iam(previous), Self::Iam(fresh)) => {
-                let fresh_keys: HashSet<IamSnapshotKey> = fresh.iter().filter_map(iam_snapshot_key).collect();
-                let mut replay = fresh.clone();
-                for item in previous {
-                    if iam_snapshot_key(item).is_some_and(|key| !fresh_keys.contains(&key)) {
-                        replay.extend(iam_snapshot_tombstones(item, observed_at));
-                    }
-                }
-                Self::Iam(replay)
-            }
-            (Self::BucketMetadata(previous), Self::BucketMetadata(fresh)) => {
-                let fresh_keys: HashSet<(&str, &str)> = fresh
-                    .iter()
-                    .map(|item| (item.bucket.as_str(), item.r#type.as_str()))
-                    .collect();
-                let mut replay = fresh.clone();
-                for item in previous {
-                    if !fresh_keys.contains(&(item.bucket.as_str(), item.r#type.as_str())) {
-                        replay.push(bucket_metadata_snapshot_tombstone(item, observed_at));
-                    }
-                }
-                Self::BucketMetadata(replay)
-            }
-            _ => fresh.clone(),
-        }
-    }
-
-    async fn send(&self, transport: &PeerTransport, access_key: &str, secret_key: &str) -> S3Result<()> {
-        match self {
-            Self::Iam(items) => {
-                for item in items {
-                    SiteReplicationRepairTask::Iam(item)
-                        .send(transport, access_key, secret_key)
-                        .await?;
-                }
-            }
-            Self::BucketMetadata(items) => {
-                for item in items {
-                    SiteReplicationRepairTask::BucketMetadata(item)
-                        .send(transport, access_key, secret_key)
-                        .await?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Hash, PartialEq, Eq)]
-enum IamSnapshotKey {
-    Policy(String),
-    User(String),
-    Group(String),
-    PolicyMapping { target: String, user_type: i64, is_group: bool },
-}
-
-fn iam_snapshot_key(item: &SRIAMItem) -> Option<IamSnapshotKey> {
-    match item.r#type.as_str() {
-        "policy" => Some(IamSnapshotKey::Policy(item.name.clone())),
-        "iam-user" => item
-            .iam_user
-            .as_ref()
-            .map(|user| IamSnapshotKey::User(user.access_key.clone())),
-        "group-info" => item
-            .group_info
-            .as_ref()
-            .map(|group| IamSnapshotKey::Group(group.update_req.group.clone())),
-        "policy-mapping" => item.policy_mapping.as_ref().map(|mapping| IamSnapshotKey::PolicyMapping {
-            target: mapping.user_or_group.clone(),
-            user_type: mapping.user_type,
-            is_group: mapping.is_group,
-        }),
-        _ => None,
-    }
-}
-
-fn iam_snapshot_tombstones(item: &SRIAMItem, observed_at: OffsetDateTime) -> Vec<SRIAMItem> {
-    let mut tombstone = item.clone();
-    tombstone.updated_at = Some(observed_at);
-    match item.r#type.as_str() {
-        "policy" => tombstone.policy = None,
-        "iam-user" => {
-            if let Some(user) = tombstone.iam_user.as_mut() {
-                user.is_delete_req = true;
-                user.user_req = None;
-            }
-        }
-        "group-info" => {
-            let Some(group) = tombstone.group_info.as_mut() else {
-                return Vec::new();
-            };
-            group.update_req.is_remove = true;
-            if group.update_req.members.is_empty() {
-                return vec![tombstone];
-            }
-            let mut delete = tombstone.clone();
-            if let Some(group) = delete.group_info.as_mut() {
-                group.update_req.members.clear();
-            }
-            return vec![tombstone, delete];
-        }
-        "policy-mapping" => {
-            if let Some(mapping) = tombstone.policy_mapping.as_mut() {
-                mapping.policy.clear();
-            }
-        }
-        _ => return Vec::new(),
-    }
-    vec![tombstone]
-}
-
-fn bucket_metadata_snapshot_tombstone(item: &SRBucketMeta, observed_at: OffsetDateTime) -> SRBucketMeta {
-    SRBucketMeta {
-        r#type: item.r#type.clone(),
-        bucket: item.bucket.clone(),
-        updated_at: Some(observed_at),
-        expiry_updated_at: Some(observed_at),
-        api_version: item.api_version.clone(),
-        derived_rule_contract: item.derived_rule_contract,
-        ..Default::default()
-    }
-}
-
-const SITE_REPLICATION_RETRY_SNAPSHOT_STABILITY_ATTEMPTS: usize = 3;
-
-fn classify_site_replication_retry_event(event: &SiteReplicationRetryEvent) -> Option<RetryDrainAction> {
-    let snapshot_action = match event.path.as_str() {
-        SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH => Some(RetryDrainAction::IamSnapshot),
-        SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH => Some(RetryDrainAction::BucketMetadataSnapshot),
-        _ => None,
-    };
-    if snapshot_action.is_some() && event.last_error != SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER {
-        return snapshot_action;
-    }
-    if event.path.starts_with("internal:") {
-        // Marker records store payloads in `last_error` (legacy
-        // pending-endpoint-refresh backup and snapshot liabilities); they are
-        // not drainable delivery failures.
-        return None;
-    }
-    if event.last_error == SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER {
-        // Already snapshot-replayed once for this failure episode; a possible
-        // deletion cannot be replayed from a snapshot, so re-sending daily
-        // proves nothing. A new hook failure overwrites the marker.
-        return None;
-    }
-    let base_path = event.path.split_once('?').map(|(base, _)| base).unwrap_or(&event.path);
-    match base_path {
-        "/rustfs/admin/v3/site-replication/peer/iam-item" => Some(RetryDrainAction::IamSnapshot),
-        "/rustfs/admin/v3/site-replication/peer/bucket-meta" => Some(RetryDrainAction::BucketMetadataSnapshot),
-        SITE_REPLICATION_PEER_EDIT_PATH => Some(RetryDrainAction::PeerEdit),
-        SITE_REPLICATION_PEER_BUCKET_OPS_PATH => {
-            let operation = retry_bucket_operation(&event.path)?;
-            if !matches!(
-                operation.as_str(),
-                SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING | SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION
-            ) {
-                // Destructive ops (delete-bucket / force-delete-bucket) are
-                // operator territory: replaying them against a peer whose
-                // bucket was since recreated is irreversible.
-                return None;
-            }
-            let bucket = retry_bucket_name(&event.path)?;
-            Some(RetryDrainAction::BucketOpReplay { operation, bucket })
-        }
-        _ => None,
-    }
-}
-
-fn retry_bucket_name(path: &str) -> Option<String> {
-    let (_, query) = path.split_once('?')?;
-    form_urlencoded::parse(query.as_bytes())
-        .find_map(|(key, value)| (key == "bucket" && !value.is_empty()).then(|| value.into_owned()))
-}
-
-/// A collapsed retry event after a stable snapshot resend is escalated with
-/// this marker instead of being cleared: the snapshot contains no task for a
-/// failed deletion, so remote absence remains operator-visible. Collapsed
-/// failures use an internal queue path so ordinary successes and older nodes
-/// cannot settle an unrelated entity's liability.
-const SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER: &str = "snapshot replayed; a failed deletion cannot be replayed from a snapshot — run site replication repair or re-deliver to settle";
-
-/// Escalate a collapsed retry event after its snapshot resend succeeded,
-/// unless a newer failure was recorded after `snapshot_updated_at` (that
-/// failure belongs to a newer local commit the snapshot did not contain and
-/// must keep the entry drain-eligible).
-fn escalate_site_replication_retry_events_up_to(
-    queue: &mut Vec<SiteReplicationRetryEvent>,
-    peer: &PeerInfo,
-    path: &str,
-    snapshot_updated_at: Option<OffsetDateTime>,
-) -> usize {
-    let Some(marker_path) = collapsed_retry_queue_path(path) else {
-        return 0;
-    };
-
-    if path != marker_path {
-        queue.retain(|event| {
-            if !retry_event_matches(event, peer, path) {
-                return true;
-            }
-            matches!((event.updated_at, snapshot_updated_at), (Some(current), Some(seen)) if current > seen)
-                || matches!((event.updated_at, snapshot_updated_at), (Some(_), None))
-        });
-    }
-
-    let marker_index = queue.iter().position(|event| retry_event_matches(event, peer, marker_path));
-    let marker_index = marker_index.unwrap_or_else(|| {
-        queue.push(SiteReplicationRetryEvent {
-            id: Uuid::new_v4().to_string(),
-            peer_deployment_id: peer.deployment_id.clone(),
-            peer_endpoint: peer.endpoint.clone(),
-            path: marker_path.to_string(),
-            updated_at: snapshot_updated_at,
-            ..Default::default()
-        });
-        queue.len() - 1
-    });
-    let event = &mut queue[marker_index];
-    let newer_failure_recorded = match (event.updated_at, snapshot_updated_at) {
-        (Some(current), Some(seen)) => current > seen,
-        (Some(_), None) => true,
-        (None, _) => false,
-    };
-    if newer_failure_recorded && event.last_error != SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER {
-        return 0;
-    }
-    event.failed = true;
-    event.retry_count = event.retry_count.max(SITE_REPLICATION_RETRY_FAILED_AFTER);
-    event.last_error = SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER.to_string();
-    event.updated_at = Some(OffsetDateTime::now_utc());
-    1
-}
-
-async fn escalate_site_replication_retry_event_up_to(peer: &PeerInfo, path: &str, snapshot_updated_at: Option<OffsetDateTime>) {
-    let peer_owned = peer.clone();
-    let path_owned = path.to_string();
-    let result = update_site_replication_state(move |state| {
-        escalate_site_replication_retry_events_up_to(&mut state.retry_queue, &peer_owned, &path_owned, snapshot_updated_at);
-        Ok(())
-    })
-    .await;
-
-    if let Err(err) = result {
-        warn!(
-            component = LOG_COMPONENT_ADMIN,
-            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-            peer = %peer.endpoint,
-            deployment_id = %peer.deployment_id,
-            path,
-            error = ?err,
-            "failed to escalate site replication retry event"
-        );
-    }
-}
-
-/// Whether the drain may attempt this event now.
-fn site_replication_retry_backoff_elapsed(event: &SiteReplicationRetryEvent, now: OffsetDateTime) -> bool {
-    let Some(updated_at) = event.updated_at else {
-        return true;
-    };
-    // 600 * 2^8 already exceeds the daily ceiling; capping the shift keeps
-    // the arithmetic overflow-free for any persisted retry_count.
-    let exponent = event.retry_count.saturating_sub(1).min(8);
-    let delay = (SITE_REPLICATION_RETRY_DRAIN_BASE_BACKOFF_SECS << exponent).min(SITE_REPLICATION_RETRY_DRAIN_MAX_BACKOFF_SECS);
-    now.unix_timestamp().saturating_sub(updated_at.unix_timestamp()) >= delay
-}
-
-/// The subset of the retry queue the background drain is allowed to touch.
-fn actionable_site_replication_retry_events(state: &SiteReplicationState, now: OffsetDateTime) -> Vec<SiteReplicationRetryEvent> {
-    state
-        .retry_queue
-        .iter()
-        .filter(|event| classify_site_replication_retry_event(event).is_some())
-        .filter(|event| state.peers.contains_key(&event.peer_deployment_id))
-        .filter(|event| site_replication_retry_backoff_elapsed(event, now))
-        .cloned()
-        .collect()
-}
-
-/// Background consumer for the retry queue, run from the reconcile tick.
-///
-/// Scope: this settles "delivered once and failed" entries whose replay is
-/// faithful (bucket ops, peer edits). Collapsed iam-item / bucket-meta
-/// entries are snapshot-resent and then *escalated*, not cleared — a failed
-/// deletion leaves no task in the snapshot, so remote absence stays unproven
-/// until a later delivery or a manual repair. A hook that never fired (crash
-/// between the local commit and the send) leaves no entry at all, so the
-/// drain is not a full cross-site diff-heal; manual repair remains the
-/// authoritative catch-all.
-async fn drain_site_replication_retry_queue() {
-    if let Err(err) = drain_site_replication_retry_queue_inner().await {
-        warn!(
-            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-            component = LOG_COMPONENT_ADMIN,
-            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-            result = "retry_drain_failed",
-            error = ?err,
-            "admin site replication state"
-        );
-    }
-}
-
-async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
-    let Some(runtime) = runtime_site_replication_targets().await? else {
-        return Ok(());
-    };
-    let actionable = actionable_site_replication_retry_events(&runtime.state, OffsetDateTime::now_utc());
-    if actionable.is_empty() {
-        return Ok(());
-    }
-    let Some(store) = current_object_store_handle() else {
-        return Ok(());
-    };
-    if runtime.state.pending_endpoint_refresh.is_some()
-        || runtime.state.pending_remove.is_some()
-        || runtime.state.pending_rotation.is_some()
-    {
-        // The tick-level gate ran before the reconcilers; a multi-step flow
-        // (endpoint refresh commits its pending marker without the lifecycle
-        // guard) may have started since. Re-check on the fresh state.
-        return Ok(());
-    }
-    // Serialize against operator repair execution. This does NOT close the
-    // dry-run -> execute window (dry-run takes no lock): a drain settling a
-    // replayable bucket-op entry in that window changes the preflight token
-    // and execute fails safe with "preflight is stale" — the operator
-    // re-runs the dry-run. Lock order matches repair: lifecycle guard (held
-    // by the reconcile tick) -> repair execution lock -> state object lock
-    // inside the send bookkeeping. An operator repair holding the lock makes
-    // this tick skip after the lock-acquire timeout.
-    with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
-        drain_site_replication_retry_queue_locked(runtime, actionable).await
-    })
-    .await
-    .map_err(ApiError::from)?
-}
-
-async fn drain_site_replication_retry_queue_locked(
-    runtime: SiteReplicationRuntime,
-    events: Vec<SiteReplicationRetryEvent>,
-) -> S3Result<()> {
-    let needs_plan = events
-        .iter()
-        .any(|event| !matches!(classify_site_replication_retry_event(event), Some(RetryDrainAction::PeerEdit)));
-    // The plan is a full local snapshot (buckets + IAM); build it once per
-    // tick and only when a snapshot resend is actually due.
-    let plan = if needs_plan {
-        let info = build_sr_info(&runtime.state, &runtime.local_peer).await?;
-        Some(site_replication_bootstrap_plan(&info)?)
-    } else {
-        None
-    };
-
-    let mut events_by_peer: BTreeMap<String, Vec<SiteReplicationRetryEvent>> = BTreeMap::new();
-    for event in events {
-        events_by_peer
-            .entry(event.peer_deployment_id.clone())
-            .or_default()
-            .push(event);
-    }
-
-    let mut settled = 0usize;
-    let mut failures = 0usize;
-    for (deployment_id, peer_events) in events_by_peer {
-        let Some(peer) = runtime.state.peers.get(&deployment_id) else {
-            continue;
-        };
-        if deployment_id == runtime.local_peer.deployment_id
-            || same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
-        {
-            continue;
-        }
-        let transport = match PeerTransport::for_runtime_peer(peer).await {
-            Ok(transport) => transport,
-            Err(err) => {
-                // Record the attempt so backoff advances for an unreachable
-                // peer instead of re-dialing it every tick.
-                for event in &peer_events {
-                    enqueue_site_replication_retry_event(peer, &event.path, &err).await;
-                }
-                failures += peer_events.len();
-                continue;
-            }
-        };
-        for event in peer_events {
-            let Some(action) = classify_site_replication_retry_event(&event) else {
-                continue;
-            };
-            match drain_one_site_replication_retry_event(&runtime, peer, &transport, &event, action, plan.as_ref()).await {
-                Ok(true) => settled += 1,
-                Ok(false) => {}
-                Err(_) => failures += 1,
-            }
-        }
-    }
-
-    if settled > 0 || failures > 0 {
-        info!(
-            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-            component = LOG_COMPONENT_ADMIN,
-            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-            result = "retry_drain_settled",
-            settled,
-            failures,
-            "admin site replication state"
-        );
-    }
-    Ok(())
-}
-
-/// Replay one retry event against its peer. Returns `Ok(true)` when the
-/// event was settled (delivered, or provably stale), `Ok(false)` when it was
-/// skipped, and `Err` after a failed delivery (already re-queued with an
-/// incremented retry count).
-async fn drain_one_site_replication_retry_event(
-    runtime: &SiteReplicationRuntime,
-    peer: &PeerInfo,
-    transport: &PeerTransport,
-    event: &SiteReplicationRetryEvent,
-    action: RetryDrainAction,
-    plan: Option<&SiteReplicationBootstrapPlan>,
-) -> S3Result<bool> {
-    let access_key = &runtime.state.service_account_access_key;
-    let secret_key = &runtime.service_account_secret_key;
-    match action.clone() {
-        RetryDrainAction::IamSnapshot | RetryDrainAction::BucketMetadataSnapshot => {
-            let Some(plan) = plan else {
-                return Ok(false);
-            };
-            let mut current_snapshot = RetrySnapshot::from_plan(&action, plan).expect("snapshot action has a snapshot");
-            let mut replay = current_snapshot.clone();
-            for _ in 0..SITE_REPLICATION_RETRY_SNAPSHOT_STABILITY_ATTEMPTS {
-                let current_fingerprint = current_snapshot.fingerprint()?;
-                if let Err(err) = replay.send(transport, access_key, secret_key).await {
-                    enqueue_site_replication_retry_event(peer, &event.path, &err).await;
-                    return Err(err);
-                }
-                let fresh_info = build_sr_info(&runtime.state, &runtime.local_peer).await?;
-                let fresh_plan = site_replication_bootstrap_plan(&fresh_info)?;
-                let fresh_snapshot = RetrySnapshot::from_plan(&action, &fresh_plan).expect("snapshot action has a snapshot");
-                if fresh_snapshot.fingerprint()? == current_fingerprint {
-                    escalate_site_replication_retry_event_up_to(peer, &event.path, event.updated_at).await;
-                    return Ok(true);
-                }
-                replay = RetrySnapshot::replay_after_change(&current_snapshot, &fresh_snapshot, OffsetDateTime::now_utc());
-                current_snapshot = fresh_snapshot;
-            }
-            Ok(false)
-        }
-        RetryDrainAction::BucketOpReplay { operation, bucket } => {
-            let Some(plan) = plan else {
-                return Ok(false);
-            };
-            // Replay from the CURRENT plan, never the recorded path: the
-            // recorded query can carry an expired one-shot bootstrap token or
-            // a stale createdAt.
-            let make_op = operation == SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING;
-            let paths = if make_op {
-                &plan.bucket_make_ops
-            } else {
-                &plan.bucket_configure_ops
-            };
-            let tasks: Vec<SiteReplicationRepairTask<'_>> = paths
-                .iter()
-                .filter(|path| retry_bucket_name(path).as_deref() == Some(bucket.as_str()))
-                .map(|path| {
-                    if make_op {
-                        SiteReplicationRepairTask::BucketMake(path)
-                    } else {
-                        SiteReplicationRepairTask::Replication(path)
-                    }
-                })
-                .collect();
-            if tasks.is_empty() {
-                // The bucket left the plan (deleted, or replication no longer
-                // configured): the recorded intent is stale, settle it.
-                dequeue_site_replication_retry_event(peer, &event.path).await;
-                return Ok(true);
-            }
-            for task in &tasks {
-                if let Err(err) = task.send(transport, access_key, secret_key).await {
-                    enqueue_site_replication_retry_event(peer, &event.path, &err).await;
-                    return Err(err);
-                }
-            }
-            dequeue_site_replication_retry_event(peer, &event.path).await;
-            Ok(true)
-        }
-        RetryDrainAction::PeerEdit => {
-            // The recorded generation is stale by definition — the receiver
-            // fences it. Allocate a fresh generation and re-send the current
-            // peer records (a superset of the failed body; the receiver
-            // upserts), all inside one state transaction so the fence and the
-            // bodies agree.
-            let target_id = peer.deployment_id.clone();
-            let (generation, bodies) = update_site_replication_state(move |state| {
-                if !state.peers.contains_key(&target_id) {
-                    return Ok((None, Vec::new()));
-                }
-                Ok((Some(next_peer_edit_generation(state)), state.peers.values().cloned().collect::<Vec<_>>()))
-            })
-            .await?;
-            let Some(generation) = generation else {
-                // Peer left between the snapshot and now; the queue entry was
-                // already pruned by remove_sites.
-                return Ok(false);
-            };
-            let local_deployment_id = Some(runtime.local_peer.deployment_id.as_str()).filter(|id| !id.is_empty());
-            let edit_path = peer_edit_path_with_fence(local_deployment_id, generation);
-            let delivery_fence = local_deployment_id.is_some().then_some(generation);
-            for body in &bodies {
-                if let Err(err) = send_peer_admin_request_with_client(
-                    &transport.client,
-                    &transport.connection,
-                    &edit_path,
-                    access_key,
-                    secret_key,
-                    body,
-                )
-                .await
-                {
-                    enqueue_site_replication_retry_event_for_generation(
-                        peer,
-                        SITE_REPLICATION_PEER_EDIT_PATH,
-                        &err,
-                        delivery_fence,
-                    )
-                    .await;
-                    return Err(err);
-                }
-            }
-            dequeue_site_replication_retry_event_for_generation(peer, SITE_REPLICATION_PEER_EDIT_PATH, delivery_fence).await;
-            Ok(true)
-        }
-    }
-}
-
-/// Remove a retry event for (peer, path) from the queue on successful delivery.
-/// This is a no-op (load + no-op persist skipped) when no matching entry exists,
-/// avoiding unnecessary I/O on the common path.
-async fn dequeue_site_replication_retry_event(peer: &PeerInfo, path: &str) {
-    dequeue_site_replication_retry_event_for_generation(peer, path, None).await
-}
-
-async fn dequeue_site_replication_retry_event_for_generation(peer: &PeerInfo, path: &str, generation: Option<u64>) {
-    let result = async {
-        // Fast path: this sits on every successful hook broadcast, so probe
-        // with a plain read first and only enter the locked RMW on a hit
-        // (the transaction re-checks under the lock).
-        let mut probe = load_site_replication_state().await?;
-        if settle_site_replication_retry_events(&mut probe.retry_queue, peer, path, generation) == 0 {
-            return Ok(());
-        }
-        let peer_owned = peer.clone();
-        let path_owned = path.to_string();
-        update_site_replication_state(move |state| {
-            settle_site_replication_retry_events(&mut state.retry_queue, &peer_owned, &path_owned, generation);
-            Ok(())
-        })
-        .await?;
-        Ok::<_, S3Error>(())
-    }
-    .await;
-
-    if let Err(err) = result {
-        warn!(
-            component = LOG_COMPONENT_ADMIN,
-            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-            peer = %peer.endpoint,
-            deployment_id = %peer.deployment_id,
-            path,
-            error = ?err,
-            "failed to dequeue site replication retry event"
-        );
-    }
-}
-
 /// The removal's client-facing verdict.
 ///
 /// A fully-notified removal keeps answering with the historical success string,
@@ -7297,6 +3853,21 @@ fn pending_operation_for_state(state: &SiteReplicationState, local_peer: &PeerIn
         });
     }
 
+    if let Some(pending) = pending_endpoint_refresh(state) {
+        let pending_peers = pending_endpoint_refresh_required_peer_ids(state, &pending, local_peer)
+            .into_iter()
+            .filter(|deployment_id| !pending.acked_deployment_ids.contains(deployment_id))
+            .collect();
+        return Some(SRPendingOperation {
+            operation: "endpoint-refresh".to_string(),
+            id: pending.id,
+            pending_peers,
+            acked_peers: pending.acked_deployment_ids.into_iter().collect(),
+            updated_at: None,
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        });
+    }
+
     state.pending_rotation.as_ref().map(|pending| {
         let pending_peers = pending_remote_peer_ids(&pending.peers, local_peer)
             .into_iter()
@@ -7323,6 +3894,30 @@ fn pending_remote_peer_ids(peers: &BTreeMap<String, PeerInfo>, local_peer: &Peer
         .collect()
 }
 
+/// The peers a pending remove / rotation still has to notify: every remote
+/// peer that has not acked, with the local site excluded by the same
+/// deployment-id-or-endpoint identity [`pending_remote_peer_ids`] finalizes
+/// on. The tick-driven `local_peer` carries the node's own listen address
+/// rather than the registered site endpoint (and a handler's carries the
+/// request `Host`, which behind a load balancer differs too), so an
+/// endpoint-only check dialed the site itself, timed out against the
+/// lifecycle lock this very request holds, and reported the operation as
+/// `Partial` (backlog#2367 A-4).
+fn pending_peers_awaiting_notification<'a>(
+    peers: &'a BTreeMap<String, PeerInfo>,
+    local_peer: &PeerInfo,
+    acked_deployment_ids: &BTreeSet<String>,
+) -> Vec<&'a PeerInfo> {
+    peers
+        .values()
+        .filter(|peer| {
+            peer.deployment_id != local_peer.deployment_id
+                && !same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
+                && !acked_deployment_ids.contains(&peer.deployment_id)
+        })
+        .collect()
+}
+
 fn pending_all_remote_peers_acked(
     peers: &BTreeMap<String, PeerInfo>,
     local_peer: &PeerInfo,
@@ -7331,6 +3926,78 @@ fn pending_all_remote_peers_acked(
     pending_remote_peer_ids(peers, local_peer)
         .iter()
         .all(|deployment_id| acked_deployment_ids.contains(deployment_id))
+}
+
+fn pending_endpoint_refresh_required_peer_ids(
+    state: &SiteReplicationState,
+    pending: &PendingEndpointRefresh,
+    local_peer: &PeerInfo,
+) -> BTreeSet<String> {
+    pending
+        .remote_peers
+        .values()
+        .filter(|peer| {
+            state.peers.contains_key(&peer.deployment_id)
+                && peer.deployment_id != local_peer.deployment_id
+                && !same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
+        })
+        .map(|peer| peer.deployment_id.clone())
+        .collect()
+}
+
+fn pending_endpoint_refresh_is_complete(
+    state: &SiteReplicationState,
+    pending: &PendingEndpointRefresh,
+    local_peer: &PeerInfo,
+) -> bool {
+    pending_endpoint_refresh_required_peer_ids(state, pending, local_peer)
+        .iter()
+        .all(|deployment_id| pending.acked_deployment_ids.contains(deployment_id))
+}
+
+fn pending_endpoint_refresh_allows_remove(
+    state: &SiteReplicationState,
+    pending: &PendingEndpointRefresh,
+    local_peer: &PeerInfo,
+    remove_req: &SRRemoveReq,
+) -> bool {
+    if remove_req.remove_all || remove_req.site_names.iter().any(|name| name == &local_peer.name) {
+        return true;
+    }
+    let removed = removed_deployment_ids_for_remove_req(state, remove_req);
+    pending_endpoint_refresh_required_peer_ids(state, pending, local_peer)
+        .difference(&pending.acked_deployment_ids)
+        .all(|deployment_id| removed.contains(deployment_id))
+}
+
+fn discard_endpoint_refresh_if_target_was_removed(state: &mut SiteReplicationState) {
+    if pending_endpoint_refresh(state)
+        .as_ref()
+        .is_some_and(|pending| !state.peers.contains_key(&pending.peer.deployment_id))
+    {
+        clear_pending_endpoint_refresh(state);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointRefreshPostwriteState {
+    Current,
+    Superseded,
+    TargetRemoved,
+}
+
+fn endpoint_refresh_postwrite_state(
+    state: &SiteReplicationState,
+    pending_id: &str,
+    target_deployment_id: &str,
+) -> EndpointRefreshPostwriteState {
+    if !state.peers.contains_key(target_deployment_id) {
+        EndpointRefreshPostwriteState::TargetRemoved
+    } else if pending_endpoint_refresh(state).is_some_and(|pending| pending.id == pending_id) {
+        EndpointRefreshPostwriteState::Current
+    } else {
+        EndpointRefreshPostwriteState::Superseded
+    }
 }
 
 fn push_unique_secret_candidate(candidates: &mut Vec<String>, secret: String) {
@@ -7417,6 +4084,303 @@ async fn finalize_pending_rotation_if_complete(rotation_id: &str, local_peer: &P
     .await
 }
 
+/// The candidate secrets a rotation push may sign with, in trial order: the
+/// persisted candidates recorded by earlier attempts, then the currently
+/// installed secret (the pre-rotation one on a fresh drive — peers still hold
+/// it, so it must come before the new secret), then the new secret itself.
+fn rotation_secret_candidates(pending: &PendingRotation, current_secret: Option<String>) -> Vec<String> {
+    let mut candidates = pending.secret_candidates.clone();
+    if let Some(current_secret) = current_secret {
+        push_unique_secret_candidate(&mut candidates, current_secret);
+    }
+    push_unique_secret_candidate(&mut candidates, pending.new_secret_key.clone());
+    candidates
+}
+
+/// Push a half-finished service-account rotation one step forward: install the
+/// new secret locally (idempotent), send the rotation join to every peer that
+/// has not acked yet, then finalize if that completed the set. Returns the
+/// per-peer failures and whether the rotation is now finished.
+///
+/// Shared by the operator-driven `SRRotateServiceAccountHandler` and the
+/// reconcile tick. The tick is what makes this self-healing: a rotation whose
+/// join push failed used to sit in `pending_rotation` forever while the local
+/// secret was already switched — so both replication directions stayed dead
+/// (outbound signed with a secret the peers reject, inbound rejecting the
+/// secret the peers still sign with) until an operator re-ran the rotation.
+///
+/// Callers must hold the lifecycle guard.
+async fn drive_pending_rotation(pending: &PendingRotation, local_peer: &PeerInfo) -> S3Result<(Vec<String>, bool)> {
+    // Capture the still-installed secret BEFORE the overwrite below: on the
+    // first drive of a fresh rotation this is the secret the peers hold, and
+    // it must be able to sign the join push — with only the new secret as a
+    // candidate every peer rejects the push and the rotation wedges.
+    let current_secret = site_replicator_service_account_secret(&pending.access_key).await.ok();
+    if let Some(current_secret) = current_secret.clone() {
+        record_pending_rotation_secret_candidate(&pending.id, current_secret).await?;
+    }
+    let secret_candidates = rotation_secret_candidates(pending, current_secret);
+
+    set_site_replicator_service_account_secret(&pending.parent, pending.new_secret_key.clone()).await?;
+    refresh_bucket_targets_after_service_account_rotation().await;
+
+    let join_req = SRPeerJoinReq {
+        svc_acct_access_key: pending.access_key.clone(),
+        svc_acct_secret_key: pending.new_secret_key.clone(),
+        svc_acct_parent: pending.parent.clone(),
+        peers: pending.peers.clone(),
+        updated_at: pending.updated_at,
+    };
+
+    let mut peer_errors = Vec::new();
+    for peer in pending_peers_awaiting_notification(&pending.peers, local_peer, &pending.acked_deployment_ids) {
+        // A superseded join returns BEFORE `apply_iam`, so a no-op answer
+        // means the peer never installed the new secret. Acking it would
+        // finalize a rotation half the mesh cannot authenticate against
+        // (rustfs/rustfs#5963).
+        let rotation_error =
+            match PeerAdminRequest::put(&runtime_peer_connection(peer)?, SITE_REPLICATION_PEER_JOIN_PATH, &pending.access_key)
+                .send_with_secret_candidates(&secret_candidates, &join_req)
+                .await
+            {
+                Err(err) => Some(summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint))),
+                Ok(body) => match parse_peer_join_response(&body, peer.clone()) {
+                    Ok(response) if response.applied == Some(false) => Some(summarize_peer_error_detail(&format!(
+                        "{}: peer did not apply the rotation join (its site replication state is newer than the snapshot it \
+                     was sent); the new service account secret was not installed",
+                        peer.endpoint
+                    ))),
+                    // Unparseable bodies keep the pre-existing behaviour: the
+                    // transport succeeded, and MinIO peers answer with an empty
+                    // body this helper already tolerates.
+                    Ok(_) | Err(_) => None,
+                },
+            };
+        if let Some(detail) = rotation_error {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                peer = %peer.endpoint,
+                result = "service_account_rotation_failed",
+                error = %detail,
+                "admin site replication state"
+            );
+            peer_errors.push(detail);
+        } else {
+            mark_pending_rotation_peer_acked(&pending.id, &peer.deployment_id).await?;
+        }
+    }
+
+    let complete = finalize_pending_rotation_if_complete(&pending.id, local_peer).await?;
+    Ok((peer_errors, complete))
+}
+
+/// The reconcile tick's half of [`drive_pending_rotation`]: resume the rotation
+/// this site could not finish, and report the outcome. Runs under the tick's
+/// lifecycle guard, which is what keeps it from racing an operator re-running
+/// the rotation (that handler takes the same guard).
+async fn resume_pending_rotation(state: &SiteReplicationState, pending: &PendingRotation) {
+    let local_peer = current_local_runtime_peer(state);
+    match drive_pending_rotation(pending, &local_peer).await {
+        Ok((peer_errors, complete)) => {
+            if complete && peer_errors.is_empty() {
+                info!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    result = "pending_rotation_resumed",
+                    "admin site replication state"
+                );
+            } else {
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    result = "pending_rotation_still_pending",
+                    error_count = peer_errors.len(),
+                    "admin site replication state"
+                );
+            }
+        }
+        Err(err) => {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "pending_rotation_resume_failed",
+                error = ?err,
+                "admin site replication state"
+            );
+        }
+    }
+}
+
+async fn mark_pending_endpoint_refresh_peer_acked(refresh_id: &str, deployment_id: &str) -> S3Result<()> {
+    let refresh_id = refresh_id.to_string();
+    let deployment_id = deployment_id.to_string();
+    update_site_replication_state_when_changed(move |state| {
+        let Some(pending) = state
+            .pending_endpoint_refresh
+            .as_mut()
+            .filter(|pending| pending.id == refresh_id)
+        else {
+            return Ok(StateCommit::Unchanged(()));
+        };
+        pending.acked_deployment_ids.insert(deployment_id);
+        Ok(StateCommit::Changed(()))
+    })
+    .await
+}
+
+async fn finalize_pending_endpoint_refresh_if_complete(refresh_id: &str, service_account_secret_key: &str) -> S3Result<bool> {
+    let state = load_site_replication_state().await?;
+    let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == refresh_id) else {
+        return Ok(true);
+    };
+    let local_peer = current_local_runtime_peer(&state);
+    if !pending_endpoint_refresh_is_complete(&state, &pending, &local_peer) {
+        return Ok(false);
+    }
+
+    refresh_bucket_targets_after_endpoint_edit(refresh_id, service_account_secret_key).await?;
+
+    let refresh_id = refresh_id.to_string();
+    update_site_replication_state_when_changed(move |state| {
+        let Some(pending) = pending_endpoint_refresh(state).filter(|pending| pending.id == refresh_id) else {
+            return Ok(StateCommit::Unchanged(true));
+        };
+        let local_peer = current_local_runtime_peer(state);
+        if !pending_endpoint_refresh_is_complete(state, &pending, &local_peer) {
+            return Ok(StateCommit::Unchanged(false));
+        }
+        *state = edit_state(std::mem::take(state), pending.peer, pending.ilm_expiry_override);
+        clear_pending_endpoint_refresh(state);
+        Ok(StateCommit::Changed(true))
+    })
+    .await
+}
+
+async fn drive_pending_endpoint_refresh(
+    state: &SiteReplicationState,
+    pending: &PendingEndpointRefresh,
+) -> S3Result<(Vec<String>, bool)> {
+    if state.service_account_access_key.is_empty() {
+        return Err(s3_error!(InvalidRequest, "site replication service account is not configured"));
+    }
+    let service_account_secret_key = site_replicator_service_account_secret(&state.service_account_access_key).await?;
+    let local_peer = current_local_runtime_peer(state);
+    let required = pending_endpoint_refresh_required_peer_ids(state, pending, &local_peer);
+    let mut peer_errors = Vec::new();
+
+    for target in pending.remote_peers.values().filter(|target| {
+        required.contains(&target.deployment_id) && !pending.acked_deployment_ids.contains(&target.deployment_id)
+    }) {
+        let refreshed = async {
+            let (status, body) = send_endpoint_refresh_admin_request_raw(
+                target,
+                pending,
+                SITE_REPLICATION_PEER_EDIT_CAPABILITY_PATH,
+                &state.service_account_access_key,
+                &service_account_secret_key,
+                &(),
+            )
+            .await?;
+            if endpoint_refresh_capability_supported(target, status, &body)? {
+                let request = EndpointRefreshRequest {
+                    id: pending.id.clone(),
+                    peer: pending.peer.clone(),
+                };
+                let body = send_endpoint_refresh_admin_request(
+                    target,
+                    pending,
+                    SITE_REPLICATION_PEER_EDIT_REFRESH_PATH,
+                    &state.service_account_access_key,
+                    &service_account_secret_key,
+                    &request,
+                )
+                .await?;
+                parse_endpoint_refresh_status(target, &body)
+            } else {
+                refresh_legacy_peer_bucket_targets(
+                    target,
+                    pending,
+                    &state.service_account_access_key,
+                    &service_account_secret_key,
+                )
+                .await
+            }
+        }
+        .await;
+
+        match refreshed {
+            Ok(()) => mark_pending_endpoint_refresh_peer_acked(&pending.id, &target.deployment_id).await?,
+            Err(err) => peer_errors.push(summarize_peer_error_detail(&format!("{}: {err}", target.endpoint))),
+        }
+    }
+
+    let complete = finalize_pending_endpoint_refresh_if_complete(&pending.id, &service_account_secret_key).await?;
+    Ok((peer_errors, complete))
+}
+
+/// The coordinator of an endpoint edit snapshots the topology it must fan out
+/// to into `remote_peers`; the peer-side handler persists its journal with an
+/// empty map ([`SRPeerEditHandler`]) because it fans out to nobody. Only the
+/// coordinator's journal may be resumed here. A receiver's journal has no
+/// required peers, so it would read as complete on the first tick and commit
+/// through [`edit_state`] instead of [`apply_internal_peer_edit`] — dropping
+/// the local-name sync and racing the in-flight request that owns it, whose
+/// own commit would then report the refresh as changed and leave the
+/// coordinator waiting for an acknowledgement it will never get. A receiver's
+/// journal is redriven by the coordinator resending the same refresh id.
+fn pending_endpoint_refresh_is_locally_driven(pending: &PendingEndpointRefresh) -> bool {
+    !pending.remote_peers.is_empty()
+}
+
+async fn resume_pending_endpoint_refresh(state: &SiteReplicationState, pending: &PendingEndpointRefresh) {
+    if !pending_endpoint_refresh_is_locally_driven(pending) {
+        debug!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "pending_endpoint_refresh_owned_by_peer_request",
+            "admin site replication state"
+        );
+        return;
+    }
+    match drive_pending_endpoint_refresh(state, pending).await {
+        Ok((peer_errors, true)) if peer_errors.is_empty() => {
+            info!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "pending_endpoint_refresh_resumed",
+                "admin site replication state"
+            );
+        }
+        Ok((peer_errors, _)) => {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "pending_endpoint_refresh_still_pending",
+                error_count = peer_errors.len(),
+                "admin site replication state"
+            );
+        }
+        Err(err) => {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "pending_endpoint_refresh_resume_failed",
+                error = ?err,
+                "admin site replication state"
+            );
+        }
+    }
+}
+
 async fn pending_remove_ready_to_finalize(remove_id: &str, local_peer: &PeerInfo) -> S3Result<Option<PendingRemove>> {
     let state = load_site_replication_state().await?;
     let Some(pending) = state.pending_remove.as_ref() else {
@@ -7472,19 +4436,15 @@ async fn drive_pending_remove(pending_remove: &PendingRemove, local_peer: &PeerI
     if secret_candidates.is_empty() {
         peer_errors.push("site replication service account secret unavailable".to_string());
     } else {
-        for peer in pending_remove.original_peers.values() {
-            if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
-                || pending_remove.acked_deployment_ids.contains(&peer.deployment_id)
-            {
-                continue;
-            }
-            if let Err(err) = send_peer_admin_request_with_secret_candidates(
+        for peer in
+            pending_peers_awaiting_notification(&pending_remove.original_peers, local_peer, &pending_remove.acked_deployment_ids)
+        {
+            if let Err(err) = PeerAdminRequest::put(
                 &runtime_peer_connection(peer)?,
                 SITE_REPLICATION_PEER_REMOVE_PATH,
                 &pending_remove.service_account_access_key,
-                &secret_candidates,
-                &pending_remove.req,
             )
+            .send_with_secret_candidates(&secret_candidates, &pending_remove.req)
             .await
             {
                 let err_detail = summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint));
@@ -7717,7 +4677,7 @@ fn site_resync_page(status: &SRResyncOpStatus, limit: usize, offset: usize) -> S
         };
         let encoded = serde_json::to_vec(&token)
             .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("encode resync cursor failed: {err}")))?;
-        URL_SAFE_NO_PAD.encode(encoded)
+        URL_SAFE_NO_PAD.encode_to_string(encoded)
     } else {
         String::new()
     };
@@ -7736,7 +4696,7 @@ fn parse_site_resync_page(query: &HashMap<String, String>, status: &SRResyncOpSt
     }
     let offset = if let Some(value) = query.get("continuationToken") {
         let decoded = URL_SAFE_NO_PAD
-            .decode(value)
+            .decode_to_vec(value)
             .map_err(|_| s3_error!(InvalidRequest, "invalid resync continuation token"))?;
         let token: SiteResyncContinuationToken =
             serde_json::from_slice(&decoded).map_err(|_| s3_error!(InvalidRequest, "invalid resync continuation token"))?;
@@ -7750,161 +4710,6 @@ fn parse_site_resync_page(query: &HashMap<String, String>, status: &SRResyncOpSt
     Ok((limit, offset))
 }
 
-fn bucket_target_endpoint(target: &BucketTarget) -> String {
-    let scheme = if target.secure { "https" } else { "http" };
-    canonical_endpoint(&format!("{scheme}://{}", target.endpoint))
-}
-
-fn bucket_target_matches_peer(target: &BucketTarget, peer: &PeerInfo) -> bool {
-    if !target.deployment_id.is_empty() {
-        return target.deployment_id == peer.deployment_id;
-    }
-    bucket_target_endpoint(target) == canonical_endpoint(&peer.endpoint)
-}
-
-fn site_replication_target_arns_by_peer(config: Option<&s3s::dto::ReplicationConfiguration>) -> HashMap<String, String> {
-    let mut arns_by_peer = HashMap::new();
-    let Some(config) = config else {
-        return arns_by_peer;
-    };
-
-    let mut configured_arns = Vec::new();
-    if !config.role.trim().is_empty() {
-        configured_arns.push(config.role.clone());
-    }
-    for rule in &config.rules {
-        let arn = rule.destination.bucket.trim();
-        if !arn.is_empty() {
-            configured_arns.push(arn.to_string());
-        }
-    }
-
-    for arn in configured_arns {
-        if let Some(deployment_id) = replication_target_arn_deployment_id(&arn) {
-            arns_by_peer.entry(deployment_id).or_insert(arn);
-        }
-    }
-
-    arns_by_peer
-}
-
-fn site_replication_bucket_target_for_peer(
-    bucket: &str,
-    state: &SiteReplicationState,
-    peer: &PeerInfo,
-    service_account_secret_key: &str,
-    arn_override: Option<String>,
-) -> S3Result<Option<BucketTarget>> {
-    if state.service_account_access_key.is_empty() || service_account_secret_key.is_empty() {
-        return Ok(None);
-    }
-
-    let parsed = Url::parse(&peer.endpoint)
-        .ok()
-        .or_else(|| Url::parse(&format!("http://{}", peer.endpoint.trim())).ok())
-        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid peer endpoint: {}", peer.endpoint)))?;
-    let host = parsed.host_str().ok_or_else(|| {
-        S3Error::with_message(S3ErrorCode::InvalidRequest, format!("peer endpoint missing host: {}", peer.endpoint))
-    })?;
-    let port = parsed.port_or_known_default().ok_or_else(|| {
-        S3Error::with_message(S3ErrorCode::InvalidRequest, format!("peer endpoint missing port: {}", peer.endpoint))
-    })?;
-    let region = current_region()
-        .map(|region| region.to_string())
-        .filter(|region| !region.is_empty())
-        .unwrap_or_else(|| "us-east-1".to_string());
-    let arn = arn_override.unwrap_or_else(|| {
-        ARN::new(
-            BucketTargetType::ReplicationService,
-            peer.deployment_id.clone(),
-            String::new(),
-            bucket.to_string(),
-        )
-        .to_string()
-    });
-
-    Ok(Some(BucketTarget {
-        source_bucket: bucket.to_string(),
-        endpoint: format!("{host}:{port}"),
-        credentials: Some(Credentials {
-            access_key: state.service_account_access_key.clone(),
-            secret_key: service_account_secret_key.to_string(),
-            session_token: None,
-            expiration: None,
-        }),
-        target_bucket: bucket.to_string(),
-        secure: parsed.scheme().eq_ignore_ascii_case("https"),
-        arn,
-        region,
-        target_type: BucketTargetType::ReplicationService,
-        deployment_id: peer.deployment_id.clone(),
-        skip_tls_verify: peer.skip_tls_verify,
-        ca_cert_pem: peer.ca_cert_pem.clone(),
-        ..Default::default()
-    }))
-}
-
-fn reconcile_site_replication_bucket_targets(
-    existing: BucketTargets,
-    bucket: &str,
-    state: &SiteReplicationState,
-    local_peer: &PeerInfo,
-    config: Option<&s3s::dto::ReplicationConfiguration>,
-    service_account_secret_key: &str,
-) -> S3Result<BucketTargets> {
-    if !state.enabled() || state.service_account_access_key.is_empty() || service_account_secret_key.is_empty() {
-        return Ok(existing);
-    }
-
-    let configured_arns = site_replication_target_arns_by_peer(config);
-    let mut targets = existing.targets;
-
-    for peer in state.peers.values() {
-        if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
-            continue;
-        }
-
-        let Some(mut target) = site_replication_bucket_target_for_peer(
-            bucket,
-            state,
-            peer,
-            service_account_secret_key,
-            configured_arns.get(&peer.deployment_id).cloned(),
-        )?
-        else {
-            continue;
-        };
-
-        if let Some(index) = targets.iter().position(|existing| {
-            existing.target_type == BucketTargetType::ReplicationService
-                && (bucket_target_matches_peer(existing, peer) || existing.arn == target.arn)
-        }) {
-            let existing = targets[index].clone();
-            target.path = existing.path;
-            target.region = existing.region;
-            target.bandwidth_limit = existing.bandwidth_limit;
-            target.replication_sync = existing.replication_sync;
-            target.storage_class = existing.storage_class;
-            target.health_check_duration = existing.health_check_duration;
-            target.disable_proxy = existing.disable_proxy;
-            target.reset_before_date = existing.reset_before_date;
-            target.reset_id = existing.reset_id;
-            target.total_downtime = existing.total_downtime;
-            target.last_online = existing.last_online;
-            target.online = existing.online;
-            target.latency = existing.latency;
-            target.edge = existing.edge;
-            target.edge_sync_before_expiry = existing.edge_sync_before_expiry;
-            target.offline_count = existing.offline_count;
-            targets[index] = target;
-        } else {
-            targets.push(target);
-        }
-    }
-
-    Ok(BucketTargets { targets })
-}
-
 fn bucket_target_deployment_id(target: &BucketTarget) -> Option<String> {
     if !target.deployment_id.trim().is_empty() {
         return Some(target.deployment_id.clone());
@@ -7912,9 +4717,44 @@ fn bucket_target_deployment_id(target: &BucketTarget) -> Option<String> {
     replication_target_arn_deployment_id(&target.arn)
 }
 
+/// The destination ARNs of the derived rules that `prune_removed_site_replication_rules`
+/// will drop for `removed_deployment_ids`, plus a site-replication `Role`
+/// naming one of them: the targets those ARNs back are the site's own.
+fn removed_site_replication_rule_arns(
+    config: Option<&ReplicationConfiguration>,
+    removed_deployment_ids: &HashSet<String>,
+) -> HashSet<String> {
+    let Some(config) = config else {
+        return HashSet::new();
+    };
+    let mut arns: HashSet<String> = config
+        .rules
+        .iter()
+        .filter(|rule| {
+            replication_rule_deployment_id(rule).is_some_and(|deployment_id| removed_deployment_ids.contains(&deployment_id))
+        })
+        .map(|rule| rule.destination.bucket.clone())
+        .collect();
+    if replication_target_arn_deployment_id(&config.role)
+        .is_some_and(|deployment_id| removed_deployment_ids.contains(&deployment_id))
+    {
+        arns.insert(config.role.clone());
+    }
+    arns
+}
+
+/// Drop the targets site replication itself derived for the removed peers:
+/// those a pruned derived rule names, or the same-name target bucket on the
+/// peer. An operator's bucket-level target to the same site (different
+/// target bucket) carries the peer's deployment id too — it was stamped on
+/// registration — but it is the operator's, and removing the peer from site
+/// replication must not silently end their bucket replication
+/// (rustfs/backlog#2489).
 fn prune_removed_site_replication_bucket_targets(
     existing: BucketTargets,
+    bucket: &str,
     removed_deployment_ids: &HashSet<String>,
+    removed_rule_arns: &HashSet<String>,
 ) -> (BucketTargets, usize) {
     if removed_deployment_ids.is_empty() {
         return (existing, 0);
@@ -7925,7 +4765,9 @@ fn prune_removed_site_replication_bucket_targets(
         .targets
         .into_iter()
         .filter(|target| {
+            let site_owned = removed_rule_arns.contains(&target.arn) || target.target_bucket == bucket;
             target.target_type != BucketTargetType::ReplicationService
+                || !site_owned
                 || bucket_target_deployment_id(target)
                     .map(|deployment_id| !removed_deployment_ids.contains(&deployment_id))
                     .unwrap_or(true)
@@ -7934,31 +4776,6 @@ fn prune_removed_site_replication_bucket_targets(
     let removed = original_len.saturating_sub(targets.len());
 
     (BucketTargets { targets }, removed)
-}
-
-/// Whether every `site-repl-*` rule on this bucket resolves to a live remote target.
-///
-/// The rule set alone cannot answer this: a rule can be perfectly formed while the endpoint
-/// recorded for its peer is one this site cannot reach, so `update_all_targets` never built
-/// a client for it and `replicate_object` drops every object against that ARN. Reads the
-/// already-resolved client map rather than rebuilding clients, so it stays cheap enough for
-/// the status path.
-async fn site_replication_targets_online(bucket: &str, replication_config_xml: &[u8]) -> bool {
-    let Ok(config) = deserialize::<ReplicationConfiguration>(replication_config_xml) else {
-        return true;
-    };
-
-    for rule in config.rules.iter().filter(|rule| is_derived_site_replication_rule(rule)) {
-        if BucketTargetSys::get()
-            .get_remote_target_client_by_arn(bucket, &rule.destination.bucket)
-            .await
-            .is_none()
-        {
-            return false;
-        }
-    }
-
-    true
 }
 
 /// Merge a peer's ILM expiry document into the local lifecycle config.
@@ -8042,88 +4859,12 @@ fn merge_incoming_lifecycle_config(
     })
 }
 
-/// True when the rule carries the expiry semantics that `replicateILMExpiry`
-/// propagates. Del-marker expiration and abort-multipart are deliberately
-/// excluded: MinIO's sender never emits them (`CloneNonTransition` drops
-/// both), so treating them as traveling state would let a MinIO peer's
-/// broadcast delete this site's del-marker-only rules.
-fn lifecycle_rule_has_expiry(rule: &s3s::dto::LifecycleRule) -> bool {
-    rule.expiration.is_some() || rule.noncurrent_version_expiration.is_some()
-}
-
 fn lifecycle_rule_has_transition(rule: &s3s::dto::LifecycleRule) -> bool {
     rule.transitions.as_ref().is_some_and(|transitions| !transitions.is_empty())
         || rule
             .noncurrent_version_transitions
             .as_ref()
             .is_some_and(|transitions| !transitions.is_empty())
-}
-
-/// Remove the fields that never travel between sites (MinIO
-/// `CloneNonTransition` parity).
-fn strip_site_local_lifecycle_fields(rule: &mut s3s::dto::LifecycleRule) {
-    rule.transitions = None;
-    rule.noncurrent_version_transitions = None;
-    rule.abort_incomplete_multipart_upload = None;
-    rule.del_marker_expiration = None;
-}
-
-/// Reduce a lifecycle XML document to the expiry subset that is allowed to
-/// travel between sites (what MinIO's sender emits): transition fields are
-/// stripped and rules left with no expiry semantics are dropped. Returns
-/// `None` when nothing remains — the receiver then merges with the empty set,
-/// which is exactly the "no expiry rules here" statement. A document that
-/// fails to parse is forwarded unfiltered (`Some(original)`): the receiver
-/// merge strips it anyway, and turning a local parse error into a `None`
-/// would delete the peers' replicated expiry rules.
-fn lifecycle_expiry_subset_xml(raw: &[u8]) -> Option<Vec<u8>> {
-    if raw.is_empty() {
-        return None;
-    }
-    let config: s3s::dto::BucketLifecycleConfiguration = match deserialize(raw) {
-        Ok(config) => config,
-        Err(err) => {
-            warn!("failed to parse local lifecycle config for expiry replication; forwarding unfiltered: {err}");
-            return Some(raw.to_vec());
-        }
-    };
-    let expiry_updated_at = config.expiry_updated_at.clone();
-    let rules: Vec<s3s::dto::LifecycleRule> = config
-        .rules
-        .into_iter()
-        .filter_map(|mut rule| {
-            strip_site_local_lifecycle_fields(&mut rule);
-            lifecycle_rule_has_expiry(&rule).then_some(rule)
-        })
-        .collect();
-    if rules.is_empty() {
-        return None;
-    }
-    let subset = s3s::dto::BucketLifecycleConfiguration {
-        rules,
-        expiry_updated_at,
-    };
-    match serialize(&subset) {
-        Ok(data) => Some(data),
-        Err(err) => {
-            warn!("failed to serialize lifecycle expiry subset; forwarding unfiltered: {err}");
-            Some(raw.to_vec())
-        }
-    }
-}
-
-/// The expiry replication axis persisted in a lifecycle XML document, if any.
-/// Used for the SRInfo bucket entry so bootstrap/repair items carry the
-/// expiry axis instead of the whole-config write time (which local
-/// transition-only edits inflate).
-fn lifecycle_expiry_updated_at(raw: &[u8]) -> Option<OffsetDateTime> {
-    if raw.is_empty() {
-        return None;
-    }
-    deserialize::<s3s::dto::BucketLifecycleConfiguration>(raw)
-        .ok()
-        .and_then(|config| config.expiry_updated_at)
-        .map(OffsetDateTime::from)
 }
 
 /// The timestamp an incoming lc-config item must beat to be applied.
@@ -8176,7 +4917,7 @@ fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
         match reader.read_event() {
             Ok(quick_xml::events::Event::Start(element)) => {
                 if depth == 0 {
-                    if seen_root || closed_root || element.name().as_ref() != b"LifecycleConfiguration" {
+                    if seen_root || closed_root || element.name().as_ref() != "LifecycleConfiguration" {
                         break false;
                     }
                     seen_root = true;
@@ -8185,7 +4926,7 @@ fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
             }
             Ok(quick_xml::events::Event::Empty(element)) => {
                 if depth == 0 {
-                    if seen_root || closed_root || element.name().as_ref() != b"LifecycleConfiguration" {
+                    if seen_root || closed_root || element.name().as_ref() != "LifecycleConfiguration" {
                         break false;
                     }
                     seen_root = true;
@@ -8208,7 +4949,9 @@ fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
                 seen_declaration = true;
             }
             Ok(quick_xml::events::Event::DocType(_)) => break false,
-            Ok(quick_xml::events::Event::Text(text)) if depth == 0 && !text.iter().all(u8::is_ascii_whitespace) => {
+            Ok(quick_xml::events::Event::Text(text))
+                if depth == 0 && !text.as_ref().bytes().all(|byte| byte.is_ascii_whitespace()) =>
+            {
                 break false;
             }
             Ok(quick_xml::events::Event::Text(_)) => {}
@@ -8222,48 +4965,6 @@ fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
     };
 
     well_formed_document && quick_xml::de::from_reader::<_, Tombstone>(raw).is_ok()
-}
-
-/// The ILM expiry statement this site contributes to its SRInfo bucket entry
-/// (feeding bootstrap/repair and consistency views), if any.
-/// `Some((subset_b64, axis))` — a `None` subset means "expiry rules were
-/// removed at `axis`" and travels as an explicit timestamped delete item, so
-/// a peer that missed the live delete still converges on repair.
-fn lifecycle_expiry_statement(
-    metadata: &crate::admin::storage_api::bucket::metadata::BucketMetadata,
-) -> Option<(Option<String>, OffsetDateTime)> {
-    if metadata.lifecycle_config_xml.is_empty() {
-        // Deleted vs never configured: the whole-config write time survives
-        // deletion in bucket metadata and strictly exceeds the created-time
-        // backfill only after a real write.
-        return (metadata.lifecycle_config_updated_at > metadata.created).then_some((None, metadata.lifecycle_config_updated_at));
-    }
-    let axis = lifecycle_expiry_updated_at(&metadata.lifecycle_config_xml);
-    match lifecycle_expiry_subset_xml(&metadata.lifecycle_config_xml) {
-        Some(subset) => {
-            // Legacy documents predate the axis field; their whole-config
-            // write time bounds the last expiry edit.
-            let axis = axis.unwrap_or(metadata.lifecycle_config_updated_at);
-            Some((raw_config_to_base64(&subset), axis))
-        }
-        // Transition-only config: with an expiry axis the site once had
-        // expiry rules and properly removed them — the delete travels at
-        // that axis. Without one there is nothing to say (a delete stamped
-        // off the whole-config time would let a local transition edit erase
-        // newer peer expiry state).
-        None => axis.map(|axis| (None, axis)),
-    }
-}
-
-/// Whether `rule` is in the shape the reconciler derives (`site-repl-<id>`
-/// naming the deployment its ARN targets). The reconciler rebuilds every such
-/// rule from the current peer set — current peer or not, so a leftover from a
-/// removed peer or a self-pointing rule is rebuilt away — while the merges
-/// keep only the current peers' rules and treat a leftover as operator state
-/// the edit replaces. An operator-authored `site-repl-*` id on an operator
-/// ARN is outside the shape and survives every pass.
-fn is_derived_site_replication_rule(rule: &ReplicationRule) -> bool {
-    site_replication_rule_deployment_id(rule).is_some()
 }
 
 fn replication_rule_deployment_id(rule: &ReplicationRule) -> Option<String> {
@@ -8315,123 +5016,6 @@ fn prune_removed_site_replication_rules(
     (Some(config), removed)
 }
 
-fn build_site_replication_rule(arn: &str, priority: i32, rule_id: &str) -> ReplicationRule {
-    ReplicationRule {
-        delete_marker_replication: Some(DeleteMarkerReplication {
-            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
-        }),
-        delete_replication: Some(DeleteReplication {
-            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
-        }),
-        destination: Destination {
-            bucket: arn.to_string(),
-            ..Default::default()
-        },
-        existing_object_replication: Some(ExistingObjectReplication {
-            status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
-        }),
-        filter: None,
-        id: Some(rule_id.to_string()),
-        prefix: None,
-        priority: Some(priority),
-        source_selection_criteria: Some(SourceSelectionCriteria {
-            replica_modifications: Some(ReplicaModifications {
-                status: ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED),
-            }),
-            sse_kms_encrypted_objects: None,
-        }),
-        status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
-    }
-}
-
-fn build_site_replication_config(
-    bucket: &str,
-    state: &SiteReplicationState,
-    local_peer: &PeerInfo,
-    service_account_secret_key: &str,
-    existing: Option<&ReplicationConfiguration>,
-) -> S3Result<Option<ReplicationConfiguration>> {
-    // Reuse the ARN already recorded for a peer so the rule keeps pointing at the same
-    // bucket target `reconcile_site_replication_bucket_targets` keys off (a MinIO-era
-    // `arn:minio:...` target would otherwise be orphaned by a freshly minted ARN).
-    let configured_arns = site_replication_target_arns_by_peer(existing);
-    let mut rules = Vec::new();
-    for peer in state.peers.values() {
-        if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
-            continue;
-        }
-
-        let Some(target) = site_replication_bucket_target_for_peer(
-            bucket,
-            state,
-            peer,
-            service_account_secret_key,
-            configured_arns.get(&peer.deployment_id).cloned(),
-        )?
-        else {
-            continue;
-        };
-        rules.push(build_site_replication_rule(
-            &target.arn,
-            (rules.len() + 1) as i32,
-            &format!("site-repl-{}", peer.deployment_id),
-        ));
-    }
-
-    if rules.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(ReplicationConfiguration {
-            role: String::new(),
-            rules,
-        }))
-    }
-}
-
-async fn ensure_site_replication_bucket_targets_with_runtime(
-    bucket: &str,
-    state: &SiteReplicationState,
-    local_peer: &PeerInfo,
-    config: Option<&s3s::dto::ReplicationConfiguration>,
-    service_account_secret_key: &str,
-    expected_incarnation_id: Uuid,
-) -> S3Result<()> {
-    let existing = match metadata_sys::list_bucket_targets(bucket).await {
-        Ok(targets) => targets,
-        Err(StorageError::ConfigNotFound) => BucketTargets::default(),
-        Err(err) => return Err(ApiError::from(err).into()),
-    };
-    let existing_json = serde_json::to_vec(&existing)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize bucket targets failed: {e}")))?;
-
-    let updated =
-        reconcile_site_replication_bucket_targets(existing, bucket, state, local_peer, config, service_account_secret_key)?;
-    if updated.targets.is_empty() {
-        return Ok(());
-    }
-
-    let json_targets = serde_json::to_vec(&updated)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize bucket targets failed: {e}")))?;
-    // Rewriting identical targets would churn bucket metadata and rebuild every remote S3
-    // client — noticeable now that startup reconciles all buckets, not just the one bucket
-    // an operation touched.
-    if json_targets == existing_json {
-        return Ok(());
-    }
-    metadata_sys::update_if_incarnation(bucket, BUCKET_TARGETS_FILE, json_targets, expected_incarnation_id)
-        .await
-        .map_err(ApiError::from)?;
-    Ok(())
-}
-
-async fn bucket_replication_config_for_target_refresh(bucket: &str) -> S3Result<Option<s3s::dto::ReplicationConfiguration>> {
-    match metadata_sys::get_replication_config(bucket).await {
-        Ok((config, _)) => Ok(Some(config)),
-        Err(StorageError::ConfigNotFound) => Ok(None),
-        Err(err) => Err(ApiError::from(err).into()),
-    }
-}
-
 async fn ensure_site_replication_bucket_targets(bucket: &str) -> S3Result<()> {
     let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(bucket)
         .await
@@ -8441,7 +5025,7 @@ async fn ensure_site_replication_bucket_targets(bucket: &str) -> S3Result<()> {
         return Ok(());
     };
     let config = bucket_replication_config_for_target_refresh(bucket).await?;
-    ensure_site_replication_bucket_targets_with_runtime(
+    let written = ensure_site_replication_bucket_targets_with_runtime(
         bucket,
         &runtime.state,
         &runtime.local_peer,
@@ -8449,65 +5033,10 @@ async fn ensure_site_replication_bucket_targets(bucket: &str) -> S3Result<()> {
         &runtime.service_account_secret_key,
         expected_incarnation_id,
     )
-    .await
-}
-
-async fn ensure_site_replication_bucket_replication_config_with_runtime(
-    bucket: &str,
-    state: &SiteReplicationState,
-    local_peer: &PeerInfo,
-    service_account_secret_key: &str,
-    expected_incarnation_id: Uuid,
-) -> S3Result<()> {
-    let existing = match metadata_sys::get_replication_config(bucket).await {
-        Ok((existing, _)) => Some(existing),
-        Err(StorageError::ConfigNotFound) => None,
-        Err(err) => return Err(ApiError::from(err).into()),
-    };
-
-    let Some(desired) = build_site_replication_config(bucket, state, local_peer, service_account_secret_key, existing.as_ref())?
-    else {
-        return Ok(());
-    };
-
-    // Derived rules are state owned by this site: rebuild them from the current peer
-    // set on every pass instead of preserving whatever is on disk. A rule left over
-    // from a removed peer — or one whose destination ARN names this very deployment,
-    // which no bucket target can ever satisfy — must not survive, otherwise objects
-    // are queued against an ARN that resolves to nothing.
-    let (existing_role, existing_rules) = existing
-        .map(|config| (config.role, config.rules))
-        .unwrap_or_else(|| (String::new(), Vec::new()));
-    let mut rules: Vec<ReplicationRule> = existing_rules
-        .iter()
-        .filter(|rule| !is_derived_site_replication_rule(rule))
-        .cloned()
-        .collect();
-    rules.extend(desired.rules);
-    // Operator priorities are the operator's policy; only the derived rules
-    // take free slots, by the same function as the config merges so a merged
-    // write and this pass agree byte for byte.
-    assign_site_replication_rule_priorities(&mut rules, is_derived_site_replication_rule);
-
-    // Only a `role` naming a current peer is ours to drop — an operator-authored role is
-    // part of the bucket's S3-visible configuration, and repairing a reverse rule must not
-    // quietly rewrite it. Same rule as `merge_incoming_replication_config`.
-    let role = if is_site_replication_role(&existing_role, &remote_peer_deployment_ids(state, local_peer)) {
-        String::new()
-    } else {
-        existing_role.clone()
-    };
-
-    if rules == existing_rules && role == existing_role {
-        return Ok(());
+    .await?;
+    if written {
+        reload_bucket_metadata_on_peers(bucket, "site_replication_bucket_targets", false).await;
     }
-
-    let data = serialize(&ReplicationConfiguration { role, rules })
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize replication failed: {e}")))?;
-    metadata_sys::update_if_incarnation(bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id)
-        .await
-        .map_err(ApiError::from)?;
-
     Ok(())
 }
 
@@ -8530,40 +5059,6 @@ async fn ensure_site_replication_bucket_setup_for_incarnation(bucket: &str, inca
     Ok(true)
 }
 
-async fn ensure_site_replication_bucket_setup_with_runtime(bucket: &str, runtime: &SiteReplicationRuntime) -> S3Result<()> {
-    let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(bucket)
-        .await
-        .map_err(ApiError::from)?;
-    ensure_site_replication_bucket_setup_with_runtime_for_incarnation(bucket, runtime, expected_incarnation_id).await
-}
-
-async fn ensure_site_replication_bucket_setup_with_runtime_for_incarnation(
-    bucket: &str,
-    runtime: &SiteReplicationRuntime,
-    expected_incarnation_id: Uuid,
-) -> S3Result<()> {
-    let _targets_guard = lock_bucket_targets_metadata(bucket).await;
-    let config = bucket_replication_config_for_target_refresh(bucket).await?;
-    ensure_site_replication_bucket_targets_with_runtime(
-        bucket,
-        &runtime.state,
-        &runtime.local_peer,
-        config.as_ref(),
-        &runtime.service_account_secret_key,
-        expected_incarnation_id,
-    )
-    .await?;
-    ensure_site_replication_bucket_replication_config_with_runtime(
-        bucket,
-        &runtime.state,
-        &runtime.local_peer,
-        &runtime.service_account_secret_key,
-        expected_incarnation_id,
-    )
-    .await?;
-    Ok(())
-}
-
 async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deployment_ids: &HashSet<String>) -> S3Result<usize> {
     let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(bucket)
         .await
@@ -8571,10 +5066,17 @@ async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deploymen
     let _targets_guard = lock_bucket_targets_metadata(bucket).await;
     let mut removed = 0usize;
 
+    let config = match metadata_sys::get_replication_config(bucket).await {
+        Ok((config, _)) => Some(config),
+        Err(StorageError::ConfigNotFound) => None,
+        Err(err) => return Err(ApiError::from(err).into()),
+    };
+    let removed_rule_arns = removed_site_replication_rule_arns(config.as_ref(), removed_deployment_ids);
+
     match metadata_sys::list_bucket_targets(bucket).await {
         Ok(targets) => {
             let (updated_targets, removed_targets) =
-                prune_removed_site_replication_bucket_targets(targets, removed_deployment_ids);
+                prune_removed_site_replication_bucket_targets(targets, bucket, removed_deployment_ids, &removed_rule_arns);
             if removed_targets > 0 {
                 let json_targets = serde_json::to_vec(&updated_targets).map_err(|e| {
                     S3Error::with_message(S3ErrorCode::InternalError, format!("serialize bucket targets failed: {e}"))
@@ -8589,8 +5091,8 @@ async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deploymen
         Err(err) => return Err(ApiError::from(err).into()),
     }
 
-    match metadata_sys::get_replication_config(bucket).await {
-        Ok((config, _)) => {
+    if let Some(config) = config {
+        {
             let (updated_config, removed_rules) = prune_removed_site_replication_rules(config, removed_deployment_ids);
             if removed_rules > 0 {
                 if let Some(updated_config) = updated_config {
@@ -8608,10 +5110,11 @@ async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deploymen
                 removed = removed.saturating_add(removed_rules);
             }
         }
-        Err(StorageError::ConfigNotFound) => {}
-        Err(err) => return Err(ApiError::from(err).into()),
     }
 
+    if removed > 0 {
+        reload_bucket_metadata_on_peers(bucket, "site_replication_bucket_cleanup", true).await;
+    }
     Ok(removed)
 }
 
@@ -8689,20 +5192,22 @@ async fn probe_reverse_peer_reachability(state: &SiteReplicationState, local_pee
                 continue;
             }
         };
-        if let Err(err) = send_peer_admin_request(
-            &connection,
-            SITE_REPLICATION_DEVNULL_PATH,
-            &state.service_account_access_key,
-            &secret_key,
-            &serde_json::json!({}),
-        )
-        .await
+        if let Err(err) = devnull_probe_request(&connection, &state.service_account_access_key)
+            .send(&secret_key, &serde_json::json!({}))
+            .await
         {
             errors.push(format!("{} is not reachable from this site: {err}", peer.endpoint));
         }
     }
 
     errors
+}
+
+/// The probe must target devnull with a method the admin router actually
+/// registers for it — a mismatched method makes every probe fail and turns
+/// the "not reachable" warning into permanent noise.
+pub(crate) fn devnull_probe_request<'a>(connection: &'a PeerConnection, access_key: &'a str) -> PeerAdminRequest<'a> {
+    PeerAdminRequest::post(connection, SITE_REPLICATION_DEVNULL_PATH, access_key)
 }
 
 async fn backfill_existing_buckets_after_add(
@@ -8733,105 +5238,135 @@ async fn backfill_existing_buckets_after_add(
 
     let resync_id = Uuid::new_v4().to_string();
     for bucket in &buckets {
-        let name = &bucket.name;
+        let operation_name = bucket.name.clone();
+        let lock_bucket = operation_name.clone();
+        let operation_state = state.clone();
+        let operation_local_peer = local_peer.clone();
+        let operation_resync_id = resync_id.clone();
+        let operation_bootstrap_token = bootstrap_token.map(str::to_owned);
+        let bucket_errors = with_site_replication_bucket_mutation_lock(store.clone(), &lock_bucket, move || async move {
+            let mut errors = SiteReplicationErrorSummary::default();
+            let name = &operation_name;
 
-        if let Err(err) = ensure_site_replication_bucket_versioning(name).await {
-            warn!(
-                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                bucket = %name,
-                result = "backfill_versioning_setup_failed",
-                error = ?err,
-                "admin site replication state"
-            );
-            errors.push(format!("{name}: versioning setup failed: {err}"));
-            continue;
-        }
-        match ensure_site_replication_bucket_setup(name).await {
-            Ok(true) => {}
-            Ok(false) => {
-                // Runtime targets unavailable: the setup silently no-ops, which would make the
-                // downstream make-bucket broadcast and resync fail. Record it and skip so the
-                // operator sees this bucket was not propagated instead of an unqualified success.
+            if let Err(err) = ensure_site_replication_bucket_versioning(name).await {
                 warn!(
                     event = EVENT_ADMIN_SITE_REPLICATION_STATE,
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
                     bucket = %name,
-                    result = "backfill_bucket_setup_skipped",
-                    "admin site replication state"
-                );
-                errors.push(format!("{name}: replication setup skipped (site replication runtime unavailable)"));
-                continue;
-            }
-            Err(err) => {
-                warn!(
-                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                    bucket = %name,
-                    result = "backfill_bucket_setup_failed",
+                    result = "backfill_versioning_setup_failed",
                     error = ?err,
                     "admin site replication state"
                 );
-                errors.push(format!("{name}: bucket setup failed: {err}"));
+                errors.push(format!("{name}: versioning setup failed: {err}"));
+                return errors;
             }
-        }
-        // Broadcast the bucket to peers so they create it too (idempotent on the peer side).
-        // Read the real lock_enabled flag so peers recreate the bucket with the same object-lock
-        // setting — object lock cannot be added after bucket creation.
-        let lock_enabled = match metadata_sys::get(name).await {
-            Ok(bm) => bm.lock_enabled,
-            Err(err) => {
-                warn!(
-                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                    bucket = %name,
-                    result = "backfill_bucket_metadata_read_failed",
-                    fallback = "lock_enabled=false",
-                    error = ?err,
-                    "admin site replication state"
-                );
-                false
+            match ensure_site_replication_bucket_setup(name).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Runtime targets unavailable: the setup silently no-ops, which would make the
+                    // downstream make-bucket broadcast and resync fail. Record it and skip so the
+                    // operator sees this bucket was not propagated instead of an unqualified success.
+                    warn!(
+                        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                        bucket = %name,
+                        result = "backfill_bucket_setup_skipped",
+                        "admin site replication state"
+                    );
+                    errors.push(format!("{name}: replication setup skipped (site replication runtime unavailable)"));
+                    return errors;
+                }
+                Err(err) => {
+                    warn!(
+                        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                        bucket = %name,
+                        result = "backfill_bucket_setup_failed",
+                        error = ?err,
+                        "admin site replication state"
+                    );
+                    errors.push(format!("{name}: bucket setup failed: {err}"));
+                }
             }
-        };
-        if let Err(err) = broadcast_site_replication_make_bucket(name, lock_enabled, None, bootstrap_token).await {
-            warn!(
-                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                bucket = %name,
-                result = "backfill_make_bucket_broadcast_failed",
-                error = ?err,
-                "admin site replication state"
-            );
-            errors.push(format!("{name}: make-bucket broadcast failed: {err}"));
-        }
-        // Kick a resync toward every remote peer so existing objects travel across.
-        for peer in state.peers.values() {
-            if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
-                continue;
-            }
-            let manifest = site_bucket_resync_manifest_entry(name, peer, OffsetDateTime::now_utc()).await;
-            let result = if manifest.target_arn.is_empty() {
-                manifest
-            } else {
-                start_site_bucket_resync(name, &manifest.target_arn, &resync_id).await
+            // Broadcast the bucket to peers so they create it too (idempotent on the peer side).
+            // Read the real lock_enabled flag so peers recreate the bucket with the same object-lock
+            // setting — object lock cannot be added after bucket creation.
+            let lock_enabled = match metadata_sys::get(name).await {
+                Ok(bm) => bm.lock_enabled,
+                Err(err) => {
+                    warn!(
+                        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                        bucket = %name,
+                        result = "backfill_bucket_metadata_read_failed",
+                        fallback = "lock_enabled=false",
+                        error = ?err,
+                        "admin site replication state"
+                    );
+                    false
+                }
             };
-            if result.status == "failed" {
+            if let Err(err) =
+                broadcast_site_replication_make_bucket(name, lock_enabled, None, operation_bootstrap_token.as_deref()).await
+            {
                 warn!(
                     event = EVENT_ADMIN_SITE_REPLICATION_STATE,
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
                     bucket = %name,
-                    peer = %peer.endpoint,
-                    result = "backfill_resync_kick_failed",
-                    detail = %result.err_detail,
+                    result = "backfill_make_bucket_broadcast_failed",
+                    error = ?err,
                     "admin site replication state"
                 );
-                errors.push(format!("{name} -> {}: resync kick failed: {}", peer.endpoint, result.err_detail));
+                errors.push(format!("{name}: make-bucket broadcast failed: {err}"));
+            }
+            // Kick a resync toward every remote peer so existing objects travel across.
+            for peer in operation_state.peers.values() {
+                if peer.deployment_id == operation_local_peer.deployment_id
+                    || same_identity_endpoint(&peer.endpoint, &operation_local_peer.endpoint)
+                {
+                    continue;
+                }
+                let manifest = site_bucket_resync_manifest_entry(name, peer, OffsetDateTime::now_utc()).await;
+                let result = if manifest.target_arn.is_empty() {
+                    manifest
+                } else {
+                    start_site_bucket_resync(name, &manifest.target_arn, &operation_resync_id).await
+                };
+                if result.status == "failed" {
+                    warn!(
+                        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                        bucket = %name,
+                        peer = %peer.endpoint,
+                        result = "backfill_resync_kick_failed",
+                        detail = %result.err_detail,
+                        "admin site replication state"
+                    );
+                    errors.push(format!("{name} -> {}: resync kick failed: {}", peer.endpoint, result.err_detail));
+                }
+            }
+            errors
+        })
+        .await;
+        match bucket_errors {
+            Ok(bucket_errors) => errors.extend(bucket_errors),
+            Err(err) => {
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    bucket = %lock_bucket,
+                    result = "backfill_bucket_mutation_lock_failed",
+                    error = ?err,
+                    "admin site replication state"
+                );
+                errors.push(format!("{lock_bucket}: bucket mutation lock failed: {err}"));
             }
         }
     }
@@ -8877,6 +5412,11 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
         .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "object store is not initialized".to_string()))?;
     let buckets = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
 
+    // Every bucket already rewritten in this pass carries the edited peer's
+    // target. A remove accepted mid-pass must undo all of them, not just the
+    // one in flight: the remove's own cleanup may have already walked past a
+    // bucket this loop wrote afterwards.
+    let mut rewritten = Vec::new();
     for bucket in buckets {
         let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket.name)
             .await
@@ -8885,13 +5425,13 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
         // every round, and the writes below are bucket metadata, not state.
         let state = load_site_replication_state().await?;
         let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
-            return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
+            return Err(endpoint_refresh_state_changed());
         };
         let target_state = endpoint_refresh_target_state(&state, &pending);
         let local_peer = current_local_runtime_peer(&target_state);
         let _targets_guard = lock_bucket_targets_metadata(&bucket.name).await;
         let replication_config = bucket_replication_config_for_target_refresh(&bucket.name).await?;
-        ensure_site_replication_bucket_targets_with_runtime(
+        let written = ensure_site_replication_bucket_targets_with_runtime(
             &bucket.name,
             &target_state,
             &local_peer,
@@ -8900,6 +5440,38 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
             expected_incarnation_id,
         )
         .await?;
+        if written {
+            reload_bucket_metadata_on_peers(&bucket.name, "site_replication_endpoint_refresh", false).await;
+        }
+
+        rewritten.push(bucket.name.clone());
+
+        // A remove accepted on another node can clear this journal while the
+        // bucket rewrite is in flight. Re-check after the write: if it removed
+        // the edited peer, undo the stale targets this pass restored, after
+        // releasing the process-local target lock. If it committed the same
+        // edit, the write is equivalent but this driver no longer owns
+        // finalization.
+        let latest = load_site_replication_state().await?;
+        let postwrite = endpoint_refresh_postwrite_state(&latest, pending_id, &pending.peer.deployment_id);
+        drop(_targets_guard);
+        if postwrite == EndpointRefreshPostwriteState::TargetRemoved {
+            let removed = HashSet::from([pending.peer.deployment_id.clone()]);
+            let mut cleanup_error = None;
+            for name in &rewritten {
+                // Attempt every bucket: one failure must not leave the rest
+                // of this pass's stale targets behind.
+                if let Err(err) = cleanup_removed_site_replication_bucket(name, &removed).await {
+                    cleanup_error.get_or_insert(err);
+                }
+            }
+            if let Some(err) = cleanup_error {
+                return Err(err);
+            }
+        }
+        if postwrite != EndpointRefreshPostwriteState::Current {
+            return Err(endpoint_refresh_state_changed());
+        }
     }
 
     Ok(())
@@ -8914,36 +5486,23 @@ async fn site_bucket_resync_manifest_entry(bucket: &str, peer: &PeerInfo, now: O
         ..Default::default()
     };
     let _targets_guard = lock_bucket_targets_metadata(bucket).await;
-    let (config, _) = match metadata_sys::get_replication_config(bucket).await {
-        Ok(config) => config,
+    // Read what is persisted, not this node's cache: the wiring may have
+    // been written by another node moments ago (`start_site_bucket_resync`
+    // already reads its targets from disk), and an operator resync must see
+    // the same records the drive will use.
+    let (config, targets) = match site_bucket_resync_persisted_wiring(bucket).await {
+        Ok(wiring) => wiring,
         Err(err) => {
             entry.status = "failed".to_string();
             entry.err_detail = summarize_peer_error_detail(&err.to_string());
             return entry;
         }
     };
-    let targets = match metadata_sys::list_bucket_targets(bucket).await {
-        Ok(targets) => targets,
-        Err(err) => {
-            entry.status = "failed".to_string();
-            entry.err_detail = summarize_peer_error_detail(&err.to_string());
-            return entry;
-        }
-    };
-    let mut matching = targets
-        .targets
-        .iter()
-        .filter(|target| target.target_type == BucketTargetType::ReplicationService && bucket_target_matches_peer(target, peer));
-    let Some(target) = matching.next() else {
+    let Some(target) = site_bucket_resync_target_for_peer(bucket, &config, &targets, peer) else {
         entry.status = "failed".to_string();
-        entry.err_detail = "no valid remote target found for peer".to_string();
+        entry.err_detail = "no site replication target found for peer".to_string();
         return entry;
     };
-    if matching.next().is_some() {
-        entry.status = "failed".to_string();
-        entry.err_detail = "multiple remote targets matched peer".to_string();
-        return entry;
-    }
     let (has_arn, existing_object_enabled) = config.has_existing_object_replication(&target.arn);
     if !has_arn || !existing_object_enabled {
         entry.status = "failed".to_string();
@@ -8952,6 +5511,46 @@ async fn site_bucket_resync_manifest_entry(bucket: &str, peer: &PeerInfo, now: O
     }
     entry.target_arn = target.arn.clone();
     entry
+}
+
+/// The bucket target a site resync drives for `peer`: the one the derived
+/// `site-repl-<deployment id>` rule names. Matching targets by peer endpoint
+/// or deployment id also catches an operator's bucket-level target to the
+/// same site (different target bucket and credentials), which either aborted
+/// the bucket as "multiple remote targets matched peer" or drove the resync
+/// into the operator's bucket (rustfs/backlog#2489). Without a derived rule
+/// the site target is recognised by its shape, as MinIO's
+/// `getRemoteARNForPeer` does: the same-name target bucket on the peer.
+fn site_bucket_resync_target_for_peer<'a>(
+    bucket: &str,
+    config: &ReplicationConfiguration,
+    targets: &'a BucketTargets,
+    peer: &PeerInfo,
+) -> Option<&'a BucketTarget> {
+    let replication_targets = || {
+        targets
+            .targets
+            .iter()
+            .filter(|target| target.target_type == BucketTargetType::ReplicationService)
+    };
+    if let Some(arn) = config
+        .rules
+        .iter()
+        .find(|rule| site_replication_rule_deployment_id(rule) == Some(peer.deployment_id.as_str()))
+        .map(|rule| rule.destination.bucket.as_str())
+    {
+        return replication_targets().find(|target| target.arn == arn);
+    }
+    replication_targets().find(|target| target.target_bucket == bucket && bucket_target_matches_peer(target, peer))
+}
+
+/// The persisted replication configuration and bucket targets, bypassing the
+/// node-local metadata cache. `ConfigNotFound` surfaces for a bucket without
+/// a replication configuration, matching the cached read's error.
+async fn site_bucket_resync_persisted_wiring(bucket: &str) -> Result<(ReplicationConfiguration, BucketTargets), StorageError> {
+    let metadata = metadata_sys::get_config_from_disk(bucket).await?;
+    let config = metadata.replication_config.ok_or(StorageError::ConfigNotFound)?;
+    Ok((config, metadata.bucket_target_config.unwrap_or_default()))
 }
 
 async fn start_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &str) -> ResyncBucketStatus {
@@ -8976,17 +5575,8 @@ async fn start_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &st
         }
     };
 
-    let (config, _) = match metadata_sys::get_replication_config(bucket).await {
-        Ok(config) => config,
-        Err(err) => {
-            bucket_status.status = "failed".to_string();
-            bucket_status.err_detail = err.to_string();
-            return bucket_status;
-        }
-    };
-
-    let targets = match metadata_sys::list_bucket_targets_from_disk(bucket).await {
-        Ok(targets) => targets,
+    let (config, targets) = match site_bucket_resync_persisted_wiring(bucket).await {
+        Ok(wiring) => wiring,
         Err(err) => {
             bucket_status.status = "failed".to_string();
             bucket_status.err_detail = err.to_string();
@@ -9258,33 +5848,40 @@ fn apply_state_edit_req(mut state: SiteReplicationState, body: SRStateEditReq) -
     state
 }
 
-fn bucket_versioning_xml() -> S3Result<Vec<u8>> {
-    let config = VersioningConfiguration {
-        status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
-        ..Default::default()
-    };
-    serialize(&config).map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize versioning failed: {e}")))
-}
-
-async fn ensure_site_replication_bucket_versioning(bucket: &str) -> S3Result<()> {
-    let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(bucket)
-        .await
-        .map_err(ApiError::from)?;
-    match metadata_sys::get_versioning_config(bucket).await {
-        Ok((config, _)) if config.enabled() => return Ok(()),
-        Ok(_) | Err(StorageError::ConfigNotFound) => {}
-        Err(err) => return Err(ApiError::from(err).into()),
-    }
-
-    metadata_sys::update_if_incarnation(bucket, BUCKET_VERSIONING_CONFIG, bucket_versioning_xml()?, expected_incarnation_id)
-        .await
-        .map_err(ApiError::from)?;
-
-    Ok(())
-}
-
 fn is_stale_update(local_updated_at: OffsetDateTime, incoming_updated_at: Option<OffsetDateTime>) -> bool {
     incoming_updated_at.is_some_and(|incoming_updated_at| incoming_updated_at < local_updated_at)
+}
+
+/// Verdict for an incoming IAM item judged against the local record it would
+/// overwrite or delete (backlog#2291).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IamItemVerdict {
+    /// Apply the item: there is no local record, the item carries no source
+    /// timestamp (older peer), or it is at least as new as the local record.
+    Apply,
+    /// The local record was written from a newer source change; acknowledge the
+    /// item without touching the record. Covers both directions: a delayed
+    /// grant must not undo a newer revoke, and a delayed revoke must not undo a
+    /// newer grant.
+    SkipStale,
+}
+
+/// Ordering rule shared by the `policy`, `policy-mapping` and `group-info`
+/// item paths (and matching `iam-user` / `service-account`).
+///
+/// `local_record_updated_at` is `None` when the targeted record does not
+/// exist locally: nothing can be stale relative to an absent record, so a
+/// create is applied and a delete falls through to the idempotent no-op paths
+/// (backlog#2071). A record that exists but predates timestamps passes
+/// `Some(UNIX_EPOCH)` and therefore never rejects an item.
+fn judge_iam_item_staleness(
+    local_record_updated_at: Option<OffsetDateTime>,
+    incoming_updated_at: Option<OffsetDateTime>,
+) -> IamItemVerdict {
+    match local_record_updated_at {
+        Some(local_updated_at) if is_stale_update(local_updated_at, incoming_updated_at) => IamItemVerdict::SkipStale,
+        _ => IamItemVerdict::Apply,
+    }
 }
 
 fn bucket_meta_local_updated_at(
@@ -9487,6 +6084,18 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
         _ => unreachable!(),
     };
 
+    // Persist the SOURCE `updated_at` as the stored `*_config_updated_at`
+    // stamp, on writes and on deletes alike (backlog#2292). The staleness
+    // gate above compares the next item's source time against that stamp, so
+    // stamping the local apply time would reject a newer source edit that was
+    // merely delivered after this write or delete (two quick edits under
+    // delivery delay, or a peer clock ahead of ours).
+    // Items without a source time keep the local stamp; lc-config keeps it
+    // too: its staleness axis is the in-document `expiry_updated_at` the merge
+    // above records, and the whole-config time is only its deletion / legacy
+    // lower bound.
+    let source_updated_at = if item.r#type == "lc-config" { None } else { item.updated_at };
+
     if !skip_config_write {
         if let Some(data) = data {
             if item.r#type == "quota-config" {
@@ -9505,13 +6114,25 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
                             "durable quota capability is not confirmed across the cluster".to_string(),
                         )
                     })?;
-                    metadata_sys::update_quota_if_incarnation(&item.bucket, data, expected_incarnation_id, &proof)
-                        .await
-                        .map_err(ApiError::from)?;
+                    match source_updated_at {
+                        Some(source_updated_at) => {
+                            metadata_sys::update_quota_if_incarnation_at(
+                                &item.bucket,
+                                data,
+                                expected_incarnation_id,
+                                &proof,
+                                source_updated_at,
+                            )
+                            .await
+                        }
+                        None => {
+                            metadata_sys::update_quota_if_incarnation(&item.bucket, data, expected_incarnation_id, &proof).await
+                        }
+                    }
+                    .map_err(ApiError::from)?;
                 } else {
-                    metadata_sys::update_if_incarnation(&item.bucket, config_file, data, expected_incarnation_id)
-                        .await
-                        .map_err(ApiError::from)?;
+                    write_replicated_bucket_config(&item.bucket, config_file, data, expected_incarnation_id, source_updated_at)
+                        .await?;
                 }
             } else {
                 if let Some(guard) = lifecycle_guard.as_ref() {
@@ -9519,9 +6140,8 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
                         .await
                         .map_err(ApiError::from)?;
                 } else {
-                    metadata_sys::update_if_incarnation(&item.bucket, config_file, data, expected_incarnation_id)
-                        .await
-                        .map_err(ApiError::from)?;
+                    write_replicated_bucket_config(&item.bucket, config_file, data, expected_incarnation_id, source_updated_at)
+                        .await?;
                 }
             }
         } else {
@@ -9530,14 +6150,32 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
                     .await
                     .map_err(ApiError::from)?;
             } else {
-                metadata_sys::delete_if_incarnation(&item.bucket, config_file, expected_incarnation_id)
-                    .await
-                    .map_err(ApiError::from)?;
+                // A delete is stamped like a write: the source time survives
+                // as the config's `*_config_updated_at`, so a newer source
+                // re-create delivered later is not judged stale against the
+                // local time this delete landed (backlog#2292).
+                match source_updated_at {
+                    Some(source_updated_at) => {
+                        metadata_sys::delete_if_incarnation_at(
+                            &item.bucket,
+                            config_file,
+                            expected_incarnation_id,
+                            source_updated_at,
+                        )
+                        .await
+                    }
+                    None => metadata_sys::delete_if_incarnation(&item.bucket, config_file, expected_incarnation_id).await,
+                }
+                .map_err(ApiError::from)?;
             }
         }
     }
     drop(lifecycle_guard);
     drop(targets_guard);
+
+    if !skip_config_write {
+        reload_bucket_metadata_on_peers(&item.bucket, "site_replication_bucket_meta", item.r#type == "lc-config").await;
+    }
 
     if item.r#type == "replication-config" {
         // Rebuild the local outbound rules too: a site that joined an already-replicated
@@ -9557,43 +6195,28 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
     Ok(())
 }
 
-fn group_info_requires_upsert(update: &rustfs_madmin::GroupAddRemove) -> bool {
-    !update.is_remove
+/// Write one replicated bucket config, stamped with the item's source
+/// `updated_at` when it carries one and with the local clock otherwise
+/// (backlog#2292; see [`apply_bucket_meta_item`]).
+async fn write_replicated_bucket_config(
+    bucket: &str,
+    config_file: &str,
+    data: Vec<u8>,
+    expected_incarnation_id: Uuid,
+    source_updated_at: Option<OffsetDateTime>,
+) -> S3Result<()> {
+    match source_updated_at {
+        Some(source_updated_at) => {
+            metadata_sys::update_if_incarnation_at(bucket, config_file, data, expected_incarnation_id, source_updated_at).await
+        }
+        None => metadata_sys::update_if_incarnation(bucket, config_file, data, expected_incarnation_id).await,
+    }
+    .map_err(ApiError::from)?;
+    Ok(())
 }
 
-pub(crate) fn encode_service_account_replication_policy(
-    claims: &HashMap<String, Value>,
-    session_policy: Option<&str>,
-) -> S3Result<(SRSessionPolicy, Option<rustfs_madmin::SRSvcAccReplicationEnvelope>)> {
-    if !claims.contains_key(OIDC_VIRTUAL_PARENT_CLAIM) {
-        return session_policy
-            .map(SRSessionPolicy::from_json)
-            .transpose()
-            .map(|policy| policy.unwrap_or_default())
-            .map(|policy| (policy, None))
-            .map_err(|err| s3_error!(InvalidArgument, "marshal policy failed: {:?}", err));
-    }
-
-    let policy = match session_policy {
-        Some(policy) => serde_json::from_str::<Policy>(policy)
-            .map_err(|err| s3_error!(InvalidArgument, "invalid service account replication policy: {:?}", err))?,
-        None => Policy::default(),
-    };
-    if policy.statements.is_empty() && (!policy.id.is_empty() || !policy.version.is_empty())
-        || policy.version.is_empty() && !policy.statements.is_empty()
-    {
-        return Err(s3_error!(InvalidArgument, "service account replication policy is not normalized"));
-    }
-    let policy = serde_json::to_string(&policy)
-        .map_err(|err| s3_error!(InternalError, "marshal service account replication policy failed: {:?}", err))?;
-    let policy = SRSessionPolicy::from_json(&policy)
-        .map_err(|err| s3_error!(InternalError, "marshal service account replication policy failed: {:?}", err))?;
-    Ok((
-        policy,
-        Some(rustfs_madmin::SRSvcAccReplicationEnvelope {
-            version: SERVICE_ACCOUNT_ENVELOPE_VERSION,
-        }),
-    ))
+fn group_info_requires_upsert(update: &rustfs_madmin::GroupAddRemove) -> bool {
+    !update.is_remove
 }
 
 #[derive(Debug)]
@@ -9662,72 +6285,232 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
     let Some(iam_sys) = current_iam_handle() else {
         return Err(s3_error!(InvalidRequest, "iam not init"));
     };
-    let incoming_updated_at = item.updated_at;
-
     match item.r#type.as_str() {
-        "policy" => apply_iam_policy_item(&iam_sys, &item.name, item.policy).await,
-        "policy-mapping" => apply_iam_policy_mapping_item(&iam_sys, item.policy_mapping).await,
-        "group-info" => apply_iam_group_info_item(&iam_sys, item.group_info).await,
         // MinIO madmin-go sends `SRIAMItemSTSAcc = "sts-account"`. The legacy alias
         // `sts-credential` (emitted by older RustFS releases) stays accepted permanently
         // so mixed-version RustFS sites keep replicating STS credentials during rolling
         // upgrades; it is a compatibility layer, not temporary code.
-        SR_IAM_ITEM_STS_ACC | SR_IAM_ITEM_STS_ACC_LEGACY => apply_iam_sts_account_item(&iam_sys, item.sts_credential).await,
-        "iam-user" => apply_iam_user_item(&iam_sys, item.iam_user, incoming_updated_at).await,
-        "service-account" => apply_iam_service_account_item(&iam_sys, item.svc_acc_change, incoming_updated_at).await,
-        _ => Err(s3_error!(
-            NotImplemented,
-            "site replication IAM item type `{}` is not supported",
-            item.r#type
-        )),
+        //
+        // STS credentials carry no source revision and leave no deletion mark,
+        // so they stay outside the ordered transaction below.
+        SR_IAM_ITEM_STS_ACC | SR_IAM_ITEM_STS_ACC_LEGACY => {
+            return apply_iam_sts_account_item(&iam_sys, item.sts_credential).await;
+        }
+        "policy" | "policy-mapping" | "group-info" | "iam-user" | "service-account" => {}
+        _ => {
+            return Err(s3_error!(
+                NotImplemented,
+                "site replication IAM item type `{}` is not supported",
+                item.r#type
+            ));
+        }
     }
+
+    // One transaction per item (backlog#2291). The staleness verdict, the IAM
+    // write and the deletion-mark commit run under the distributed
+    // state-object lock, so an older grant and a newer revoke delivered
+    // concurrently — to this node or to a sibling node of this site — are
+    // applied one after the other, each judged against what the other left
+    // behind. The write stamps the record with the item's source
+    // `updated_at`, which is what the next item is judged against: stamping
+    // the local apply time would reject a newer source edit that was merely
+    // delivered later. A committed deletion leaves no record, so its source
+    // timestamp is kept as a mark in the same commit; failing to persist the
+    // mark fails the item, and the sender retries the (idempotent) deletion
+    // rather than leaving a revoke that a stale grant could still undo.
+    with_site_replication_state_transaction(move |mut state| async move {
+        let incoming_updated_at = item.updated_at;
+        let deletion_mark_entities = iam_item_deletion_mark_entities(&item);
+        let verdict = match item.r#type.as_str() {
+            "policy" => apply_iam_policy_item(&iam_sys, &state, &item.name, item.policy, incoming_updated_at).await?,
+            "policy-mapping" => apply_iam_policy_mapping_item(&iam_sys, &state, item.policy_mapping, incoming_updated_at).await?,
+            "group-info" => apply_iam_group_info_item(&iam_sys, &state, item.group_info, incoming_updated_at).await?,
+            "iam-user" => apply_iam_user_item(&iam_sys, &state, item.iam_user, incoming_updated_at).await?,
+            "service-account" => {
+                apply_iam_service_account_item(&iam_sys, &state, item.svc_acc_change, incoming_updated_at).await?
+            }
+            _ => unreachable!("unsupported IAM item types are rejected before the transaction"),
+        };
+        let changed = verdict == IamItemVerdict::Apply
+            && incoming_updated_at
+                .filter(|_| !deletion_mark_entities.is_empty())
+                .is_some_and(|deleted_at| record_iam_deletion_marks(&mut state, &deletion_mark_entities, deleted_at));
+        Ok(((), changed.then_some(state)))
+    })
+    .await
 }
 
-async fn apply_iam_policy_item(iam_sys: &IamSys<ObjectStore>, name: &str, policy: Option<Value>) -> S3Result<()> {
+/// The stamp a replicated write persists on the record: the item's source
+/// `updated_at`, or the local clock for an item from a peer that predates
+/// timestamps (those keep last-writer-wins, see [`judge_iam_item_staleness`]).
+fn replicated_write_stamp(incoming_updated_at: Option<OffsetDateTime>) -> OffsetDateTime {
+    incoming_updated_at.unwrap_or_else(OffsetDateTime::now_utc)
+}
+
+async fn apply_iam_policy_item(
+    iam_sys: &IamSys<ObjectStore>,
+    marks: &SiteReplicationState,
+    name: &str,
+    policy: Option<Value>,
+    incoming_updated_at: Option<OffsetDateTime>,
+) -> S3Result<IamItemVerdict> {
+    // Judge the item against the local document's own timestamp — the source
+    // time of the edit that wrote it — so a delayed older body (or delete)
+    // cannot overwrite a newer edit; once the document is deleted, its
+    // deletion mark stands in for it (backlog#2291).
+    let local_updated_at = match iam_sys.get_policy_doc(name).await {
+        Ok(doc) => Some(doc.update_date.unwrap_or(OffsetDateTime::UNIX_EPOCH)),
+        Err(err) if rustfs_iam::error::is_err_no_such_policy(&err) => {
+            iam_deletion_mark(marks, &[iam_policy_deletion_mark_entity(name)])
+        }
+        Err(err) => return Err(ApiError::from(err).into()),
+    };
+    if judge_iam_item_staleness(local_updated_at, incoming_updated_at) == IamItemVerdict::SkipStale {
+        return Ok(IamItemVerdict::SkipStale);
+    }
     if let Some(policy) = policy {
         let policy: Policy =
             serde_json::from_value(policy).map_err(|e| s3_error!(InvalidRequest, "invalid policy body: {}", e))?;
-        iam_sys.set_policy(name, policy).await.map_err(ApiError::from)?;
+        iam_sys
+            .set_policy_at(name, policy, replicated_write_stamp(incoming_updated_at))
+            .await
+            .map_err(ApiError::from)?;
     } else {
-        iam_sys.delete_policy(name, true).await.map_err(ApiError::from)?;
+        // Idempotent delete: the retry drain replays recorded deletions, and
+        // an entity already absent here IS the converged outcome — erroring
+        // would wedge the replay forever (backlog#2071).
+        match iam_sys.delete_policy(name, true).await {
+            Ok(()) => {}
+            Err(err) if rustfs_iam::error::is_err_no_such_policy(&err) => {}
+            Err(err) => return Err(ApiError::from(err).into()),
+        }
     }
-    Ok(())
+    Ok(IamItemVerdict::Apply)
 }
 
-async fn apply_iam_policy_mapping_item(iam_sys: &IamSys<ObjectStore>, policy_mapping: Option<SRPolicyMapping>) -> S3Result<()> {
+async fn apply_iam_policy_mapping_item(
+    iam_sys: &IamSys<ObjectStore>,
+    marks: &SiteReplicationState,
+    policy_mapping: Option<SRPolicyMapping>,
+    incoming_updated_at: Option<OffsetDateTime>,
+) -> S3Result<IamItemVerdict> {
     let Some(mapping) = policy_mapping else {
         return Err(s3_error!(InvalidRequest, "policyMapping is required"));
     };
     let user_type = user_type_from_sr_wire(mapping.user_type).ok_or_else(|| s3_error!(InvalidRequest, "invalid userType"))?;
+    // Judge the item against the stored mapping's timestamp so a delayed older
+    // attach (or an older detach, `policy == ""`) cannot overwrite a newer one
+    // (backlog#2291). A detach removes the mapping outright, so once it is
+    // gone the detach's deletion mark stands in for the record.
+    let local_updated_at = match iam_sys
+        .get_mapped_policy_record(&mapping.user_or_group, user_type, mapping.is_group)
+        .await
+    {
+        Some(record) => Some(record.update_at),
+        None => iam_deletion_mark(
+            marks,
+            &[iam_policy_mapping_deletion_mark_entity(
+                &mapping.user_or_group,
+                mapping.user_type,
+                mapping.is_group,
+            )],
+        ),
+    };
+    if judge_iam_item_staleness(local_updated_at, incoming_updated_at) == IamItemVerdict::SkipStale {
+        return Ok(IamItemVerdict::SkipStale);
+    }
     iam_sys
-        .policy_db_set(&mapping.user_or_group, user_type, mapping.is_group, &mapping.policy)
+        .policy_db_set_at(
+            &mapping.user_or_group,
+            user_type,
+            mapping.is_group,
+            &mapping.policy,
+            replicated_write_stamp(incoming_updated_at),
+        )
         .await
         .map_err(ApiError::from)?;
-    Ok(())
+    Ok(IamItemVerdict::Apply)
 }
 
-async fn apply_iam_group_info_item(iam_sys: &IamSys<ObjectStore>, group_info: Option<SRGroupInfo>) -> S3Result<()> {
+async fn apply_iam_group_info_item(
+    iam_sys: &IamSys<ObjectStore>,
+    marks: &SiteReplicationState,
+    group_info: Option<SRGroupInfo>,
+    incoming_updated_at: Option<OffsetDateTime>,
+) -> S3Result<IamItemVerdict> {
     let Some(group_info) = group_info else {
         return Err(s3_error!(InvalidRequest, "groupInfo is required"));
     };
     let update = group_info.update_req;
+    // The record is the group itself: its own timestamp moves on every
+    // membership or status change, so a delayed older add cannot re-add a
+    // member a newer removal took out, and a delayed older removal (or group
+    // delete) cannot undo a newer add (backlog#2291). Once the group is gone
+    // the marks of its deletion and of its members' removals stand in for it,
+    // so a stale add cannot re-create it or re-add a removed member.
+    let local_updated_at = match iam_sys.get_group_info(&update.group).await {
+        Some(group) => Some(group.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH)),
+        None => {
+            let entities: Vec<String> = std::iter::once(iam_group_deletion_mark_entity(&update.group))
+                .chain(
+                    update
+                        .members
+                        .iter()
+                        .map(|member| iam_group_member_deletion_mark_entity(&update.group, member)),
+                )
+                .collect();
+            iam_deletion_mark(marks, &entities)
+        }
+    };
+    if judge_iam_item_staleness(local_updated_at, incoming_updated_at) == IamItemVerdict::SkipStale {
+        return Ok(IamItemVerdict::SkipStale);
+    }
+    let stamp = replicated_write_stamp(incoming_updated_at);
     if !group_info_requires_upsert(&update) {
-        iam_sys
-            .remove_users_from_group(&update.group, update.members)
-            .await
-            .map_err(ApiError::from)?;
-        return Ok(());
+        // Idempotent removal: a replayed deletion may find the group or a
+        // member already gone (deleted here earlier, or the user tombstone
+        // was replayed first) — that IS the converged outcome, and erroring
+        // would wedge the retry drain forever (backlog#2071). Members absent
+        // here are dropped individually so one missing user cannot veto the
+        // removal of the members that do exist.
+        let mut members = Vec::with_capacity(update.members.len());
+        for member in update.members.iter() {
+            if iam_sys.get_user(member).await.is_some() {
+                members.push(member.clone());
+            }
+        }
+        if members.is_empty() && !update.members.is_empty() {
+            return Ok(IamItemVerdict::Apply);
+        }
+        match iam_sys.remove_users_from_group_at(&update.group, members, stamp).await {
+            Ok(_) => {}
+            Err(err) if rustfs_iam::error::is_err_no_such_group(&err) => {}
+            Err(err) => return Err(ApiError::from(err).into()),
+        }
+        return Ok(IamItemVerdict::Apply);
     }
 
+    // A membership change carries the sender's client payload verbatim, and
+    // the madmin wire maps an unset `groupStatus` to Enabled
+    // (`crates/madmin/src/group.rs`), so writing the status alongside members
+    // would re-enable a group this site has disabled. Disabled can only come
+    // from an explicit "disabled", so it is never that default: honouring it
+    // keeps the full-IAM snapshot (`site_replication::hooks`), which always
+    // carries members and the real status, able to propagate a disabled group
+    // to a peer that does not have it yet — `GroupInfo::new` would otherwise
+    // create it enabled and hand its members live access.
+    let status_is_explicit = update.members.is_empty() || matches!(update.status, GroupStatus::Disabled);
     iam_sys
-        .add_users_to_group(&update.group, update.members)
+        .add_users_to_group_at(&update.group, update.members, stamp)
         .await
         .map_err(ApiError::from)?;
-    iam_sys
-        .set_group_status(&update.group, matches!(update.status, GroupStatus::Enabled))
-        .await
-        .map_err(ApiError::from)?;
-    Ok(())
+    if status_is_explicit {
+        iam_sys
+            .set_group_status_at(&update.group, matches!(update.status, GroupStatus::Enabled), stamp)
+            .await
+            .map_err(ApiError::from)?;
+    }
+    Ok(IamItemVerdict::Apply)
 }
 
 async fn apply_iam_sts_account_item(iam_sys: &IamSys<ObjectStore>, sts_credential: Option<SRSTSCredential>) -> S3Result<()> {
@@ -9767,17 +6550,23 @@ async fn apply_iam_sts_account_item(iam_sys: &IamSys<ObjectStore>, sts_credentia
 
 async fn apply_iam_user_item(
     iam_sys: &IamSys<ObjectStore>,
+    marks: &SiteReplicationState,
     iam_user: Option<SRIAMUser>,
     incoming_updated_at: Option<OffsetDateTime>,
-) -> S3Result<()> {
+) -> S3Result<IamItemVerdict> {
     let Some(user) = iam_user else {
         return Err(s3_error!(InvalidRequest, "iamUser is required"));
     };
-    if let Some(local) = iam_sys.get_user(&user.access_key).await
-        && is_stale_update(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), incoming_updated_at)
-    {
-        return Ok(());
+    // Once the identity is deleted, its deletion mark stands in for the
+    // record so a stale re-create cannot resurrect it (backlog#2291).
+    let local_updated_at = match iam_sys.get_user(&user.access_key).await {
+        Some(local) => Some(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH)),
+        None => iam_deletion_mark(marks, &[iam_user_deletion_mark_entity(&user.access_key)]),
+    };
+    if judge_iam_item_staleness(local_updated_at, incoming_updated_at) == IamItemVerdict::SkipStale {
+        return Ok(IamItemVerdict::SkipStale);
     }
+    let stamp = replicated_write_stamp(incoming_updated_at);
     if user.is_delete_req {
         iam_sys.delete_user(&user.access_key, true).await.map_err(ApiError::from)?;
     } else {
@@ -9787,36 +6576,42 @@ async fn apply_iam_user_item(
         let is_status_only_update = user_req.secret_key.is_empty() && user_req.policy.is_none();
         if is_status_only_update {
             iam_sys
-                .set_user_status(&user.access_key, user_req.status)
+                .set_user_status_at(&user.access_key, user_req.status, stamp)
                 .await
                 .map_err(ApiError::from)?;
         } else {
             iam_sys
-                .create_user(&user.access_key, &user_req)
+                .create_user_at(&user.access_key, &user_req, stamp)
                 .await
                 .map_err(ApiError::from)?;
         }
     }
-    Ok(())
+    Ok(IamItemVerdict::Apply)
 }
 
 async fn apply_iam_service_account_item(
     iam_sys: &IamSys<ObjectStore>,
+    marks: &SiteReplicationState,
     svc_acc_change: Option<SRSvcAccChange>,
     incoming_updated_at: Option<OffsetDateTime>,
-) -> S3Result<()> {
+) -> S3Result<IamItemVerdict> {
     let Some(change) = svc_acc_change else {
         return Err(s3_error!(InvalidRequest, "serviceAccountChange is required"));
     };
     let envelope = change.oidc_service_account_envelope;
+    let stamp = replicated_write_stamp(incoming_updated_at);
     if let Some(create) = change.create {
-        let local_updated_at = iam_sys
-            .get_user(&create.access_key)
-            .await
-            .map(|local| local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH));
+        // Like the user path: with the account already deleted here, the
+        // recorded deletion mark is the timestamp a stale create/update
+        // (a snapshot or a delayed delivery) has to beat (backlog#2291).
+        let local_updated_at = match iam_sys.get_user(&create.access_key).await {
+            Some(local) => Some(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH)),
+            None if create.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT => None,
+            None => iam_deletion_mark(marks, &[format!("svc-acc:{}", create.access_key)]),
+        };
         let replicated_policy = if create.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT {
             if local_updated_at.is_some_and(|local_updated_at| is_stale_update(local_updated_at, incoming_updated_at)) {
-                return Ok(());
+                return Ok(IamItemVerdict::SkipStale);
             }
             ReplicatedServiceAccountPolicy {
                 policy: Some(site_replicator_service_account_policy()?),
@@ -9826,7 +6621,7 @@ async fn apply_iam_service_account_item(
             let Some(replicated_policy) =
                 decode_service_account_replication_policy(&create, envelope.as_ref(), incoming_updated_at, local_updated_at)?
             else {
-                return Ok(());
+                return Ok(IamItemVerdict::SkipStale);
             };
             replicated_policy
         };
@@ -9840,7 +6635,7 @@ async fn apply_iam_service_account_item(
                     ));
                 }
                 iam_sys
-                    .update_service_account(
+                    .update_service_account_at(
                         &create.access_key,
                         UpdateServiceAccountOpts {
                             name: replicated_policy.metadata_for_existing_account(create.name),
@@ -9852,13 +6647,19 @@ async fn apply_iam_service_account_item(
                             parent_user: None,
                             allow_site_replicator_account: create.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
                         },
+                        stamp,
                     )
                     .await
                     .map_err(ApiError::from)?;
             }
             Err(err) if is_err_no_such_service_account(&err) => {
+                // A snapshot (bootstrap / repair / retry resend) carries the
+                // account's current status, and the account is created with
+                // it in the same write: a disabled account must never exist
+                // enabled here, not even between a create and a follow-up
+                // status write that might fail (backlog#2289).
                 iam_sys
-                    .new_service_account(
+                    .new_service_account_at(
                         &create.parent,
                         Some(create.groups),
                         NewServiceAccountOpts {
@@ -9870,21 +6671,23 @@ async fn apply_iam_service_account_item(
                             expiration: create.expiration,
                             allow_site_replicator_account: true,
                             claims: Some(create.claims),
+                            status: (!create.status.is_empty()).then_some(create.status),
                         },
+                        stamp,
                     )
                     .await
                     .map_err(ApiError::from)?;
             }
             Err(err) => return Err(ApiError::from(err).into()),
         }
-        return Ok(());
+        return Ok(IamItemVerdict::Apply);
     }
 
     if let Some(update) = change.update {
         if let Some(local) = iam_sys.get_user(&update.access_key).await
             && is_stale_update(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), incoming_updated_at)
         {
-            return Ok(());
+            return Ok(IamItemVerdict::SkipStale);
         }
         let allow_site_replicator_account = update.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT;
         let session_policy = if allow_site_replicator_account {
@@ -9893,7 +6696,7 @@ async fn apply_iam_service_account_item(
             update.session_policy.as_str().and_then(|raw| serde_json::from_str(raw).ok())
         };
         iam_sys
-            .update_service_account(
+            .update_service_account_at(
                 &update.access_key,
                 UpdateServiceAccountOpts {
                     session_policy,
@@ -9907,23 +6710,24 @@ async fn apply_iam_service_account_item(
                     parent_user: None,
                     allow_site_replicator_account,
                 },
+                stamp,
             )
             .await
             .map_err(ApiError::from)?;
-        return Ok(());
+        return Ok(IamItemVerdict::Apply);
     }
 
     if let Some(delete) = change.delete {
         if let Some(local) = iam_sys.get_user(&delete.access_key).await
             && is_stale_update(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), incoming_updated_at)
         {
-            return Ok(());
+            return Ok(IamItemVerdict::SkipStale);
         }
         iam_sys
             .delete_service_account(&delete.access_key, true)
             .await
             .map_err(ApiError::from)?;
-        return Ok(());
+        return Ok(IamItemVerdict::Apply);
     }
 
     Err(s3_error!(InvalidRequest, "serviceAccountChange is empty"))
@@ -9952,6 +6756,54 @@ fn sts_replication_compatibility_policy<'a>(claims: &HashMap<String, Value>, par
     (!claims.contains_key(OIDC_VIRTUAL_PARENT_CLAIM) && !parent_policy_mapping.is_empty()).then_some(parent_policy_mapping)
 }
 
+/// Adopt only the fields a committed add computed onto the freshly loaded
+/// transaction state. Everything else is owned by writers that commit without
+/// touching `updated_at` (retry events, peer-edit generations, resync
+/// progress, the acks/clears of an already pending rotation), so the add's
+/// `updated_at` CAS cannot vouch for them — they keep the freshly loaded
+/// value, except `pending_remove`:
+///
+/// A committed add supersedes a half-finished removal THIS site started,
+/// exactly as an accepted join does on the receiving side (`apply_peer_join`,
+/// rustfs/rustfs#5963): the adopted topology IS the new membership, while the
+/// pending record only exists to keep notifying peers about the old one. Left
+/// in place, the reconcile tick would replay the stale `SRRemoveReq` against
+/// a freshly re-paired peer — `SRPeerRemoveHandler` applies it
+/// unconditionally — and dismantle the pairing this add just created
+/// (rustfs/backlog#2070). A removal that started AFTER the add's preflight
+/// snapshot moved `updated_at`, so the CAS refuses the commit before this
+/// runs.
+///
+/// The exhaustive destructure makes adding a state field a compile error here
+/// until it is classified.
+fn adopt_add_commit_state(state: &mut SiteReplicationState, next_state: SiteReplicationState) {
+    let SiteReplicationState {
+        name,
+        service_account_access_key,
+        service_account_secret_key: _,
+        service_account_parent,
+        peers,
+        updated_at,
+        resync_status: _,
+        pending_rotation: _,
+        pending_remove: _,
+        pending_endpoint_refresh: _,
+        retry_queue: _,
+        iam_deletion_replays: _,
+        sync_state_initialized,
+        edit_generation: _,
+        applied_edit_generations: _,
+        iam_deletion_marks: _,
+    } = next_state;
+    state.name = name;
+    state.service_account_access_key = service_account_access_key;
+    state.service_account_parent = service_account_parent;
+    state.peers = peers;
+    state.updated_at = updated_at;
+    state.sync_state_initialized = sync_state_initialized;
+    state.pending_remove = None;
+}
+
 pub struct SiteReplicationAddHandler {}
 
 /// MinIO's `SRPeerJoin` replies with an empty body on success; synthesize the
@@ -9963,10 +6815,39 @@ fn parse_peer_join_response(body: &[u8], fallback_peer: PeerInfo) -> Result<SRPe
         return Ok(SRPeerJoinResponse {
             peer: fallback_peer,
             initial_sync_error_message: String::new(),
+            initial_sync_deferred: false,
             applied: None,
         });
     }
     serde_json::from_slice(body)
+}
+
+fn ensure_add_bucket_set_matches_preflight(expected: &HashSet<String>, present: &HashSet<String>) -> S3Result<()> {
+    let mut missing = expected.difference(present).cloned().collect::<Vec<_>>();
+    if !missing.is_empty() {
+        missing.sort_unstable();
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!(
+                "bucket `{}` disappeared while site replication was being added; peers may already be joined — re-run replicate add",
+                missing[0]
+            ),
+        ));
+    }
+
+    let mut unexpected = present.difference(expected).cloned().collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+        unexpected.sort_unstable();
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!(
+                "bucket `{}` appeared while site replication was being added; peers may already be joined — re-run replicate add",
+                unexpected[0]
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -9975,167 +6856,191 @@ impl Operation for SiteReplicationAddHandler {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let replicate_ilm_expiry = sr_add_replicate_ilm_expiry(&req.uri);
+        let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
         let lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
-        // Everything up to the commit below is preflight: peer probes, IAM
-        // work and the join fan-out all talk to the network, so none of it may
-        // run inside the state transaction. The snapshot read here is what the
-        // `updated_at` CAS in the commit validates.
-        let current_state = load_site_replication_state().await?;
-        if pending_endpoint_refresh(&current_state).is_some() {
-            return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
-        }
-        let local_peer = current_local_peer(&req, &current_state);
         let mut sites: Vec<PeerSite> = read_site_replication_json(req, &cred.secret_key, true).await?;
-        // The web console's "Set Up Site Replication" omits the local deployment from the payload;
-        // inject it so the add preflight (which requires the local deployment) succeeds. No-op for `mc`.
-        ensure_local_site_present(&mut sites, &local_peer);
-        validate_add_sites(&sites, &local_peer)?;
-        let preflight_infos = add_preflight_infos(&sites, &current_state, &local_peer).await?;
-        validate_add_preflight_topology(&preflight_infos, &local_peer)?;
-        let expected_updated_at = current_state.updated_at;
-        require_add_peer_tls_capability(&sites, &local_peer).await?;
-        // Early exit on a state that moved under the preflight probes, BEFORE
-        // the IAM write and the join fan-out change anything remote. Advisory
-        // only — the binding check is the CAS inside the commit — but it fences
-        // the common race off the side-effect path and refreshes the merge
-        // base so the CAS window is only the join round trips.
-        let latest_state = load_site_replication_state().await?;
-        ensure_edit_precondition(&latest_state, expected_updated_at, None, "add preflight")?;
-        let current_state = latest_state;
-        let (service_account_access_key, service_account_secret_key) =
-            ensure_site_replicator_service_account(&cred.access_key, false).await?;
-        let bootstrap_buckets = preflight_infos
-            .iter()
-            .filter(|info| !same_identity_endpoint(&info.endpoint, &local_peer.endpoint))
-            .flat_map(|info| info.bucket_names.iter().cloned())
-            .collect();
-        let add_in_progress_guard = SiteReplicationAddInProgressGuard::start(lifecycle_guard, bootstrap_buckets)?;
-        let mut state = merge_add_sites(
-            current_state,
-            local_peer.clone(),
-            sites.clone(),
-            service_account_access_key.clone(),
-            cred.access_key.clone(),
-            replicate_ilm_expiry,
-        );
-        state.sync_state_initialized = true;
-        let join_req = SRPeerJoinEnvelope {
-            request: SRPeerJoinReq {
-                svc_acct_access_key: service_account_access_key,
-                svc_acct_secret_key: service_account_secret_key.clone(),
-                svc_acct_parent: String::new(),
-                peers: state.peers.clone(),
-                updated_at: state.updated_at,
-            },
-            defer_sync_state_enable: true,
-        };
-        let peer_join_path =
-            with_site_replication_bootstrap_token(SITE_REPLICATION_PEER_JOIN_PATH, &add_in_progress_guard.token.to_string());
+        let admin_access_key = cred.access_key.clone();
+        let admission_store = current_object_store_handle()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
+        let list_store = admission_store.clone();
+        let (state, edit_generation, local_peer, service_account_secret_key, mut initial_sync_errors, _add_guard) =
+            with_site_replication_bucket_mutation_admission_lock(admission_store, move || async move {
+                // The writer starts before the local bucket snapshot and stays
+                // held through every peer join and the topology commit. A
+                // delete followed by a same-name create therefore cannot hide
+                // behind an unchanged final name set. Peer bootstrap callbacks
+                // use their internal path and do not acquire this public-
+                // mutation admission lock.
+                let current_state = load_site_replication_state().await?;
+                if pending_endpoint_refresh(&current_state).is_some() {
+                    return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
+                }
+                let local_peer = local_peer_at_endpoint(local_endpoint, &current_state);
+                // The web console's "Set Up Site Replication" omits the local deployment from the payload;
+                // inject it so the add preflight (which requires the local deployment) succeeds. No-op for `mc`.
+                ensure_local_site_present(&mut sites, &local_peer);
+                validate_add_sites(&sites, &local_peer)?;
+                let preflight_infos = add_preflight_infos(&sites, &current_state, &local_peer).await?;
+                validate_add_preflight_topology(&preflight_infos, &local_peer)?;
+                let expected_updated_at = current_state.updated_at;
+                require_add_peer_tls_capability(&sites, &local_peer).await?;
+                // Early exit on a state that moved under the preflight probes, BEFORE
+                // the IAM write and the join fan-out change anything remote. Advisory
+                // only — the binding check is the CAS inside the commit — but it fences
+                // the common race off the side-effect path and refreshes the merge
+                // base so the CAS window is only the join round trips.
+                let latest_state = load_site_replication_state().await?;
+                ensure_edit_precondition(&latest_state, expected_updated_at, None, "add preflight")?;
+                let current_state = latest_state;
+                let (service_account_access_key, service_account_secret_key) =
+                    ensure_site_replicator_service_account(&admin_access_key, false).await?;
+                let expected_buckets: HashSet<String> =
+                    preflight_infos.iter().flat_map(|info| info.buckets.keys().cloned()).collect();
+                let bootstrap_buckets: HashSet<String> = preflight_infos
+                    .iter()
+                    .filter(|info| !same_identity_endpoint(&info.endpoint, &local_peer.endpoint))
+                    .flat_map(|info| info.buckets.keys().cloned())
+                    .collect();
+                let add_in_progress_guard =
+                    SiteReplicationAddInProgressGuard::start(lifecycle_guard, bootstrap_buckets.clone())?;
+                let mut state = merge_add_sites(
+                    current_state,
+                    local_peer.clone(),
+                    sites.clone(),
+                    &preflight_infos,
+                    service_account_access_key.clone(),
+                    admin_access_key,
+                    replicate_ilm_expiry,
+                );
+                state.sync_state_initialized = true;
+                let join_req = SRPeerJoinEnvelope {
+                    request: SRPeerJoinReq {
+                        svc_acct_access_key: service_account_access_key,
+                        svc_acct_secret_key: service_account_secret_key.clone(),
+                        svc_acct_parent: String::new(),
+                        peers: state.peers.clone(),
+                        updated_at: state.updated_at,
+                    },
+                    defer_sync_state_enable: true,
+                    defer_initial_sync: true,
+                };
+                let peer_join_path = with_site_replication_bootstrap_token(
+                    SITE_REPLICATION_PEER_JOIN_PATH,
+                    &add_in_progress_guard.token.to_string(),
+                );
 
-        let mut joined_endpoints = HashSet::new();
-        let mut initial_sync_errors = SiteReplicationErrorSummary::default();
-        for (site, preflight) in sites.iter().zip(preflight_infos.iter()) {
-            if same_identity_endpoint(&site.endpoint, &local_peer.endpoint)
-                || !joined_endpoints.insert(site_identity_key(&site.endpoint))
-            {
-                continue;
-            }
+                // Install every site's service account before any receiver probes or
+                // backfills to a peer that may not have joined yet. Reuse the join
+                // snapshot for the second pass without repeating IAM/topology writes.
+                // Only peers acknowledging deferral get a second request; older
+                // receivers retain their one-pass behavior and reported errors.
+                let initial_sync_path = format!("{peer_join_path}&initial-sync=true");
+                let mut initial_sync_errors = SiteReplicationErrorSummary::default();
+                let mut deferred_endpoints = HashSet::new();
+                for (path, defer_initial_sync) in [(&peer_join_path, true), (&initial_sync_path, false)] {
+                    let mut joined_endpoints = HashSet::new();
+                    for (site, preflight) in sites.iter().zip(preflight_infos.iter()) {
+                        if same_identity_endpoint(&site.endpoint, &local_peer.endpoint)
+                            || (!defer_initial_sync && !deferred_endpoints.contains(&site_identity_key(&site.endpoint)))
+                            || !joined_endpoints.insert(site_identity_key(&site.endpoint))
+                        {
+                            continue;
+                        }
 
-            let mut peer_join_req = join_req.clone();
-            peer_join_req.request.svc_acct_parent = site.access_key.clone();
-            let connection = PeerConnection::try_from(site)?;
-            let body =
-                send_peer_admin_request(&connection, &peer_join_path, &site.access_key, &site.secret_key, &peer_join_req).await?;
+                        let mut peer_join_req = join_req.clone();
+                        peer_join_req.defer_initial_sync = defer_initial_sync;
+                        peer_join_req.request.svc_acct_parent = site.access_key.clone();
+                        let connection = PeerConnection::try_from(site)?;
+                        let body = PeerAdminRequest::put(&connection, path, &site.access_key)
+                            .send(&site.secret_key, &peer_join_req)
+                            .await?;
 
-            let mut fallback_peer = existing_peer_for_endpoint(&state, &site.endpoint)
-                .unwrap_or_else(|| normalize_peer_site(site.clone(), replicate_ilm_expiry));
-            fallback_peer.deployment_id = preflight.deployment_id.clone();
-            let join_response = parse_peer_join_response(&body, fallback_peer).map_err(|e| {
-                S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    format!("parse peer join response from {} failed: {e}", site.endpoint),
-                )
-            })?;
-            if !join_response.initial_sync_error_message.is_empty() {
-                initial_sync_errors.push(format!("{}: {}", site.endpoint, join_response.initial_sync_error_message));
-            }
-            // An explicit no-op join. The peer answered 200 but wrote nothing —
-            // its persisted state is already newer than the snapshot it was
-            // sent — so the add is only PARTIALLY configured and saying
-            // "configured successfully" would be a lie (rustfs/rustfs#5963).
-            // `None` (a MinIO peer, or one older than the field) is not a
-            // no-op signal and is deliberately not reported.
-            if join_response.applied == Some(false) {
-                initial_sync_errors.push(format!(
-                    "{}: peer did not apply the join (its site replication state is newer than the snapshot it was sent); \
-                     the site is not configured against this peer",
-                    site.endpoint
-                ));
-            }
-            state = reconcile_peer_with_actual_identity(state, join_response.peer);
-            let reconciled_peer = existing_peer_for_endpoint(&state, &site.endpoint).ok_or_else(|| {
-                S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    format!("peer join response from {} did not identify the requested site", site.endpoint),
-                )
-            })?;
-            validate_proposed_peer(&reconciled_peer).map_err(|err| {
-                S3Error::with_message(
-                    S3ErrorCode::InvalidRequest,
-                    format!("invalid peer join response from {}: {err}", site.endpoint),
-                )
-            })?;
-        }
+                        let mut fallback_peer = existing_peer_for_endpoint(&state, &site.endpoint)
+                            .unwrap_or_else(|| normalize_peer_site(site.clone(), replicate_ilm_expiry));
+                        fallback_peer.deployment_id = preflight.deployment_id.clone();
+                        let join_response = parse_peer_join_response(&body, fallback_peer).map_err(|e| {
+                            S3Error::with_message(
+                                S3ErrorCode::InternalError,
+                                format!("parse peer join response from {} failed: {e}", site.endpoint),
+                            )
+                        })?;
+                        if join_response.initial_sync_deferred {
+                            if defer_initial_sync {
+                                deferred_endpoints.insert(site_identity_key(&site.endpoint));
+                            } else {
+                                initial_sync_errors.push(format!("{}: peer did not complete initial sync", site.endpoint));
+                            }
+                        }
+                        if !join_response.initial_sync_error_message.is_empty() {
+                            initial_sync_errors.push(format!("{}: {}", site.endpoint, join_response.initial_sync_error_message));
+                        }
+                        // An explicit no-op join. The peer answered 200 but wrote nothing —
+                        // its persisted state is already newer than the snapshot it was
+                        // sent — so the add is only PARTIALLY configured and saying
+                        // "configured successfully" would be a lie (rustfs/rustfs#5963).
+                        // `None` (a MinIO peer, or one older than the field) is not a
+                        // no-op signal and is deliberately not reported.
+                        if join_response.applied == Some(false) {
+                            let phase = if defer_initial_sync { "join" } else { "initial sync" };
+                            initial_sync_errors.push(format!(
+                                "{}: peer did not apply the {phase} (its site replication state is newer than the snapshot it was sent); \
+                                 the site is not configured against this peer",
+                                site.endpoint
+                            ));
+                        }
+                        state = reconcile_peer_with_actual_identity(state, join_response.peer);
+                        let reconciled_peer = existing_peer_for_endpoint(&state, &site.endpoint).ok_or_else(|| {
+                            S3Error::with_message(
+                                S3ErrorCode::InternalError,
+                                format!("peer join response from {} did not identify the requested site", site.endpoint),
+                            )
+                        })?;
+                        validate_proposed_peer(&reconciled_peer).map_err(|err| {
+                            S3Error::with_message(
+                                S3ErrorCode::InvalidRequest,
+                                format!("invalid peer join response from {}: {err}", site.endpoint),
+                            )
+                        })?;
+                    }
+                }
 
-        mark_unknown_peer_sync_enabled(&mut state.peers);
+                mark_unknown_peer_sync_enabled(&mut state.peers);
 
-        // Commit. The CAS runs inside the transaction, against the state the
-        // transaction itself loaded — the peer round trips above took however
-        // long they took, and only this check can tell whether the topology
-        // this add was planned against is still the current one. The error
-        // says so: by this point the remote sites already accepted their
-        // joins, and re-running the add is what reconverges the local side.
-        let next_state = state;
-        let (state, edit_generation) = update_site_replication_state(move |state| {
-            if state.updated_at != expected_updated_at || pending_endpoint_refresh(state).is_some() {
-                return Err(s3_error!(
-                    InvalidRequest,
-                    "site replication state changed during peer join; the peers may already be joined — re-run replicate add"
-                ));
-            }
-            // Adopt only the fields this add computed. Everything else is
-            // owned by writers that commit without touching `updated_at`
-            // (retry events, peer-edit generations, resync progress, the
-            // acks/clears of an already pending rotation or removal), so the
-            // CAS above cannot vouch for them — they keep the freshly loaded
-            // value. The exhaustive destructure makes adding a state field a
-            // compile error here until it is classified.
-            let SiteReplicationState {
-                name,
-                service_account_access_key,
-                service_account_secret_key: _,
-                service_account_parent,
-                peers,
-                updated_at,
-                resync_status: _,
-                pending_rotation: _,
-                pending_remove: _,
-                pending_endpoint_refresh: _,
-                retry_queue: _,
-                sync_state_initialized,
-                edit_generation: _,
-                applied_edit_generations: _,
-            } = next_state;
-            state.name = name;
-            state.service_account_access_key = service_account_access_key;
-            state.service_account_parent = service_account_parent;
-            state.peers = peers;
-            state.updated_at = updated_at;
-            state.sync_state_initialized = sync_state_initialized;
-            let edit_generation = next_peer_edit_generation(state);
-            Ok((state.clone(), edit_generation))
-        })
-        .await?;
+                // Commit. The state transaction's CAS still fences topology
+                // writers that do not use bucket admission. By this point
+                // remote sites may already have accepted their joins, so a
+                // mismatch asks the operator to re-run add and reconverge.
+                let next_state = state;
+                let present = list_store
+                    .list_bucket(&BucketOptions::default())
+                    .await
+                    .map_err(ApiError::from)?
+                    .into_iter()
+                    .map(|bucket| bucket.name)
+                    .collect::<HashSet<_>>();
+                ensure_add_bucket_set_matches_preflight(&expected_buckets, &present)?;
+                let (state, edit_generation) = update_site_replication_state(move |state| {
+                    if state.updated_at != expected_updated_at || pending_endpoint_refresh(state).is_some() {
+                        return Err(s3_error!(
+                            InvalidRequest,
+                            "site replication state changed during peer join; the peers may already be joined — re-run replicate add"
+                        ));
+                    }
+                    adopt_add_commit_state(state, next_state);
+                    let edit_generation = next_peer_edit_generation(state);
+                    Ok((state.clone(), edit_generation))
+                })
+                .await?;
+                Ok((
+                    state,
+                    edit_generation,
+                    local_peer,
+                    service_account_secret_key,
+                    initial_sync_errors,
+                    add_in_progress_guard,
+                ))
+            })
+            .await?;
 
         // The finalize fan-out delivers peer-edit payloads, so it carries the
         // generation allocated in the commit above: the receiving site orders
@@ -10158,15 +7063,11 @@ impl Operation for SiteReplicationAddHandler {
                 }
             };
             for peer in state.peers.values() {
-                if let Err(err) = send_peer_admin_request_with_client(
-                    &transport.client,
-                    &transport.connection,
-                    &finalize_edit_path,
-                    &state.service_account_access_key,
-                    &service_account_secret_key,
-                    peer,
-                )
-                .await
+                if let Err(err) =
+                    PeerAdminRequest::put(&transport.connection, &finalize_edit_path, &state.service_account_access_key)
+                        .with_client(&transport.client)
+                        .send(&service_account_secret_key, peer)
+                        .await
                 {
                     initial_sync_errors
                         .push(format!("{}: finalize sync state for {} failed: {err}", target.endpoint, peer.endpoint));
@@ -10181,13 +7082,16 @@ impl Operation for SiteReplicationAddHandler {
         // response below (BUG2) rather than swallowed; they do not abort the overall add.
         initial_sync_errors.extend(backfill_existing_buckets_after_add(&state, &local_peer, None).await);
 
-        json_response(&ReplicateAddStatus {
-            success: true,
-            status: SITE_REPL_ADD_SUCCESS.to_string(),
-            initial_sync_error_message: initial_sync_errors.render(),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        })
+        json_response(
+            StatusCode::OK,
+            &ReplicateAddStatus {
+                success: true,
+                status: SITE_REPL_ADD_SUCCESS.to_string(),
+                initial_sync_error_message: initial_sync_errors.render(),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            },
+        )
     }
 }
 
@@ -10208,13 +7112,15 @@ impl Operation for SiteReplicationRemoveHandler {
         let (pending_remove, local_peer) = {
             let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
             update_site_replication_state_when_changed(move |state| {
-                if pending_endpoint_refresh(state).is_some() {
+                let local_peer = local_peer_at_endpoint(local_endpoint, state);
+                if let Some(pending) = pending_endpoint_refresh(state)
+                    && !pending_endpoint_refresh_allows_remove(state, &pending, &local_peer, &remove_req)
+                {
                     return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
                 }
                 if state.pending_rotation.is_some() {
                     return Err(s3_error!(InvalidRequest, "service account rotation is pending"));
                 }
-                let local_peer = local_peer_at_endpoint(local_endpoint, state);
 
                 // Resuming: the peers were already told about this pending
                 // removal, so re-persisting the same record buys nothing.
@@ -10229,6 +7135,11 @@ impl Operation for SiteReplicationRemoveHandler {
                 let mut peer_remove_req = remove_req.clone();
                 peer_remove_req.requesting_dep_id = local_peer.deployment_id.clone();
                 *state = remove_sites(std::mem::take(state), remove_req);
+                // A permitted remove can include the endpoint being edited.
+                // Drop that obsolete journal before recording the removal;
+                // otherwise its resume path would commit the edited peer back
+                // into the topology on the next heavyweight tick.
+                discard_endpoint_refresh_if_target_was_removed(state);
                 let pending = PendingRemove {
                     id: Uuid::new_v4().to_string(),
                     req: peer_remove_req,
@@ -10254,7 +7165,7 @@ impl Operation for SiteReplicationRemoveHandler {
             site_replication_remove_status(&peer_errors)
         };
 
-        json_response(&status)
+        json_response(StatusCode::OK, &status)
     }
 }
 
@@ -10285,7 +7196,7 @@ impl Operation for SiteReplicationInfoHandler {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationInfoAction).await?;
         let state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
-        json_response(&site_replication_info_for(&state, &local_peer))
+        json_response(StatusCode::OK, &site_replication_info_for(&state, &local_peer))
     }
 }
 
@@ -10299,7 +7210,7 @@ impl Operation for SiteReplicationMetaInfoHandler {
         let local_peer = current_local_peer(&req, &state);
         let opts = sr_status_options(&req.uri);
         let info = filter_sr_info(build_sr_info(&state, &local_peer).await?, &opts);
-        json_response(&info)
+        json_response(StatusCode::OK, &info)
     }
 }
 
@@ -10312,7 +7223,7 @@ impl Operation for SiteReplicationStatusHandler {
         let state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
         let status = build_status_info(&state, &local_peer, &req.uri).await?;
-        json_response(&status)
+        json_response(StatusCode::OK, &status)
     }
 }
 
@@ -10363,6 +7274,24 @@ impl Operation for SiteReplicationNetPerfHandler {
 }
 
 pub struct SRPeerJoinHandler {}
+
+fn ensure_initial_sync_join_current(state: &SiteReplicationState, join_req: &SRPeerJoinReq) -> S3Result<()> {
+    if !state.enabled()
+        || join_req.updated_at.is_none()
+        || state.updated_at != join_req.updated_at
+        || state.service_account_access_key.is_empty()
+        || state.service_account_access_key != join_req.svc_acct_access_key
+        || state.pending_remove.is_some()
+        || state.pending_rotation.is_some()
+        || pending_endpoint_refresh(state).is_some()
+    {
+        return Err(s3_error!(
+            InvalidRequest,
+            "site replication changed before initial sync; re-run replicate add"
+        ));
+    }
+    Ok(())
+}
 
 /// What the join admission decided about an incoming peer join. The verdict —
 /// and the committed state the back-fill afterwards needs — travel out of
@@ -10508,6 +7437,7 @@ async fn apply_peer_join_service_account(join_req: SRPeerJoinReq) -> S3Result<()
                     expiration: None,
                     allow_site_replicator_account: join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
                     claims: None,
+                    status: None,
                 },
             )
             .await
@@ -10525,6 +7455,7 @@ fn superseded_join_response(peer: PeerInfo) -> SRPeerJoinResponse {
     SRPeerJoinResponse {
         peer,
         initial_sync_error_message: String::new(),
+        initial_sync_deferred: false,
         applied: Some(false),
     }
 }
@@ -10534,6 +7465,7 @@ fn applied_join_response(peer: PeerInfo, initial_sync_error_message: String) -> 
     SRPeerJoinResponse {
         peer,
         initial_sync_error_message,
+        initial_sync_deferred: false,
         applied: Some(true),
     }
 }
@@ -10543,17 +7475,30 @@ impl Operation for SRPeerJoinHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         let bootstrap_token = site_replication_bootstrap_token(&req.uri);
+        let initial_sync_only = query_pairs(&req.uri).get("initial-sync").is_some_and(|value| value == "true");
         let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
         // The body is fully read before the admission takes the lifecycle
         // guard: a sender that stalls mid-body must not block this node's
         // add/remove/rotate/reconciler.
         let join_envelope: SRPeerJoinEnvelope = read_site_replication_json(req, &cred.secret_key, true).await?;
         let defer_sync_state_enable = join_envelope.defer_sync_state_enable;
+        let defer_initial_sync = join_envelope.defer_initial_sync;
         let join_req = join_envelope.request;
         validate_join_peer_snapshot(&join_req.peers)?;
 
-        let committed =
-            admit_peer_join(local_endpoint, join_req, defer_sync_state_enable, apply_peer_join_service_account).await?;
+        let _initial_sync_guard = if initial_sync_only {
+            Some(SiteReplicationLifecycleGuard::acquire().await?)
+        } else {
+            None
+        };
+        let committed = if initial_sync_only {
+            let state = load_site_replication_state().await?;
+            ensure_initial_sync_join_current(&state, &join_req)?;
+            let local_peer = local_peer_at_endpoint(local_endpoint, &state);
+            PeerJoinOutcome::Applied(Box::new(state), local_peer)
+        } else {
+            admit_peer_join(local_endpoint, join_req, defer_sync_state_enable, apply_peer_join_service_account).await?
+        };
         // Committed; the reverse-reachability probe and the bucket back-fill
         // run outside the transaction — their transport helpers' retry-event
         // bookkeeping re-enters it (P1-15).
@@ -10567,9 +7512,15 @@ impl Operation for SRPeerJoinHandler {
                     result = "join_superseded",
                     "admin site replication state"
                 );
-                return json_response(&superseded_join_response(peer));
+                return json_response(StatusCode::OK, &superseded_join_response(peer));
             }
         };
+        if defer_initial_sync && !initial_sync_only {
+            let mut response =
+                applied_join_response(state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer), String::new());
+            response.initial_sync_deferred = true;
+            return json_response(StatusCode::OK, &response);
+        }
         // Fix 1 (receiving side): ensure the joining peer also sets up replication for any
         // buckets it already owns so the reverse direction works from the start. Per-bucket
         // failures are logged (BUG2) so a reverse-direction back-fill gap is observable.
@@ -10586,10 +7537,13 @@ impl Operation for SRPeerJoinHandler {
                 "admin site replication state"
             );
         }
-        json_response(&applied_join_response(
-            state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
-            backfill_errors.render(),
-        ))
+        json_response(
+            StatusCode::OK,
+            &applied_join_response(
+                state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
+                backfill_errors.render(),
+            ),
+        )
     }
 }
 
@@ -10670,6 +7624,7 @@ impl Operation for SRPeerBucketOpsHandler {
                 )
                 .await
                 .map_err(ApiError::from)?;
+                reload_bucket_metadata_on_peers(&bucket, "site_replication_make_bucket", false).await;
             }
             "configure-replication" => {
                 store
@@ -10756,7 +7711,7 @@ impl Operation for SRPeerGetIDPSettingsHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
 
-        json_response(&local_idp_settings())
+        json_response(StatusCode::OK, &local_idp_settings())
     }
 }
 
@@ -10787,10 +7742,20 @@ impl Operation for SiteReplicationEditHandler {
         if persisted_pending.is_some() && !endpoint_refresh_requested {
             return Err(s3_error!(InvalidRequest, "an endpoint target refresh is already pending"));
         }
+        if endpoint_refresh_requested
+            && let Some(persisted) = persisted_pending.as_ref()
+            && endpoint_refresh_ilm_override_conflicts(persisted, ilm_expiry_override)
+        {
+            return Err(s3_error!(
+                InvalidRequest,
+                "endpoint target refresh is pending with a different ilm expiry setting"
+            ));
+        }
         let pending = endpoint_refresh_requested.then(|| {
             persisted_pending.clone().unwrap_or_else(|| PendingEndpointRefresh {
                 id: Uuid::new_v4().to_string(),
                 peer: normalize_peer_info(incoming.clone()),
+                ilm_expiry_override,
                 remote_peers: current_state.peers.clone(),
                 acked_deployment_ids: BTreeSet::new(),
             })
@@ -10939,7 +7904,7 @@ impl Operation for SiteReplicationEditHandler {
                 let acked_pending_id = pending_id.clone();
                 let service_account_access_key = update_site_replication_state(move |state| {
                     let Some(pending) = pending_endpoint_refresh(state).filter(|pending| pending.id == acked_pending_id) else {
-                        return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
+                        return Err(endpoint_refresh_state_changed());
                     };
                     let pending = merge_pending_endpoint_refresh(state, &pending, acked_deployment_ids)?;
                     set_pending_endpoint_refresh(state, pending)?;
@@ -10953,9 +7918,9 @@ impl Operation for SiteReplicationEditHandler {
                 refresh_bucket_targets_after_endpoint_edit(&pending_id, &service_account_secret_key).await?;
                 update_site_replication_state(move |state| {
                     let Some(pending) = pending_endpoint_refresh(state).filter(|pending| pending.id == pending_id) else {
-                        return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
+                        return Err(endpoint_refresh_state_changed());
                     };
-                    *state = edit_state(std::mem::take(state), pending.peer, ilm_expiry_override);
+                    *state = edit_state(std::mem::take(state), pending.peer, pending.ilm_expiry_override);
                     clear_pending_endpoint_refresh(state);
                     Ok(())
                 })
@@ -10998,15 +7963,11 @@ impl Operation for SiteReplicationEditHandler {
                 'fanout: for target in remote_targets {
                     let transport = PeerTransport::for_runtime_peer(target).await?;
                     for peer in &peers_to_send {
-                        if let Err(err) = send_peer_admin_request_with_client(
-                            &transport.client,
-                            &transport.connection,
-                            &edit_path,
-                            &current_state.service_account_access_key,
-                            &service_account_secret_key,
-                            peer,
-                        )
-                        .await
+                        if let Err(err) =
+                            PeerAdminRequest::put(&transport.connection, &edit_path, &current_state.service_account_access_key)
+                                .with_client(&transport.client)
+                                .send(&service_account_secret_key, peer)
+                                .await
                         {
                             failure = Some((target.clone(), err));
                             break 'fanout;
@@ -11035,12 +7996,15 @@ impl Operation for SiteReplicationEditHandler {
             }
         }
 
-        json_response(&ReplicateEditStatus {
-            success: true,
-            status: SITE_REPL_EDIT_SUCCESS.to_string(),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        })
+        json_response(
+            StatusCode::OK,
+            &ReplicateEditStatus {
+                success: true,
+                status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            },
+        )
     }
 }
 
@@ -11050,14 +8014,17 @@ pub struct SRPeerEditCapabilitiesHandler {}
 impl Operation for SRPeerEditCapabilitiesHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
-        json_response(&ReplicateEditStatus {
-            success: query_pairs(&req.uri)
-                .get("capability")
-                .is_some_and(|value| peer_edit_capability_supported(value)),
-            status: SITE_REPL_EDIT_SUCCESS.to_string(),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        })
+        json_response(
+            StatusCode::OK,
+            &ReplicateEditStatus {
+                success: query_pairs(&req.uri)
+                    .get("capability")
+                    .is_some_and(|value| peer_edit_capability_supported(value)),
+                status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            },
+        )
     }
 }
 
@@ -11105,8 +8072,14 @@ impl Operation for SRPeerEditHandler {
             // The fence is self-reported — the shared service account means
             // the sender cannot be identified — so it is honoured only after
             // the admissibility check, against the same state it will gate.
-            let commit_fence =
-                commit_fence.filter(|fence| peer_edit_fence_is_admissible(state, &local_peer.deployment_id, fence));
+            let commit_fence = match commit_fence {
+                Some(fence) if peer_edit_fence_is_admissible(state, &local_peer.deployment_id, &fence) => Some(fence),
+                // A fenced edit can only come from a current remote peer. If
+                // that origin left while the retry was in flight, applying
+                // its body here would resurrect the removed topology.
+                Some(_) => return Ok(StateCommit::Unchanged(PeerEditOutcome::Acked)),
+                None => None,
+            };
             // Ordering fence: the sending site allocates the generation under
             // its state-object lock, so a delivery that lost the race carries
             // a generation this site has already passed. Applying it would
@@ -11152,6 +8125,7 @@ impl Operation for SRPeerEditHandler {
                     PendingEndpointRefresh {
                         id: commit_refresh_id.unwrap_or_default(),
                         peer: incoming,
+                        ilm_expiry_override,
                         remote_peers: BTreeMap::new(),
                         acked_deployment_ids: BTreeSet::new(),
                     },
@@ -11172,30 +8146,39 @@ impl Operation for SRPeerEditHandler {
         let service_account_access_key = match outcome {
             PeerEditOutcome::Applied(service_account_access_key) => service_account_access_key,
             PeerEditOutcome::Acked => {
-                return json_response(&ReplicateEditStatus {
-                    success: true,
-                    status: SITE_REPL_EDIT_SUCCESS.to_string(),
-                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                    ..Default::default()
-                });
+                return json_response(
+                    StatusCode::OK,
+                    &ReplicateEditStatus {
+                        success: true,
+                        status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                        ..Default::default()
+                    },
+                );
             }
             PeerEditOutcome::Rejected(err_detail) => {
-                return json_response(&ReplicateEditStatus {
-                    success: false,
-                    status: SITE_REPL_EDIT_SUCCESS.to_string(),
-                    err_detail: err_detail.to_string(),
-                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                });
+                return json_response(
+                    StatusCode::OK,
+                    &ReplicateEditStatus {
+                        success: false,
+                        status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                        err_detail: err_detail.to_string(),
+                        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    },
+                );
             }
         };
         if endpoint_refresh_requested {
             if service_account_access_key.is_empty() {
-                return json_response(&ReplicateEditStatus {
-                    success: false,
-                    status: SITE_REPL_EDIT_SUCCESS.to_string(),
-                    err_detail: "site replicator service account is not configured".to_string(),
-                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                });
+                return json_response(
+                    StatusCode::OK,
+                    &ReplicateEditStatus {
+                        success: false,
+                        status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                        err_detail: "site replicator service account is not configured".to_string(),
+                        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    },
+                );
             }
             let service_account_secret_key = site_replicator_service_account_secret(&service_account_access_key).await?;
             let pending_id = refresh_id.unwrap_or_default();
@@ -11207,25 +8190,31 @@ impl Operation for SRPeerEditHandler {
                 let Some(pending) = pending_endpoint_refresh(state).filter(|pending| pending.id == pending_id) else {
                     return Ok(StateCommit::Unchanged(false));
                 };
-                *state = apply_internal_peer_edit(std::mem::take(state), &local_peer, pending.peer, ilm_expiry_override)?;
+                *state = apply_internal_peer_edit(std::mem::take(state), &local_peer, pending.peer, pending.ilm_expiry_override)?;
                 clear_pending_endpoint_refresh(state);
                 Ok(StateCommit::Changed(true))
             })
             .await?;
             if !committed {
-                return json_response(&ReplicateEditStatus {
-                    success: false,
-                    status: SITE_REPL_EDIT_SUCCESS.to_string(),
-                    err_detail: "endpoint target refresh state changed during update".to_string(),
-                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                });
+                return json_response(
+                    StatusCode::OK,
+                    &ReplicateEditStatus {
+                        success: false,
+                        status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                        err_detail: "endpoint target refresh state changed during update".to_string(),
+                        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    },
+                );
             }
-            return json_response(&ReplicateEditStatus {
-                success: true,
-                status: SITE_REPL_EDIT_SUCCESS.to_string(),
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                ..Default::default()
-            });
+            return json_response(
+                StatusCode::OK,
+                &ReplicateEditStatus {
+                    success: true,
+                    status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    ..Default::default()
+                },
+            );
         }
         Ok(empty_response(StatusCode::OK))
     }
@@ -11432,7 +8421,7 @@ impl Operation for SiteReplicationResyncOpHandler {
             .buckets
             .sort_by(|left, right| left.bucket.cmp(&right.bucket).then(left.target_arn.cmp(&right.target_arn)));
         let (limit, offset) = parse_site_resync_page(&query, &status)?;
-        json_response(&site_resync_page(&status, limit, offset)?)
+        json_response(StatusCode::OK, &site_resync_page(&status, limit, offset)?)
     }
 }
 
@@ -11467,7 +8456,7 @@ impl Operation for SiteReplicationRepairHandler {
         let local_peer = current_local_peer(&req, &state);
         let body: SiteReplicationRepairRequest = read_site_replication_json(req, "", false).await?;
         let info = build_sr_info(&state, &local_peer).await?;
-        let plan = site_replication_bootstrap_plan(&info)?;
+        let plan = build_site_replication_bootstrap_plan(&info).await?;
         let signing_key = current_token_signing_key().ok_or_else(|| {
             S3Error::with_message(S3ErrorCode::InternalError, "token signing key is not initialized".to_string())
         })?;
@@ -11478,17 +8467,20 @@ impl Operation for SiteReplicationRepairHandler {
             if body.preflight_token.is_some() || body.operation_id.is_some() {
                 return Err(s3_error!(InvalidRequest, "dry-run does not accept preflightToken or operationId"));
             }
-            return json_response(&SiteReplicationRepairPreflight {
-                mode: "dry-run",
-                status: "planned",
-                preflight_token,
-                retry_events: state
-                    .retry_queue
-                    .iter()
-                    .filter(|event| retry_event_replayed_by_bootstrap(event))
-                    .count(),
-                sites,
-            });
+            return json_response(
+                StatusCode::OK,
+                &SiteReplicationRepairPreflight {
+                    mode: "dry-run",
+                    status: "planned",
+                    preflight_token,
+                    retry_events: state
+                        .retry_queue
+                        .iter()
+                        .filter(|event| retry_event_replayed_by_bootstrap(event))
+                        .count(),
+                    sites,
+                },
+            );
         }
 
         let supplied_token = body
@@ -11541,7 +8533,7 @@ impl Operation for SiteReplicationRepairStatusHandler {
             .get(&operation_id)
             .cloned()
             .ok_or_else(|| s3_error!(InvalidRequest, "repair operation was not found"))?;
-        json_response(&site_replication_repair_operation_response(&operation))
+        json_response(StatusCode::OK, &site_replication_repair_operation_response(&operation))
     }
 }
 
@@ -11617,113 +8609,251 @@ impl Operation for SRRotateServiceAccountHandler {
         })
         .await?;
 
+        // Record the pre-rotation secret before drive_pending_rotation
+        // overwrites the local one: the join push must still be able to sign
+        // with the secret the peers hold, and the persisted candidate is also
+        // what lets a later resume recover a rotation this attempt could not
+        // finish. Push it into the local copy too — the persisted record alone
+        // is invisible to the snapshot this call already holds.
+        let mut pending_rotation = pending_rotation;
         if !previous_access_key.is_empty()
             && let Ok(previous_iam_secret) = site_replicator_service_account_secret(&previous_access_key).await
         {
-            record_pending_rotation_secret_candidate(&pending_rotation.id, previous_iam_secret).await?;
+            record_pending_rotation_secret_candidate(&pending_rotation.id, previous_iam_secret.clone()).await?;
+            push_unique_secret_candidate(&mut pending_rotation.secret_candidates, previous_iam_secret);
         }
 
-        set_site_replicator_service_account_secret(&pending_rotation.parent, pending_rotation.new_secret_key.clone()).await?;
-
-        refresh_bucket_targets_after_service_account_rotation().await;
-
-        let mut secret_candidates = pending_rotation.secret_candidates.clone();
-        if let Ok(current_secret) = site_replicator_service_account_secret(&pending_rotation.access_key).await {
-            push_unique_secret_candidate(&mut secret_candidates, current_secret);
-        }
-        push_unique_secret_candidate(&mut secret_candidates, pending_rotation.new_secret_key.clone());
-
-        let join_req = SRPeerJoinReq {
-            svc_acct_access_key: pending_rotation.access_key.clone(),
-            svc_acct_secret_key: pending_rotation.new_secret_key.clone(),
-            svc_acct_parent: pending_rotation.parent.clone(),
-            peers: pending_rotation.peers.clone(),
-            updated_at: pending_rotation.updated_at,
-        };
-
-        let mut peer_errors = Vec::new();
-        for peer in pending_rotation.peers.values() {
-            if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
-                || pending_rotation.acked_deployment_ids.contains(&peer.deployment_id)
-            {
-                continue;
-            }
-            // A superseded join returns BEFORE `apply_iam`, so a no-op answer
-            // means the peer never installed the new secret. Acking it would
-            // finalize a rotation half the mesh cannot authenticate against
-            // (rustfs/rustfs#5963).
-            let rotation_error = match send_peer_admin_request_with_secret_candidates(
-                &runtime_peer_connection(peer)?,
-                SITE_REPLICATION_PEER_JOIN_PATH,
-                &pending_rotation.access_key,
-                &secret_candidates,
-                &join_req,
-            )
-            .await
-            {
-                Err(err) => Some(summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint))),
-                Ok(body) => match parse_peer_join_response(&body, peer.clone()) {
-                    Ok(response) if response.applied == Some(false) => Some(summarize_peer_error_detail(&format!(
-                        "{}: peer did not apply the rotation join (its site replication state is newer than the snapshot it \
-                         was sent); the new service account secret was not installed",
-                        peer.endpoint
-                    ))),
-                    // Unparseable bodies keep the pre-existing behaviour: the
-                    // transport succeeded, and MinIO peers answer with an empty
-                    // body this helper already tolerates.
-                    Ok(_) | Err(_) => None,
-                },
-            };
-            if let Some(detail) = rotation_error {
-                warn!(
-                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                    peer = %peer.endpoint,
-                    result = "service_account_rotation_failed",
-                    error = %detail,
-                    "admin site replication state"
-                );
-                peer_errors.push(detail);
-            } else {
-                mark_pending_rotation_peer_acked(&pending_rotation.id, &peer.deployment_id).await?;
-            }
-        }
-
-        let complete = finalize_pending_rotation_if_complete(&pending_rotation.id, &local_peer).await?;
+        let (mut peer_errors, complete) = drive_pending_rotation(&pending_rotation, &local_peer).await?;
         if !complete && peer_errors.is_empty() {
             peer_errors.push("service account rotation is still pending".to_string());
         }
 
-        json_response(&ReplicateEditStatus {
-            success: complete && peer_errors.is_empty(),
-            status: if complete && peer_errors.is_empty() {
-                "Success"
-            } else {
-                "Partial"
-            }
-            .to_string(),
-            err_detail: peer_errors.join("; "),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-        })
+        json_response(
+            StatusCode::OK,
+            &ReplicateEditStatus {
+                success: complete && peer_errors.is_empty(),
+                status: if complete && peer_errors.is_empty() {
+                    "Success"
+                } else {
+                    "Partial"
+                }
+                .to_string(),
+                err_detail: peer_errors.join("; "),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            },
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::runtime_sources::{current_outbound_tls_generation, set_test_outbound_tls_generation};
-    use crate::admin::storage_api::runtime::Endpoint;
-    use crate::admin::storage_api::runtime::{EndpointServerPools, Endpoints, PoolEndpoints};
+    use rustfs_madmin::SRSessionPolicy;
+
+    #[test]
+    fn peer_states_preserve_each_sites_actual_membership_and_metadata() {
+        let local = SRStateInfo {
+            name: "local".to_string(),
+            peers: BTreeMap::from([(
+                "actual-remote".to_string(),
+                PeerInfo {
+                    deployment_id: "actual-remote".to_string(),
+                    endpoint: "http://remote:9000".to_string(),
+                    ..Default::default()
+                },
+            )]),
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+            api_version: Some("1".to_string()),
+        };
+        let remote = SRStateInfo {
+            name: "remote-reported-name".to_string(),
+            peers: BTreeMap::from([(
+                "legacy-placeholder".to_string(),
+                PeerInfo {
+                    deployment_id: "legacy-placeholder".to_string(),
+                    endpoint: "http://local:9000".to_string(),
+                    ..Default::default()
+                },
+            )]),
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10)),
+            api_version: None,
+        };
+        let infos = BTreeMap::from([
+            (
+                "local".to_string(),
+                SRInfo {
+                    state: local.clone(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "remote".to_string(),
+                SRInfo {
+                    state: remote.clone(),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let states = peer_states_from_infos(infos, &HashSet::from(["local".to_string(), "remote".to_string()]));
+        assert_eq!(states.len(), 2);
+        assert_eq!(serde_json::to_value(&states["local"]).unwrap(), serde_json::to_value(local).unwrap());
+        assert_eq!(serde_json::to_value(&states["remote"]).unwrap(), serde_json::to_value(remote).unwrap());
+    }
+
+    #[test]
+    fn peer_states_omit_unreachable_peers_instead_of_defaulting_them() {
+        let infos = BTreeMap::from([
+            ("local".to_string(), SRInfo::default()),
+            ("offline".to_string(), SRInfo::default()),
+        ]);
+        let states = peer_states_from_infos(infos, &HashSet::from(["local".to_string()]));
+        assert_eq!(states.len(), 1);
+        assert!(states.contains_key("local"));
+        assert!(!states.contains_key("offline"));
+    }
+
+    #[test]
+    fn peer_states_preserve_a_reachable_peers_empty_membership() {
+        let states = peer_states_from_infos(
+            BTreeMap::from([(
+                "remote".to_string(),
+                SRInfo {
+                    enabled: false,
+                    state: SRStateInfo {
+                        name: "remote".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )]),
+            &HashSet::from(["remote".to_string()]),
+        );
+        assert_eq!(states["remote"].name, "remote");
+        assert!(states["remote"].peers.is_empty());
+        assert!(states["remote"].updated_at.is_none());
+        assert!(states["remote"].api_version.is_none());
+    }
+
+    /// A peer the status probe could not reach must render as offline.
+    ///
+    /// Regression: `build_metrics_summary` used to hardcode `online: true` and
+    /// only ever emitted the local deployment, so a peer outage was invisible
+    /// on the status page — `Link: ● online` stayed green through a multi-minute
+    /// outage while replication was failing.
+    #[test]
+    fn peer_metric_entry_reports_unreachable_peer_as_offline() {
+        let heartbeat_last_online = OffsetDateTime::UNIX_EPOCH;
+        let entry = peer_metric_entry(
+            "remote-deployment",
+            "http://remote.example:9000",
+            false,
+            false,
+            (5_000_000_000, Some(heartbeat_last_online)),
+            (4096, 8),
+            TimedErrStats::default(),
+        );
+
+        assert!(!entry.online, "an unreachable peer must not be reported online");
+        assert_eq!(entry.total_downtime_ns, 5_000_000_000);
+        assert_eq!(
+            entry.last_online,
+            Some(heartbeat_last_online),
+            "an offline peer keeps the heartbeat's last-seen instead of being stamped 'now'"
+        );
+    }
+
+    /// Node-local replication counters must not be copied onto remote entries,
+    /// or a two-site cluster would double-count its own traffic.
+    #[test]
+    fn peer_metric_entry_keeps_replication_counters_on_the_local_entry() {
+        let local = peer_metric_entry(
+            "local",
+            "http://local.example:9000",
+            true,
+            true,
+            (0, None),
+            (4096, 8),
+            TimedErrStats::default(),
+        );
+        let remote = peer_metric_entry(
+            "remote",
+            "http://remote.example:9000",
+            false,
+            true,
+            (0, None),
+            (4096, 8),
+            TimedErrStats::default(),
+        );
+
+        assert_eq!(local.replicated_size, 4096);
+        assert_eq!(local.replicated_count, 8);
+        assert_eq!(remote.replicated_size, 0);
+        assert_eq!(remote.replicated_count, 0);
+        assert!(remote.online, "a reachable remote peer is still online");
+    }
+
+    #[test]
+    fn peer_metric_entry_wires_local_replication_failures() {
+        let source = include_str!("site_replication.rs");
+        let body = source
+            .split("fn peer_metric_entry(")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn build_metrics_summary").next())
+            .expect("peer metric builder");
+
+        assert!(body.contains("failed:"), "the local site metric must expose failed replication totals");
+
+        let failures = TimedErrStats {
+            totals: RStat { count: 3.0, bytes: 900 },
+            ..Default::default()
+        };
+        let local = peer_metric_entry("local", "http://local", true, true, (0, None), (0, 0), failures.clone());
+        let remote = peer_metric_entry("remote", "http://remote", false, true, (0, None), (0, 0), failures);
+        assert_eq!(local.failed.totals.count, 3.0);
+        assert_eq!(local.failed.totals.bytes, 900);
+        assert_eq!(remote.failed.totals.count, 0.0, "node-local failures must not be copied to peers");
+    }
+
+    #[test]
+    fn test_rotation_secret_candidates_try_the_installed_secret_before_the_new_one() {
+        let mut pending = PendingRotation {
+            id: "rotation-id".to_string(),
+            access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+            parent: "root".to_string(),
+            new_secret_key: "new-secret".to_string(),
+            ..Default::default()
+        };
+
+        // Fresh rotation: nothing persisted yet, the installed secret is still
+        // the pre-rotation one the peers hold — it must be tried first.
+        assert_eq!(
+            rotation_secret_candidates(&pending, Some("old-secret".to_string())),
+            ["old-secret", "new-secret"]
+        );
+
+        // Resume after a failed first push: the old secret was persisted by
+        // that attempt, and the installed secret is already the new one.
+        pending.secret_candidates = vec!["old-secret".to_string()];
+        assert_eq!(
+            rotation_secret_candidates(&pending, Some("new-secret".to_string())),
+            ["old-secret", "new-secret"]
+        );
+
+        // An unreadable installed secret must still leave the push a candidate.
+        pending.secret_candidates = Vec::new();
+        assert_eq!(rotation_secret_candidates(&pending, None), ["new-secret"]);
+    }
     use axum::{Router, extract::State, routing::any};
-    use http::{HeaderMap, HeaderValue, Uri};
+    use base64_simd::STANDARD as BASE64_STANDARD;
+    use http::Uri;
+    use rustfs_madmin::{SRBucketInfo, SRIAMPolicy};
     use rustfs_policy::policy::action::S3Action;
+    use rustfs_tls_runtime::GlobalPublishedOutboundTlsState;
     use serial_test::serial;
     use std::sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     };
-    use temp_env::with_var;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -11794,6 +8924,419 @@ mod tests {
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
             ..Default::default()
         }
+    }
+
+    // --- Review regressions on rustfs#7195 (backlog#2289 / #2291 / #2292):
+    // delivery order and concurrency through the real receiver.
+
+    /// Two-peer state so the apply transaction's persist keeps the state
+    /// object (a single-peer state is cleared on write) and the deletion
+    /// marks it records survive between items.
+    async fn seed_two_peer_state_for_iam_apply() {
+        let seed = SiteReplicationState {
+            peers: BTreeMap::from([
+                (
+                    "site-a".to_string(),
+                    PeerInfo {
+                        deployment_id: "site-a".to_string(),
+                        ..peer("site-a", "https://a.example:9000")
+                    },
+                ),
+                (
+                    "site-b".to_string(),
+                    PeerInfo {
+                        deployment_id: "site-b".to_string(),
+                        ..peer("site-b", "https://b.example:9000")
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        save_site_replication_state(&seed).await.expect("seed state");
+    }
+
+    async fn clear_seeded_state() {
+        save_site_replication_state(&SiteReplicationState::default())
+            .await
+            .expect("clear state");
+    }
+
+    fn sr_item(item_type: &str, updated_at: OffsetDateTime) -> SRIAMItem {
+        SRIAMItem {
+            r#type: item_type.to_string(),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn allow_actions_policy(actions: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": actions, "Resource": ["arn:aws:s3:::*"]}]
+        })
+    }
+
+    fn sr_policy_item(name: &str, body: serde_json::Value, updated_at: OffsetDateTime) -> SRIAMItem {
+        let mut item = sr_item("policy", updated_at);
+        item.name = name.to_string();
+        item.policy = Some(body);
+        item
+    }
+
+    fn sr_mapping_item(user: &str, policy: &str, updated_at: OffsetDateTime) -> SRIAMItem {
+        let mut item = sr_item("policy-mapping", updated_at);
+        item.policy_mapping = Some(SRPolicyMapping {
+            user_or_group: user.to_string(),
+            user_type: 0,
+            is_group: false,
+            policy: policy.to_string(),
+            ..Default::default()
+        });
+        item
+    }
+
+    fn sr_group_item(group: &str, members: &[&str], is_remove: bool, updated_at: OffsetDateTime) -> SRIAMItem {
+        sr_group_item_with_status(group, members, is_remove, rustfs_madmin::GroupStatus::Enabled, updated_at)
+    }
+
+    fn sr_group_item_with_status(
+        group: &str,
+        members: &[&str],
+        is_remove: bool,
+        status: rustfs_madmin::GroupStatus,
+        updated_at: OffsetDateTime,
+    ) -> SRIAMItem {
+        let mut item = sr_item("group-info", updated_at);
+        item.group_info = Some(SRGroupInfo {
+            update_req: rustfs_madmin::GroupAddRemove {
+                group: group.to_string(),
+                members: members.iter().map(|member| member.to_string()).collect(),
+                status,
+                is_remove,
+            },
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        });
+        item
+    }
+
+    fn sr_user_item(
+        access_key: &str,
+        user_req: Option<rustfs_madmin::AddOrUpdateUserReq>,
+        updated_at: OffsetDateTime,
+    ) -> SRIAMItem {
+        let mut item = sr_item("iam-user", updated_at);
+        item.iam_user = Some(SRIAMUser {
+            access_key: access_key.to_string(),
+            is_delete_req: user_req.is_none(),
+            user_req,
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        });
+        item
+    }
+
+    fn user_req(secret_key: &str, status: rustfs_madmin::AccountStatus) -> rustfs_madmin::AddOrUpdateUserReq {
+        rustfs_madmin::AddOrUpdateUserReq {
+            secret_key: secret_key.to_string(),
+            policy: None,
+            status,
+        }
+    }
+
+    fn sr_service_account_create_item(parent: &str, access_key: &str, status: &str, updated_at: OffsetDateTime) -> SRIAMItem {
+        let mut item = sr_item("service-account", updated_at);
+        item.svc_acc_change = Some(SRSvcAccChange {
+            create: Some(SRSvcAccCreate {
+                parent: parent.to_string(),
+                access_key: access_key.to_string(),
+                secret_key: "replicated-svc-secret-123".to_string(),
+                groups: Vec::new(),
+                claims: HashMap::new(),
+                session_policy: rustfs_madmin::SRSessionPolicy::default(),
+                status: status.to_string(),
+                name: String::new(),
+                description: String::new(),
+                expiration: None,
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            ..Default::default()
+        });
+        item
+    }
+
+    async fn stored_policy_json(name: &str) -> (String, Option<OffsetDateTime>) {
+        let iam = current_iam_handle().expect("test IAM");
+        let doc = iam.get_policy_doc(name).await.expect("policy doc");
+        (serde_json::to_string(&doc.policy).expect("serialize policy"), doc.update_date)
+    }
+
+    /// Review finding on rustfs#7195 (P1): two source edits T1 < T2 that both
+    /// predate their delivery. The record T1 writes must carry T1 — not the
+    /// later receive time — or T2 is judged stale against it and the newer
+    /// revoke is silently dropped. Exercised through the real receiver for
+    /// every gated item type.
+    #[tokio::test]
+    #[serial]
+    async fn apply_iam_item_applies_delayed_in_order_updates_through_the_receiver() {
+        publish_ready_iam_context().await;
+        seed_two_peer_state_for_iam_apply().await;
+        let iam = current_iam_handle().expect("test IAM");
+        let t1 = OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let t2 = t1 + time::Duration::minutes(5);
+
+        // policy: the grant, then the narrower revision.
+        let policy = "sr-delayed-order-policy";
+        apply_iam_item(sr_policy_item(policy, allow_actions_policy(&["s3:GetObject", "s3:PutObject"]), t1))
+            .await
+            .expect("T1 grant");
+        apply_iam_item(sr_policy_item(policy, allow_actions_policy(&["s3:GetObject"]), t2))
+            .await
+            .expect("T2 narrowed body");
+        let (stored, stamp) = stored_policy_json(policy).await;
+        assert_eq!(stamp, Some(t2), "the stored stamp is the source time of the last applied edit");
+        assert!(
+            !stored.contains("s3:PutObject"),
+            "the narrower T2 body must replace the T1 grant: {stored}"
+        );
+
+        // policy-mapping: attach the wide policy, then the narrow one.
+        for (name, actions) in [
+            ("sr-delayed-order-wide", &["s3:*"][..]),
+            ("sr-delayed-order-narrow", &["s3:GetObject"][..]),
+        ] {
+            let body: rustfs_policy::policy::Policy = serde_json::from_value(allow_actions_policy(actions)).expect("policy body");
+            iam.set_policy(name, body).await.expect("local policy");
+        }
+        let user = "sr-delayed-order-user";
+        apply_iam_item(sr_mapping_item(user, "sr-delayed-order-wide", t1))
+            .await
+            .expect("T1 attach");
+        apply_iam_item(sr_mapping_item(user, "sr-delayed-order-narrow", t2))
+            .await
+            .expect("T2 attach");
+        let mapping = iam
+            .get_mapped_policy_record(user, rustfs_iam::store::UserType::Reg, false)
+            .await
+            .expect("mapping");
+        assert_eq!(mapping.policies, "sr-delayed-order-narrow");
+        assert_eq!(mapping.update_at, t2);
+
+        // group: add the member, then remove it.
+        let member = "sr-delayed-order-member";
+        iam.create_user(member, &user_req("member-secret-key-123", rustfs_madmin::AccountStatus::Enabled))
+            .await
+            .expect("member");
+        let group = "sr-delayed-order-group";
+        apply_iam_item(sr_group_item(group, &[member], false, t1))
+            .await
+            .expect("T1 add");
+        apply_iam_item(sr_group_item(group, &[member], true, t2))
+            .await
+            .expect("T2 remove");
+        let info = iam.get_group_info(group).await.expect("group");
+        assert!(info.members.is_empty(), "the T2 removal must land after the delayed T1 add");
+        assert_eq!(info.update_at, Some(t2));
+
+        // iam-user: create enabled, then the status-only disable.
+        let access_key = "sr-delayed-order-account";
+        apply_iam_item(sr_user_item(
+            access_key,
+            Some(user_req("account-secret-key-123", rustfs_madmin::AccountStatus::Enabled)),
+            t1,
+        ))
+        .await
+        .expect("T1 create");
+        apply_iam_item(sr_user_item(access_key, Some(user_req("", rustfs_madmin::AccountStatus::Disabled)), t2))
+            .await
+            .expect("T2 disable");
+        let identity = iam.get_user(access_key).await.expect("user");
+        assert_eq!(identity.credentials.status, "off", "the T2 disable must land after the delayed T1 create");
+        assert_eq!(identity.update_at, Some(t2));
+
+        clear_seeded_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn apply_group_member_add_preserves_a_disabled_group_status() {
+        publish_ready_iam_context().await;
+        seed_two_peer_state_for_iam_apply().await;
+        let iam = current_iam_handle().expect("test IAM");
+        let member = "sr-disabled-group-member";
+        let group = "sr-disabled-group";
+        iam.create_user(member, &user_req("member-secret-key-123", rustfs_madmin::AccountStatus::Enabled))
+            .await
+            .expect("member");
+        iam.add_users_to_group(group, Vec::new()).await.expect("group");
+        iam.set_group_status(group, false).await.expect("disable group");
+
+        apply_iam_item(sr_group_item(
+            group,
+            &[member],
+            false,
+            OffsetDateTime::now_utc() + time::Duration::seconds(1),
+        ))
+        .await
+        .expect("replicated member add");
+
+        let info = iam.get_group_info(group).await.expect("group after replicated member add");
+        assert_eq!(info.status, "disabled", "a membership-only update must not enable the group");
+        assert!(info.members.iter().any(|current| current == member));
+        clear_seeded_state().await;
+    }
+
+    /// A full-IAM snapshot always carries members and the sender's real group
+    /// status (`site_replication::hooks`). A peer that does not have the group
+    /// yet creates it through `GroupInfo::new`, which is enabled — so dropping
+    /// an explicit Disabled here would hand every member of a frozen group
+    /// live access on the peer, which is the same escalation the
+    /// membership-only guard above exists to prevent.
+    #[tokio::test]
+    #[serial]
+    async fn apply_group_snapshot_propagates_a_disabled_status_with_members() {
+        publish_ready_iam_context().await;
+        seed_two_peer_state_for_iam_apply().await;
+        let iam = current_iam_handle().expect("test IAM");
+        let member = "sr-snapshot-group-member";
+        let group = "sr-snapshot-disabled-group";
+        iam.create_user(member, &user_req("member-secret-key-123", rustfs_madmin::AccountStatus::Enabled))
+            .await
+            .expect("member");
+
+        apply_iam_item(sr_group_item_with_status(
+            group,
+            &[member],
+            false,
+            rustfs_madmin::GroupStatus::Disabled,
+            OffsetDateTime::now_utc() + time::Duration::seconds(1),
+        ))
+        .await
+        .expect("replicated group snapshot");
+
+        let info = iam.get_group_info(group).await.expect("group after replicated snapshot");
+        assert_eq!(
+            info.status, "disabled",
+            "a snapshot carrying an explicit disabled status must not create an enabled group"
+        );
+        assert!(info.members.iter().any(|current| current == member));
+        clear_seeded_state().await;
+    }
+
+    /// Review finding on rustfs#7195: an older grant and a newer revoke for
+    /// the same record delivered concurrently must always leave the revoke,
+    /// whichever request reaches the transaction first — the verdict and
+    /// the write of one cannot interleave with the other's.
+    #[tokio::test]
+    #[serial]
+    async fn apply_iam_item_serializes_a_concurrent_older_grant_and_newer_revoke() {
+        publish_ready_iam_context().await;
+        seed_two_peer_state_for_iam_apply().await;
+        let t1 = OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let t2 = t1 + time::Duration::minutes(5);
+
+        for round in 0..6u32 {
+            let policy = format!("sr-race-policy-{round}");
+            let grant = tokio::spawn(apply_iam_item(sr_policy_item(
+                &policy,
+                allow_actions_policy(&["s3:GetObject", "s3:PutObject"]),
+                t1,
+            )));
+            let revoke = tokio::spawn(apply_iam_item(sr_policy_item(&policy, allow_actions_policy(&["s3:GetObject"]), t2)));
+            let (grant, revoke) = if round % 2 == 0 {
+                tokio::join!(grant, revoke)
+            } else {
+                let (revoke, grant) = tokio::join!(revoke, grant);
+                (grant, revoke)
+            };
+            grant.expect("join grant").expect("grant delivery is acknowledged");
+            revoke.expect("join revoke").expect("revoke delivery is acknowledged");
+            let (stored, stamp) = stored_policy_json(&policy).await;
+            assert!(
+                !stored.contains("s3:PutObject"),
+                "round {round}: the grant won over the newer revoke: {stored}"
+            );
+            assert_eq!(stamp, Some(t2), "round {round}");
+        }
+
+        clear_seeded_state().await;
+    }
+
+    /// Review finding on rustfs#7195: a replicated delete followed by the
+    /// delayed delivery of the older create must not resurrect the entity,
+    /// and the mark that fences it is committed by the same transaction that
+    /// applied the delete; a genuinely newer create still lands.
+    #[tokio::test]
+    #[serial]
+    async fn apply_iam_item_rejects_a_stale_recreate_after_a_replicated_delete() {
+        publish_ready_iam_context().await;
+        seed_two_peer_state_for_iam_apply().await;
+        let iam = current_iam_handle().expect("test IAM");
+        let t1 = OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let t3 = t1 + time::Duration::minutes(10);
+        let t4 = t3 + time::Duration::minutes(10);
+        let access_key = "sr-recreate-account";
+        let create = |at| {
+            sr_user_item(
+                access_key,
+                Some(user_req("recreate-secret-key-123", rustfs_madmin::AccountStatus::Enabled)),
+                at,
+            )
+        };
+
+        apply_iam_item(create(t1)).await.expect("T1 create");
+        assert!(iam.get_user(access_key).await.is_some());
+        apply_iam_item(sr_user_item(access_key, None, t3)).await.expect("T3 delete");
+        assert!(iam.get_user(access_key).await.is_none());
+        let state = load_site_replication_state().await.expect("state");
+        assert_eq!(
+            state.iam_deletion_marks.get(&iam_user_deletion_mark_entity(access_key)),
+            Some(&t3),
+            "the delete's mark is committed with the delete"
+        );
+
+        apply_iam_item(create(t1)).await.expect("the stale replay is acknowledged");
+        assert!(
+            iam.get_user(access_key).await.is_none(),
+            "a create older than the recorded deletion must not re-create the user"
+        );
+
+        apply_iam_item(create(t4)).await.expect("T4 create");
+        let identity = iam.get_user(access_key).await.expect("a newer create lands");
+        assert_eq!(identity.update_at, Some(t4));
+
+        clear_seeded_state().await;
+    }
+
+    /// Review finding on rustfs#7195 (backlog#2289): a replicated disabled
+    /// service account is created disabled in one write, never enabled and
+    /// then switched off, and carries the source stamp.
+    #[tokio::test]
+    #[serial]
+    async fn apply_iam_item_creates_a_replicated_service_account_with_its_status() {
+        publish_ready_iam_context().await;
+        seed_two_peer_state_for_iam_apply().await;
+        let iam = current_iam_handle().expect("test IAM");
+        let t1 = OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let parent = "sr-svc-parent";
+        iam.create_user(parent, &user_req("parent-secret-key-123", rustfs_madmin::AccountStatus::Enabled))
+            .await
+            .expect("parent");
+
+        for (access_key, status, expected) in [
+            ("sr-svc-disabled", "off", "off"),
+            ("sr-svc-enabled", "on", "on"),
+            ("sr-svc-default", "", "on"),
+        ] {
+            apply_iam_item(sr_service_account_create_item(parent, access_key, status, t1))
+                .await
+                .expect("service account create");
+            let (credentials, _) = iam.get_service_account(access_key).await.expect("service account");
+            assert_eq!(credentials.status, expected, "{access_key}");
+            let identity = iam.get_user(access_key).await.expect("identity");
+            assert_eq!(identity.update_at, Some(t1), "{access_key} carries the source stamp");
+        }
+
+        clear_seeded_state().await;
     }
 
     #[tokio::test]
@@ -12098,14 +9641,6 @@ mod tests {
             .pem()
     }
 
-    fn empty_outbound_tls_state() -> GlobalPublishedOutboundTlsState {
-        GlobalPublishedOutboundTlsState {
-            generation: rustfs_tls_runtime::TlsGeneration(0),
-            root_ca_pem: None,
-            mtls_identity: None,
-        }
-    }
-
     struct TestTlsIdentity {
         cert_pem: String,
         cert_der: rustls_pki_types::CertificateDer<'static>,
@@ -12157,131 +9692,6 @@ mod tests {
         (endpoint, task)
     }
 
-    async fn spawn_test_tls_server() -> (String, String, tokio::task::JoinHandle<bool>) {
-        spawn_test_tls_server_with_response(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok").await
-    }
-
-    async fn spawn_test_tls_server_with_response(response: &'static [u8]) -> (String, String, tokio::task::JoinHandle<bool>) {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let certified =
-            rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).expect("generate TLS server certificate");
-        let ca_pem = certified.cert.pem();
-        let private_key = rustls_pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
-            .expect("convert TLS server private key");
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![certified.cert.der().clone()], private_key)
-            .expect("build TLS server config");
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind TLS test server");
-        let endpoint = format!("https://{}", listener.local_addr().expect("TLS test server address"));
-        let task = tokio::spawn(async move {
-            let Ok((stream, _)) = listener.accept().await else {
-                return false;
-            };
-            let Ok(mut stream) = acceptor.accept(stream).await else {
-                return false;
-            };
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            loop {
-                let Ok(read) = stream.read(&mut buffer).await else {
-                    return false;
-                };
-                if read == 0 {
-                    return false;
-                }
-                request.extend_from_slice(&buffer[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            stream.write_all(response).await.is_ok()
-        });
-        (endpoint, ca_pem, task)
-    }
-
-    #[test]
-    fn peer_connection_validation_accepts_supported_combinations() {
-        let ca = valid_test_ca_pem("peer.example.com");
-
-        assert!(validate_peer_connection_inner("http://10.0.0.5:9000", false, "", false).is_ok());
-        assert!(validate_peer_connection_inner("https://peer.example.com", false, "", false).is_ok());
-        assert!(validate_peer_connection_inner("https://peer.example.com", true, "", false).is_ok());
-        assert!(validate_peer_connection_inner("https://peer.example.com", false, &ca, false).is_ok());
-    }
-
-    #[test]
-    fn peer_connection_validation_rejects_invalid_tls_combinations() {
-        let ca = valid_test_ca_pem("peer.example.com");
-
-        for (endpoint, skip_tls_verify, ca_cert_pem) in [
-            ("http://10.0.0.5:9000", true, ""),
-            ("http://10.0.0.5:9000", false, ca.as_str()),
-            ("https://peer.example.com", true, ca.as_str()),
-        ] {
-            assert!(validate_peer_connection_inner(endpoint, skip_tls_verify, ca_cert_pem, false).is_err());
-        }
-    }
-
-    #[test]
-    fn peer_connection_validation_requires_pure_origin() {
-        for endpoint in [
-            "ftp://peer.example.com",
-            "https://user@peer.example.com",
-            "https://peer.example.com/admin",
-            "https://peer.example.com/?query=1",
-            "https://peer.example.com/#fragment",
-        ] {
-            assert!(
-                validate_peer_connection_inner(endpoint, false, "", false).is_err(),
-                "endpoint should be rejected: {endpoint}"
-            );
-        }
-        assert!(validate_peer_connection_inner("https://peer.example.com/", false, "", false).is_ok());
-    }
-
-    #[test]
-    fn peer_connection_validation_matches_replication_egress_policy() {
-        assert!(validate_peer_connection_inner("http://10.0.0.5:9000", false, "", false).is_ok());
-        assert!(validate_peer_connection_inner("http://127.0.0.1:9000", false, "", false).is_err());
-        assert!(validate_peer_connection_inner("http://127.0.0.1:9000", false, "", true).is_ok());
-        assert!(validate_peer_connection_inner("http://[::1]:9000", false, "", true).is_ok());
-        assert!(validate_peer_connection_inner("http://localhost:9000", false, "", true).is_ok());
-
-        for endpoint in [
-            "http://169.254.169.254",
-            "http://[fe80::1]:9000",
-            "http://0.0.0.0:9000",
-            "http://[::ffff:127.0.0.1]:9000",
-            "http://[::127.0.0.1]:9000",
-            "http://[::ffff:169.254.169.254]:9000",
-        ] {
-            assert!(
-                validate_peer_connection_inner(endpoint, false, "", true).is_err(),
-                "endpoint should remain forbidden with loopback opt-in: {endpoint}"
-            );
-        }
-    }
-
-    #[test]
-    fn peer_connection_validation_accepts_multi_cert_ca_and_rejects_unsafe_pem() {
-        let multi_cert = format!("{}{}", valid_test_ca_pem("one.example.com"), valid_test_ca_pem("two.example.com"));
-        assert!(validate_peer_connection_inner("https://peer.example.com", false, &multi_cert, false).is_ok());
-
-        for pem in [
-            "not a certificate",
-            "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----",
-            "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----",
-            "-----BEGIN RSA PRIVATE KEY-----\nsecret\n-----END RSA PRIVATE KEY-----",
-        ] {
-            assert!(validate_peer_connection_inner("https://peer.example.com", false, pem, false).is_err());
-        }
-
-        let oversized = "x".repeat(MAX_PEER_CA_CERT_PEM_SIZE + 1);
-        assert!(validate_peer_connection_inner("https://peer.example.com", false, &oversized, false).is_err());
-    }
-
     #[test]
     fn persisted_peer_connection_errors_are_internal_and_refresh_can_use_valid_candidate() {
         let invalid_peer = PeerInfo {
@@ -12314,189 +9724,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_dns_resolver_filters_forbidden_addresses_and_reqwest_cannot_bypass() {
-        let resolver = PeerDnsResolver::with_overrides(
-            true,
-            HashMap::from([
-                ("public.test".to_string(), vec!["8.8.8.8".parse().expect("public IP")]),
-                ("private.test".to_string(), vec!["10.0.0.5".parse().expect("private IP")]),
-                ("metadata.test".to_string(), vec!["169.254.169.254".parse().expect("metadata IP")]),
-                ("alias.test".to_string(), vec!["127.0.0.1".parse().expect("loopback IP")]),
-                ("mapped.test".to_string(), vec!["::ffff:127.0.0.1".parse().expect("mapped loopback IP")]),
-                ("localhost".to_string(), vec!["127.0.0.1".parse().expect("localhost IP")]),
-            ]),
-        );
-
-        for host in ["public.test", "private.test", "localhost"] {
-            let address_count = reqwest::dns::Resolve::resolve(&resolver, host.parse().expect("resolver test hostname"))
-                .await
-                .expect("allowed resolver result")
-                .count();
-            assert_eq!(address_count, 1, "expected one allowed address for {host}");
-        }
-        for host in ["metadata.test", "alias.test", "mapped.test"] {
-            assert!(
-                reqwest::dns::Resolve::resolve(&resolver, host.parse().expect("resolver test hostname"))
-                    .await
-                    .is_err(),
-                "resolver must reject {host}"
-            );
-        }
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind resolver bypass listener");
-        let port = listener.local_addr().expect("resolver bypass listener address").port();
-        let accepted = Arc::new(AtomicBool::new(false));
-        let accepted_by_server = accepted.clone();
-        let server = tokio::spawn(async move {
-            if listener.accept().await.is_ok() {
-                accepted_by_server.store(true, Ordering::SeqCst);
-            }
-        });
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .dns_resolver(resolver)
-            .build()
-            .expect("resolver bypass client");
-        assert!(client.get(format!("http://alias.test:{port}/")).send().await.is_err());
-        assert!(!accepted.load(Ordering::SeqCst));
-        server.abort();
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn production_peer_clients_ignore_environment_proxies_before_dns_filtering() {
-        let proxy_listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind observable proxy listener");
-        let proxy_url = format!("http://{}", proxy_listener.local_addr().expect("observable proxy listener address"));
-        let (proxy_hit_tx, mut proxy_hit_rx) = tokio::sync::mpsc::unbounded_channel();
-        let proxy = tokio::spawn(async move {
-            while let Ok((_stream, _address)) = proxy_listener.accept().await {
-                if proxy_hit_tx.send(()).is_err() {
-                    break;
-                }
-            }
-        });
-
-        temp_env::async_with_vars(
-            [
-                ("HTTP_PROXY", Some(proxy_url.as_str())),
-                ("HTTPS_PROXY", Some(proxy_url.as_str())),
-                ("ALL_PROXY", Some(proxy_url.as_str())),
-                ("http_proxy", Some(proxy_url.as_str())),
-                ("https_proxy", Some(proxy_url.as_str())),
-                ("all_proxy", Some(proxy_url.as_str())),
-                ("NO_PROXY", Some("")),
-                ("no_proxy", Some("")),
-            ],
-            async {
-                let resolver = PeerDnsResolver::with_overrides(
-                    false,
-                    HashMap::from([("metadata.test".to_string(), vec!["169.254.169.254".parse().expect("metadata IP")])]),
-                );
-                let outbound_tls = empty_outbound_tls_state();
-                let default_connection =
-                    validate_peer_connection_inner("http://metadata.test", false, "", false).expect("default peer connection");
-                let custom_connection =
-                    validate_peer_connection_inner("https://metadata.test", true, "", false).expect("custom peer connection");
-                let default_client = build_site_replication_peer_client_with_resolver(&outbound_tls, resolver.clone())
-                    .expect("default production peer client");
-                let custom_client =
-                    build_custom_site_replication_peer_client_with_resolver(&outbound_tls, &custom_connection, resolver)
-                        .expect("custom production peer client");
-
-                for (client, connection) in [(&default_client, &default_connection), (&custom_client, &custom_connection)] {
-                    let result = send_peer_admin_get_request_with_client(
-                        client,
-                        connection,
-                        "/rustfs/admin/v3/site-replication/metainfo",
-                        "access-key",
-                        "secret-key",
-                    )
-                    .await;
-                    assert!(result.is_err(), "forbidden DNS result must fail closed");
-                }
-            },
-        )
-        .await;
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), proxy_hit_rx.recv())
-                .await
-                .is_err(),
-            "site-replication peer traffic must never reach an environment proxy"
-        );
-        proxy.abort();
-    }
-
-    #[test]
-    fn peer_url_join_preserves_wire_path_and_query_encoding() {
-        let connection =
-            validate_peer_connection_inner("https://peer.example.com", false, "", false).expect("peer connection for URL join");
-        let url = site_replication_peer_url(
-            &connection,
-            "/minio/admin/v3/site-replication/peer/bucket-ops?bucket=a%2Fb&operation=configure-replication",
-        )
-        .expect("join peer wire URL");
-
-        assert_eq!(
-            url.as_str(),
-            "https://peer.example.com/minio/admin/v3/site-replication/peer/bucket-ops?bucket=a%2Fb&operation=configure-replication"
-        );
-    }
-
-    #[tokio::test]
-    async fn peer_clients_isolate_skip_and_custom_ca_trust() {
-        let outbound_tls = empty_outbound_tls_state();
-
-        let (ca_endpoint, ca_pem, ca_server) = spawn_test_tls_server().await;
-        let ca_connection =
-            validate_peer_connection_inner(&ca_endpoint, false, &ca_pem, true).expect("custom CA peer connection");
-        let ca_client = build_custom_site_replication_peer_client(&outbound_tls, &ca_connection).expect("custom CA peer client");
-        assert_eq!(
-            ca_client.get(&ca_endpoint).send().await.expect("custom CA request").status(),
-            StatusCode::OK
-        );
-        assert!(ca_server.await.expect("custom CA server task"));
-
-        let (untrusted_endpoint, _untrusted_ca, untrusted_server) = spawn_test_tls_server().await;
-        assert!(ca_client.get(&untrusted_endpoint).send().await.is_err());
-        assert!(!untrusted_server.await.expect("untrusted TLS server task"));
-
-        let (other_endpoint, other_ca, other_server) = spawn_test_tls_server().await;
-        let other_connection =
-            validate_peer_connection_inner(&other_endpoint, false, &other_ca, true).expect("second custom CA peer connection");
-        let other_client =
-            build_custom_site_replication_peer_client(&outbound_tls, &other_connection).expect("second custom CA peer client");
-        assert_eq!(
-            other_client
-                .get(&other_endpoint)
-                .send()
-                .await
-                .expect("second custom CA request")
-                .status(),
-            StatusCode::OK
-        );
-        assert!(other_server.await.expect("second custom CA server task"));
-
-        let (skip_endpoint, _skip_ca, skip_server) = spawn_test_tls_server().await;
-        let skip_connection =
-            validate_peer_connection_inner(&skip_endpoint, true, "", true).expect("skip-verify peer connection");
-        let skip_client =
-            build_custom_site_replication_peer_client(&outbound_tls, &skip_connection).expect("skip-verify peer client");
-        assert_eq!(
-            skip_client
-                .get(&skip_endpoint)
-                .send()
-                .await
-                .expect("skip-verify request")
-                .status(),
-            StatusCode::OK
-        );
-        assert!(skip_server.await.expect("skip-verify server task"));
-    }
-
-    #[tokio::test]
     #[serial]
     async fn peer_admin_transport_uses_full_connection_for_get_and_put() {
         temp_env::async_with_vars([(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV, Some("true"))], async {
@@ -12506,7 +9733,8 @@ mod tests {
                     .await;
             let ca_connection =
                 PeerConnection::new(&ca_endpoint, false, &ca_identity.cert_pem).expect("production custom-CA peer connection");
-            let get_body = send_peer_admin_get_request(&ca_connection, "/rustfs/admin/v3/site-replication/metainfo", "ak", "sk")
+            let get_body = PeerAdminRequest::get(&ca_connection, "/rustfs/admin/v3/site-replication/metainfo", "ak")
+                .send_get("sk")
                 .await
                 .expect("production custom-CA GET");
             assert_eq!(get_body, b"ok");
@@ -12519,15 +9747,10 @@ mod tests {
             )
             .await;
             let skip_connection = PeerConnection::new(&skip_endpoint, true, "").expect("production skip-verify peer connection");
-            let (status, put_body) = send_peer_admin_request_raw(
-                &skip_connection,
-                "/rustfs/admin/v3/site-replication/peer/edit",
-                "ak",
-                "sk",
-                &serde_json::json!({"peer": "test"}),
-            )
-            .await
-            .expect("production skip-verify PUT");
+            let (status, put_body) = PeerAdminRequest::put(&skip_connection, "/rustfs/admin/v3/site-replication/peer/edit", "ak")
+                .send_raw("sk", Some(&serde_json::json!({"peer": "test"})))
+                .await
+                .expect("production skip-verify PUT");
             assert_eq!(status, StatusCode::OK);
             assert_eq!(put_body, b"ok");
             assert_eq!(skip_server.await.expect("skip-verify PUT server task").as_deref(), Some("PUT"));
@@ -12590,38 +9813,6 @@ mod tests {
         assert!(peer_server.await.expect("unrelated peer isolation server task").is_none());
     }
 
-    #[tokio::test]
-    async fn peer_clients_do_not_follow_redirects() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind redirect test server");
-        let endpoint = format!("http://{}", listener.local_addr().expect("redirect test server address"));
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept redirect test request");
-            let mut request = [0_u8; 1024];
-            let read = stream.read(&mut request).await.expect("read redirect test request");
-            assert!(read > 0);
-            stream
-                .write_all(b"HTTP/1.1 302 Found\r\nlocation: /followed\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                .await
-                .expect("write redirect response");
-        });
-
-        let client = build_site_replication_peer_client(&empty_outbound_tls_state()).expect("default peer client");
-        let response = client.get(&endpoint).send().await.expect("redirect test request");
-        assert_eq!(response.status(), StatusCode::FOUND);
-        server.await.expect("redirect test server task");
-
-        let (tls_endpoint, _tls_ca, tls_server) = spawn_test_tls_server_with_response(
-            b"HTTP/1.1 302 Found\r\nlocation: /followed\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-        )
-        .await;
-        let connection = validate_peer_connection_inner(&tls_endpoint, true, "", true).expect("custom redirect peer connection");
-        let client = build_custom_site_replication_peer_client(&empty_outbound_tls_state(), &connection)
-            .expect("custom redirect peer client");
-        let response = client.get(&tls_endpoint).send().await.expect("custom redirect test request");
-        assert_eq!(response.status(), StatusCode::FOUND);
-        assert!(tls_server.await.expect("custom redirect TLS server task"));
-    }
-
     fn peer(name: &str, endpoint: &str) -> PeerInfo {
         PeerInfo {
             name: name.to_string(),
@@ -12635,18 +9826,6 @@ mod tests {
             ca_cert_pem: String::new(),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
         }
-    }
-
-    #[test]
-    fn test_stored_peer_tls_settings_preserve_configured_values() {
-        let stored_peer = PeerInfo {
-            skip_tls_verify: true,
-            ca_cert_pem: "custom-ca".to_string(),
-            ..peer("local", "https://local.example.com")
-        };
-
-        assert_eq!(stored_peer_tls_settings(Some(&stored_peer)), (true, "custom-ca".to_string()));
-        assert_eq!(stored_peer_tls_settings(None), (false, String::new()));
     }
 
     #[test]
@@ -12975,320 +10154,6 @@ mod tests {
         assert!(target_state.peers["remote"].skip_tls_verify);
     }
 
-    fn drain_event(peer: &str, path: &str, retry_count: u32, updated_at: Option<OffsetDateTime>) -> SiteReplicationRetryEvent {
-        SiteReplicationRetryEvent {
-            id: format!("evt-{peer}"),
-            peer_deployment_id: peer.to_string(),
-            peer_endpoint: format!("https://{peer}.example.com"),
-            path: path.to_string(),
-            retry_count,
-            failed: retry_count >= SITE_REPLICATION_RETRY_FAILED_AFTER,
-            last_error: "remote-operation-failed".to_string(),
-            updated_at,
-            edit_generation: None,
-        }
-    }
-
-    /// P1-3 red-light: the drain must only ever act on deliveries it can
-    /// replay faithfully. IAM / bucket-meta entries collapse per (peer, path)
-    /// with no body persisted — only a snapshot resend is truthful; bucket
-    /// makes/replication configs are re-derivable; destructive bucket ops and
-    /// unrelated `internal:` marker records are never background-replayed.
-    #[test]
-    fn test_classify_site_replication_retry_event_actions() {
-        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
-        let classify = |path: &str| classify_site_replication_retry_event(&drain_event("remote", path, 1, Some(now)));
-
-        assert_eq!(
-            classify("/rustfs/admin/v3/site-replication/peer/iam-item"),
-            Some(RetryDrainAction::IamSnapshot)
-        );
-        assert_eq!(
-            classify("/rustfs/admin/v3/site-replication/peer/bucket-meta"),
-            Some(RetryDrainAction::BucketMetadataSnapshot)
-        );
-        assert_eq!(classify(SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH), Some(RetryDrainAction::IamSnapshot));
-        assert_eq!(
-            classify(SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH),
-            Some(RetryDrainAction::BucketMetadataSnapshot)
-        );
-        assert_eq!(classify(SITE_REPLICATION_PEER_EDIT_PATH), Some(RetryDrainAction::PeerEdit));
-        assert_eq!(
-            classify(
-                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning&createdAt=1"
-            ),
-            Some(RetryDrainAction::BucketOpReplay {
-                operation: SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING.to_string(),
-                bucket: "photos".to_string(),
-            })
-        );
-        assert_eq!(
-            classify("/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=configure-replication"),
-            Some(RetryDrainAction::BucketOpReplay {
-                operation: SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION.to_string(),
-                bucket: "photos".to_string(),
-            })
-        );
-        // Destructive ops are operator territory: replaying a bucket delete
-        // against a peer whose bucket was since recreated is irreversible.
-        assert_eq!(
-            classify("/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket"),
-            None
-        );
-        assert_eq!(
-            classify("/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=force-delete-bucket"),
-            None
-        );
-        // `internal:` records store payloads in `last_error`, not failures.
-        assert_eq!(classify(SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH), None);
-        assert_eq!(classify("internal:some-future-marker"), None);
-        assert_eq!(classify("/rustfs/admin/v3/site-replication/peer/unknown"), None);
-    }
-
-    #[test]
-    fn test_retry_snapshot_fingerprint_detects_concurrent_iam_change() {
-        let old = SRIAMItem {
-            r#type: "policy".to_string(),
-            name: "readwrite".to_string(),
-            updated_at: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp")),
-            ..Default::default()
-        };
-        let mut new = old.clone();
-        new.updated_at = Some(OffsetDateTime::from_unix_timestamp(1_700_000_001).expect("timestamp"));
-
-        let sent = RetrySnapshot::Iam(vec![old]);
-        let changed = RetrySnapshot::Iam(vec![new]);
-        assert_ne!(sent.fingerprint().unwrap(), changed.fingerprint().unwrap());
-    }
-
-    #[test]
-    fn test_retry_snapshot_replays_a_concurrent_deletion_as_a_tombstone() {
-        let observed_at = OffsetDateTime::from_unix_timestamp(1_700_000_010).expect("timestamp");
-        let policy = SRIAMItem {
-            r#type: "policy".to_string(),
-            name: "readwrite".to_string(),
-            policy: Some(serde_json::json!({"Version": "2012-10-17"})),
-            ..Default::default()
-        };
-        let replay =
-            RetrySnapshot::replay_after_change(&RetrySnapshot::Iam(vec![policy]), &RetrySnapshot::Iam(Vec::new()), observed_at);
-        let RetrySnapshot::Iam(items) = replay else {
-            panic!("IAM snapshot expected");
-        };
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].name, "readwrite");
-        assert!(items[0].policy.is_none());
-        assert_eq!(items[0].updated_at, Some(observed_at));
-
-        let bucket = SRBucketMeta {
-            r#type: "tags".to_string(),
-            bucket: "photos".to_string(),
-            tags: Some("encoded-tags".to_string()),
-            ..Default::default()
-        };
-        let replay = RetrySnapshot::replay_after_change(
-            &RetrySnapshot::BucketMetadata(vec![bucket]),
-            &RetrySnapshot::BucketMetadata(Vec::new()),
-            observed_at,
-        );
-        let RetrySnapshot::BucketMetadata(items) = replay else {
-            panic!("bucket metadata snapshot expected");
-        };
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].bucket, "photos");
-        assert_eq!(items[0].r#type, "tags");
-        assert!(items[0].tags.is_none());
-        assert_eq!(items[0].updated_at, Some(observed_at));
-    }
-
-    /// Exponential backoff gates every attempt: without it a dead peer's
-    /// entries hit `failed` (retry_count >= 3) within 30 minutes of reconcile
-    /// ticks and the retry stats lose their signal.
-    #[test]
-    fn test_site_replication_retry_backoff_schedule() {
-        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
-        let at = |secs_ago: i64| Some(now - time::Duration::seconds(secs_ago));
-        let elapsed = |retry_count: u32, secs_ago: i64| {
-            site_replication_retry_backoff_elapsed(&drain_event("remote", "/p", retry_count, at(secs_ago)), now)
-        };
-
-        // No record of when it failed: attempt now.
-        assert!(site_replication_retry_backoff_elapsed(&drain_event("remote", "/p", 1, None), now));
-        // First failure: one reconcile interval.
-        assert!(!elapsed(1, 599));
-        assert!(elapsed(1, 601));
-        // Third failure: 600 * 2^2 = 2400s.
-        assert!(!elapsed(3, 1200));
-        assert!(elapsed(3, 2401));
-        // Ceiling: a long-dead peer is still probed daily, never less often.
-        assert!(!elapsed(30, 86_000));
-        assert!(elapsed(30, 86_401));
-    }
-
-    /// The actionable subset respects classification, peer membership and
-    /// backoff; everything else stays untouched in the queue.
-    #[test]
-    fn test_actionable_site_replication_retry_events_filters() {
-        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
-        let old = Some(now - time::Duration::seconds(700));
-        let mut state = SiteReplicationState::default();
-        state
-            .peers
-            .insert("remote".to_string(), peer("remote", "https://remote.example.com"));
-
-        state.retry_queue = vec![
-            // Eligible: known peer, replayable, past backoff.
-            drain_event("remote", SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH, 1, old),
-            // Not yet due.
-            drain_event("remote", "/rustfs/admin/v3/site-replication/peer/bucket-meta", 2, Some(now)),
-            // Unknown peer (removed since the failure was recorded).
-            drain_event("gone", "/rustfs/admin/v3/site-replication/peer/iam-item", 1, old),
-            // Marker record, not a delivery failure.
-            drain_event("remote", SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH, 0, old),
-            // Destructive op: operator-only.
-            drain_event(
-                "remote",
-                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket",
-                1,
-                old,
-            ),
-        ];
-
-        let actionable = actionable_site_replication_retry_events(&state, now);
-        assert_eq!(actionable.len(), 1, "only the due, replayable, known-peer event is actionable");
-        assert_eq!(actionable[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
-    }
-
-    /// The drain settles a peer-edit success under a freshly allocated
-    /// generation; legacy queue entries carry `edit_generation: None` and
-    /// must be cleared by that generation-scoped settlement (`(Some, None)`
-    /// falls through to removal), or the drain would spin on them forever.
-    #[test]
-    fn test_settle_clears_legacy_none_generation_event_for_generation_scoped_success() {
-        let target = peer("remote", "https://remote.example.com");
-        let mut queue = vec![drain_event("remote", SITE_REPLICATION_PEER_EDIT_PATH, 1, None)];
-        assert!(queue[0].edit_generation.is_none());
-
-        let settled = settle_site_replication_retry_events(&mut queue, &target, SITE_REPLICATION_PEER_EDIT_PATH, Some(42));
-
-        assert_eq!(settled, 1, "a legacy None-generation event must settle under a newer generation");
-        assert!(queue.is_empty());
-    }
-
-    /// A successful snapshot resend cannot prove a failed *deletion* was
-    /// replayed, so the collapsed entry is escalated (operator-visible,
-    /// drain-idle) instead of cleared — unless a newer failure was stamped
-    /// during the delivery window, which keeps the entry drain-eligible.
-    #[test]
-    fn test_escalate_up_to_marks_snapshot_replayed_and_keeps_newer_failures() {
-        let target = peer("remote", "https://remote.example.com");
-        let path = "/rustfs/admin/v3/site-replication/peer/iam-item";
-        let snapshot_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
-
-        // Failure re-stamped after the snapshot: untouched, still eligible.
-        let mut queue = vec![drain_event(
-            "remote",
-            SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
-            2,
-            Some(snapshot_at + time::Duration::seconds(5)),
-        )];
-        assert_eq!(
-            escalate_site_replication_retry_events_up_to(
-                &mut queue,
-                &target,
-                SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
-                Some(snapshot_at),
-            ),
-            0
-        );
-        assert!(!queue[0].failed);
-        assert!(
-            classify_site_replication_retry_event(&queue[0]).is_some(),
-            "a newer failure must stay drain-eligible"
-        );
-
-        // Unchanged since the snapshot: escalated, kept, drain-idle.
-        let mut queue = vec![drain_event(
-            "remote",
-            SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
-            2,
-            Some(snapshot_at),
-        )];
-        assert_eq!(
-            escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
-            1
-        );
-        assert_eq!(queue.len(), 1, "the entry must survive until remote absence is proven");
-        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
-        assert!(queue[0].failed);
-        assert_eq!(queue[0].last_error, SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER);
-        assert!(
-            classify_site_replication_retry_event(&queue[0]).is_none(),
-            "a snapshot-replayed entry must not be re-sent daily"
-        );
-        // Ordinary success dequeues must not clear the marker: collapsed
-        // paths are shared by every entity, so a successful Bob update
-        // proves nothing about a failed Alice deletion (second review
-        // round).
-        assert_eq!(dequeue_site_replication_retry_events(&mut queue, &target, path), 0);
-        assert_eq!(queue.len(), 1, "an escalated entry must survive an ordinary delivery success");
-        // Only a repair — the operator's accountability transfer — settles it.
-        assert_eq!(dequeue_site_replication_retry_events_including_escalated(&mut queue, &target, path), 1);
-        assert!(queue.is_empty());
-
-        // A failed Alice deletion is stored under the internal path, so a
-        // successful Bob update on the shared wire path cannot erase it even
-        // before the drain runs.
-        let mut queue = Vec::new();
-        upsert_site_replication_retry_event(&mut queue, &target, path, "alice delete failed", None);
-        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
-        assert_eq!(dequeue_site_replication_retry_events(&mut queue, &target, path), 0);
-        assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
-
-        // A later hook failure overwrites the marker and re-arms the drain.
-        let mut queue = vec![drain_event("remote", path, 2, Some(snapshot_at))];
-        escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at));
-        upsert_site_replication_retry_event(&mut queue, &target, path, "peer offline", None);
-        assert!(classify_site_replication_retry_event(&queue[0]).is_some());
-
-        // Legacy entry without a timestamp: escalated.
-        let mut queue = vec![drain_event("remote", path, 2, None)];
-        assert_eq!(
-            escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
-            1
-        );
-
-        // A cloned event can disappear during replay; escalation recreates
-        // the internal liability while leaving another peer's row untouched.
-        let mut queue = vec![drain_event("other", path, 2, Some(snapshot_at))];
-        assert_eq!(
-            escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
-            1
-        );
-        assert!(!queue[0].failed);
-        assert_eq!(queue.len(), 2);
-        assert_eq!(queue[1].peer_deployment_id, target.deployment_id);
-        assert_eq!(queue[1].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
-    }
-
-    #[test]
-    fn test_collapsed_retry_queue_migration_preserves_legacy_liability() {
-        let peer = PeerInfo {
-            deployment_id: "remote-dep".to_string(),
-            ..peer("remote", "https://remote.example.com")
-        };
-        let wire_path = "/rustfs/admin/v3/site-replication/peer/iam-item";
-        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
-        let mut queue = vec![drain_event("remote-dep", wire_path, 2, Some(now))];
-
-        assert_eq!(dequeue_site_replication_retry_events(&mut queue, &peer, wire_path), 0);
-        assert!(normalize_collapsed_retry_queue_paths(&mut queue));
-        assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
-        assert!(!normalize_collapsed_retry_queue_paths(&mut queue));
-    }
-
     #[test]
     fn test_pending_endpoint_refresh_retry_summary_redacts_pem() {
         let pem = "-----BEGIN CERTIFICATE-----\nsecret-marker\n-----END CERTIFICATE-----";
@@ -13327,31 +10192,6 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_pending_retry_json_remains_readable() {
-        let legacy = PendingEndpointRefresh {
-            id: "legacy-refresh".to_string(),
-            peer: PeerInfo {
-                deployment_id: "remote".to_string(),
-                ..peer("remote", "https://remote.example.com")
-            },
-            ..Default::default()
-        };
-        let state = SiteReplicationState {
-            retry_queue: vec![SiteReplicationRetryEvent {
-                path: SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH.to_string(),
-                last_error: serde_json::to_string(&legacy).expect("serialize legacy pending"),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-
-        assert_eq!(
-            pending_endpoint_refresh(&state).map(|pending| pending.id).as_deref(),
-            Some("legacy-refresh")
-        );
-    }
-
-    #[test]
     fn test_pending_endpoint_refresh_ack_merge_is_monotonic() {
         let latest = PendingEndpointRefresh {
             id: "refresh-acks".to_string(),
@@ -13373,6 +10213,50 @@ mod tests {
 
         let merged = merge_pending_endpoint_refresh(&state, &stale, ["peer-b".to_string()]).expect("merge ACKs");
         assert_eq!(merged.acked_deployment_ids, BTreeSet::from(["peer-a".to_string(), "peer-b".to_string()]));
+    }
+
+    /// A refresh that cannot finish used to take the whole heavyweight pass
+    /// with it, including the retry drain, so an unreachable peer froze IAM
+    /// and bucket replay to every healthy peer as well. The bucket reconciler
+    /// still waits - it rewrites the topology the refresh is changing - but
+    /// the drain must run.
+    #[test]
+    fn a_pending_endpoint_refresh_still_drains_the_retry_queue() {
+        let source = include_str!("site_replication.rs");
+        let body = source
+            .split("fn reconcile_site_replication_wiring()")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn send_site_replication_bootstrap_plan").next())
+            .expect("reconcile function body");
+        let refresh_arm = body
+            .split("resume_pending_endpoint_refresh(")
+            .nth(1)
+            .and_then(|rest| rest.split("A wedged rotation").next())
+            .expect("endpoint refresh arm");
+
+        assert!(
+            refresh_arm.contains("drain_site_replication_retry_queue().await;"),
+            "a pending endpoint refresh must not stall replay to the healthy peers"
+        );
+        assert!(
+            !refresh_arm.contains("reconcile_site_replication_buckets"),
+            "bucket wiring still waits for the refresh to settle"
+        );
+    }
+
+    #[test]
+    fn reconcile_redrives_a_pending_endpoint_refresh() {
+        let source = include_str!("site_replication.rs");
+        let body = source
+            .split("fn reconcile_site_replication_wiring()")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn send_site_replication_bootstrap_plan").next())
+            .expect("reconcile function body");
+
+        assert!(
+            body.contains("resume_pending_endpoint_refresh"),
+            "the heavyweight reconcile tick must resume a persisted endpoint refresh"
+        );
     }
 
     #[test]
@@ -13436,56 +10320,6 @@ mod tests {
     }
 
     #[test]
-    fn test_site_replication_bucket_target_replaces_tls_and_preserves_operational_fields() {
-        let local = PeerInfo {
-            deployment_id: "local".to_string(),
-            ..peer("local", "https://local.example.com")
-        };
-        let remote = PeerInfo {
-            deployment_id: "remote".to_string(),
-            skip_tls_verify: true,
-            ..peer("remote", "https://remote.example.com:9443")
-        };
-        let state = SiteReplicationState {
-            service_account_access_key: "svc".to_string(),
-            peers: BTreeMap::from([("local".to_string(), local.clone()), ("remote".to_string(), remote.clone())]),
-            ..Default::default()
-        };
-        let generated = site_replication_bucket_target_for_peer("photos", &state, &remote, "secret", None)
-            .expect("build target")
-            .expect("target exists");
-        assert!(generated.skip_tls_verify);
-        assert_eq!(generated.ca_cert_pem, "");
-
-        let existing = BucketTarget {
-            arn: generated.arn,
-            endpoint: "remote.example.com:9443".to_string(),
-            secure: true,
-            target_type: BucketTargetType::ReplicationService,
-            deployment_id: "remote".to_string(),
-            skip_tls_verify: false,
-            ca_cert_pem: "old-ca".to_string(),
-            bandwidth_limit: 42,
-            disable_proxy: true,
-            ..Default::default()
-        };
-        let reconciled = reconcile_site_replication_bucket_targets(
-            BucketTargets { targets: vec![existing] },
-            "photos",
-            &state,
-            &local,
-            None,
-            "secret",
-        )
-        .expect("reconcile targets");
-        let target = reconciled.targets.first().expect("reconciled target");
-        assert!(target.skip_tls_verify);
-        assert_eq!(target.ca_cert_pem, "");
-        assert_eq!(target.bandwidth_limit, 42);
-        assert!(target.disable_proxy);
-    }
-
-    #[test]
     fn test_peer_tls_capability_query_is_supported_and_legacy_response_fails_closed() {
         let remote = peer("remote", "https://remote.example.com");
 
@@ -13524,6 +10358,41 @@ mod tests {
             !add.contains("SITE_REPLICATION_PEER_EDIT_PATH"),
             "the finalize fan-out must not fall back to the unstamped peer-edit path"
         );
+    }
+
+    #[test]
+    fn add_admission_starts_before_preflight_and_rejects_bucket_set_changes() {
+        let expected = HashSet::from(["remote-owned".to_string(), "shared".to_string()]);
+        let present = HashSet::from(["shared".to_string()]);
+
+        let err = ensure_add_bucket_set_matches_preflight(&expected, &present)
+            .expect_err("a missing bootstrap bucket must reject the topology commit");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+        let present = HashSet::from([
+            "remote-owned".to_string(),
+            "shared".to_string(),
+            "created-during-add".to_string(),
+        ]);
+        let err = ensure_add_bucket_set_matches_preflight(&expected, &present)
+            .expect_err("a bucket created during add must reject the topology commit");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+        let src = include_str!("site_replication.rs");
+        let add = src
+            .split("impl Operation for SiteReplicationAddHandler")
+            .nth(1)
+            .and_then(|rest| rest.split("pub struct SiteReplicationRemoveHandler").next())
+            .expect("add handler block");
+        let admission = add
+            .find("with_site_replication_bucket_mutation_admission_lock")
+            .expect("distributed mutation admission");
+        let preflight = add.find("add_preflight_infos").expect("bucket preflight");
+        let validation = add
+            .find("ensure_add_bucket_set_matches_preflight")
+            .expect("bucket-set validation");
+        let commit = add.find("adopt_add_commit_state").expect("topology commit");
+        assert!(admission < preflight && preflight < validation && validation < commit);
     }
 
     #[test]
@@ -13822,12 +10691,18 @@ mod tests {
         );
         // Fence hardening: origin and generation are self-reported by a
         // caller the shared service account cannot identify, so the handler
-        // must pass the fence through the admissibility check — against the
-        // same state the fence gates, i.e. inside the transaction — before
-        // reading or raising any high-water mark.
+        // must admit the fence against the same state it gates. An origin
+        // removed while a retry was in flight is acknowledged without
+        // applying the stale body; otherwise it could recreate topology.
         assert!(
-            handler_block.contains(".filter(|fence| peer_edit_fence_is_admissible(state, &local_peer.deployment_id, fence))"),
+            handler_block.contains(
+                "Some(fence) if peer_edit_fence_is_admissible(state, &local_peer.deployment_id, &fence) => Some(fence)"
+            ),
             "SRPeerEditHandler must admit a fence only through peer_edit_fence_is_admissible inside the state transaction"
+        );
+        assert!(
+            handler_block.contains("Some(_) => return Ok(StateCommit::Unchanged(PeerEditOutcome::Acked))"),
+            "SRPeerEditHandler must not apply a fenced edit after its origin leaves the current topology"
         );
         // P1-15 PR2: both halves of the fence and the edit they fence share
         // ONE transaction. Checking the fence against a state read outside the
@@ -13851,14 +10726,6 @@ mod tests {
             sender_block.contains("Ok((next_peer_edit_generation(state), peers_to_send))"),
             "the edit handler must allocate the generation inside the committed state, not outside the lock"
         );
-    }
-
-    #[test]
-    fn test_bucket_versioning_xml_enables_versioning() {
-        let data = bucket_versioning_xml().expect("versioning XML should serialize");
-        let config: VersioningConfiguration = deserialize(&data).expect("versioning XML should deserialize");
-
-        assert!(config.enabled());
     }
 
     #[test]
@@ -14087,30 +10954,6 @@ mod tests {
             .expect("devnull must drain bodies larger than the admin body cap");
     }
 
-    /// A3 red-light: `versioningEnabled` must travel on every outbound
-    /// make-with-versioning bucket op so the query matches MinIO's
-    /// site-replication make-bucket wire contract (MinIO's own hook sends
-    /// `versioningEnabled=true` on this op).
-    #[test]
-    fn test_make_with_versioning_op_paths_send_versioning_enabled() {
-        let bucket = SRBucketInfo {
-            bucket: "photos".to_string(),
-            created_at: Some(OffsetDateTime::UNIX_EPOCH),
-            object_lock_config: Some(BASE64_STANDARD.encode("<ObjectLockConfiguration/>")),
-            ..Default::default()
-        };
-        let bootstrap = bootstrap_bucket_make_op_path(&bucket);
-        assert!(bootstrap.contains("operation=make-with-versioning"), "{bootstrap}");
-        assert!(bootstrap.contains("versioningEnabled=true"), "{bootstrap}");
-        assert!(bootstrap.contains("createdAt="), "{bootstrap}");
-        assert!(bootstrap.contains("lockEnabled=true"), "{bootstrap}");
-
-        // The broadcast path (create-bucket hook) shares the same builder.
-        let broadcast = make_with_versioning_bucket_op_path("photos", Some("1970-01-01T00:00:00Z"), false);
-        assert!(broadcast.contains("versioningEnabled=true"), "{broadcast}");
-        assert!(!broadcast.contains("lockEnabled"), "{broadcast}");
-    }
-
     #[tokio::test]
     #[serial]
     async fn test_add_bootstrap_scope_only_allows_expected_bucket_setup_until_guard_drops() {
@@ -14322,6 +11165,7 @@ mod tests {
                 secret_key: "remote-sk".to_string(),
                 ..PeerSite::default()
             }],
+            &[],
             "svc-ak".to_string(),
             "root".to_string(),
             true,
@@ -14355,6 +11199,7 @@ mod tests {
                     ..PeerSite::default()
                 },
             ],
+            &[],
             "svc-ak".to_string(),
             "root".to_string(),
             true,
@@ -14459,15 +11304,26 @@ mod tests {
     }
 
     fn preflight_site(name: &str, endpoint: &str, deployment_id: &str, bucket_count: usize) -> SiteReplicationAddPreflightInfo {
+        // Site-prefixed names keep the generated buckets disjoint across
+        // sites; tests exercising shared-bucket merges insert their own.
+        let buckets = (0..bucket_count)
+            .map(|i| (format!("{name}-bucket-{i}"), versioned_bucket()))
+            .collect();
         SiteReplicationAddPreflightInfo {
             name: name.to_string(),
             endpoint: endpoint.to_string(),
             deployment_id: deployment_id.to_string(),
             enabled: false,
-            bucket_count,
-            bucket_names: HashSet::new(),
+            buckets,
             peer_deployment_ids: BTreeSet::new(),
             idp_settings: serde_json::json!({"provider": "same"}),
+        }
+    }
+
+    fn versioned_bucket() -> AddPreflightBucketCompat {
+        AddPreflightBucketCompat {
+            versioning_enabled: true,
+            object_lock_enabled: false,
         }
     }
 
@@ -14514,6 +11370,119 @@ mod tests {
         assert!(err.to_string().contains("must include the local deployment"));
     }
 
+    fn openid_provider(client_id: &str) -> OpenIDProviderSettings {
+        OpenIDProviderSettings {
+            claim_name: "groups".to_string(),
+            claim_userinfo_enabled: false,
+            role_policy: "readwrite".to_string(),
+            client_id: client_id.to_string(),
+            hashed_client_secret: "hashed".to_string(),
+        }
+    }
+
+    // rustfs#7003: the site region is per-site and must not reach the peer
+    // IDP comparison while OpenID is unconfigured, or two sites in different
+    // regions can never be paired even with an identical (empty) IDP config.
+    #[test]
+    fn test_open_id_settings_omits_region_without_providers() {
+        let settings = open_id_settings(Vec::new(), "eu-site-1".to_string());
+
+        assert!(!settings.enabled);
+        assert_eq!(settings.region, "");
+        assert!(settings.roles.is_empty());
+        assert_eq!(
+            serde_json::to_value(&settings).expect("serialize OpenID settings"),
+            serde_json::to_value(OpenIDSettings::default()).expect("serialize default OpenID settings"),
+            "a site without OpenID providers must report the same settings in every region"
+        );
+    }
+
+    #[test]
+    fn test_open_id_settings_keeps_region_with_providers() {
+        let settings = open_id_settings(vec![("default".to_string(), openid_provider("client-a"))], "eu-site-1".to_string());
+
+        assert!(settings.enabled);
+        assert_eq!(settings.region, "eu-site-1");
+        assert_eq!(settings.claim_provider.client_id, "client-a");
+    }
+
+    // A whole provider object present on one side only must not spill its
+    // credential-derived leaves into the rejection message.
+    #[test]
+    fn test_validate_add_preflight_topology_omits_nested_values_in_idp_diff() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let mut local = preflight_site("local", "https://local.example.com", "local-dep", 0);
+        local.idp_settings = serde_json::json!({
+            "OpenID": {"Enabled": true, "ClaimProvider": {"ClientID": "client-a", "HashedClientSecret": "local-hash"}},
+        });
+        let mut remote = preflight_site("remote", "https://remote.example.com", "remote-dep", 0);
+        remote.idp_settings = serde_json::json!({"OpenID": {"Enabled": true}});
+        let infos = vec![local, remote];
+
+        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("IDP mismatch should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("OpenID.ClaimProvider"), "{message}");
+        assert!(!message.contains("local-hash"), "{message}");
+    }
+
+    // rustfs#7003: a bare "IDP settings mismatch" leaves the operator with no
+    // way to tell which element diverged.
+    #[test]
+    fn test_validate_add_preflight_topology_reports_differing_idp_field() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let mut local = preflight_site("local", "https://local.example.com", "local-dep", 0);
+        local.idp_settings = serde_json::json!({
+            "LDAP": {"IsLDAPEnabled": false},
+            "OpenID": {"Enabled": false, "Region": "eu-site-1"},
+        });
+        let mut remote = preflight_site("remote", "https://remote.example.com", "remote-dep", 0);
+        remote.idp_settings = serde_json::json!({
+            "LDAP": {"IsLDAPEnabled": false},
+            "OpenID": {"Enabled": false, "Region": "eu-site-2"},
+        });
+        let infos = vec![local, remote];
+
+        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("IDP mismatch should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("OpenID.Region"), "{message}");
+        assert!(message.contains("eu-site-1"), "{message}");
+        assert!(message.contains("eu-site-2"), "{message}");
+    }
+
+    // Hashed client secrets are still credential-derived material: name the
+    // field that diverged, never its value.
+    #[test]
+    fn test_validate_add_preflight_topology_redacts_secret_values_in_idp_diff() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let mut local = preflight_site("local", "https://local.example.com", "local-dep", 0);
+        local.idp_settings = serde_json::json!({
+            "OpenID": {"ClaimProvider": {"HashedClientSecret": "local-hash"}},
+        });
+        let mut remote = preflight_site("remote", "https://remote.example.com", "remote-dep", 0);
+        remote.idp_settings = serde_json::json!({
+            "OpenID": {"ClaimProvider": {"HashedClientSecret": "remote-hash"}},
+        });
+        let infos = vec![local, remote];
+
+        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("IDP mismatch should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("OpenID.ClaimProvider.HashedClientSecret"), "{message}");
+        assert!(!message.contains("local-hash"), "{message}");
+        assert!(!message.contains("remote-hash"), "{message}");
+    }
+
     #[test]
     fn test_validate_add_preflight_topology_rejects_idp_mismatch() {
         let local_peer = PeerInfo {
@@ -14529,20 +11498,120 @@ mod tests {
         assert!(err.to_string().contains("IDP settings mismatch"));
     }
 
+    // rustfs/backlog#2070: two sites that both hold data (the DR re-pair
+    // case) must be admitted when their bucket sets are merge-safe, instead
+    // of the historical unconditional "only one site may hold data" rejection
+    // that made `replicate remove` a one-way door.
     #[test]
-    fn test_validate_add_preflight_topology_rejects_multiple_non_empty_sites() {
+    fn test_validate_add_preflight_topology_accepts_compatible_non_empty_sites() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let mut local = preflight_site("local", "https://local.example.com", "local-dep", 1);
+        let mut remote = preflight_site("remote", "https://remote.example.com", "remote-dep", 1);
+        // The same bucket on both sites, versioning enabled on both: the
+        // exact shape a formerly paired cluster is left in after a remove.
+        local.buckets.insert("shared".to_string(), versioned_bucket());
+        remote.buckets.insert("shared".to_string(), versioned_bucket());
+        let infos = vec![local, remote];
+
+        validate_add_preflight_topology(&infos, &local_peer).expect("compatible non-empty sites should be admitted");
+    }
+
+    #[test]
+    fn test_validate_add_preflight_topology_accepts_disjoint_non_empty_sites() {
         let local_peer = PeerInfo {
             deployment_id: "local-dep".to_string(),
             ..peer("local", "https://local.example.com")
         };
         let infos = vec![
-            preflight_site("local", "https://local.example.com", "local-dep", 1),
-            preflight_site("remote", "https://remote.example.com", "remote-dep", 1),
+            preflight_site("local", "https://local.example.com", "local-dep", 2),
+            preflight_site("remote", "https://remote.example.com", "remote-dep", 2),
         ];
 
-        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("multiple non-empty sites should fail");
+        validate_add_preflight_topology(&infos, &local_peer).expect("disjoint non-empty sites should be admitted");
+    }
 
-        assert!(err.to_string().contains("only one site"));
+    #[test]
+    fn test_validate_add_preflight_topology_rejects_shared_bucket_object_lock_mismatch() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let mut local = preflight_site("local", "https://local.example.com", "local-dep", 0);
+        let mut remote = preflight_site("remote", "https://remote.example.com", "remote-dep", 0);
+        local.buckets.insert(
+            "shared".to_string(),
+            AddPreflightBucketCompat {
+                versioning_enabled: true,
+                object_lock_enabled: true,
+            },
+        );
+        remote.buckets.insert("shared".to_string(), versioned_bucket());
+        let infos = vec![local, remote];
+
+        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("object-lock mismatch should fail");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("bucket `shared` has object lock enabled on site `local`"),
+            "got: {message}"
+        );
+        // The rejection must carry the operator recovery steps, not a bare no.
+        assert!(message.contains("re-run `replicate add`"), "got: {message}");
+        assert!(message.contains("`replicate resync`"), "got: {message}");
+    }
+
+    #[test]
+    fn test_validate_add_preflight_topology_rejects_shared_unversioned_bucket() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let mut local = preflight_site("local", "https://local.example.com", "local-dep", 0);
+        let mut remote = preflight_site("remote", "https://remote.example.com", "remote-dep", 0);
+        local.buckets.insert("shared".to_string(), versioned_bucket());
+        remote.buckets.insert(
+            "shared".to_string(),
+            AddPreflightBucketCompat {
+                versioning_enabled: false,
+                object_lock_enabled: false,
+            },
+        );
+        let infos = vec![local, remote];
+
+        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("shared unversioned bucket should fail");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("bucket `shared`") && message.contains("versioning enabled on site `remote`"),
+            "got: {message}"
+        );
+        assert!(message.contains("re-run `replicate add`"), "got: {message}");
+    }
+
+    // A bucket held by a single site never blocks the add, whatever its
+    // configs: the backfill creates it on the peers exactly like the
+    // historical one-non-empty-site path.
+    #[test]
+    fn test_validate_add_preflight_topology_ignores_unshared_bucket_configs() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let mut local = preflight_site("local", "https://local.example.com", "local-dep", 1);
+        let remote = preflight_site("remote", "https://remote.example.com", "remote-dep", 1);
+        local.buckets.insert(
+            "local-only".to_string(),
+            AddPreflightBucketCompat {
+                versioning_enabled: false,
+                object_lock_enabled: true,
+            },
+        );
+        let infos = vec![local, remote];
+
+        validate_add_preflight_topology(&infos, &local_peer).expect("unshared buckets should not block the add");
     }
 
     #[test]
@@ -14562,656 +11631,89 @@ mod tests {
         assert!(err.to_string().contains("different site replication peer set"));
     }
 
+    // add_preflight_bucket_compat reads the build_sr_info wire form:
+    // base64-encoded XML for both the versioning and the object-lock config.
     #[test]
-    fn test_site_replication_bootstrap_plan_includes_replayable_snapshot_items() {
-        let mut info = SRInfo::default();
-        info.state.peers.insert(
-            "remote".to_string(),
-            PeerInfo {
-                replicate_ilm_expiry: true,
-                ..peer("remote", "https://remote.example.com")
-            },
-        );
-        info.policies.insert(
-            "readwrite".to_string(),
-            SRIAMPolicy {
-                policy: Some(serde_json::json!({"Version": "2012-10-17", "Statement": []})),
-                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            },
-        );
-        info.user_info_map.insert(
-            "alice".to_string(),
-            rustfs_madmin::UserInfo {
-                secret_key: Some("alice-secret".to_string()),
-                policy_name: Some("readwrite".to_string()),
-                status: rustfs_madmin::AccountStatus::Enabled,
-                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
-                ..Default::default()
-            },
-        );
-        info.user_info_map.insert(
-            "external".to_string(),
-            rustfs_madmin::UserInfo {
-                secret_key: None,
-                status: rustfs_madmin::AccountStatus::Enabled,
-                ..Default::default()
-            },
-        );
-        info.group_desc_map.insert(
-            "devs".to_string(),
-            rustfs_madmin::GroupDesc {
-                name: "devs".to_string(),
-                status: "enabled".to_string(),
-                members: vec!["alice".to_string()],
-                policy: String::new(),
-                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
-            },
-        );
-        info.user_policies.insert(
-            "alice".to_string(),
-            SRPolicyMapping {
-                user_or_group: "alice".to_string(),
-                user_type: sr_wire_user_type(UserType::Reg, false),
-                policy: "readwrite".to_string(),
-                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
-                ..Default::default()
-            },
-        );
-        info.buckets.insert(
-            "photos".to_string(),
-            SRBucketInfo {
-                bucket: "photos".to_string(),
-                policy: Some(serde_json::json!({"Statement": []})),
-                versioning: Some(BASE64_STANDARD.encode("<VersioningConfiguration/>")),
-                quota_config: Some(BASE64_STANDARD.encode(r#"{"quota":1024}"#)),
-                expiry_lc_config: Some(BASE64_STANDARD.encode("<LifecycleConfiguration/>")),
-                object_lock_config: Some(BASE64_STANDARD.encode("<ObjectLockConfiguration/>")),
-                created_at: Some(OffsetDateTime::UNIX_EPOCH),
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                ..Default::default()
-            },
-        );
-
-        let plan = site_replication_bootstrap_plan(&info).expect("bootstrap plan should build");
-
-        assert_eq!(plan.iam_items.iter().map(|item| item.r#type.as_str()).collect::<Vec<_>>(), {
-            vec!["policy", "iam-user", "group-info", "policy-mapping"]
-        });
-        assert_eq!(plan.bucket_make_ops.len(), 1);
-        assert!(plan.bucket_make_ops[0].contains("operation=make-with-versioning"));
-        assert!(plan.bucket_make_ops[0].contains("lockEnabled=true"));
-        assert_eq!(plan.bucket_configure_ops.len(), 1);
-        assert!(plan.bucket_configure_ops[0].contains("operation=configure-replication"));
-
-        let bucket_types = plan.bucket_items.iter().map(|item| item.r#type.as_str()).collect::<Vec<_>>();
-        assert_eq!(
-            bucket_types,
-            vec!["policy", "version-config", "object-lock-config", "quota-config", "lc-config"]
-        );
-        let quota = plan
-            .bucket_items
-            .iter()
-            .find(|item| item.r#type == "quota-config")
-            .and_then(|item| item.quota.as_ref())
-            .expect("quota item should exist");
-        assert_eq!(quota["quota"], 1024);
-    }
-
-    #[test]
-    fn test_site_replication_bootstrap_plan_skips_lifecycle_by_default() {
-        let mut info = SRInfo::default();
-        info.buckets.insert(
-            "photos".to_string(),
-            SRBucketInfo {
-                bucket: "photos".to_string(),
-                expiry_lc_config: Some(BASE64_STANDARD.encode("<LifecycleConfiguration/>")),
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                ..Default::default()
-            },
-        );
-
-        let plan = site_replication_bootstrap_plan(&info).expect("bootstrap plan should build");
-
-        assert!(!plan.bucket_items.iter().any(|item| item.r#type == "lc-config"));
-    }
-
-    /// A deleted expiry state (entry value None, axis set) must travel as an
-    /// explicit timestamped delete item — a peer that missed the live delete
-    /// otherwise keeps stale expiry rules through every repair (review
-    /// finding).
-    #[test]
-    fn test_site_replication_bootstrap_plan_emits_timestamped_lifecycle_delete() {
-        let deleted_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
-        let mut info = SRInfo::default();
-        info.state.peers.insert(
-            "remote-dep".to_string(),
-            PeerInfo {
-                replicate_ilm_expiry: true,
-                ..peer("remote", "https://remote.example.com")
-            },
-        );
-        info.buckets.insert(
-            "photos".to_string(),
-            SRBucketInfo {
-                bucket: "photos".to_string(),
-                expiry_lc_config: None,
-                expiry_lc_config_updated_at: Some(deleted_at),
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                ..Default::default()
-            },
-        );
-
-        let plan = site_replication_bootstrap_plan(&info).expect("bootstrap plan should build");
-
-        let item = plan
-            .bucket_items
-            .iter()
-            .find(|item| item.r#type == "lc-config")
-            .expect("a deleted expiry state must produce an lc-config delete item");
-        assert!(item.expiry_lc_config.is_none(), "delete items carry no config body");
-        assert_eq!(item.expiry_updated_at, Some(deleted_at));
-        assert_eq!(item.updated_at, Some(deleted_at));
-    }
-
-    /// What each local lifecycle state contributes to the SRInfo entry:
-    /// deletions are timestamped statements, never-configured buckets and
-    /// transition-only configs without an expiry axis say nothing.
-    #[test]
-    fn test_lifecycle_expiry_statement_matrix() {
-        let created = OffsetDateTime::from_unix_timestamp(1_600_000_000).expect("timestamp");
-        let mut meta = crate::admin::storage_api::bucket::metadata::BucketMetadata::new("photos");
-        meta.created = created;
-        // Never configured: load backfills the write time to `created`.
-        meta.lifecycle_config_updated_at = created;
-        assert!(lifecycle_expiry_statement(&meta).is_none());
-
-        // Deleted: the write time survives deletion and exceeds creation.
-        let deleted_at = created + time::Duration::seconds(100);
-        meta.lifecycle_config_updated_at = deleted_at;
-        let (subset, axis) = lifecycle_expiry_statement(&meta).expect("deletion is a statement");
-        assert!(subset.is_none());
-        assert_eq!(axis, deleted_at);
-
-        // Present with expiry rules and the axis: subset + axis travel.
-        let expiry_axis = created + time::Duration::seconds(50);
-        let mut config = lc_config(vec![lc_rule("e1", Some(7), None)]);
-        config.expiry_updated_at = Some(s3s::dto::Timestamp::from(expiry_axis));
-        meta.lifecycle_config_xml = serialize(&config).expect("serialize config");
-        let (subset, axis) = lifecycle_expiry_statement(&meta).expect("expiry config is a statement");
-        assert!(subset.is_some());
-        assert_eq!(axis.unix_timestamp(), expiry_axis.unix_timestamp());
-
-        // Transition-only without an axis: nothing to say (a delete stamped
-        // off the whole-config time would erase newer peer expiry state).
-        meta.lifecycle_config_xml = serialize(&lc_config(vec![lc_rule("t1", None, Some(30))])).expect("serialize config");
-        assert!(lifecycle_expiry_statement(&meta).is_none());
-
-        // Transition-only WITH an axis: expiry rules were properly removed —
-        // the delete travels at that axis.
-        let mut transition_only = lc_config(vec![lc_rule("t1", None, Some(30))]);
-        transition_only.expiry_updated_at = Some(s3s::dto::Timestamp::from(expiry_axis));
-        meta.lifecycle_config_xml = serialize(&transition_only).expect("serialize config");
-        let (subset, axis) = lifecycle_expiry_statement(&meta).expect("removed expiry state is a statement");
-        assert!(subset.is_none());
-        assert_eq!(axis.unix_timestamp(), expiry_axis.unix_timestamp());
-    }
-
-    #[test]
-    fn test_site_replication_repair_request_is_strict_and_requires_explicit_mode() {
-        assert!(serde_json::from_str::<SiteReplicationRepairRequest>(r#"{"mode":"dry-run"}"#).is_ok());
-        assert!(serde_json::from_str::<SiteReplicationRepairRequest>(r#"{"mode":"execute"}"#).is_ok());
-        assert!(serde_json::from_str::<SiteReplicationRepairRequest>(r#"{}"#).is_err());
-        assert!(serde_json::from_str::<SiteReplicationRepairRequest>(r#"{"mode":"dry-run","secret":"leak"}"#).is_err());
-    }
-
-    #[test]
-    fn test_site_replication_repair_dry_run_plan_is_non_mutating_and_redacted() {
-        let state = SiteReplicationState {
-            name: "local".to_string(),
-            service_account_access_key: "site-replicator-0".to_string(),
-            service_account_secret_key: "state-secret".to_string(),
-            peers: BTreeMap::from([
-                (
-                    "local-dep".to_string(),
-                    PeerInfo {
-                        deployment_id: "local-dep".to_string(),
-                        ..peer("local", "https://local.example.com")
-                    },
-                ),
-                (
-                    "remote-dep".to_string(),
-                    PeerInfo {
-                        deployment_id: "remote-dep".to_string(),
-                        ..peer("remote", "https://remote.example.com")
-                    },
-                ),
-            ]),
-            retry_queue: vec![SiteReplicationRetryEvent {
-                peer_deployment_id: "remote-dep".to_string(),
-                path: format!(
-                    "{SITE_REPLICATION_PEER_BUCKET_OPS_PATH}?bucket=photos&operation={SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING}"
-                ),
-                last_error: "credential=retry-secret".to_string(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let plan = SiteReplicationBootstrapPlan {
-            iam_items: vec![SRIAMItem {
-                r#type: "iam-user".to_string(),
-                iam_user: Some(rustfs_madmin::SRIAMUser {
-                    access_key: "alice".to_string(),
-                    user_req: Some(AddOrUpdateUserReq {
-                        secret_key: "iam-secret".to_string(),
-                        policy: None,
-                        status: rustfs_madmin::AccountStatus::Enabled,
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }],
-            bucket_make_ops: vec![format!(
-                "{SITE_REPLICATION_PEER_BUCKET_OPS_PATH}?bucket=photos&operation={SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING}"
-            )],
-            ..Default::default()
-        };
-        let before = serde_json::to_vec(&state).expect("serialize state before planning");
-        let local = state.peers.get("local-dep").expect("local peer");
-
-        let response = SiteReplicationRepairPreflight {
-            mode: "dry-run",
-            status: "planned",
-            preflight_token: site_replication_repair_preflight_token(&state, &plan, b"test-signing-key")
-                .expect("preflight token"),
-            retry_events: state.retry_queue.len(),
-            sites: site_replication_repair_sites(&state, local, &plan, b"test-signing-key").expect("repair sites"),
-        };
-        let encoded = serde_json::to_string(&response).expect("serialize preflight");
-
-        assert_eq!(serde_json::to_vec(&state).expect("serialize state after planning"), before);
-        assert!(!encoded.contains("state-secret"));
-        assert!(!encoded.contains("iam-secret"));
-        assert!(!encoded.contains("retry-secret"));
-        assert!(!encoded.contains("remote.example.com"));
-        assert_eq!(response.sites["remote-dep"].families[SITE_REPLICATION_REPAIR_IAM_FAMILY].planned, 1);
-        let bucket_family = &response.sites["remote-dep"].families[SITE_REPLICATION_REPAIR_BUCKET_FAMILY];
-        assert_eq!(bucket_family.retry_events, 1);
-        let task_id = &bucket_family.tasks[0].task_id;
-        assert_eq!(task_id.len(), 43);
-        assert!(
-            task_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        );
-        assert!(!task_id.contains("bucket"));
-        assert!(!task_id.contains("photos"));
-        assert!(!task_id.contains("remote-dep"));
-        assert_eq!(bucket_family.tasks[0].status, "planned");
-        let repeated = site_replication_repair_sites(&state, local, &plan, b"test-signing-key").expect("repeat repair sites");
-        assert_eq!(
-            task_id,
-            &repeated["remote-dep"].families[SITE_REPLICATION_REPAIR_BUCKET_FAMILY].tasks[0].task_id
-        );
-        let rotated = site_replication_repair_sites(&state, local, &plan, b"rotated-signing-key").expect("rotated repair sites");
-        assert_ne!(
-            task_id,
-            &rotated["remote-dep"].families[SITE_REPLICATION_REPAIR_BUCKET_FAMILY].tasks[0].task_id
-        );
-    }
-
-    #[test]
-    fn test_site_replication_repair_preflight_detects_stale_snapshot() {
-        let mut state = SiteReplicationState {
-            name: "local".to_string(),
-            service_account_access_key: "site-replicator-0".to_string(),
-            peers: BTreeMap::from([(
-                "remote-dep".to_string(),
-                PeerInfo {
-                    deployment_id: "remote-dep".to_string(),
-                    ..peer("remote", "https://remote.example.com")
-                },
-            )]),
-            ..Default::default()
-        };
-        let plan = SiteReplicationBootstrapPlan {
-            bucket_make_ops: vec![
-                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning".to_string(),
-            ],
-            ..Default::default()
-        };
-        let original = site_replication_repair_preflight_token(&state, &plan, b"test-signing-key").expect("original token");
-        let original_plan = site_replication_repair_plan_token(&state, &plan).expect("original plan token");
-
-        state.updated_at = Some(OffsetDateTime::UNIX_EPOCH);
-        let changed = site_replication_repair_preflight_token(&state, &plan, b"test-signing-key").expect("changed token");
-        let changed_plan = site_replication_repair_plan_token(&state, &plan).expect("changed plan token");
-
-        assert_ne!(original, changed);
-        assert_eq!(original.len(), 43);
-        assert!(
-            original
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        );
-        assert_ne!(
-            changed,
-            site_replication_repair_preflight_token(&state, &plan, b"different-signing-key").expect("differently signed token")
-        );
-        assert!(site_replication_repair_preflight_token(&state, &plan, b"").is_err());
-
-        state.retry_queue.push(SiteReplicationRetryEvent {
-            id: "retry-1".to_string(),
-            peer_deployment_id: "remote-dep".to_string(),
-            path: "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning".to_string(),
-            ..Default::default()
-        });
-        let retry_changed =
-            site_replication_repair_preflight_token(&state, &plan, b"test-signing-key").expect("retry-aware token");
-        assert_ne!(changed, retry_changed);
-        assert_eq!(
-            changed_plan,
-            site_replication_repair_plan_token(&state, &plan).expect("retry-stable plan token")
-        );
-        assert_ne!(original_plan, changed_plan, "updated_at changes the plan token");
-    }
-
-    #[test]
-    fn test_site_replication_repair_partial_retry_skips_completed_tasks_and_survives_restart() {
-        let local = PeerInfo {
-            deployment_id: "local-dep".to_string(),
-            ..peer("local", "https://local.example.com")
-        };
-        let remote = PeerInfo {
-            deployment_id: "remote-dep".to_string(),
-            ..peer("remote", "https://remote.example.com")
-        };
-        let state = SiteReplicationState {
-            peers: BTreeMap::from([
-                (local.deployment_id.clone(), local.clone()),
-                (remote.deployment_id.clone(), remote.clone()),
-            ]),
-            ..Default::default()
-        };
-        let plan = SiteReplicationBootstrapPlan {
-            iam_items: vec![SRIAMItem {
-                r#type: "policy".to_string(),
-                name: "readwrite".to_string(),
-                ..Default::default()
-            }],
-            bucket_make_ops: vec![
-                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning".to_string(),
-            ],
-            ..Default::default()
-        };
-        let tasks = site_replication_repair_tasks(&plan);
-        let (first_index, first_task) = &tasks[0];
-        let (second_index, second_task) = &tasks[1];
-        let now = OffsetDateTime::UNIX_EPOCH;
-        let mut operation = SiteReplicationRepairOperation {
-            operation_id: Uuid::new_v4().to_string(),
-            preflight_token: site_replication_repair_preflight_token(&state, &plan, b"test-signing-key")
-                .expect("preflight token"),
-            plan_token: site_replication_repair_plan_token(&state, &plan).expect("plan token"),
-            status: "running".to_string(),
-            sites: site_replication_repair_sites(&state, &local, &plan, b"test-signing-key").expect("repair sites"),
-            created_at: Some(now),
-            updated_at: Some(now),
-            completed_at: None,
-        };
-
-        update_site_replication_repair_task(&mut operation, &remote.deployment_id, first_task.family(), *first_index, Ok(()))
-            .expect("record first success");
-        update_site_replication_repair_task(
-            &mut operation,
-            &remote.deployment_id,
-            second_task.family(),
-            *second_index,
-            Err("peer response included secret=must-not-leak"),
-        )
-        .expect("record injected failure");
-        summarize_site_replication_repair_operation(&mut operation);
-        assert_eq!(operation.status, "partial");
-        assert_eq!(
-            operation.sites["remote-dep"].families[SITE_REPLICATION_REPAIR_IAM_FAMILY].tasks[0].status,
-            "succeeded"
-        );
-        assert_eq!(
-            operation.sites["remote-dep"].families[SITE_REPLICATION_REPAIR_BUCKET_FAMILY].tasks[0].status,
-            "failed"
-        );
-        assert!(
-            !site_replication_repair_task_pending(&operation, &remote.deployment_id, first_task.family(), *first_index)
-                .expect("first task state")
-        );
-        assert!(
-            !site_replication_repair_task_pending(&operation, &remote.deployment_id, second_task.family(), *second_index)
-                .expect("failed task waits for retry")
-        );
-        let response = serde_json::to_string(&site_replication_repair_operation_response(&operation))
-            .expect("serialize public operation response");
-        assert!(!response.contains(&operation.preflight_token));
-        assert!(!response.contains(&operation.plan_token));
-
-        let persisted_state = SiteReplicationRepairState {
-            operations: BTreeMap::from([(operation.operation_id.clone(), operation)]),
-        };
-        let encoded = serde_json::to_vec(&persisted_state).expect("persist state");
-        let recovered_state: SiteReplicationRepairState = serde_json::from_slice(&encoded).expect("load state after restart");
-        let mut recovered = recovered_state
-            .operations
-            .into_values()
-            .next()
-            .expect("recover operation after restart");
-        assert_eq!(recovered.sites["remote-dep"].families[SITE_REPLICATION_REPAIR_IAM_FAMILY].succeeded, 1);
-        assert!(!String::from_utf8(encoded).expect("operation JSON").contains("must-not-leak"));
-
-        prepare_site_replication_repair_retry(&mut recovered);
-        assert_eq!(
-            recovered.sites["remote-dep"].families[SITE_REPLICATION_REPAIR_IAM_FAMILY].tasks[0].status,
-            "skipped"
-        );
-        assert_eq!(
-            recovered.sites["remote-dep"].families[SITE_REPLICATION_REPAIR_BUCKET_FAMILY].tasks[0].status,
-            "planned"
-        );
-        assert!(
-            site_replication_repair_task_pending(&recovered, &remote.deployment_id, second_task.family(), *second_index)
-                .expect("failed task becomes retryable")
-        );
-        update_site_replication_repair_task(&mut recovered, &remote.deployment_id, second_task.family(), *second_index, Ok(()))
-            .expect("retry failed task");
-        assert!(
-            !site_replication_repair_task_pending(&recovered, &remote.deployment_id, first_task.family(), *first_index)
-                .expect("completed task remains skipped")
-        );
-        summarize_site_replication_repair_operation(&mut recovered);
-
-        assert_eq!(recovered.status, "success");
-        assert_eq!(recovered.sites["remote-dep"].families[SITE_REPLICATION_REPAIR_IAM_FAMILY].succeeded, 1);
-        assert_eq!(recovered.sites["remote-dep"].families[SITE_REPLICATION_REPAIR_BUCKET_FAMILY].succeeded, 1);
-    }
-
-    #[test]
-    fn test_site_replication_repair_error_classification_is_redacted() {
-        assert_eq!(
-            classify_site_replication_repair_error(
-                "peer request to https://user:secret@example.com failed with 403: token=private"
+    fn test_add_preflight_bucket_compat_parses_wire_configs() {
+        let info = SRBucketInfo {
+            versioning: Some(
+                BASE64_STANDARD.encode_to_string(b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"),
             ),
-            "authorization-failed"
-        );
-        assert_eq!(
-            classify_site_replication_repair_error("peer request body contained secret=private"),
-            "remote-operation-failed"
-        );
+            object_lock_config: Some(BASE64_STANDARD.encode_to_string(
+                b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>",
+            )),
+            ..Default::default()
+        };
+
+        let compat = add_preflight_bucket_compat("https://a.example.com", "b", &info).expect("wire configs should parse");
+
+        assert!(compat.versioning_enabled);
+        assert!(compat.object_lock_enabled);
     }
 
     #[test]
-    fn test_site_replication_repair_admission_resumes_same_id_and_rejects_conflicts() {
-        let existing = SiteReplicationRepairOperation {
-            operation_id: "operation-a".to_string(),
-            preflight_token: "preflight-a".to_string(),
-            plan_token: "plan-a".to_string(),
-            status: "running".to_string(),
+    fn test_add_preflight_bucket_compat_absent_and_suspended_configs_are_disabled() {
+        let absent = add_preflight_bucket_compat("https://a.example.com", "b", &SRBucketInfo::default())
+            .expect("absent configs should parse");
+        assert!(!absent.versioning_enabled);
+        assert!(!absent.object_lock_enabled);
+
+        let suspended = SRBucketInfo {
+            versioning: Some(
+                BASE64_STANDARD
+                    .encode_to_string(b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>"),
+            ),
             ..Default::default()
         };
-        let mut state = SiteReplicationRepairState {
-            operations: BTreeMap::from([(existing.operation_id.clone(), existing.clone())]),
-        };
-
-        let resumed = admit_site_replication_repair_operation(
-            &mut state,
-            existing.operation_id.clone(),
-            &existing.preflight_token,
-            existing.clone(),
-        )
-        .expect("same operation ID and preflight should resume");
-        assert_eq!(resumed.operation_id, existing.operation_id);
-
-        let conflicting_operation = SiteReplicationRepairOperation {
-            operation_id: "operation-b".to_string(),
-            preflight_token: "preflight-b".to_string(),
-            plan_token: "plan-b".to_string(),
-            status: "running".to_string(),
-            ..Default::default()
-        };
-        let conflicting_preflight = conflicting_operation.preflight_token.clone();
-        let err = admit_site_replication_repair_operation(
-            &mut state,
-            conflicting_operation.operation_id.clone(),
-            &conflicting_preflight,
-            conflicting_operation,
-        )
-        .expect_err("a different operation must not pass a persisted running operation");
-        assert_eq!(err.code(), &S3ErrorCode::ClientTokenConflict);
-
-        let stale_candidate = SiteReplicationRepairOperation {
-            plan_token: "plan-changed".to_string(),
-            ..existing.clone()
-        };
-        let err = admit_site_replication_repair_operation(
-            &mut state,
-            existing.operation_id.clone(),
-            &existing.preflight_token,
-            stale_candidate,
-        )
-        .expect_err("a resumed operation must remain bound to its original plan");
-        assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
-
-        let err =
-            admit_site_replication_repair_operation(&mut state, existing.operation_id.clone(), "different-preflight", existing)
-                .expect_err("an operation ID must remain bound to its original preflight");
-        assert_eq!(err.code(), &S3ErrorCode::ClientTokenConflict);
+        let compat =
+            add_preflight_bucket_compat("https://a.example.com", "b", &suspended).expect("suspended config should parse");
+        assert!(!compat.versioning_enabled, "suspended versioning is not merge-safe");
     }
 
+    // rustfs/backlog#2070: a committed add must supersede this site's own
+    // half-finished removal (mirroring the join side, rustfs/rustfs#5963) —
+    // otherwise the reconcile tick replays the stale removal against the
+    // freshly re-paired peer and dismantles the new pairing.
     #[test]
-    fn test_site_replication_repair_history_never_prunes_retriable_operations() {
-        let mut operations = (0..=SITE_REPLICATION_REPAIR_OPERATION_LIMIT)
-            .map(|index| {
-                (
-                    format!("success-{index}"),
-                    SiteReplicationRepairOperation {
-                        operation_id: format!("success-{index}"),
-                        status: "success".to_string(),
-                        created_at: OffsetDateTime::from_unix_timestamp(i64::try_from(index).expect("small test index")).ok(),
-                        ..Default::default()
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        operations.insert(
-            "partial".to_string(),
-            SiteReplicationRepairOperation {
-                operation_id: "partial".to_string(),
-                status: "partial".to_string(),
-                created_at: Some(OffsetDateTime::UNIX_EPOCH),
+    fn test_adopt_add_commit_state_clears_pending_remove() {
+        let mut state = SiteReplicationState {
+            pending_remove: Some(PendingRemove {
+                id: "remove-1".to_string(),
                 ..Default::default()
-            },
-        );
-
-        prune_site_replication_repair_operations(&mut operations);
-
-        assert!(operations.contains_key("partial"));
-        assert_eq!(operations.len(), SITE_REPLICATION_REPAIR_OPERATION_LIMIT);
-        assert!(!operations.contains_key("success-0"));
-        assert!(!operations.contains_key("success-1"));
-    }
-
-    #[test]
-    fn test_site_replication_state_replicates_ilm_expiry_detects_enabled_peer() {
-        let mut state = SiteReplicationState::default();
-        state.peers.insert(
-            "remote".to_string(),
-            PeerInfo {
-                replicate_ilm_expiry: true,
-                ..peer("remote", "https://remote.example.com")
-            },
-        );
-
-        assert!(site_replication_state_replicates_ilm_expiry(&state));
-    }
-
-    #[test]
-    fn test_retry_event_upsert_marks_repeated_failures() {
-        let peer = PeerInfo {
-            deployment_id: "remote-dep".to_string(),
-            ..peer("remote", "https://remote.example.com")
+            }),
+            edit_generation: 7,
+            ..Default::default()
         };
-        let mut queue = Vec::new();
+        let next_state = SiteReplicationState {
+            name: "local".to_string(),
+            peers: BTreeMap::from([
+                ("local-dep".to_string(), peer("local", "https://local.example.com")),
+                ("remote-dep".to_string(), peer("remote", "https://remote.example.com")),
+            ]),
+            updated_at: Some(OffsetDateTime::now_utc()),
+            sync_state_initialized: true,
+            ..Default::default()
+        };
 
-        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "first", None);
-        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "second", None);
-        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "third", None);
+        adopt_add_commit_state(&mut state, next_state);
 
-        assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
-        assert_eq!(queue[0].retry_count, SITE_REPLICATION_RETRY_FAILED_AFTER);
-        assert!(queue[0].failed);
-        assert_eq!(queue[0].last_error, "third");
+        assert!(state.pending_remove.is_none(), "the committed add supersedes the removal");
+        assert_eq!(state.peers.len(), 2, "the add's topology is adopted");
+        assert_eq!(state.edit_generation, 7, "commit-owned fields keep the loaded value");
     }
 
-    /// P1-15 review follow-up: a successful peer-edit delivery only proves the
-    /// peer reached the state THAT delivery carried. Settling it must not
-    /// erase a retry event a newer edit left behind, or the local site sits on
-    /// edit B, the peer on edit A, and nothing is queued to converge them.
+    // Fail closed: a config this site cannot read must fail the preflight
+    // instead of defaulting into an unsafe admission.
     #[test]
-    fn retry_settlement_must_not_erase_a_newer_generation_failure() {
-        let peer = PeerInfo {
-            deployment_id: "remote-dep".to_string(),
-            ..peer("remote", "https://remote.example.com")
+    fn test_add_preflight_bucket_compat_rejects_undecodable_config() {
+        let info = SRBucketInfo {
+            versioning: Some(BASE64_STANDARD.encode_to_string(b"<VersioningConfiguration")),
+            ..Default::default()
         };
-        let mut queue = Vec::new();
 
-        // Edit A (generation 5) delivered successfully and is stalled before
-        // settling. Edit B (generation 6) commits meanwhile, fails delivery to
-        // the same peer, and enqueues.
-        upsert_site_replication_retry_event(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, "peer offline", Some(6));
+        let err = add_preflight_bucket_compat("https://a.example.com", "b", &info).expect_err("broken XML should fail");
 
-        // A resumes: its own settlement must leave B's retry alone.
-        assert_eq!(
-            settle_site_replication_retry_events(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, Some(5)),
-            0
-        );
-        assert_eq!(queue.len(), 1, "the newer edit's retry event was erased by an older success");
-        assert_eq!(queue[0].edit_generation, Some(6));
-
-        // An even older delivery failing afterwards must not lower the fence.
-        upsert_site_replication_retry_event(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, "still offline", Some(4));
-        assert_eq!(queue[0].edit_generation, Some(6));
-
-        // B's own delivery succeeding is what clears it.
-        assert_eq!(
-            settle_site_replication_retry_events(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, Some(6)),
-            1
-        );
-        assert!(queue.is_empty());
-
-        // Collapsed broadcast failures live under an internal snapshot path;
-        // an unrelated success on their shared wire path cannot settle them.
-        let iam_path = "/rustfs/admin/v3/site-replication/peer/iam-item";
-        upsert_site_replication_retry_event(&mut queue, &peer, iam_path, "peer offline", None);
-        assert_eq!(dequeue_site_replication_retry_events(&mut queue, &peer, iam_path), 0);
-        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
+        assert!(err.to_string().contains("unreadable versioning config"));
     }
 
     /// P1-15 review follow-up: the receiving side of the ordering fence. Two
@@ -15367,8 +11869,9 @@ mod tests {
     /// A fence is self-reported: every site authenticates peer traffic with
     /// the same site-replicator credential, so a compromised peer can stamp
     /// ANY origin with ANY generation. An origin the receiver does not
-    /// replicate with — or the receiver itself — is ignored and plants no
-    /// mark; a mark a compromised peer plants for a CURRENT origin cannot
+    /// replicate with — or the receiver itself — is inadmissible and plants
+    /// no mark; the handler acknowledges such a request without applying its
+    /// body. A mark a compromised peer plants for a CURRENT origin cannot
     /// silence that origin, because the staleness window refuses to fence on
     /// a mark implausibly far above the genuine deliveries.
     #[test]
@@ -15592,126 +12095,6 @@ mod tests {
         );
     }
 
-    /// The `previous + 1` half of the hybrid clock: allocations stay strictly
-    /// increasing even when the wall clock cannot move them forward — two
-    /// allocations inside one clock tick, or a clock that stepped backwards
-    /// mid-lifetime (a counter already ahead of the wall clock advances by
-    /// exactly one per allocation instead of jumping back). Dropping the
-    /// `previous + 1` half (allocating bare wall time) turns this red.
-    #[test]
-    fn hybrid_generation_is_strictly_increasing_when_the_clock_stalls() {
-        let mut state = SiteReplicationState {
-            // A counter far ahead of any wall clock this test will see.
-            edit_generation: u64::MAX / 2,
-            ..Default::default()
-        };
-        assert_eq!(next_peer_edit_generation(&mut state), u64::MAX / 2 + 1);
-        assert_eq!(next_peer_edit_generation(&mut state), u64::MAX / 2 + 2);
-        // Saturation pins at the ceiling instead of wrapping; the equal-value
-        // escape (`applied > generation` is false for equal) keeps deliveries
-        // applying rather than fencing the origin out.
-        state.edit_generation = u64::MAX;
-        assert_eq!(next_peer_edit_generation(&mut state), u64::MAX);
-    }
-
-    #[test]
-    fn test_retry_stats_for_state_counts_pending_and_failed() {
-        let state = SiteReplicationState {
-            retry_queue: vec![
-                SiteReplicationRetryEvent {
-                    failed: false,
-                    last_error: "pending".to_string(),
-                    ..Default::default()
-                },
-                SiteReplicationRetryEvent {
-                    failed: true,
-                    last_error: "failed".to_string(),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-
-        let stats = retry_stats_for_state(&state).expect("retry stats should be present");
-
-        assert_eq!(stats.pending, 1);
-        assert_eq!(stats.failed, 1);
-        assert_eq!(stats.last_error, "failed");
-    }
-
-    #[test]
-    fn test_retry_event_dequeue_matches_deployment_id_or_endpoint() {
-        let peer = PeerInfo {
-            deployment_id: "current-dep".to_string(),
-            ..peer("remote", "https://remote.example.com")
-        };
-        let path = SITE_REPLICATION_PEER_EDIT_PATH;
-        let mut queue = vec![
-            SiteReplicationRetryEvent {
-                id: "same-endpoint".to_string(),
-                peer_deployment_id: "old-dep".to_string(),
-                peer_endpoint: "https://remote.example.com".to_string(),
-                path: path.to_string(),
-                ..Default::default()
-            },
-            SiteReplicationRetryEvent {
-                id: "different-path".to_string(),
-                peer_deployment_id: "old-dep".to_string(),
-                peer_endpoint: "https://remote.example.com".to_string(),
-                path: "/rustfs/admin/v3/site-replication/peer/bucket-meta".to_string(),
-                ..Default::default()
-            },
-        ];
-
-        let removed = dequeue_site_replication_retry_events(&mut queue, &peer, path);
-
-        assert_eq!(removed, 1);
-        assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].id, "different-path");
-    }
-
-    #[test]
-    fn test_retry_event_replayed_by_bootstrap_only_clears_replayable_bucket_ops() {
-        let retry_event = |id: &str, path: &str| SiteReplicationRetryEvent {
-            id: id.to_string(),
-            path: path.to_string(),
-            ..Default::default()
-        };
-        let mut queue = vec![
-            retry_event(
-                "make",
-                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning",
-            ),
-            retry_event(
-                "configure",
-                "/rustfs/admin/v3/site-replication/peer/bucket-ops?operation=configure-replication&bucket=photos",
-            ),
-            retry_event(
-                "delete",
-                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket",
-            ),
-            retry_event(
-                "force-delete",
-                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=force-delete-bucket",
-            ),
-            retry_event(
-                "purge",
-                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=purge-deleted-bucket",
-            ),
-            retry_event(
-                "unknown",
-                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=custom",
-            ),
-            retry_event("iam", "/rustfs/admin/v3/site-replication/peer/iam-item"),
-            retry_event("bucket-meta", "/rustfs/admin/v3/site-replication/peer/bucket-meta"),
-        ];
-
-        queue.retain(|event| !retry_event_replayed_by_bootstrap(event));
-
-        let retained_ids = queue.iter().map(|event| event.id.as_str()).collect::<Vec<_>>();
-        assert_eq!(retained_ids, vec!["delete", "force-delete", "purge", "unknown", "iam", "bucket-meta"]);
-    }
-
     #[test]
     fn test_remove_sites_prunes_retry_queue_for_removed_peer() {
         let state = SiteReplicationState {
@@ -15731,6 +12114,13 @@ mod tests {
                 path: "/rustfs/admin/v3/site-replication/peer/iam-item".to_string(),
                 ..Default::default()
             }],
+            iam_deletion_replays: vec![SiteReplicationIamDeletionReplay {
+                id: "record-1".to_string(),
+                peer_deployment_id: "remote-dep".to_string(),
+                peer_endpoint: "https://remote.example.com".to_string(),
+                entity: "iam-user:alice".to_string(),
+                ..Default::default()
+            }],
             ..Default::default()
         };
 
@@ -15743,6 +12133,10 @@ mod tests {
         );
 
         assert!(state.retry_queue.is_empty());
+        assert!(
+            state.iam_deletion_replays.is_empty(),
+            "a departed peer's recorded deletions can never be replayed"
+        );
     }
 
     #[test]
@@ -15800,6 +12194,188 @@ mod tests {
         );
     }
 
+    fn endpoint_refresh_remove_fixture() -> (SiteReplicationState, PendingEndpointRefresh, PeerInfo) {
+        let local = PeerInfo {
+            deployment_id: "site-a-dep".to_string(),
+            name: "site-a".to_string(),
+            ..peer("site-a", "https://site-a.example.com")
+        };
+        let edited = PeerInfo {
+            deployment_id: "site-b-dep".to_string(),
+            name: "site-b".to_string(),
+            ..peer("site-b", "https://new-site-b.example.com")
+        };
+        let unavailable = PeerInfo {
+            deployment_id: "site-c-dep".to_string(),
+            name: "site-c".to_string(),
+            ..peer("site-c", "https://site-c.example.com")
+        };
+        let peers = BTreeMap::from([
+            (local.deployment_id.clone(), local.clone()),
+            (edited.deployment_id.clone(), edited.clone()),
+            (unavailable.deployment_id.clone(), unavailable),
+        ]);
+        let pending = PendingEndpointRefresh {
+            id: "refresh-1".to_string(),
+            peer: edited,
+            remote_peers: peers.clone(),
+            acked_deployment_ids: BTreeSet::from(["site-b-dep".to_string()]),
+            ..Default::default()
+        };
+        let state = SiteReplicationState {
+            name: local.name.clone(),
+            peers,
+            pending_endpoint_refresh: Some(pending.clone()),
+            ..Default::default()
+        };
+        (state, pending, local)
+    }
+
+    #[test]
+    fn pending_endpoint_refresh_allows_removing_every_unacked_peer() {
+        let (state, pending, local) = endpoint_refresh_remove_fixture();
+        let remove_unacked = SRRemoveReq {
+            site_names: vec!["site-c".to_string()],
+            ..Default::default()
+        };
+        let remove_acked_only = SRRemoveReq {
+            site_names: vec!["site-b".to_string()],
+            ..Default::default()
+        };
+
+        assert!(pending_endpoint_refresh_allows_remove(&state, &pending, &local, &remove_unacked));
+        assert!(!pending_endpoint_refresh_allows_remove(&state, &pending, &local, &remove_acked_only));
+        assert!(pending_endpoint_refresh_allows_remove(
+            &state,
+            &pending,
+            &local,
+            &SRRemoveReq {
+                remove_all: true,
+                ..Default::default()
+            }
+        ));
+    }
+
+    /// The peer-side edit handler journals a refresh with no `remote_peers`
+    /// and commits it inside the same request. That journal reads as complete
+    /// on sight, so the reconcile tick must not adopt it: committing it here
+    /// would use `edit_state` (no local-name sync) and would clear the journal
+    /// under the request that owns it, whose own commit then reports the
+    /// refresh as changed and denies the coordinator its acknowledgement.
+    /// Needs a live store to exercise, so pin the shape instead: the undo
+    /// must cover every bucket the pass already rewrote, not only the one
+    /// holding the lock when the removal was noticed.
+    #[test]
+    fn an_interrupted_endpoint_refresh_undoes_every_bucket_it_rewrote() {
+        let body = include_str!("site_replication.rs")
+            .split("async fn refresh_bucket_targets_after_endpoint_edit")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn site_bucket_resync_manifest_entry").next())
+            .expect("refresh body");
+
+        assert!(body.contains("rewritten.push(bucket.name.clone());"));
+        assert!(
+            body.contains("for name in "),
+            "the removal undo must walk every bucket rewritten in this pass"
+        );
+    }
+
+    #[test]
+    fn a_pending_endpoint_refresh_pins_its_ilm_expiry_override() {
+        let (_, pending, _) = endpoint_refresh_remove_fixture();
+        let with_override = PendingEndpointRefresh {
+            ilm_expiry_override: Some(true),
+            ..pending.clone()
+        };
+
+        assert!(
+            !endpoint_refresh_ilm_override_conflicts(&with_override, None),
+            "re-running the edit without the flag redrives the pinned refresh"
+        );
+        assert!(!endpoint_refresh_ilm_override_conflicts(&with_override, Some(true)));
+        assert!(
+            endpoint_refresh_ilm_override_conflicts(&with_override, Some(false)),
+            "a different requested value must be rejected, not silently ignored"
+        );
+        assert!(
+            endpoint_refresh_ilm_override_conflicts(&pending, Some(false)),
+            "the journal pins an unset override too"
+        );
+    }
+
+    #[test]
+    fn a_peer_side_endpoint_refresh_journal_is_not_resumed_locally() {
+        let (state, coordinator_pending, local) = endpoint_refresh_remove_fixture();
+        let peer_side = PendingEndpointRefresh {
+            remote_peers: BTreeMap::new(),
+            acked_deployment_ids: BTreeSet::new(),
+            ..coordinator_pending.clone()
+        };
+
+        assert!(pending_endpoint_refresh_is_locally_driven(&coordinator_pending));
+        assert!(!pending_endpoint_refresh_is_locally_driven(&peer_side));
+        assert!(
+            pending_endpoint_refresh_is_complete(&state, &peer_side, &local),
+            "a peer-side journal has no required peers, so only the driver guard keeps the tick off it"
+        );
+        assert!(
+            include_str!("site_replication.rs")
+                .split("async fn resume_pending_endpoint_refresh")
+                .nth(1)
+                .and_then(|rest| rest.split("async fn pending_remove_ready_to_finalize").next())
+                .expect("resume body")
+                .contains("pending_endpoint_refresh_is_locally_driven"),
+            "the resume path must refuse a journal it does not own"
+        );
+    }
+
+    #[test]
+    fn pending_endpoint_refresh_completion_ignores_a_peer_removed_from_the_topology() {
+        let (mut state, pending, local) = endpoint_refresh_remove_fixture();
+        assert!(!pending_endpoint_refresh_is_complete(&state, &pending, &local));
+
+        state.peers.remove("site-c-dep");
+        assert!(pending_endpoint_refresh_is_complete(&state, &pending, &local));
+    }
+
+    #[test]
+    fn removing_the_edited_peer_discards_its_pending_endpoint_refresh() {
+        let (state, pending, _) = endpoint_refresh_remove_fixture();
+        assert_eq!(
+            endpoint_refresh_postwrite_state(&state, &pending.id, &pending.peer.deployment_id),
+            EndpointRefreshPostwriteState::Current
+        );
+        let mut state = remove_sites(
+            state,
+            SRRemoveReq {
+                site_names: vec!["site-b".to_string(), "site-c".to_string()],
+                ..Default::default()
+            },
+        );
+
+        discard_endpoint_refresh_if_target_was_removed(&mut state);
+
+        assert!(pending_endpoint_refresh(&state).is_none());
+        assert!(
+            state
+                .retry_queue
+                .iter()
+                .all(|event| event.path != SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH)
+        );
+        assert_eq!(
+            endpoint_refresh_postwrite_state(&state, &pending.id, &pending.peer.deployment_id),
+            EndpointRefreshPostwriteState::TargetRemoved,
+            "a refresh write racing this removal must clean the stale target it may have restored"
+        );
+
+        let mut completed = endpoint_refresh_remove_fixture().0;
+        completed.pending_endpoint_refresh = None;
+        assert_eq!(
+            endpoint_refresh_postwrite_state(&completed, &pending.id, &pending.peer.deployment_id),
+            EndpointRefreshPostwriteState::Superseded
+        );
+    }
+
     #[test]
     fn test_normalize_join_peers_rewrites_local_endpoint_to_real_deployment_id() {
         let local_peer = PeerInfo {
@@ -15831,143 +12407,170 @@ mod tests {
     }
 
     #[test]
-    fn test_site_identity_key_deduplicates_scheme_drift_on_same_host_port() {
-        assert_eq!(
-            site_identity_key("https://node-a.example.com:9000"),
-            site_identity_key("http://NODE-A.example.com:9000/"),
+    fn test_peer_identity_join_snapshot_uses_verified_ids() {
+        let actual = ["site-a", "site-b", "site-c"].map(|name| PeerInfo {
+            deployment_id: format!("{name}-deployment"),
+            ..peer(name, &format!("https://{name}.example.com:9000"))
+        });
+        let preflight = actual
+            .iter()
+            .map(|peer| preflight_site("reported-name", &peer.endpoint, &peer.deployment_id, 0))
+            .collect::<Vec<_>>();
+        let sites = actual
+            .iter()
+            .map(|peer| PeerSite {
+                name: peer.name.clone(),
+                endpoint: peer.endpoint.clone(),
+                skip_tls_verify: true,
+                ca_cert_pem: "requested-ca".to_string(),
+                ..Default::default()
+            })
+            .collect();
+        let state = merge_add_sites(
+            SiteReplicationState::default(),
+            actual[0].clone(),
+            sites,
+            &preflight,
+            "svc-ak".to_string(),
+            "root".to_string(),
+            false,
         );
-    }
-
-    #[test]
-    fn test_normalize_peer_map_by_identity_prefers_https_endpoint() {
-        let peers = BTreeMap::from([
-            (
-                "peer-http".to_string(),
-                PeerInfo {
-                    deployment_id: "peer-http".to_string(),
-                    ..peer("peer", "http://node-a.example.com:9000")
+        assert_eq!(state.peers.len(), actual.len());
+        for expected in &actual {
+            let stored = state
+                .peers
+                .get(&expected.deployment_id)
+                .expect("verified ID in initial join map");
+            assert_eq!(stored.name, expected.name);
+            assert_eq!(stored.endpoint, expected.endpoint);
+            assert!(stored.skip_tls_verify);
+            assert_eq!(stored.ca_cert_pem, "requested-ca");
+        }
+        for local in &actual[1..] {
+            let mut joined = SiteReplicationState::default();
+            apply_peer_join(
+                &mut joined,
+                local,
+                SRPeerJoinReq {
+                    peers: state.peers.clone(),
+                    ..Default::default()
                 },
-            ),
-            (
-                "peer-https".to_string(),
-                PeerInfo {
-                    deployment_id: "peer-https".to_string(),
-                    ..peer("peer", "https://node-a.example.com:9000")
-                },
-            ),
-        ]);
-
-        let normalized = normalize_peer_map_by_identity(peers);
-        assert_eq!(normalized.len(), 1);
-        let normalized_peer = normalized.values().next().expect("normalized peer");
-        assert!(normalized_peer.endpoint.starts_with("https://"));
+                true,
+            );
+            assert_eq!(joined.peers.keys().collect::<Vec<_>>(), state.peers.keys().collect::<Vec<_>>());
+        }
     }
 
     #[test]
-    fn test_request_endpoint_prefers_forwarded_proto() {
-        let uri: Uri = "/rustfs/admin/v3/site-replication/status".parse().unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-scheme", HeaderValue::from_static("http"));
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        headers.insert("host", HeaderValue::from_static("node-a.example.com:9000"));
-
-        let endpoint = request_endpoint(&uri, &headers);
-
-        assert_eq!(endpoint, "https://node-a.example.com:9000");
+    fn test_peer_identity_legacy_edit_does_not_restore_placeholder() {
+        let actual = PeerInfo {
+            deployment_id: "actual-remote".to_string(),
+            ..peer("remote", "http://remote.example.com:9000")
+        };
+        for name in ["remote", ""] {
+            let state = SiteReplicationState {
+                peers: BTreeMap::from([(actual.deployment_id.clone(), actual.clone())]),
+                ..Default::default()
+            };
+            let mut incoming = PeerInfo {
+                deployment_id: deployment_id_for_endpoint("https://REMOTE.example.com:9000/"),
+                sync_state: SyncStatus::Enable,
+                ..peer(name, "https://REMOTE.example.com:9000/")
+            };
+            align_peer_edit_deployment_id(&state, &mut incoming);
+            let state = update_peer(state, incoming, None);
+            assert_eq!(state.peers.len(), 1);
+            assert_eq!(state.peers[&actual.deployment_id].sync_state, SyncStatus::Enable);
+        }
     }
 
     #[test]
-    fn test_request_endpoint_uses_absolute_uri_without_host_header() {
-        let uri: Uri = "https://node-a.example.com:9443/rustfs/admin/v3/site-replication/status"
-            .parse()
-            .unwrap();
-        let headers = HeaderMap::new();
-
-        let endpoint = request_endpoint(&uri, &headers);
-
-        assert_eq!(endpoint, "https://node-a.example.com:9443");
-    }
-
-    #[test]
-    fn test_request_endpoint_falls_back_to_https_when_tls_path_is_configured() {
-        with_var(ENV_RUSTFS_TLS_PATH, Some("/tmp/tls"), || {
-            let uri: Uri = "/rustfs/admin/v3/site-replication/status".parse().unwrap();
-            let headers = HeaderMap::new();
-
-            let endpoint = request_endpoint(&uri, &headers);
-
-            assert!(endpoint.starts_with("https://"));
+    fn test_peer_identity_finalization_repairs_legacy_three_site_join() {
+        let actual = ["site-a", "site-b", "site-c"].map(|name| PeerInfo {
+            deployment_id: format!("{name}-deployment"),
+            ..peer(name, &format!("http://{name}.example.com:9000"))
         });
+        let sites = actual
+            .iter()
+            .map(|peer| PeerSite {
+                name: peer.name.clone(),
+                endpoint: peer.endpoint.clone(),
+                ..Default::default()
+            })
+            .collect();
+        let mut coordinator = merge_add_sites(
+            SiteReplicationState::default(),
+            actual[0].clone(),
+            sites,
+            &[],
+            "svc-ak".to_string(),
+            "root".to_string(),
+            true,
+        );
+        let join = SRPeerJoinReq {
+            peers: coordinator.peers.clone(),
+            ..Default::default()
+        };
+        for remote in &actual[1..] {
+            coordinator = reconcile_peer_with_actual_identity(coordinator, remote.clone());
+        }
+        mark_unknown_peer_sync_enabled(&mut coordinator.peers);
+
+        for local in &actual[1..] {
+            let mut state = SiteReplicationState::default();
+            apply_peer_join(&mut state, local, join.clone(), true);
+            for mut incoming in coordinator.peers.values().cloned() {
+                align_peer_edit_deployment_id(&state, &mut incoming);
+                state = apply_internal_peer_edit(state, local, incoming, None).expect("finalize peer identity");
+            }
+            assert_eq!(state.peers.len(), actual.len(), "finalization must not retain placeholder peers");
+            for expected in &actual {
+                let stored = existing_peer_for_endpoint(&state, &expected.endpoint).expect("peer remains configured");
+                assert_eq!(stored.deployment_id, expected.deployment_id, "observer: {}", local.name);
+                assert_eq!(stored.sync_state, SyncStatus::Enable);
+            }
+        }
     }
 
     #[test]
-    fn test_site_replication_local_endpoint_uses_api_port_for_console_host_header() {
-        let uri: Uri = "/rustfs/admin/v3/site-replication/status".parse().unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        headers.insert("host", HeaderValue::from_static("node-a.example.com:9001"));
-
-        let endpoint = site_replication_local_endpoint(&uri, &headers);
-
-        assert_eq!(endpoint, "https://node-a.example.com:9000");
-    }
-
-    #[test]
-    fn test_site_replication_local_endpoint_preserves_ipv6_host() {
-        let uri: Uri = "/rustfs/admin/v3/site-replication/status".parse().unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        headers.insert("host", HeaderValue::from_static("[::1]:9001"));
-
-        let endpoint = site_replication_local_endpoint(&uri, &headers);
-
-        assert_eq!(endpoint, "https://[::1]:9000");
-    }
-
-    #[test]
-    fn test_site_replication_local_endpoint_preserves_non_console_port() {
-        let uri: Uri = "/rustfs/admin/v3/site-replication/status".parse().unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        headers.insert("host", HeaderValue::from_static("lb.example.com:9443"));
-
-        let endpoint = site_replication_local_endpoint(&uri, &headers);
-
-        assert_eq!(endpoint, "https://lb.example.com:9443");
-    }
-
-    #[test]
-    fn test_site_replication_local_endpoint_rejects_forwarded_non_http_scheme() {
-        let uri: Uri = "/rustfs/admin/v3/site-replication/status".parse().unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("ftp"));
-        headers.insert("host", HeaderValue::from_static("node-a.example.com:9000"));
-
-        let endpoint = site_replication_local_endpoint(&uri, &headers);
-
-        assert!(!endpoint.starts_with("ftp://"));
-    }
-
-    #[test]
-    fn test_runtime_tls_enabled_prefers_explicit_tls_over_http_runtime_endpoint() {
-        let endpoints = EndpointServerPools::from(vec![PoolEndpoints {
-            legacy: false,
-            set_count: 1,
-            drives_per_set: 1,
-            endpoints: Endpoints::from(vec![Endpoint {
-                url: Url::parse("http://127.0.0.1:9000/tmp").unwrap(),
-                is_local: true,
-                pool_idx: 0,
-                set_idx: 0,
-                disk_idx: 0,
-            }]),
-            cmd_line: String::new(),
-            platform: String::new(),
-        }]);
-
-        with_var(ENV_RUSTFS_TLS_PATH, Some("/tmp/tls"), || {
-            assert!(runtime_tls_enabled_with(Some(&endpoints)));
-        });
+    fn test_peer_identity_edit_replaces_placeholder_for_canonical_endpoint() {
+        let local = PeerInfo {
+            deployment_id: "local-deployment".to_string(),
+            ..peer("local", "https://local.example.com:9000")
+        };
+        let endpoint = "http://remote.example.com:9000";
+        let placeholder = PeerInfo {
+            deployment_id: deployment_id_for_endpoint(endpoint),
+            ..peer("remote", endpoint)
+        };
+        for deployment_id in ["00000000-0000-4000-8000-000000000001", "ffffffff-ffff-4fff-bfff-ffffffffffff"] {
+            for name in ["remote", ""] {
+                for already_present in [false, true] {
+                    let mut incoming = PeerInfo {
+                        deployment_id: deployment_id.to_string(),
+                        sync_state: SyncStatus::Enable,
+                        ..peer(name, "https://REMOTE.example.com:9000/")
+                    };
+                    let mut state = SiteReplicationState {
+                        peers: BTreeMap::from([
+                            (local.deployment_id.clone(), local.clone()),
+                            (placeholder.deployment_id.clone(), placeholder.clone()),
+                        ]),
+                        ..Default::default()
+                    };
+                    if already_present {
+                        state.peers.insert(incoming.deployment_id.clone(), incoming.clone());
+                    }
+                    align_peer_edit_deployment_id(&state, &mut incoming);
+                    let state = apply_internal_peer_edit(state, &local, incoming, None).expect("repair peer identity");
+                    assert_eq!(state.peers.len(), 2, "repair must replace, not duplicate, the placeholder");
+                    assert!(!state.peers.contains_key(&placeholder.deployment_id));
+                    assert!(state.peers.contains_key(deployment_id));
+                    let normalized = normalize_peer_map_by_identity(state.peers);
+                    assert!(normalized.contains_key(deployment_id), "normalization must retain the actual ID");
+                }
+            }
+        }
     }
 
     #[test]
@@ -16019,28 +12622,6 @@ mod tests {
         state = sync_state_name_for_local_peer(state, &local_peer, &incoming);
 
         assert_eq!(state.name, "new-local");
-    }
-
-    #[test]
-    fn test_site_replication_state_requires_remote_peer_to_be_enabled() {
-        let mut state = SiteReplicationState::default();
-        state.peers.insert(
-            "local".to_string(),
-            PeerInfo {
-                deployment_id: "local".to_string(),
-                ..peer("local", "https://local.example.com")
-            },
-        );
-
-        assert!(!state.enabled());
-    }
-
-    #[test]
-    fn test_sr_remove_req_accepts_null_sites() {
-        let req: SRRemoveReq = serde_json::from_str(r#"{"all":true,"sites":null}"#).expect("parse remove req");
-
-        assert!(req.remove_all);
-        assert!(req.site_names.is_empty());
     }
 
     #[test]
@@ -16356,33 +12937,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bucket_target_matches_peer_by_deployment_id() {
-        let target = BucketTarget {
-            deployment_id: "remote-dep".to_string(),
-            endpoint: "other-host:9000".to_string(),
-            target_type: BucketTargetType::ReplicationService,
-            ..Default::default()
-        };
-        let mut remote = peer("remote", "https://remote.example.com");
-        remote.deployment_id = "remote-dep".to_string();
-
-        assert!(bucket_target_matches_peer(&target, &remote));
-    }
-
-    #[test]
-    fn test_bucket_target_matches_peer_by_endpoint() {
-        let target = BucketTarget {
-            endpoint: "remote.example.com:443".to_string(),
-            secure: true,
-            target_type: BucketTargetType::ReplicationService,
-            ..Default::default()
-        };
-        let remote = peer("remote", "https://remote.example.com/");
-
-        assert!(bucket_target_matches_peer(&target, &remote));
-    }
-
-    #[test]
     fn test_peer_deployment_id_for_endpoint_matches_normalized_endpoint() {
         let mut state = SiteReplicationState::default();
         let mut remote = peer("remote", "https://remote.example.com");
@@ -16392,10 +12946,6 @@ mod tests {
         let deployment_id = peer_deployment_id_for_endpoint(&state, "https://remote.example.com/");
 
         assert_eq!(deployment_id.as_deref(), Some("remote-dep"));
-    }
-
-    fn home_office() -> HashSet<String> {
-        HashSet::from(["home".to_string(), "office".to_string()])
     }
 
     fn site_repl_config(peer: &str) -> ReplicationConfiguration {
@@ -16481,84 +13031,6 @@ mod tests {
         assert!(
             !is_missing_service_account_error(&IamError::IAMActionNotAllowed),
             "a permission failure is not evidence that the account is absent"
-        );
-    }
-
-    fn operator_rule(id: &str) -> ReplicationRule {
-        ReplicationRule {
-            id: Some(id.to_string()),
-            ..build_site_replication_rule("arn:aws:s3:::backup", 1, id)
-        }
-    }
-
-    // The one-directional bug: the joined site applied the initiator's replication config
-    // verbatim, so its own `site-repl-<initiator>` rule was replaced by a rule pointing at
-    // itself. No bucket target backs that ARN, so every object was dropped without a log.
-    #[test]
-    fn test_merge_incoming_replication_config_keeps_local_reverse_rule() {
-        let merged = merge_incoming_replication_config(
-            Some(site_repl_config("home")),
-            Some(site_repl_config("office")),
-            &home_office(),
-            OperatorRuleContract::Derived,
-        )
-        .expect("merge should keep the local rule");
-
-        assert_eq!(merged.rules.len(), 1);
-        assert_eq!(merged.rules[0].id.as_deref(), Some("site-repl-office"));
-        assert_eq!(merged.rules[0].destination.bucket, "arn:rustfs:replication::office:photos");
-    }
-
-    // A peer deleting its replication config must not delete the receiver's reverse rule
-    // either — the delete travels as `replication-config` with no payload.
-    #[test]
-    fn test_merge_incoming_replication_config_survives_peer_delete() {
-        let merged = merge_incoming_replication_config(
-            None,
-            Some(site_repl_config("office")),
-            &home_office(),
-            OperatorRuleContract::Derived,
-        )
-        .expect("local site rules must survive a peer delete");
-
-        assert_eq!(merged.rules.len(), 1);
-        assert_eq!(merged.rules[0].id.as_deref(), Some("site-repl-office"));
-    }
-
-    #[test]
-    fn test_merge_incoming_replication_config_replicates_operator_rules() {
-        let mut incoming = site_repl_config("home");
-        incoming.rules.push(operator_rule("nightly-backup"));
-        incoming.role = "arn:rustfs:replication::home:photos".to_string();
-
-        let merged = merge_incoming_replication_config(
-            Some(incoming),
-            Some(site_repl_config("office")),
-            &home_office(),
-            OperatorRuleContract::Derived,
-        )
-        .expect("merge should produce rules");
-
-        let ids: Vec<_> = merged.rules.iter().filter_map(|rule| rule.id.as_deref()).collect();
-        assert_eq!(ids, vec!["nightly-backup", "site-repl-office"]);
-        assert_eq!(merged.rules[0].priority, Some(1));
-        assert_eq!(merged.rules[1].priority, Some(2));
-        assert!(
-            merged.role.is_empty(),
-            "a site-replication ARN in `role` belongs to the sender and must not be adopted"
-        );
-    }
-
-    #[test]
-    fn test_merge_incoming_replication_config_returns_none_when_nothing_remains() {
-        assert!(
-            merge_incoming_replication_config(
-                Some(site_repl_config("home")),
-                None,
-                &home_office(),
-                OperatorRuleContract::Derived
-            )
-            .is_none()
         );
     }
 
@@ -16931,113 +13403,6 @@ mod tests {
         assert_eq!(local_lifecycle_staleness_axis(None, whole), whole, "deletion lower bound");
     }
 
-    /// Sender-side filter: only the expiry subset leaves this site. MinIO
-    /// peers install incoming rules verbatim, so a full document would plant
-    /// this site's transition rules there.
-    #[test]
-    fn test_lifecycle_expiry_subset_xml_strips_transitions() {
-        let full = serialize(&lc_config(vec![lc_rule("mixed", Some(1), Some(30)), lc_rule("t-only", None, Some(7))]))
-            .expect("serialize full config");
-
-        let subset = lifecycle_expiry_subset_xml(&full).expect("expiry subset should remain");
-        let parsed: s3s::dto::BucketLifecycleConfiguration = deserialize(&subset).expect("subset should parse");
-        assert_eq!(rule_ids(&parsed), vec!["mixed"]);
-        assert!(parsed.rules[0].transitions.is_none(), "transition side must not travel");
-
-        let transition_only =
-            serialize(&lc_config(vec![lc_rule("t-only", None, Some(7))])).expect("serialize transition-only config");
-        assert!(
-            lifecycle_expiry_subset_xml(&transition_only).is_none(),
-            "a transition-only config states 'no expiry rules' (delete semantics)"
-        );
-        assert!(lifecycle_expiry_subset_xml(b"").is_none());
-    }
-
-    /// A local parse failure must forward the document unfiltered — mapping
-    /// it to `None` would delete the peers' replicated expiry rules.
-    #[test]
-    fn test_lifecycle_expiry_subset_xml_forwards_unparseable_config() {
-        let garbage = b"<LifecycleConfiguration><Rule></Broken>";
-        assert_eq!(lifecycle_expiry_subset_xml(garbage).as_deref(), Some(garbage.as_slice()));
-    }
-
-    // `role` is part of the bucket's S3-visible configuration. Repairing a reverse rule must
-    // drop only a role naming a current peer, never an operator's own role — an IAM role or
-    // a remote target whose ARN carries an empty region — the same rule the merge path
-    // applies, so both paths agree on what is ours to rewrite.
-    #[test]
-    fn test_replication_role_is_only_cleared_when_it_names_a_peer() {
-        let sites = home_office();
-        assert!(!is_site_replication_role("arn:aws:iam::123456789012:role/replication", &sites));
-        assert!(!is_site_replication_role("arn:minio:replication::operator-dep:photos", &sites));
-        assert!(is_site_replication_role("arn:rustfs:replication::home:photos", &sites));
-
-        for operator_role in [
-            "arn:aws:iam::123456789012:role/replication",
-            "arn:minio:replication::operator-dep:photos",
-        ] {
-            let mut incoming = site_repl_config("home");
-            incoming.role = operator_role.to_string();
-            let merged = merge_incoming_replication_config(
-                Some(incoming),
-                Some(site_repl_config("office")),
-                &sites,
-                OperatorRuleContract::Derived,
-            )
-            .expect("merge should produce rules");
-            assert_eq!(merged.role, operator_role, "operator role must survive the merge");
-        }
-    }
-
-    // Rules and targets are keyed off the same ARN. Minting a fresh one while
-    // `reconcile_site_replication_bucket_targets` preserves a MinIO-era `arn:minio:...`
-    // target would leave the rule pointing at an ARN no target satisfies.
-    #[test]
-    fn test_build_site_replication_config_reuses_configured_arn() {
-        let mut state = SiteReplicationState {
-            service_account_access_key: "site-replicator-0".to_string(),
-            ..Default::default()
-        };
-        state.peers.insert(
-            "local".to_string(),
-            PeerInfo {
-                deployment_id: "local".to_string(),
-                ..peer("local", "https://local.example.com")
-            },
-        );
-        state.peers.insert(
-            "remote".to_string(),
-            PeerInfo {
-                deployment_id: "remote".to_string(),
-                ..peer("remote", "http://remote.example.com:9000")
-            },
-        );
-        let existing = ReplicationConfiguration {
-            role: String::new(),
-            rules: vec![build_site_replication_rule(
-                "arn:minio:replication::remote:photos",
-                1,
-                "site-repl-remote",
-            )],
-        };
-
-        let config = build_site_replication_config(
-            "photos",
-            &state,
-            &PeerInfo {
-                deployment_id: "local".to_string(),
-                ..peer("local", "https://local.example.com")
-            },
-            "runtime-iam-secret",
-            Some(&existing),
-        )
-        .expect("build site replication config")
-        .expect("a remote peer yields one rule");
-
-        assert_eq!(config.rules.len(), 1);
-        assert_eq!(config.rules[0].destination.bucket, "arn:minio:replication::remote:photos");
-    }
-
     #[test]
     fn test_reconcile_site_replication_bucket_targets_upserts_remote_peer_targets() {
         let mut state = SiteReplicationState {
@@ -17181,6 +13546,7 @@ mod tests {
             PendingEndpointRefresh {
                 id: "refresh-1".to_string(),
                 peer: retry_peer.clone(),
+                ilm_expiry_override: None,
                 remote_peers,
                 acked_deployment_ids: BTreeSet::new(),
             },
@@ -17297,12 +13663,14 @@ mod tests {
                 BucketTarget {
                     arn: "arn:rustfs:replication::removed-dep:photos".to_string(),
                     deployment_id: "removed-dep".to_string(),
+                    target_bucket: "photos".to_string(),
                     target_type: BucketTargetType::ReplicationService,
                     ..Default::default()
                 },
                 BucketTarget {
                     arn: "arn:rustfs:replication::kept-dep:photos".to_string(),
                     deployment_id: "kept-dep".to_string(),
+                    target_bucket: "photos".to_string(),
                     target_type: BucketTargetType::ReplicationService,
                     ..Default::default()
                 },
@@ -17315,7 +13683,8 @@ mod tests {
             ],
         };
 
-        let (updated, removed) = prune_removed_site_replication_bucket_targets(targets, &removed_deployment_ids);
+        let (updated, removed) =
+            prune_removed_site_replication_bucket_targets(targets, "photos", &removed_deployment_ids, &HashSet::new());
 
         assert_eq!(removed, 1);
         assert_eq!(updated.targets.len(), 2);
@@ -17326,6 +13695,107 @@ mod tests {
                 .iter()
                 .any(|target| target.target_type == BucketTargetType::IlmService)
         );
+    }
+
+    /// rustfs/backlog#2489: removing a peer drops the targets the site derived
+    /// for it — by pruned-rule ARN or same-name shape — and leaves an
+    /// operator's bucket-level target to that peer alone even though it
+    /// carries the peer's deployment id.
+    #[test]
+    fn test_prune_removed_site_replication_bucket_targets_keeps_operator_target_to_removed_peer() {
+        let removed_deployment_ids = HashSet::from(["removed-dep".to_string()]);
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                build_site_replication_rule("arn:rustfs:replication:eu-west-1:removed-dep:photos", 1, "site-repl-removed-dep"),
+                build_site_replication_rule("arn:minio:replication::removed-dep:photos-dst", 9, "operator-rule"),
+            ],
+        };
+        let removed_rule_arns = removed_site_replication_rule_arns(Some(&config), &removed_deployment_ids);
+        assert_eq!(
+            removed_rule_arns,
+            HashSet::from(["arn:rustfs:replication:eu-west-1:removed-dep:photos".to_string()]),
+            "only the derived rule's ARN is the site's"
+        );
+
+        let targets = BucketTargets {
+            targets: vec![
+                BucketTarget {
+                    arn: "arn:rustfs:replication:eu-west-1:removed-dep:photos".to_string(),
+                    deployment_id: "removed-dep".to_string(),
+                    target_bucket: "photos".to_string(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                },
+                BucketTarget {
+                    arn: "arn:minio:replication::removed-dep:photos-dst".to_string(),
+                    deployment_id: "removed-dep".to_string(),
+                    target_bucket: "photos-dst".to_string(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                },
+            ],
+        };
+        let (updated, removed) =
+            prune_removed_site_replication_bucket_targets(targets, "photos", &removed_deployment_ids, &removed_rule_arns);
+
+        assert_eq!(removed, 1);
+        assert_eq!(updated.targets.len(), 1);
+        assert_eq!(
+            updated.targets[0].target_bucket, "photos-dst",
+            "the operator target survives the peer removal"
+        );
+    }
+
+    /// rustfs/backlog#2489: the resync manifest picks the derived rule's
+    /// target, never an operator target to the same peer; without a derived
+    /// rule it falls back to the same-name shape.
+    #[test]
+    fn test_site_bucket_resync_target_for_peer_ignores_operator_target() {
+        let peer = PeerInfo {
+            deployment_id: "remote".to_string(),
+            ..peer("remote", "http://remote.example.com:9000")
+        };
+        let targets = BucketTargets {
+            targets: vec![
+                BucketTarget {
+                    arn: "arn:minio:replication::7c0c5a1e-operator:photos-dst".to_string(),
+                    deployment_id: "remote".to_string(),
+                    target_bucket: "photos-dst".to_string(),
+                    endpoint: "remote.example.com:9000".to_string(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                },
+                BucketTarget {
+                    arn: "arn:minio:replication::remote:photos".to_string(),
+                    deployment_id: "remote".to_string(),
+                    target_bucket: "photos".to_string(),
+                    endpoint: "remote.example.com:9000".to_string(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                },
+            ],
+        };
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                build_site_replication_rule("arn:minio:replication::7c0c5a1e-operator:photos-dst", 9, "operator-rule"),
+                build_site_replication_rule("arn:minio:replication::remote:photos", 1, "site-repl-remote"),
+            ],
+        };
+        let picked = site_bucket_resync_target_for_peer("photos", &config, &targets, &peer).expect("site target");
+        assert_eq!(picked.arn, "arn:minio:replication::remote:photos");
+
+        let without_rule = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![build_site_replication_rule(
+                "arn:minio:replication::7c0c5a1e-operator:photos-dst",
+                9,
+                "operator-rule",
+            )],
+        };
+        let picked = site_bucket_resync_target_for_peer("photos", &without_rule, &targets, &peer).expect("shape fallback");
+        assert_eq!(picked.arn, "arn:minio:replication::remote:photos");
     }
 
     #[test]
@@ -17349,55 +13819,6 @@ mod tests {
         assert_eq!(updated.rules[0].priority, Some(9), "the operator's priority is policy and stays");
         assert_eq!(updated.rules[1].id.as_deref(), Some("site-repl-kept-dep"));
         assert_eq!(updated.rules[1].priority, Some(1), "the derived rule moves to the lowest free slot");
-    }
-
-    // Issue #1948 review: one pre-contract peer pins an S3 edit to the legacy
-    // merge; only a cluster where every remote peer answered the probe moves
-    // to the derived contract. A probe error counts as a pre-contract peer.
-    #[test]
-    fn test_operator_rule_contract_requires_every_remote_peer() {
-        let home = normalize_peer_info(PeerInfo {
-            endpoint: "https://home.example.com".to_string(),
-            ..Default::default()
-        });
-        let office = normalize_peer_info(PeerInfo {
-            endpoint: "https://office.example.com".to_string(),
-            ..Default::default()
-        });
-
-        assert_eq!(operator_rule_contract_from_probes([]), OperatorRuleContract::Derived);
-        assert_eq!(
-            operator_rule_contract_from_probes([(&home, Ok(true)), (&office, Ok(true))]),
-            OperatorRuleContract::Derived
-        );
-        assert_eq!(
-            operator_rule_contract_from_probes([(&home, Ok(true)), (&office, Ok(false))]),
-            OperatorRuleContract::Legacy
-        );
-        assert_eq!(
-            operator_rule_contract_from_probes([(&home, Err(s3_error!(InternalError, "unreachable"))), (&office, Ok(true))]),
-            OperatorRuleContract::Legacy
-        );
-    }
-
-    // The contract travels with the payload: a pre-contract sender's item has
-    // no marker and is merged the legacy way; every item this site sends is
-    // marked, bootstrap snapshots included, so a preserved config is never
-    // renumbered by a peer on the derived contract.
-    #[test]
-    fn test_bucket_meta_items_carry_the_derived_rule_contract() {
-        let legacy: SRBucketMeta = serde_json::from_str(r#"{"type":"replication-config","bucket":"photos"}"#).expect("item");
-        assert!(!legacy.derived_rule_contract);
-
-        let bucket = SRBucketInfo {
-            bucket: "photos".to_string(),
-            ..Default::default()
-        };
-        let item = bootstrap_bucket_meta_item(&bucket, "replication-config", None);
-        assert!(item.derived_rule_contract);
-        let wire = serde_json::to_value(&item).expect("json");
-        assert_eq!(wire["derivedRuleContract"], serde_json::Value::Bool(true));
-        assert!(bucket_metadata_snapshot_tombstone(&item, OffsetDateTime::now_utc()).derived_rule_contract);
     }
 
     // Issue #1948 review: an owner's `site-repl-user` rule on an operator ARN
@@ -17430,44 +13851,6 @@ mod tests {
             .map(|rule| (rule.id.as_deref().unwrap(), rule.priority))
             .collect();
         assert_eq!(rules, vec![("site-repl-user", Some(9)), ("site-repl-kept-dep", Some(1))]);
-    }
-
-    #[test]
-    fn test_site_replication_state_does_not_serialize_service_account_secret() {
-        let state = SiteReplicationState {
-            service_account_access_key: "site-replicator-0".to_string(),
-            service_account_secret_key: "do-not-persist".to_string(),
-            ..Default::default()
-        };
-
-        let json = serde_json::to_value(&state).expect("serialize state");
-
-        assert!(json.get("service_account_secret_key").is_none());
-        assert!(json.get("service_account_access_key").is_some());
-    }
-
-    #[test]
-    fn test_pending_rotation_serializes_temporary_secret_until_cleanup() {
-        let state = SiteReplicationState {
-            service_account_access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
-            service_account_secret_key: "do-not-persist".to_string(),
-            pending_rotation: Some(PendingRotation {
-                id: "rotation-id".to_string(),
-                access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
-                parent: "root".to_string(),
-                new_secret_key: "temporary-new-secret".to_string(),
-                secret_candidates: vec!["temporary-old-secret".to_string()],
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let json = serde_json::to_value(&state).expect("serialize state");
-
-        assert!(json.get("service_account_secret_key").is_none());
-        let pending = json.get("pending_rotation").expect("pending rotation should serialize");
-        assert_eq!(pending.get("new_secret_key").and_then(Value::as_str), Some("temporary-new-secret"));
-        assert!(pending.get("secret_candidates").is_some());
     }
 
     #[test]
@@ -17526,18 +13909,65 @@ mod tests {
     }
 
     #[test]
+    fn test_pending_operation_for_state_reports_endpoint_refresh_progress() {
+        let local = PeerInfo {
+            deployment_id: "local".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let remote_a = PeerInfo {
+            deployment_id: "remote-a".to_string(),
+            ..peer("remote-a", "https://remote-a.example.com")
+        };
+        let remote_b = PeerInfo {
+            deployment_id: "remote-b".to_string(),
+            ..peer("remote-b", "https://remote-b.example.com")
+        };
+        let state = SiteReplicationState {
+            peers: BTreeMap::from([
+                (local.deployment_id.clone(), local.clone()),
+                (remote_a.deployment_id.clone(), remote_a.clone()),
+                (remote_b.deployment_id.clone(), remote_b.clone()),
+            ]),
+            pending_endpoint_refresh: Some(PendingEndpointRefresh {
+                id: "refresh-id".to_string(),
+                peer: PeerInfo {
+                    endpoint: "https://remote-a-new.example.com".to_string(),
+                    ..remote_a.clone()
+                },
+                remote_peers: BTreeMap::from([
+                    (remote_a.deployment_id.clone(), remote_a),
+                    (remote_b.deployment_id.clone(), remote_b),
+                    (local.deployment_id.clone(), local.clone()),
+                ]),
+                acked_deployment_ids: BTreeSet::from(["remote-b".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let operation = pending_operation_for_state(&state, &local).expect("pending endpoint refresh operation");
+
+        assert_eq!(operation.operation, "endpoint-refresh");
+        assert_eq!(operation.id, "refresh-id");
+        assert_eq!(operation.acked_peers, vec!["remote-b".to_string()]);
+        assert_eq!(operation.pending_peers, vec!["remote-a".to_string()]);
+    }
+
+    #[test]
     fn test_status_peer_error_summarizes_details() {
         let remote = PeerInfo {
             deployment_id: "remote".to_string(),
             ..peer("remote", "https://remote.example.com")
         };
-        let detail = "x".repeat(SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT + 32);
+        let detail = format!("HEAD{}TAIL", "x".repeat(SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT + 32));
 
         let error = status_peer_error(&remote, detail);
 
         assert_eq!(error.name, "remote");
         assert_eq!(error.endpoint, "https://remote.example.com");
-        assert!(error.error.ends_with("(truncated)"));
+        assert!(error.error.contains("(truncated)"));
+        assert!(error.error.starts_with("HEAD"));
+        assert!(error.error.ends_with("TAIL"));
         assert!(error.error.chars().count() <= SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT);
     }
 
@@ -17558,21 +13988,6 @@ mod tests {
     }
 
     #[test]
-    fn test_site_replication_peer_payload_encryption_matches_minio_contract() {
-        assert!(site_replication_peer_payload_encrypted("/minio/admin/v3/site-replication/peer/join"));
-        assert!(site_replication_peer_payload_encrypted(
-            "/minio/admin/v3/site-replication/peer/join?bootstrapToken=token"
-        ));
-        // The outbound rewrite no longer produces the legacy `/site-replication/join`
-        // path; it must not be treated as an encrypted MinIO route.
-        assert!(!site_replication_peer_payload_encrypted("/minio/admin/v3/site-replication/join"));
-        assert!(!site_replication_peer_payload_encrypted(
-            "/minio/admin/v3/site-replication/peer/bucket-meta"
-        ));
-        assert!(!site_replication_peer_payload_encrypted("/minio/admin/v3/site-replication/peer/iam-item"));
-    }
-
-    #[test]
     fn test_parse_peer_join_response_tolerates_empty_minio_success_body() {
         let fallback = PeerInfo {
             deployment_id: "remote-deployment".to_string(),
@@ -17584,6 +13999,7 @@ mod tests {
             assert_eq!(response.peer.deployment_id, "remote-deployment");
             assert_eq!(response.peer.endpoint, "https://remote.example.com");
             assert!(response.initial_sync_error_message.is_empty());
+            assert!(!response.initial_sync_deferred);
             assert_eq!(
                 response.applied, None,
                 "a MinIO empty-body success reports nothing; it must not read as a no-op join"
@@ -17593,6 +14009,7 @@ mod tests {
         let json = serde_json::to_vec(&SRPeerJoinResponse {
             peer: peer("actual", "https://actual.example.com"),
             initial_sync_error_message: "sync failed".to_string(),
+            initial_sync_deferred: false,
             applied: Some(true),
         })
         .expect("serialize join response");
@@ -17602,42 +14019,6 @@ mod tests {
         assert_eq!(response.applied, Some(true));
 
         assert!(parse_peer_join_response(b"not-json", fallback).is_err());
-    }
-
-    #[test]
-    fn test_secret_candidate_retry_only_for_auth_errors() {
-        assert!(peer_error_may_be_secret_mismatch(
-            "peer request failed with 403 Forbidden: SignatureDoesNotMatch"
-        ));
-        assert!(peer_error_may_be_secret_mismatch("AccessDenied"));
-        assert!(!peer_error_may_be_secret_mismatch("peer request failed (timeout): deadline elapsed"));
-        assert!(!peer_error_may_be_secret_mismatch("peer request failed (tls handshake): bad certificate"));
-    }
-
-    #[test]
-    fn test_bucket_meta_wire_values_are_base64_encoded_and_legacy_raw_decodes() {
-        let raw = "<VersioningConfiguration/>";
-        let item = encode_bucket_meta_wire_item(SRBucketMeta {
-            r#type: "version-config".to_string(),
-            bucket: "photos".to_string(),
-            versioning: Some(raw.to_string()),
-            ..Default::default()
-        });
-
-        let encoded = item.versioning.expect("encoded versioning config");
-
-        assert_eq!(decode_bucket_meta_wire_value(&encoded), raw.as_bytes());
-        assert_eq!(decode_bucket_meta_wire_value(raw), raw.as_bytes());
-        assert_ne!(encoded, raw);
-    }
-
-    #[test]
-    fn test_metainfo_bucket_config_values_are_base64_encoded() {
-        let raw = br#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>"#;
-
-        assert_eq!(raw_config_to_base64(raw), Some(BASE64_STANDARD.encode(raw)));
-        assert_ne!(raw_config_to_base64(raw), raw_config_to_string(raw));
-        assert_eq!(raw_config_to_base64(&[]), None);
     }
 
     #[test]
@@ -17652,47 +14033,353 @@ mod tests {
         assert!(!is_stale_update(local, None));
     }
 
+    /// Minimal model of one replicated IAM record (a policy document body, a
+    /// user/group mapping, or a group's member set) as the apply paths treat
+    /// it: `None` is "absent", `Some((content, stamp))` is the local record
+    /// with the timestamp of the change that last wrote it. Applying an item
+    /// goes through `judge_iam_item_staleness` exactly like the three apply
+    /// functions do; a delete (`incoming == None`) on an absent record is the
+    /// idempotent no-op of backlog#2071.
+    fn apply_iam_item_to_model(
+        record: &mut Option<(&'static str, OffsetDateTime)>,
+        incoming: Option<&'static str>,
+        incoming_updated_at: Option<OffsetDateTime>,
+    ) -> IamItemVerdict {
+        let verdict = judge_iam_item_staleness(record.map(|(_, stamp)| stamp), incoming_updated_at);
+        if verdict == IamItemVerdict::Apply {
+            *record = incoming.map(|content| (content, incoming_updated_at.unwrap_or(OffsetDateTime::UNIX_EPOCH)));
+        }
+        verdict
+    }
+
+    fn at(seconds: i64) -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(seconds)
+    }
+
+    /// backlog#2291: a revoke (narrowed policy body, detached mapping, member
+    /// removed from the group) followed by the delayed delivery of the older
+    /// grant must leave the revoke in place.
     #[test]
-    fn test_reconcile_site_replication_bucket_targets_allows_peer_on_same_port_as_local_console() {
-        with_var("RUSTFS_CONSOLE_ADDRESS", Some(":9001"), || {
-            let mut state = SiteReplicationState {
-                service_account_access_key: "site-replicator-0".to_string(),
-                service_account_secret_key: "secret".to_string(),
-                ..Default::default()
-            };
-            state.peers.insert(
-                "local".to_string(),
-                PeerInfo {
-                    deployment_id: "local".to_string(),
-                    ..peer("local", "https://local.example.com:9000")
-                },
-            );
-            state.peers.insert(
-                "remote".to_string(),
-                PeerInfo {
-                    deployment_id: "remote".to_string(),
-                    ..peer("remote", "https://remote.example.com:9001")
-                },
-            );
+    fn test_iam_item_stale_grant_after_revoke_is_not_applied() {
+        let mut record = None;
+        assert_eq!(apply_iam_item_to_model(&mut record, Some("grant"), Some(at(10))), IamItemVerdict::Apply);
+        assert_eq!(apply_iam_item_to_model(&mut record, Some("revoke"), Some(at(20))), IamItemVerdict::Apply);
 
-            let targets = reconcile_site_replication_bucket_targets(
-                BucketTargets::default(),
-                "photos",
-                &state,
-                &PeerInfo {
-                    deployment_id: "local".to_string(),
-                    ..peer("local", "https://local.example.com:9000")
-                },
-                None,
-                "secret",
-            )
-            .expect("peer using same numeric port as local console should remain valid");
+        // The older grant is redelivered (retry drain, slow peer) after the revoke.
+        assert_eq!(
+            apply_iam_item_to_model(&mut record, Some("grant"), Some(at(10))),
+            IamItemVerdict::SkipStale,
+            "a grant older than the local revoke must be acknowledged without being applied"
+        );
+        assert_eq!(record, Some(("revoke", at(20))), "the revoke must survive the stale grant");
+    }
 
-            assert_eq!(targets.targets.len(), 1);
-            let target = &targets.targets[0];
-            assert_eq!(target.endpoint, "remote.example.com:9001");
-            assert!(target.secure);
-        });
+    /// backlog#2291: the mirror image — a grant followed by the delayed delivery
+    /// of an older revoke (older body, older detach, older member removal, or
+    /// an older delete) must leave the grant in place.
+    #[test]
+    fn test_iam_item_stale_revoke_after_grant_is_not_applied() {
+        let mut record = None;
+        assert_eq!(apply_iam_item_to_model(&mut record, Some("revoke"), Some(at(10))), IamItemVerdict::Apply);
+        assert_eq!(apply_iam_item_to_model(&mut record, Some("grant"), Some(at(20))), IamItemVerdict::Apply);
+
+        assert_eq!(
+            apply_iam_item_to_model(&mut record, Some("revoke"), Some(at(10))),
+            IamItemVerdict::SkipStale,
+            "a revoke older than the local grant must not be applied"
+        );
+        assert_eq!(
+            apply_iam_item_to_model(&mut record, None, Some(at(15))),
+            IamItemVerdict::SkipStale,
+            "a delete older than the local record must not remove it"
+        );
+        assert_eq!(record, Some(("grant", at(20))));
+    }
+
+    /// backlog#2291: an item at least as new as the local record is applied,
+    /// including a newer delete; equal timestamps are not stale (same rule as
+    /// `iam-user`).
+    #[test]
+    fn test_iam_item_newer_than_local_record_is_applied() {
+        let mut record = Some(("grant", at(20)));
+        assert_eq!(apply_iam_item_to_model(&mut record, Some("revoke"), Some(at(20))), IamItemVerdict::Apply);
+        assert_eq!(record, Some(("revoke", at(20))));
+
+        assert_eq!(apply_iam_item_to_model(&mut record, Some("grant"), Some(at(30))), IamItemVerdict::Apply);
+        assert_eq!(record, Some(("grant", at(30))));
+
+        assert_eq!(apply_iam_item_to_model(&mut record, None, Some(at(40))), IamItemVerdict::Apply);
+        assert_eq!(record, None, "a newer delete removes the record");
+    }
+
+    /// backlog#2291: peers that predate item timestamps keep today's
+    /// last-writer-wins behaviour — an item without `updatedAt` is applied even
+    /// over a newer local record.
+    #[test]
+    fn test_iam_item_without_source_timestamp_is_applied() {
+        let mut record = Some(("grant", at(20)));
+        assert_eq!(apply_iam_item_to_model(&mut record, Some("revoke"), None), IamItemVerdict::Apply);
+        assert_eq!(record.map(|(content, _)| content), Some("revoke"));
+
+        assert_eq!(judge_iam_item_staleness(Some(at(20)), None), IamItemVerdict::Apply);
+        assert_eq!(judge_iam_item_staleness(None, None), IamItemVerdict::Apply);
+    }
+
+    /// backlog#2291: nothing is stale relative to an absent record. A create
+    /// with any timestamp is applied, and a delete falls through to the
+    /// idempotent no-op paths (backlog#2071) instead of being judged.
+    #[test]
+    fn test_iam_item_targeting_absent_record_is_applied() {
+        assert_eq!(judge_iam_item_staleness(None, Some(at(1))), IamItemVerdict::Apply);
+
+        let mut record = None;
+        assert_eq!(apply_iam_item_to_model(&mut record, None, Some(at(1))), IamItemVerdict::Apply);
+        assert_eq!(record, None);
+        assert_eq!(apply_iam_item_to_model(&mut record, Some("grant"), Some(at(1))), IamItemVerdict::Apply);
+        assert_eq!(record, Some(("grant", at(1))));
+
+        // A record that predates timestamps is reported as UNIX_EPOCH by the
+        // apply paths and therefore never rejects an item.
+        assert_eq!(
+            judge_iam_item_staleness(Some(OffsetDateTime::UNIX_EPOCH), Some(at(1))),
+            IamItemVerdict::Apply
+        );
+    }
+
+    /// The apply paths once the record is gone: the local timestamp the gate
+    /// sees is the deletion mark (or `None` when no deletion was recorded),
+    /// and a committed deletion records its source timestamp as the mark —
+    /// the same sequence `apply_iam_item` runs.
+    fn apply_iam_item_to_deleted_record_model(
+        marks: &mut SiteReplicationState,
+        entity: &str,
+        incoming_is_delete: bool,
+        incoming_updated_at: Option<OffsetDateTime>,
+    ) -> IamItemVerdict {
+        let entities = vec![entity.to_string()];
+        let verdict = judge_iam_item_staleness(iam_deletion_mark(marks, &entities), incoming_updated_at);
+        if verdict == IamItemVerdict::Apply
+            && incoming_is_delete
+            && let Some(deleted_at) = incoming_updated_at
+        {
+            // Pruning is judged from the deletion's own clock in the model.
+            record_iam_deletion_marks_at(marks, &entities, deleted_at, deleted_at);
+        }
+        verdict
+    }
+
+    /// backlog#2291 (real-VM case R6.3a of backlog#2080): a detach deletes the
+    /// mapping outright, so the older grant that arrives afterwards finds no
+    /// record — the deletion mark must stand in for it and reject the grant.
+    /// The same holds for a deleted policy document, user or group.
+    #[test]
+    fn test_iam_item_stale_grant_after_record_deletion_is_not_applied() {
+        let mut marks = SiteReplicationState::default();
+        let entity = "policy-mapping:alice:0:false";
+
+        // The revoke (detach) is applied first: the record is gone, the mark stays.
+        assert_eq!(
+            apply_iam_item_to_deleted_record_model(&mut marks, entity, true, Some(at(20))),
+            IamItemVerdict::Apply
+        );
+        assert_eq!(marks.iam_deletion_marks.get(entity), Some(&at(20)));
+
+        // The older grant is delivered after the revoke.
+        assert_eq!(
+            apply_iam_item_to_deleted_record_model(&mut marks, entity, false, Some(at(10))),
+            IamItemVerdict::SkipStale,
+            "a grant older than the recorded deletion must not re-create the record"
+        );
+        // A replayed copy of the same revoke stays a no-op and keeps the mark.
+        assert_eq!(
+            apply_iam_item_to_deleted_record_model(&mut marks, entity, true, Some(at(20))),
+            IamItemVerdict::Apply
+        );
+        assert_eq!(marks.iam_deletion_marks.get(entity), Some(&at(20)));
+        // An older replayed revoke is stale against the newer one.
+        assert_eq!(
+            apply_iam_item_to_deleted_record_model(&mut marks, entity, true, Some(at(5))),
+            IamItemVerdict::SkipStale
+        );
+        assert_eq!(
+            marks.iam_deletion_marks.get(entity),
+            Some(&at(20)),
+            "an older deletion never lowers the mark"
+        );
+    }
+
+    /// backlog#2291: a mark only fences items older than the deletion. A grant
+    /// newer than (or as new as) the recorded deletion re-creates the record,
+    /// an unmarked entity and an item without a source timestamp keep today's
+    /// behaviour.
+    #[test]
+    fn test_iam_item_newer_than_deletion_mark_is_applied() {
+        let mut marks = SiteReplicationState::default();
+        let entity = "policy:readonly";
+        assert_eq!(
+            apply_iam_item_to_deleted_record_model(&mut marks, entity, true, Some(at(20))),
+            IamItemVerdict::Apply
+        );
+
+        assert_eq!(
+            apply_iam_item_to_deleted_record_model(&mut marks, entity, false, Some(at(20))),
+            IamItemVerdict::Apply,
+            "a grant as new as the deletion is not stale"
+        );
+        assert_eq!(
+            apply_iam_item_to_deleted_record_model(&mut marks, entity, false, Some(at(30))),
+            IamItemVerdict::Apply
+        );
+        assert_eq!(
+            apply_iam_item_to_deleted_record_model(&mut marks, entity, false, None),
+            IamItemVerdict::Apply,
+            "an item from a peer without timestamps keeps last-writer-wins"
+        );
+        assert_eq!(
+            apply_iam_item_to_deleted_record_model(&mut marks, "policy:other", false, Some(at(1))),
+            IamItemVerdict::Apply,
+            "no mark, no record: nothing to be stale against"
+        );
+        assert_eq!(
+            judge_iam_item_staleness(iam_deletion_mark(&marks, &[]), Some(at(1))),
+            IamItemVerdict::Apply
+        );
+    }
+
+    /// backlog#2291: a group's removal marks are per member (plus the group
+    /// itself for a group delete), so with the group gone a stale add is
+    /// judged against the newest mark among the group and the members it
+    /// would add.
+    #[test]
+    fn test_iam_group_item_after_deletion_is_judged_against_member_marks() {
+        let mut marks = SiteReplicationState::default();
+        let bob = iam_group_member_deletion_mark_entity("devs", "bob");
+        let group = iam_group_deletion_mark_entity("devs");
+        record_iam_deletion_marks_at(&mut marks, std::slice::from_ref(&bob), at(20), at(20));
+        record_iam_deletion_marks_at(&mut marks, std::slice::from_ref(&group), at(30), at(30));
+
+        // The gate for an add of `bob` to the (deleted) group.
+        let add_bob = [group.clone(), bob.clone()];
+        assert_eq!(iam_deletion_mark(&marks, &add_bob), Some(at(30)));
+        assert_eq!(
+            judge_iam_item_staleness(iam_deletion_mark(&marks, &add_bob), Some(at(25))),
+            IamItemVerdict::SkipStale
+        );
+        assert_eq!(
+            judge_iam_item_staleness(iam_deletion_mark(&marks, &add_bob), Some(at(30))),
+            IamItemVerdict::Apply
+        );
+
+        // An add of `carol` to a group that was only ever partially emptied
+        // (no group delete) is judged against carol's own mark only.
+        marks.iam_deletion_marks.remove(&group);
+        let add_carol = [group.clone(), iam_group_member_deletion_mark_entity("devs", "carol")];
+        assert_eq!(iam_deletion_mark(&marks, &add_carol), None);
+        assert_eq!(
+            judge_iam_item_staleness(iam_deletion_mark(&marks, &add_carol), Some(at(1))),
+            IamItemVerdict::Apply
+        );
+        let add_bob = [group, bob];
+        assert_eq!(
+            judge_iam_item_staleness(iam_deletion_mark(&marks, &add_bob), Some(at(10))),
+            IamItemVerdict::SkipStale
+        );
+    }
+
+    /// Cheap wiring guard for backlog#2291: every one of the `policy`,
+    /// `policy-mapping`, `group-info`, `iam-user` and `service-account` apply
+    /// paths must judge the item against the local record (falling back to
+    /// the deletion marks of the transaction's state when the record is
+    /// absent) before it writes or deletes anything, must stamp every write
+    /// with the item's source time, and `apply_iam_item` must run verdict,
+    /// write and mark commit inside one state transaction. The ordering rule
+    /// itself is covered by the `test_iam_item_*` model tests above and the
+    /// `apply_iam_item_*` receiver tests; this only pins that no path bypasses
+    /// it again.
+    #[test]
+    fn test_iam_policy_mapping_and_group_items_gate_on_incoming_updated_at() {
+        let source = include_str!("site_replication.rs");
+        let locally_stamped_writes = [
+            ".set_policy(",
+            ".policy_db_set(",
+            ".add_users_to_group(",
+            ".remove_users_from_group(",
+            ".set_group_status(",
+            ".create_user(",
+            ".set_user_status(",
+            ".new_service_account(",
+            ".update_service_account(",
+        ];
+        for (start, end, judged_by_shared_verdict) in [
+            ("async fn apply_iam_policy_item(", "async fn apply_iam_policy_mapping_item(", true),
+            ("async fn apply_iam_policy_mapping_item(", "async fn apply_iam_group_info_item(", true),
+            ("async fn apply_iam_group_info_item(", "async fn apply_iam_sts_account_item(", true),
+            ("async fn apply_iam_user_item(", "async fn apply_iam_service_account_item(", true),
+            ("async fn apply_iam_service_account_item(", "fn claims_unix_timestamp(", false),
+        ] {
+            let body = source
+                .split(start)
+                .nth(1)
+                .and_then(|rest| rest.split(end).next())
+                .expect(start);
+            if judged_by_shared_verdict {
+                assert!(
+                    body.contains("judge_iam_item_staleness(local_updated_at, incoming_updated_at)"),
+                    "{start} must judge the item against the local record before applying it"
+                );
+            } else {
+                assert!(
+                    body.contains("is_stale_update(local_updated_at, incoming_updated_at)"),
+                    "{start} must judge the item against the local record before applying it"
+                );
+            }
+            assert!(
+                body.contains("iam_deletion_mark("),
+                "{start} must fall back to the deletion marks of the transaction's state when the record is absent"
+            );
+            assert!(
+                body.contains("replicated_write_stamp(incoming_updated_at)"),
+                "{start} must stamp its writes with the item's source time"
+            );
+            for write in locally_stamped_writes {
+                assert!(
+                    !body.contains(write),
+                    "{start} must not stamp a replicated write with the local clock ({write})"
+                );
+            }
+        }
+        let dispatch = source
+            .split("async fn apply_iam_item(")
+            .nth(1)
+            .and_then(|rest| rest.split("fn replicated_write_stamp(").next())
+            .expect("apply_iam_item");
+        assert!(
+            dispatch.contains("with_site_replication_state_transaction(move |mut state| async move {"),
+            "apply_iam_item must run verdict, write and mark commit in one state transaction"
+        );
+        assert!(
+            dispatch.contains("record_iam_deletion_marks(&mut state, &deletion_mark_entities, deleted_at)"),
+            "apply_iam_item must record the mark of a deletion it committed in the same transaction"
+        );
+        assert!(
+            !dispatch.contains("commit_iam_deletion_marks("),
+            "the mark must not be committed in a second transaction"
+        );
+        // backlog#2289: a replicated service account is created with its
+        // status; a second status write could fail and leave it enabled.
+        let create_branch = source
+            .split("Err(err) if is_err_no_such_service_account(&err) => {")
+            .nth(1)
+            .and_then(|rest| rest.split("Err(err) => return Err(ApiError::from(err).into()),").next())
+            .expect("service account create branch");
+        assert!(
+            create_branch.contains("status: (!create.status.is_empty()).then_some(create.status),"),
+            "the service account must be created with the source status"
+        );
+        assert!(
+            !create_branch.contains("update_service_account"),
+            "the created service account's status must not depend on a second write"
+        );
     }
 
     #[test]
@@ -17800,11 +14487,6 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_client_secret_matches_minio_style_base64url_sha256() {
-        assert_eq!(hash_client_secret(Some("secret")), "K7gNU3sdo-OL0wNhqoVWhr3g6s1xYv72ol_pe_Unols");
-    }
-
-    #[test]
     fn test_ldap_settings_from_kvs_reads_minio_style_keys() {
         let kvs = rustfs_config::server_config::KVS(vec![
             rustfs_config::server_config::KV {
@@ -17843,77 +14525,6 @@ mod tests {
         assert_eq!(ldap.ldap_group_search_filter, "(&(objectclass=groupOfNames)(member=%s))");
         assert!(ldap_configs.enabled);
         assert!(ldap_configs.configs.contains_key("default"));
-    }
-
-    #[test]
-    fn test_site_replication_peer_client_cache_hit_generation_mismatch_returns_none() {
-        let cache = Some(SiteReplicationPeerClientCache {
-            generation: 7,
-            entry: SiteReplicationPeerClientCacheEntry::Failed("cached error".to_string()),
-        });
-
-        assert!(site_replication_peer_client_cache_hit(&cache, 8).is_none());
-    }
-
-    #[test]
-    fn test_site_replication_peer_client_cache_hit_returns_cached_ready_client() {
-        let cache = Some(SiteReplicationPeerClientCache {
-            generation: 7,
-            entry: SiteReplicationPeerClientCacheEntry::Ready(reqwest::Client::new()),
-        });
-
-        site_replication_peer_client_cache_hit(&cache, 7)
-            .expect("cache hit expected")
-            .expect("ready cache entry should return cached client");
-    }
-
-    #[test]
-    fn test_site_replication_peer_client_cache_hit_returns_cached_error() {
-        let cache = Some(SiteReplicationPeerClientCache {
-            generation: 7,
-            entry: SiteReplicationPeerClientCacheEntry::Failed("cached error".to_string()),
-        });
-
-        let err = site_replication_peer_client_cache_hit(&cache, 7)
-            .expect("cache hit expected")
-            .expect_err("error cache entry should return error");
-        assert!(err.to_string().contains("cached error"), "expected cached error detail, got: {}", err);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_site_replication_peer_client_rebuilds_when_generation_changes() {
-        let previous_generation = current_outbound_tls_generation().0;
-        let previous_cache = {
-            let mut cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
-            let snapshot = cache.clone();
-            *cache = None;
-            snapshot
-        };
-
-        set_test_outbound_tls_generation(101);
-        site_replication_peer_client()
-            .await
-            .expect("initial client build should succeed");
-        let cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
-        let cached = cache.as_ref().expect("cache should be populated");
-        assert_eq!(cached.generation, 101);
-        assert!(matches!(cached.entry, SiteReplicationPeerClientCacheEntry::Ready(_)));
-        drop(cache);
-
-        set_test_outbound_tls_generation(102);
-        site_replication_peer_client()
-            .await
-            .expect("new generation should rebuild client");
-        let cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
-        let cached = cache.as_ref().expect("cache should be populated");
-        assert_eq!(cached.generation, 102);
-        assert!(matches!(cached.entry, SiteReplicationPeerClientCacheEntry::Ready(_)));
-
-        drop(cache);
-        set_test_outbound_tls_generation(previous_generation);
-        let mut cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
-        *cache = previous_cache;
     }
 
     #[test]
@@ -18180,8 +14791,8 @@ mod tests {
         };
         let dep_a_xml = site_config_xml("dep-b");
         let dep_b_xml = site_config_xml("dep-a");
-        let dep_a_b64 = BASE64_STANDARD.encode(dep_a_xml.as_bytes());
-        let dep_b_b64 = BASE64_STANDARD.encode(dep_b_xml.as_bytes());
+        let dep_a_b64 = BASE64_STANDARD.encode_to_string(dep_a_xml.as_bytes());
+        let dep_b_b64 = BASE64_STANDARD.encode_to_string(dep_b_xml.as_bytes());
 
         // Both sites present the complete config in base64 wire form → NOT a mismatch.
         assert_eq!(
@@ -18227,31 +14838,6 @@ mod tests {
         );
     }
 
-    // BUG1: an explicit Disable is a meaningful state and must survive the Unknown -> Enable promotion.
-    #[test]
-    fn test_mark_peers_sync_enabled_preserves_disable() {
-        let mut peers = BTreeMap::new();
-        peers.insert(
-            "a".to_string(),
-            PeerInfo {
-                deployment_id: "a".to_string(),
-                sync_state: SyncStatus::Unknown,
-                ..peer("a", "https://a.example.com")
-            },
-        );
-        peers.insert(
-            "b".to_string(),
-            PeerInfo {
-                deployment_id: "b".to_string(),
-                sync_state: SyncStatus::Disable,
-                ..peer("b", "https://b.example.com")
-            },
-        );
-        mark_unknown_peer_sync_enabled(&mut peers);
-        assert_eq!(peers["a"].sync_state, SyncStatus::Enable, "Unknown must be promoted to Enable");
-        assert_eq!(peers["b"].sync_state, SyncStatus::Disable, "explicit Disable must be preserved");
-    }
-
     #[test]
     fn test_join_peer_sync_state_waits_for_deferred_commit() {
         let mut peers = BTreeMap::from([("a".to_string(), peer("a", "https://a.example.com"))]);
@@ -18274,6 +14860,69 @@ mod tests {
         })
         .expect("serialize peer join request");
         assert_eq!(value.get("deferSyncStateEnable"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_initial_sync_join_requires_the_committed_snapshot() {
+        let now = OffsetDateTime::now_utc();
+        let mut state = SiteReplicationState {
+            updated_at: Some(now),
+            service_account_access_key: "replicator".to_string(),
+            peers: BTreeMap::from([
+                ("a".to_string(), peer("a", "https://a.example.com")),
+                ("b".to_string(), peer("b", "https://b.example.com")),
+            ]),
+            ..Default::default()
+        };
+        let mut request = SRPeerJoinReq {
+            updated_at: Some(now),
+            svc_acct_access_key: "replicator".to_string(),
+            ..Default::default()
+        };
+        ensure_initial_sync_join_current(&state, &request).expect("same committed join");
+        for timestamp in [None, Some(now - time::Duration::SECOND), Some(now + time::Duration::SECOND)] {
+            request.updated_at = timestamp;
+            assert!(ensure_initial_sync_join_current(&state, &request).is_err());
+        }
+        request.updated_at = Some(now);
+        request.svc_acct_access_key = "another-replicator".to_string();
+        assert!(ensure_initial_sync_join_current(&state, &request).is_err());
+        request.svc_acct_access_key.clone_from(&state.service_account_access_key);
+        state.pending_remove = Some(PendingRemove::default());
+        assert!(ensure_initial_sync_join_current(&state, &request).is_err());
+        state.pending_remove = None;
+        state.pending_rotation = Some(PendingRotation::default());
+        assert!(ensure_initial_sync_join_current(&state, &request).is_err());
+        state.pending_rotation = None;
+        state.pending_endpoint_refresh = Some(PendingEndpointRefresh::default());
+        assert!(ensure_initial_sync_join_current(&state, &request).is_err());
+        state.pending_endpoint_refresh = None;
+        state.service_account_access_key.clear();
+        request.svc_acct_access_key.clear();
+        assert!(ensure_initial_sync_join_current(&state, &request).is_err());
+        state.service_account_access_key = "replicator".to_string();
+        request.svc_acct_access_key.clone_from(&state.service_account_access_key);
+        state.peers.clear();
+        assert!(ensure_initial_sync_join_current(&state, &request).is_err());
+    }
+
+    #[test]
+    fn test_join_initial_sync_deferral_preserves_legacy_requests() {
+        let legacy: SRPeerJoinEnvelope = serde_json::from_str("{}").expect("legacy join");
+        assert!(!legacy.defer_initial_sync);
+        assert!(serde_json::to_value(&legacy).unwrap().get("deferInitialSync").is_none());
+        let deferred: SRPeerJoinEnvelope = serde_json::from_str(r#"{"deferInitialSync":true}"#).expect("deferred join");
+        assert!(deferred.defer_initial_sync);
+        assert_eq!(serde_json::to_value(deferred).unwrap()["deferInitialSync"], true);
+        let mut response = applied_join_response(peer("b", "https://b.example.com"), String::new());
+        assert!(serde_json::to_value(&response).unwrap().get("initialSyncDeferred").is_none());
+        response.initial_sync_deferred = true;
+        let wire = serde_json::to_vec(&response).unwrap();
+        assert!(
+            parse_peer_join_response(&wire, PeerInfo::default())
+                .unwrap()
+                .initial_sync_deferred
+        );
     }
 
     // BUG2: pre-existing-bucket back-fill failures must be surfaced in the add response's
@@ -18328,6 +14977,7 @@ mod tests {
         let value = serde_json::to_value(SRPeerJoinResponse {
             peer: peer("remote", "https://remote.example.com"),
             initial_sync_error_message: "bucket setup failed".to_string(),
+            initial_sync_deferred: false,
             applied: Some(true),
         })
         .expect("serialize peer join response");
@@ -18339,6 +14989,7 @@ mod tests {
         let value = serde_json::to_value(SRPeerJoinResponse {
             peer: peer("remote", "https://remote.example.com"),
             initial_sync_error_message: String::new(),
+            initial_sync_deferred: false,
             applied: None,
         })
         .expect("serialize peer join response");
@@ -18573,6 +15224,8 @@ mod tests {
                 last_error: "site replication is not enabled".to_string(),
                 updated_at: Some(OffsetDateTime::now_utc()),
                 edit_generation: None,
+                peer_unreachable: false,
+                deletions_recorded: false,
             }],
             ..Default::default()
         };
@@ -18594,45 +15247,6 @@ mod tests {
         let info = site_replication_info_for(&healthy, &local);
         assert!(info.retry_stats.is_none());
         assert!(info.pending_operation.is_none());
-    }
-
-    /// rustfs/rustfs#5963: `replicate info` reported a healthy cluster while
-    /// every peer operation was failing. The health it used to omit now rides
-    /// along, and a healthy site still serializes without the new fields.
-    #[test]
-    fn site_replication_info_health_fields_are_absent_when_healthy() {
-        let healthy = SiteReplicationInfo {
-            enabled: true,
-            name: "site-a".to_string(),
-            sites: vec![peer("site-a", "https://site-a.example.com")],
-            service_account_access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            retry_stats: None,
-            pending_operation: None,
-        };
-        let value = serde_json::to_value(&healthy).expect("serialize info");
-        assert!(value.get("retryStats").is_none(), "a healthy site must not grow fields: {value}");
-        assert!(value.get("pendingOperation").is_none(), "a healthy site must not grow fields: {value}");
-
-        let degraded = SiteReplicationInfo {
-            retry_stats: Some(SRRetryStats {
-                pending: 1,
-                failed: 4,
-                last_error: "site replication is not enabled".to_string(),
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            }),
-            ..healthy
-        };
-        let value = serde_json::to_value(&degraded).expect("serialize info");
-        assert_eq!(
-            value.pointer("/retryStats/failed").and_then(Value::as_u64),
-            Some(4),
-            "a source site whose peer rejects everything must say so in `info`"
-        );
-        assert_eq!(
-            value.pointer("/retryStats/lastError").and_then(Value::as_str),
-            Some("site replication is not enabled")
-        );
     }
 
     // Fix 5: remove --all must purge local state unconditionally even when peer errors occur
@@ -18693,44 +15307,6 @@ mod tests {
             status.err_detail.contains("403 Forbidden"),
             "peer errors are included in err_detail for diagnostics"
         );
-    }
-
-    // Fix 6: ensure_site_replication_bucket_replication_config must reconcile rather than
-    // early-return so that a bucket propagated to the second site gets a rule back to the first.
-    #[test]
-    fn test_reconcile_adds_missing_peer_rules_to_existing_config() {
-        // Start with a config that has only rule for dep-b (first site's initial config)
-        let rule_b = build_site_replication_rule("arn:rustfs:replication::dep-b:bucket", 1, "site-repl-dep-b");
-        let rule_c = build_site_replication_rule("arn:rustfs:replication::dep-c:bucket", 2, "site-repl-dep-c");
-
-        let mut existing_rules = vec![rule_b.clone()];
-
-        // Desired config has rules for both dep-b and dep-c (3-site setup)
-        let desired_rules = vec![rule_b, rule_c];
-
-        // Simulate the reconcile: collect existing site-repl rule IDs
-        let existing_ids: std::collections::HashSet<String> = existing_rules
-            .iter()
-            .filter_map(|r| r.id.as_deref())
-            .filter(|id| id.starts_with("site-repl-"))
-            .map(String::from)
-            .collect();
-
-        let mut added = false;
-        for rule in &desired_rules {
-            let rid = rule.id.as_deref().unwrap_or("");
-            if !existing_ids.contains(rid) {
-                existing_rules.push(rule.clone());
-                added = true;
-            }
-        }
-
-        assert!(added, "missing rule should have been added");
-        assert_eq!(existing_rules.len(), 2, "should now have rules for both peers");
-
-        let rule_ids: Vec<&str> = existing_rules.iter().filter_map(|r| r.id.as_deref()).collect();
-        assert!(rule_ids.contains(&"site-repl-dep-b"));
-        assert!(rule_ids.contains(&"site-repl-dep-c"));
     }
 
     #[test]
@@ -18847,6 +15423,8 @@ mod tests {
                 last_error: "peer offline".to_string(),
                 updated_at: Some(OffsetDateTime::now_utc()),
                 edit_generation: None,
+                peer_unreachable: false,
+                deletions_recorded: false,
             }],
             ..Default::default()
         };
@@ -19399,5 +15977,127 @@ mod tests {
                 "rotation ack {round} must survive the concurrent retry-event writers; acked: {acked:?}"
             );
         }
+    }
+
+    /// backlog#2292: the receiver persists the SOURCE `updated_at` of an
+    /// applied bucket config and judges the next item's source time against
+    /// it. Stamping the local apply time instead rejected a source edit that
+    /// was newer than the applied one but delivered after the local stamp
+    /// (two quick source edits under delivery delay; a peer clock ahead of
+    /// ours) and acknowledged it with 200.
+    #[test]
+    fn test_bucket_meta_staleness_is_judged_against_the_applied_source_timestamp() {
+        let apply_wall_clock = OffsetDateTime::now_utc();
+        let source_edit_t1 = apply_wall_clock - time::Duration::seconds(30);
+        let source_edit_t2 = source_edit_t1 + time::Duration::seconds(2);
+        let source_edit_t0 = source_edit_t1 - time::Duration::seconds(2);
+        assert!(
+            source_edit_t2 < apply_wall_clock,
+            "T2 is newer at the source yet older than the local apply clock"
+        );
+
+        // Edit T1 arrives first and is applied the way apply_bucket_meta_item
+        // persists a replicated config: stamped with its source time.
+        let mut meta = crate::admin::storage_api::bucket::metadata::BucketMetadata::new("photos");
+        meta.update_config_at(
+            BUCKET_POLICY_CONFIG,
+            br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec(),
+            source_edit_t1,
+        )
+        .expect("apply edit T1");
+        let local_updated_at = bucket_meta_local_updated_at(&meta, BUCKET_POLICY_CONFIG);
+        assert_eq!(
+            local_updated_at, source_edit_t1,
+            "the stored stamp is the source time, not the apply clock"
+        );
+
+        // Edit T2 is newer at the source but delivered late: it must apply.
+        assert!(
+            !is_stale_update(local_updated_at, Some(source_edit_t2)),
+            "edit T2 ({source_edit_t2}) is newer than applied edit T1 ({source_edit_t1}) but is rejected against local stamp {local_updated_at}"
+        );
+        // Edit T0 predates the applied edit: it stays rejected.
+        assert!(
+            is_stale_update(local_updated_at, Some(source_edit_t0)),
+            "edit T0 ({source_edit_t0}) is older than applied edit T1 ({source_edit_t1}) and must be rejected"
+        );
+        // An item without a source time is never judged stale (unchanged).
+        assert!(!is_stale_update(local_updated_at, None));
+    }
+
+    /// backlog#2292: the replicated-config write in `apply_bucket_meta_item`
+    /// must go through the source-stamped entries; a plain
+    /// `update_if_incarnation` there would reintroduce local stamping.
+    #[test]
+    fn test_apply_bucket_meta_item_writes_through_the_source_stamped_entries() {
+        let source = include_str!("site_replication.rs");
+        let apply = source
+            .split("async fn apply_bucket_meta_item")
+            .nth(1)
+            .and_then(|rest| rest.split("fn group_info_requires_upsert").next())
+            .expect("apply_bucket_meta_item source");
+        assert!(
+            apply.contains("update_quota_if_incarnation_at("),
+            "durable quota must carry the source stamp"
+        );
+        assert!(apply.contains("update_if_incarnation_at("), "bucket configs must carry the source stamp");
+        assert!(
+            apply.contains("delete_if_incarnation_at("),
+            "bucket config deletes must carry the source stamp too, or a newer re-create is judged stale"
+        );
+        assert!(
+            !apply.contains("metadata_sys::update_if_incarnation(&item.bucket"),
+            "no replicated config write may bypass the source stamp"
+        );
+    }
+
+    /// backlog#2367 A-4: `remove --all` notified "the peer" at the site's own
+    /// registered endpoint. The tick-driven local peer carries the node's
+    /// listen address, so an endpoint-only self check let the loop dial the
+    /// site itself and report `Partial: failed to notify 1 peer(s)`.
+    #[test]
+    fn pending_notifications_skip_the_local_site_by_deployment_id() {
+        let local_registered = PeerInfo {
+            deployment_id: "site-b".to_string(),
+            ..peer("site-b", "http://site-b.example.com:9000")
+        };
+        let remote = PeerInfo {
+            deployment_id: "site-a".to_string(),
+            ..peer("site-a", "http://site-a.example.com:9000")
+        };
+        let acked = PeerInfo {
+            deployment_id: "site-c".to_string(),
+            ..peer("site-c", "http://site-c.example.com:9000")
+        };
+        let peers = BTreeMap::from([
+            (local_registered.deployment_id.clone(), local_registered.clone()),
+            (remote.deployment_id.clone(), remote),
+            (acked.deployment_id.clone(), acked.clone()),
+        ]);
+        let acked_ids = BTreeSet::from([acked.deployment_id]);
+
+        // The tick resolves the local peer from its own listen address.
+        let local_from_tick = PeerInfo {
+            deployment_id: "site-b".to_string(),
+            ..peer("site-b", "http://127.0.0.1:9000")
+        };
+        let to_notify: Vec<&str> = pending_peers_awaiting_notification(&peers, &local_from_tick, &acked_ids)
+            .iter()
+            .map(|peer| peer.deployment_id.as_str())
+            .collect();
+        assert_eq!(to_notify, vec!["site-a"], "the local site and the acked peer are never dialed");
+
+        // Identity stays consistent with what finalization waits for.
+        assert_eq!(
+            pending_remote_peer_ids(&peers, &local_from_tick),
+            BTreeSet::from(["site-a".to_string(), "site-c".to_string()])
+        );
+
+        // A handler-resolved local peer (registered endpoint) agrees.
+        let to_notify: Vec<&str> = pending_peers_awaiting_notification(&peers, &local_registered, &acked_ids)
+            .iter()
+            .map(|peer| peer.deployment_id.as_str())
+            .collect();
+        assert_eq!(to_notify, vec!["site-a"]);
     }
 }

@@ -18,11 +18,14 @@ use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLock
 use time::OffsetDateTime;
 use tracing::info;
 
-use rustfs_common::metrics::IlmAction;
 use rustfs_replication::ReplicationStatusType;
+use rustfs_scanner_metrics::metrics::IlmAction;
 
 use crate::object_lock;
-use crate::{Event, Lifecycle, ObjectOpts};
+use crate::{
+    Event, LIFECYCLE_CORRUPT_RULE_ERROR_KIND, Lifecycle, ObjectOpts, expiration_action_has_valid_target,
+    lifecycle_has_corrupt_retention_count,
+};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
@@ -80,6 +83,9 @@ impl Evaluator {
         'top_loop: {
             for (i, obj) in objs.iter().enumerate() {
                 let mut event = self.policy.eval_inner(obj, now, newer_noncurrent_versions).await;
+                if !expiration_action_has_valid_target(event.action, obj.version_id, obj.is_latest, obj.delete_marker) {
+                    event = Event::default();
+                }
                 if lifecycle_action_waits_for_replication(event.action) && self.is_pending_replication(obj) {
                     event = Event::default();
                 }
@@ -113,19 +119,10 @@ impl Evaluator {
                             break 'top_loop;
                         }
                     }
-                    IlmAction::DeleteAction
-                    | IlmAction::DeleteRestoredAction
-                    | IlmAction::DeleteVersionAction
-                    | IlmAction::DeleteRestoredVersionAction => {
-                        // Defensive code, should never happen
-                        if matches!(event.action, IlmAction::DeleteVersionAction | IlmAction::DeleteRestoredVersionAction)
-                            && obj.version_id.is_none_or(|v| v.is_nil())
-                        {
-                            event.action = IlmAction::NoneAction;
-                        }
-                        if self.is_object_locked(obj) {
-                            event = Event::default();
-                        }
+                    // Restore expiry removes only the temporary local copy; the
+                    // retained logical version and its remote data remain intact.
+                    IlmAction::DeleteAction | IlmAction::DeleteVersionAction if self.is_object_locked(obj) => {
+                        event = obj.restored_copy_expiry(now).unwrap_or_default();
                     }
                     _ => {}
                 }
@@ -156,6 +153,17 @@ impl Evaluator {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("number of versions mismatch, expected {}, got {}", objs[0].num_versions, objs.len()),
+            ));
+        }
+        // PUT validation rejects a negative retention count, so a rule that
+        // carries one came from older persistence or an import. Report it
+        // instead of evaluating a configuration that cannot be honoured;
+        // `eval_inner` independently takes no action for such a rule
+        // (backlog#2201).
+        if lifecycle_has_corrupt_retention_count(&self.policy) {
+            return Err(std::io::Error::new(
+                LIFECYCLE_CORRUPT_RULE_ERROR_KIND,
+                "lifecycle configuration carries a negative 'NewerNoncurrentVersions'",
             ));
         }
         Ok(self.eval_inner(objs, OffsetDateTime::now_utc()).await)
@@ -197,18 +205,107 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use rustfs_common::metrics::IlmAction;
+    use rustfs_scanner_metrics::metrics::IlmAction;
+    use rustfs_storage_api::metadata_keys;
     use s3s::dto::{
         BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, LifecycleExpiration, LifecycleRule,
         NoncurrentVersionExpiration, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule,
         Transition, TransitionStorageClass,
     };
-    use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
     use time::OffsetDateTime;
     use uuid::Uuid;
 
     use super::*;
     use rustfs_replication::{ReplicationStatusType, VersionPurgeStatusType};
+
+    #[tokio::test]
+    async fn adversarial_restore_expiry_survives_legal_hold() {
+        let mut policy = (*latest_expiration_lifecycle()).clone();
+        policy.rules[0].status = ExpirationStatus::from_static(ExpirationStatus::DISABLED);
+        let policy = Arc::new(policy);
+        policy
+            .validate(&lock_enabled_without_default_retention())
+            .await
+            .expect("valid disabled lifecycle rule");
+        let mut objects = [true, false].map(|is_latest| ObjectOpts {
+            is_latest,
+            num_versions: 2,
+            mod_time: Some(
+                OffsetDateTime::from_unix_timestamp(if is_latest { 1_200_000 } else { 1_000_000 })
+                    .expect("fixed version timestamp"),
+            ),
+            successor_mod_time: (!is_latest)
+                .then(|| OffsetDateTime::from_unix_timestamp(1_200_000).expect("fixed successor timestamp")),
+            transition_status: crate::TRANSITION_COMPLETE.to_string(),
+            restore_expires: Some(OffsetDateTime::from_unix_timestamp(2_000_000).expect("fixed expired restore timestamp")),
+            ..current_object_opts(ReplicationStatusType::Completed)
+        });
+        let evaluator = Evaluator::new(policy).with_lock_retention(Some(lock_enabled_without_default_retention()));
+        let expected = [IlmAction::DeleteRestoredAction, IlmAction::DeleteRestoredVersionAction];
+        let unlocked = evaluator
+            .eval(&objects)
+            .await
+            .expect("unlocked restored versions should evaluate");
+        assert_eq!(unlocked.iter().map(|event| event.action).collect::<Vec<_>>(), expected);
+
+        for object in &mut objects {
+            object
+                .user_defined
+                .insert(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string());
+        }
+        let locked = evaluator
+            .eval(&objects)
+            .await
+            .expect("locked restored versions should evaluate");
+        assert_eq!(
+            locked.iter().map(|event| event.action).collect::<Vec<_>>(),
+            expected,
+            "expiring a restored local copy preserves the retained logical version and remote object"
+        );
+
+        let mut expiring_policy = (*latest_expiration_lifecycle()).clone();
+        expiring_policy.rules[0].noncurrent_version_expiration = Some(NoncurrentVersionExpiration {
+            noncurrent_days: Some(1),
+            newer_noncurrent_versions: None,
+        });
+        let expiring_evaluator =
+            Evaluator::new(Arc::new(expiring_policy)).with_lock_retention(Some(lock_enabled_without_default_retention()));
+        let locked = expiring_evaluator
+            .eval(&objects)
+            .await
+            .expect("locked expired versions should evaluate");
+        assert_eq!(
+            locked.iter().map(|event| event.action).collect::<Vec<_>>(),
+            expected,
+            "blocked logical expiration must still allow an eligible restore-copy cleanup"
+        );
+
+        for status in [ReplicationStatusType::Pending, ReplicationStatusType::Failed] {
+            for object in &mut objects {
+                object.replication_status = status.clone();
+            }
+            for evaluator in [&evaluator, &expiring_evaluator] {
+                let events = evaluator.eval(&objects).await.expect("pending replication should evaluate");
+                assert!(events.iter().all(|event| event.action == IlmAction::NoneAction));
+            }
+        }
+        for object in &mut objects {
+            object.replication_status = ReplicationStatusType::Completed;
+        }
+        for transition_status in ["", crate::TRANSITION_PENDING, "unknown"] {
+            for object in &mut objects {
+                object.transition_status = transition_status.to_string();
+            }
+            for evaluator in [&evaluator, &expiring_evaluator] {
+                let events = evaluator.eval(&objects).await.expect("incomplete transition should evaluate");
+                assert!(
+                    events.iter().all(|event| event.action == IlmAction::NoneAction),
+                    "restore metadata cannot authorize cleanup without a completed transition"
+                );
+            }
+        }
+    }
+
     fn expired_marker_lifecycle() -> Arc<BucketLifecycleConfiguration> {
         Arc::new(BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -336,6 +433,30 @@ mod tests {
         })
     }
 
+    fn current_and_noncurrent_expiration_lifecycle() -> Arc<BucketLifecycleConfiguration> {
+        Arc::new(BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("expire-current-and-noncurrent".to_string()),
+                noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                }),
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        })
+    }
+
     fn object_opts(replication_status: ReplicationStatusType, version_purge_status: VersionPurgeStatusType) -> ObjectOpts {
         ObjectOpts {
             name: "logs/object".to_string(),
@@ -364,7 +485,7 @@ mod tests {
 
     fn locked_current_object_opts(replication_status: ReplicationStatusType) -> ObjectOpts {
         let mut user_defined = HashMap::new();
-        user_defined.insert(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string());
+        user_defined.insert(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string());
 
         ObjectOpts {
             user_defined,
@@ -386,10 +507,10 @@ mod tests {
             .expect("future retain-until date should format");
         let mut user_defined = HashMap::new();
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_MODE.to_string(),
             s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
         );
-        user_defined.insert(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), retain_until);
+        user_defined.insert(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until);
 
         ObjectOpts {
             user_defined,
@@ -539,6 +660,68 @@ mod tests {
             .expect("lifecycle evaluation should succeed");
 
         assert_eq!(events[0].action, IlmAction::DeleteVersionAction);
+    }
+
+    #[tokio::test]
+    async fn evaluator_treats_explicit_null_as_an_exact_noncurrent_identity() {
+        let lifecycle = current_and_noncurrent_expiration_lifecycle();
+        let now = OffsetDateTime::now_utc();
+        let version_group =
+            |version_id: Option<Uuid>, replication_status: ReplicationStatusType, user_defined: HashMap<String, String>| {
+                vec![
+                    ObjectOpts {
+                        name: "logs/object".to_string(),
+                        mod_time: Some(now),
+                        version_id: Some(Uuid::new_v4()),
+                        is_latest: true,
+                        num_versions: 2,
+                        replication_status: ReplicationStatusType::Completed,
+                        ..Default::default()
+                    },
+                    ObjectOpts {
+                        name: "logs/object".to_string(),
+                        mod_time: Some(now - time::Duration::days(40)),
+                        successor_mod_time: Some(now - time::Duration::days(3)),
+                        version_id,
+                        is_latest: false,
+                        num_versions: 2,
+                        versioned: true,
+                        replication_status,
+                        user_defined,
+                        ..Default::default()
+                    },
+                ]
+            };
+
+        let events = Evaluator::new(lifecycle.clone())
+            .eval(&version_group(Some(Uuid::nil()), ReplicationStatusType::Completed, HashMap::new()))
+            .await
+            .expect("explicit null-version lifecycle evaluation should succeed");
+        assert_eq!(events[0].action, IlmAction::NoneAction);
+        assert_eq!(events[1].action, IlmAction::DeleteVersionAction);
+
+        let events = Evaluator::new(lifecycle.clone())
+            .eval(&version_group(None, ReplicationStatusType::Completed, HashMap::new()))
+            .await
+            .expect("missing historical identity should fail closed without aborting evaluation");
+        assert_eq!(events[1].action, IlmAction::NoneAction);
+
+        let events = Evaluator::new(lifecycle.clone())
+            .eval(&version_group(Some(Uuid::nil()), ReplicationStatusType::Pending, HashMap::new()))
+            .await
+            .expect("pending null-version replication should fail closed without aborting evaluation");
+        assert_eq!(events[1].action, IlmAction::NoneAction);
+
+        let events = Evaluator::new(lifecycle)
+            .with_lock_retention(Some(lock_enabled_without_default_retention()))
+            .eval(&version_group(
+                Some(Uuid::nil()),
+                ReplicationStatusType::Completed,
+                HashMap::from([(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string())]),
+            ))
+            .await
+            .expect("locked null-version lifecycle evaluation should fail closed without aborting evaluation");
+        assert_eq!(events[1].action, IlmAction::NoneAction);
     }
 
     #[tokio::test]

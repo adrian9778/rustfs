@@ -19,6 +19,7 @@ use crate::disk::error_reduce::{
 use crate::erasure::coding::BitrotWriterWrapper;
 use crate::erasure::coding::Erasure;
 use crate::erasure::coding::erasure::EncodedBlock;
+use crate::io_support::shard_integrity::{IntegrityBuilder, PreparedIntegrity};
 use crate::runtime::sources as runtime_sources;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
@@ -42,6 +43,13 @@ const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: usize = 32 * 1024 * 1024
 const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS: usize = 32;
 const DEFAULT_RUSTFS_ERASURE_ENCODE_BATCH_BLOCKS: usize = 4;
 const DEFAULT_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST: bool = false;
+
+pub(crate) enum IntegrityEncodeMode {
+    Inline(usize),
+    SingleBlock(usize),
+    Streaming,
+    Batched,
+}
 
 /// Cached value of `RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES` env var.
 /// Read once at first use via `OnceLock` to avoid per-encode syscall.
@@ -116,11 +124,33 @@ impl<T> AbortOnDropTask<T> {
     async fn join(&mut self) -> Result<T, JoinError> {
         (&mut self.0).await
     }
+
+    fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
 }
 
 impl<T> Drop for AbortOnDropTask<T> {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+enum ReadyProducerState {
+    ReadError(std::io::Error),
+    Finished,
+}
+
+async fn ready_producer_state<R>(task: &mut AbortOnDropTask<std::io::Result<(R, usize)>>) -> Option<ReadyProducerState> {
+    if !task.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    if !task.is_finished() {
+        return None;
+    }
+    match task.join().await {
+        Ok(Err(err)) => Some(ReadyProducerState::ReadError(err)),
+        Ok(Ok(_)) | Err(_) => Some(ReadyProducerState::Finished),
     }
 }
 
@@ -297,6 +327,7 @@ impl Default for WriteProgressPolicy {
 
 pub(crate) struct MultiWriter<'a> {
     writers: &'a mut [Option<BitrotWriterWrapper>],
+    integrity: Option<&'a mut IntegrityBuilder>,
     write_quorum: usize,
     errs: Vec<Option<Error>>,
     policy: WriteProgressPolicy,
@@ -314,11 +345,19 @@ impl<'a> MultiWriter<'a> {
         let length = writers.len();
         MultiWriter {
             writers,
+            integrity: None,
             write_quorum,
             errs: vec![None; length],
             policy,
             absolute_deadline: None,
         }
+    }
+
+    pub(super) fn take_retryable_internode_write_failure(&mut self) -> Option<Error> {
+        self.errs
+            .iter_mut()
+            .find(|error| error.as_ref().is_some_and(Error::is_retryable_internode_write_failure))
+            .and_then(Option::take)
     }
 
     /// Effective budget for one shard operation: the smaller of the per-shard
@@ -368,6 +407,10 @@ impl<'a> MultiWriter<'a> {
     }
 
     async fn write_block(&mut self, block: &EncodedBlock) -> std::io::Result<()> {
+        if let Some(integrity) = &mut self.integrity {
+            // Commit every coding index, including disks absent from the write.
+            integrity.push(block.shards()).await?;
+        }
         self.write_shards(block.shards()).await
     }
 
@@ -424,7 +467,7 @@ impl<'a> MultiWriter<'a> {
             errs = ?self.errs,
             "Erasure encode write quorum unavailable: {summary_text}"
         );
-        Err(std::io::Error::other(format!("Failed to write data: {summary_text}")))
+        Err(write_err.into())
     }
 
     async fn shutdown_writer(writer_opt: &mut Option<BitrotWriterWrapper>, err: &mut Option<Error>) {
@@ -496,11 +539,68 @@ impl<'a> MultiWriter<'a> {
             errs = ?self.errs,
             "Erasure encode shutdown quorum unavailable: {summary_text}"
         );
-        Err(std::io::Error::other(format!("Failed to shutdown writers: {summary_text}")))
+        Err(write_err.into())
     }
 }
 
 impl Erasure {
+    pub(crate) async fn encode_with_shard_integrity<R>(
+        self: Arc<Self>,
+        reader: R,
+        writers: &mut [Option<BitrotWriterWrapper>],
+        quorum: usize,
+        part_number: usize,
+        mode: IntegrityEncodeMode,
+        protected: bool,
+    ) -> std::io::Result<(R, usize, Option<Vec<Bytes>>, Option<PreparedIntegrity>)>
+    where
+        R: AsyncRead + Send + Sync + Unpin + 'static,
+    {
+        let mut integrity = if protected {
+            let layout = rustfs_filemeta::shard_integrity::IntegrityLayout::new(
+                self.data_shards,
+                self.parity_shards,
+                self.block_size,
+                self.uses_legacy_codec(),
+            )
+            .map_err(std::io::Error::other)?;
+            Some(IntegrityBuilder::new(layout, part_number)?)
+        } else {
+            None
+        };
+        let (reader, size, inline) = match mode {
+            IntegrityEncodeMode::Inline(hint) => {
+                let (reader, size, shards) = self
+                    .encode_inline_shards_with_integrity(reader, hint, integrity.as_mut())
+                    .await?;
+                (reader, size, Some(shards))
+            }
+            IntegrityEncodeMode::SingleBlock(hint) => {
+                let (reader, size) = self
+                    .encode_small_direct(reader, writers, quorum, true, hint, integrity.as_mut())
+                    .await?;
+                (reader, size, None)
+            }
+            IntegrityEncodeMode::Streaming => {
+                let (reader, size) = self
+                    .encode_with_ingest_mode(reader, writers, quorum, use_bytesmut_ingest(), integrity.as_mut())
+                    .await?;
+                (reader, size, None)
+            }
+            IntegrityEncodeMode::Batched => {
+                let (reader, size) = self
+                    .encode_batched_with_integrity(reader, writers, quorum, integrity.as_mut())
+                    .await?;
+                (reader, size, None)
+            }
+        };
+        let integrity = match integrity {
+            Some(integrity) => Some(integrity.finish(size).await?),
+            None => None,
+        };
+        Ok((reader, size, inline, integrity))
+    }
+
     async fn encode_block(self: Arc<Self>, encode_buf: Vec<u8>, len: usize) -> std::io::Result<(EncodedBlock, Vec<u8>)> {
         let encode_stage_start = stage_timer_if_enabled();
         let encode_once = move || {
@@ -557,6 +657,7 @@ impl Erasure {
         quorum: usize,
         require_single_block: bool,
         size_hint: usize,
+        integrity: Option<&mut IntegrityBuilder>,
     ) -> std::io::Result<(R, usize)>
     where
         R: AsyncRead + Send + Sync + Unpin,
@@ -589,6 +690,7 @@ impl Erasure {
 
         let block = self.encode_data_owned_block(buf)?;
         let mut mw = MultiWriter::new(writers, quorum);
+        mw.integrity = integrity;
         mw.write_block(&block).await?;
         mw.shutdown().await?;
         Ok((reader, total))
@@ -598,10 +700,23 @@ impl Erasure {
     /// The returned bytes are the same `[hash][shard]` representation produced
     /// by `BitrotWriter`, ready to be embedded in each disk's staged `xl.meta`.
     #[hotpath::measure(impl_type = "Erasure")]
+    #[cfg(test)]
     pub(crate) async fn encode_inline_shards_with_size_hint<R>(
+        self: Arc<Self>,
+        reader: R,
+        size_hint: usize,
+    ) -> std::io::Result<(R, usize, Vec<Bytes>)>
+    where
+        R: AsyncRead + Send + Sync + Unpin,
+    {
+        self.encode_inline_shards_with_integrity(reader, size_hint, None).await
+    }
+
+    async fn encode_inline_shards_with_integrity<R>(
         self: Arc<Self>,
         mut reader: R,
         size_hint: usize,
+        integrity: Option<&mut IntegrityBuilder>,
     ) -> std::io::Result<(R, usize, Vec<Bytes>)>
     where
         R: AsyncRead + Send + Sync + Unpin,
@@ -615,6 +730,9 @@ impl Erasure {
         }
 
         let block = self.encode_data_owned_block(buf)?;
+        if let Some(integrity) = integrity {
+            integrity.push(block.shards()).await?;
+        }
         let mut inline_shards = Vec::with_capacity(block.shards().len());
         for shard in block.shards() {
             let hash = HashAlgorithm::HighwayHash256S.hash_encode(shard);
@@ -638,7 +756,7 @@ impl Erasure {
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
         let use_bytesmut_ingest = use_bytesmut_ingest();
-        self.encode_with_ingest_mode(reader, writers, quorum, use_bytesmut_ingest)
+        self.encode_with_ingest_mode(reader, writers, quorum, use_bytesmut_ingest, None)
             .await
     }
 
@@ -652,6 +770,7 @@ impl Erasure {
         writers: &mut [Option<BitrotWriterWrapper>],
         quorum: usize,
         use_bytesmut_ingest: bool,
+        integrity: Option<&mut IntegrityBuilder>,
     ) -> std::io::Result<(R, usize)>
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
@@ -680,6 +799,8 @@ impl Erasure {
                 // capacity and never reallocates. Reading into uninitialized spare capacity
                 // (instead of resize + slice read) also skips zero-filling each fresh buffer.
                 let ingest_capacity = expanded_block_bytes.max(block_size);
+                // Pre-allocate buffer pool for this encoding session
+                let mut buf_pool: Vec<BytesMut> = Vec::with_capacity(4);
                 let mut buf = BytesMut::with_capacity(ingest_capacity);
                 loop {
                     match read_full_buf_or_eof(&mut reader, &mut buf, block_size).await {
@@ -689,7 +810,8 @@ impl Erasure {
                             total += n;
                             let encode_buf = buf;
                             let res = self.clone().encode_block_bytes_mut(encode_buf, n).await?;
-                            buf = BytesMut::with_capacity(ingest_capacity);
+                            // Try to reuse buffer from pool, or allocate new one
+                            buf = buf_pool.pop().unwrap_or_else(|| BytesMut::with_capacity(ingest_capacity));
                             let queued_bytes = res.queued_bytes();
                             let _producer_stage = rustfs_io_metrics::track_ec_encode_producer_bytes(queued_bytes);
                             let send_wait_stage_start = stage_timer_if_enabled();
@@ -697,6 +819,11 @@ impl Erasure {
                                 return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                             }
                             record_internal_stage_if_enabled("erasure_encode_send_wait", send_wait_stage_start);
+                            // Return buffer to pool if it has sufficient capacity
+                            if buf.capacity() >= ingest_capacity && buf_pool.len() < 4 {
+                                buf_pool.push(buf);
+                                buf = BytesMut::with_capacity(ingest_capacity);
+                            }
                         }
                         Ok(None) => break,
                         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -751,6 +878,7 @@ impl Erasure {
         }));
 
         let mut writers = MultiWriter::new(writers, quorum);
+        writers.integrity = integrity;
 
         let mut write_err = None;
 
@@ -773,8 +901,12 @@ impl Erasure {
             record_internal_stage_if_enabled("erasure_encode_write", write_stage_start);
         }
 
-        if let Some(err) = write_err {
-            task.abort_and_wait().await;
+        if let Some(mut err) = write_err {
+            match ready_producer_state(&mut task).await {
+                Some(ReadyProducerState::ReadError(read_err)) => err = read_err,
+                Some(ReadyProducerState::Finished) => {}
+                None => task.abort_and_wait().await,
+            }
             drop(rx);
             let shutdown_stage_start = stage_timer_if_enabled();
             if let Err(shutdown_err) = writers.shutdown().await {
@@ -794,9 +926,22 @@ impl Erasure {
     #[hotpath::measure(impl_type = "Erasure")]
     pub async fn encode_batched<R>(
         self: Arc<Self>,
+        reader: R,
+        writers: &mut [Option<BitrotWriterWrapper>],
+        quorum: usize,
+    ) -> std::io::Result<(R, usize)>
+    where
+        R: AsyncRead + Send + Sync + Unpin + 'static,
+    {
+        self.encode_batched_with_integrity(reader, writers, quorum, None).await
+    }
+
+    async fn encode_batched_with_integrity<R>(
+        self: Arc<Self>,
         mut reader: R,
         writers: &mut [Option<BitrotWriterWrapper>],
         quorum: usize,
+        integrity: Option<&mut IntegrityBuilder>,
     ) -> std::io::Result<(R, usize)>
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
@@ -877,6 +1022,7 @@ impl Erasure {
         }));
 
         let mut writers = MultiWriter::new(writers, quorum);
+        writers.integrity = integrity;
         let mut write_err = None;
 
         loop {
@@ -900,8 +1046,12 @@ impl Erasure {
             }
         }
 
-        if let Some(err) = write_err {
-            task.abort_and_wait().await;
+        if let Some(mut err) = write_err {
+            match ready_producer_state(&mut task).await {
+                Some(ReadyProducerState::ReadError(read_err)) => err = read_err,
+                Some(ReadyProducerState::Finished) => {}
+                None => task.abort_and_wait().await,
+            }
             drop(rx);
             let shutdown_stage_start = stage_timer_if_enabled();
             if let Err(shutdown_err) = writers.shutdown().await {
@@ -931,7 +1081,8 @@ impl Erasure {
         R: AsyncRead + Send + Sync + Unpin,
     {
         let size_hint = self.block_size;
-        self.encode_small_direct(reader, writers, quorum, false, size_hint).await
+        self.encode_small_direct(reader, writers, quorum, false, size_hint, None)
+            .await
     }
 
     /// Size-aware inline fast path. `size_hint` only controls the bounded initial
@@ -947,7 +1098,8 @@ impl Erasure {
     where
         R: AsyncRead + Send + Sync + Unpin,
     {
-        self.encode_small_direct(reader, writers, quorum, false, size_hint).await
+        self.encode_small_direct(reader, writers, quorum, false, size_hint, None)
+            .await
     }
 
     /// Fast path for single-block non-inline objects: avoids the producer/consumer
@@ -963,7 +1115,7 @@ impl Erasure {
         R: AsyncRead + Send + Sync + Unpin,
     {
         let size_hint = self.block_size;
-        self.encode_small_direct(reader, writers, quorum, true, size_hint).await
+        self.encode_small_direct(reader, writers, quorum, true, size_hint, None).await
     }
 
     /// Size-aware single-block fast path. `size_hint` only controls the bounded
@@ -979,7 +1131,7 @@ impl Erasure {
     where
         R: AsyncRead + Send + Sync + Unpin,
     {
-        self.encode_small_direct(reader, writers, quorum, true, size_hint).await
+        self.encode_small_direct(reader, writers, quorum, true, size_hint, None).await
     }
 }
 
@@ -987,6 +1139,7 @@ impl Erasure {
 mod tests {
     use super::*;
     use crate::erasure::coding::{BitrotWriterWrapper, CustomWriter};
+    use crate::error::StorageError;
     use rustfs_rio::HardLimitReader;
     use rustfs_utils::HashAlgorithm;
     use std::future::Future;
@@ -1094,6 +1247,52 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ReadyReaderFailure;
+
+    impl std::fmt::Display for ReadyReaderFailure {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("injected reader failure")
+        }
+    }
+
+    impl std::error::Error for ReadyReaderFailure {}
+
+    #[derive(Debug)]
+    struct BlocksThenErrorReader {
+        blocks_remaining: usize,
+        block: Vec<u8>,
+        failed: Option<oneshot::Sender<()>>,
+    }
+
+    impl BlocksThenErrorReader {
+        fn new(blocks_remaining: usize, block_size: usize) -> (Self, oneshot::Receiver<()>) {
+            let (failed_tx, failed_rx) = oneshot::channel();
+            (
+                Self {
+                    blocks_remaining,
+                    block: vec![0x6b; block_size],
+                    failed: Some(failed_tx),
+                },
+                failed_rx,
+            )
+        }
+    }
+
+    impl AsyncRead for BlocksThenErrorReader {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if self.blocks_remaining > 0 {
+                self.blocks_remaining -= 1;
+                buf.put_slice(&self.block);
+                return Poll::Ready(Ok(()));
+            }
+            if let Some(failed) = self.failed.take() {
+                let _ = failed.send(());
+            }
+            Poll::Ready(Err(std::io::Error::other(ReadyReaderFailure)))
+        }
+    }
+
     fn erasure_with_zero_block_size() -> Erasure {
         let mut erasure = Erasure::default();
         erasure.data_shards = 1;
@@ -1163,6 +1362,27 @@ mod tests {
                     self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Poll::Ready(Err(std::io::Error::other("injected write failure after producer blocks")))
                 }
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct FailAfterReaderErrorWriter {
+        reader_failed: oneshot::Receiver<()>,
+    }
+
+    impl AsyncWrite for FailAfterReaderErrorWriter {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, _buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            match Pin::new(&mut self.reader_failed).poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(_) => Poll::Ready(Err(std::io::Error::other("injected write failure after reader error"))),
             }
         }
 
@@ -1365,10 +1585,10 @@ mod tests {
 
         let encode = match pipeline {
             EncodePipeline::Vec => {
-                tokio::spawn(async move { erasure.encode_with_ingest_mode(reader, &mut writers, 1, false).await })
+                tokio::spawn(async move { erasure.encode_with_ingest_mode(reader, &mut writers, 1, false, None).await })
             }
             EncodePipeline::BytesMut => {
-                tokio::spawn(async move { erasure.encode_with_ingest_mode(reader, &mut writers, 1, true).await })
+                tokio::spawn(async move { erasure.encode_with_ingest_mode(reader, &mut writers, 1, true, None).await })
             }
             EncodePipeline::Batched => tokio::spawn(async move { erasure.encode_batched(reader, &mut writers, 1).await }),
         };
@@ -1427,8 +1647,8 @@ mod tests {
         ))];
 
         let result = match pipeline {
-            EncodePipeline::Vec => erasure.encode_with_ingest_mode(reader, &mut writers, 1, false).await,
-            EncodePipeline::BytesMut => erasure.encode_with_ingest_mode(reader, &mut writers, 1, true).await,
+            EncodePipeline::Vec => erasure.encode_with_ingest_mode(reader, &mut writers, 1, false, None).await,
+            EncodePipeline::BytesMut => erasure.encode_with_ingest_mode(reader, &mut writers, 1, true, None).await,
             EncodePipeline::Batched => erasure.encode_batched(reader, &mut writers, 1).await,
         };
 
@@ -1436,7 +1656,14 @@ mod tests {
             Ok(_) => panic!("writer quorum failure should fail the encode pipeline"),
             Err(err) => err,
         };
-        assert!(err.to_string().contains("Failed to write data"));
+        let err = StorageError::from(err);
+        assert!(matches!(
+            &err,
+            StorageError::Io(source)
+                if source.kind() == std::io::ErrorKind::Other
+                    && source.to_string() == "injected write failure after producer blocks"
+        ));
+        assert!(!err.is_quorum_error());
         tokio::time::timeout(Duration::from_secs(1), reader_dropped)
             .await
             .expect("writer failure should abort the blocked producer")
@@ -1478,6 +1705,34 @@ mod tests {
         rustfs_io_metrics::set_put_stage_metrics_enabled(false);
     }
 
+    async fn ready_reader_error_wins_over_writer_error(pipeline: EncodePipeline) {
+        const BLOCK_SIZE: usize = 16;
+
+        let erasure = Arc::new(Erasure::new(1, 0, BLOCK_SIZE));
+        let batch_blocks = encode_batch_block_count().min(encode_channel_capacity(
+            erasure.shard_size().saturating_mul(erasure.total_shard_count()),
+            erasure_encode_max_inflight_bytes(),
+        ));
+        let blocks_before_error = match pipeline {
+            EncodePipeline::Batched => batch_blocks,
+            EncodePipeline::Vec | EncodePipeline::BytesMut => 1,
+        };
+        let (reader, reader_failed) = BlocksThenErrorReader::new(blocks_before_error, BLOCK_SIZE);
+        let mut writers = vec![Some(bitrot_writer(FailAfterReaderErrorWriter { reader_failed }, BLOCK_SIZE))];
+
+        let result = match pipeline {
+            EncodePipeline::Vec => erasure.encode_with_ingest_mode(reader, &mut writers, 1, false, None).await,
+            EncodePipeline::BytesMut => erasure.encode_with_ingest_mode(reader, &mut writers, 1, true, None).await,
+            EncodePipeline::Batched => erasure.encode_batched(reader, &mut writers, 1).await,
+        };
+
+        let err = result.expect_err("reader and writer failures must fail the encode pipeline");
+        assert!(
+            err.get_ref().is_some_and(|source| source.is::<ReadyReaderFailure>()),
+            "ready reader failures must keep precedence over writer failures: {err:?}"
+        );
+    }
+
     async fn aborting_full_queue_settles_pending_send() {
         const BLOCK_SIZE: usize = 16;
 
@@ -1502,7 +1757,11 @@ mod tests {
             BLOCK_SIZE,
         ))];
         let erasure_for_task = erasure.clone();
-        let encode = tokio::spawn(async move { erasure_for_task.encode_with_ingest_mode(reader, &mut writers, 1, false).await });
+        let encode = tokio::spawn(async move {
+            erasure_for_task
+                .encode_with_ingest_mode(reader, &mut writers, 1, false, None)
+                .await
+        });
 
         tokio::time::timeout(Duration::from_secs(1), writer_entered)
             .await
@@ -1599,8 +1858,92 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn vec_ready_reader_error_wins_over_writer_error() {
+        ready_reader_error_wins_over_writer_error(EncodePipeline::Vec).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bytesmut_ready_reader_error_wins_over_writer_error() {
+        ready_reader_error_wins_over_writer_error(EncodePipeline::BytesMut).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn batched_ready_reader_error_wins_over_writer_error() {
+        ready_reader_error_wins_over_writer_error(EncodePipeline::Batched).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn cancelling_full_queue_settles_pending_send() {
         aborting_full_queue_settles_pending_send().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_reader_error_keeps_source_and_drops_every_encode_path() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("injected request body inactivity")]
+        struct BodyInactivity;
+
+        #[derive(Debug)]
+        struct StalledReader {
+            data: Cursor<Vec<u8>>,
+            timer: Option<Pin<Box<tokio::time::Sleep>>>,
+            dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl AsyncRead for StalledReader {
+            fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+                if self.data.position() < self.data.get_ref().len() as u64 {
+                    return Pin::new(&mut self.data).poll_read(cx, buf);
+                }
+                let timer = self
+                    .timer
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(Duration::from_secs(300))));
+                std::task::ready!(timer.as_mut().poll(cx));
+                Poll::Ready(Err(std::io::Error::other(BodyInactivity)))
+            }
+        }
+
+        impl Drop for StalledReader {
+            fn drop(&mut self) {
+                self.dropped.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        // Explicit entry points select the paths; environment caches and input
+        // size heuristics cannot silently turn this into repeated Vec coverage.
+        for path in ["direct", "vec", "bytesmut", "batched"] {
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader = StalledReader {
+                data: Cursor::new(vec![7; 64]),
+                timer: None,
+                dropped: Arc::clone(&dropped),
+            };
+            let committed = Arc::new(Mutex::new(Vec::new()));
+            let mut writers = (0..4)
+                .map(|_| Some(bitrot_writer(DeferredCommitWriter::new(Arc::clone(&committed)), 32)))
+                .collect::<Vec<_>>();
+            let erasure = Arc::new(Erasure::new(2, 2, 64));
+            let result = match path {
+                "direct" => erasure.encode_single_block_non_inline(reader, &mut writers, 2).await,
+                "vec" => erasure.encode_with_ingest_mode(reader, &mut writers, 2, false, None).await,
+                "bytesmut" => erasure.encode_with_ingest_mode(reader, &mut writers, 2, true, None).await,
+                "batched" => erasure.encode_batched(reader, &mut writers, 2).await,
+                _ => unreachable!(),
+            };
+            let error = result.expect_err("stalled input must fail before shard commit");
+            assert!(error.get_ref().is_some_and(|source| source.is::<BodyInactivity>()), "{path}: {error:?}");
+            assert!(
+                dropped.load(std::sync::atomic::Ordering::Acquire),
+                "{path} must release its reader/producer before returning"
+            );
+            assert!(
+                committed.lock().expect("committed bytes").is_empty(),
+                "{path} must not commit partial shards"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1629,7 +1972,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_writer_short_write_fails_before_shutdown() {
-        let mut writers = vec![Some(bitrot_writer(ShortWriteWriter, 16))];
+        let mut writers = vec![Some(bitrot_writer(ShortWriteWriter, 32))];
         let err = {
             let mut writer = MultiWriter::new(&mut writers, 1);
             writer
@@ -1638,63 +1981,93 @@ mod tests {
                 .expect_err("short writes must fail the shard writer")
         };
 
-        assert!(err.to_string().contains("Failed to write data"));
+        let err = StorageError::from(err);
+        assert!(matches!(&err, StorageError::Io(source) if source.kind() == std::io::ErrorKind::WriteZero));
+        assert!(!err.is_quorum_error());
         assert!(writers[0].is_none(), "short-write shard must be removed before commit");
     }
 
     #[tokio::test]
     async fn multi_writer_reports_fallback_summary_when_only_offline_writers_remain() {
         let mut writers = vec![None, None];
-        let err = {
+        let (err, summary) = {
             let mut writer = MultiWriter::new(&mut writers, 1);
-            writer
+            let err = writer
                 .write(vec![Bytes::from_static(b"offline-a"), Bytes::from_static(b"offline-b")])
                 .await
-                .expect_err("offline writers cannot satisfy write quorum")
+                .expect_err("offline writers cannot satisfy write quorum");
+            let summary = build_write_quorum_failure_summary(&writer.errs, OBJECT_OP_IGNORED_ERRS, writer.write_quorum);
+            (err, format_write_quorum_failure(&summary))
         };
 
-        let err = err.to_string();
-        assert!(err.contains("Failed to write data"));
-        assert!(err.contains("offline-disks=2/2"));
-        assert!(err.contains("required=1"));
+        assert_eq!(
+            err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let err = StorageError::from(err);
+        assert_eq!(err, StorageError::ErasureWriteQuorum);
+        assert!(err.is_quorum_error());
+        assert!(summary.contains("offline-disks=2/2"));
+        assert!(summary.contains("required=1"));
 
-        let shutdown_err = {
+        let (shutdown_err, summary) = {
             let mut writer = MultiWriter::new(&mut writers, 1);
-            writer
+            let err = writer
                 .shutdown()
                 .await
-                .expect_err("offline writers cannot satisfy shutdown quorum")
+                .expect_err("offline writers cannot satisfy shutdown quorum");
+            let summary = build_write_quorum_failure_summary(&writer.errs, OBJECT_OP_IGNORED_ERRS, writer.write_quorum);
+            (err, format_write_quorum_failure(&summary))
         };
 
-        let shutdown_err = shutdown_err.to_string();
-        assert!(shutdown_err.contains("Failed to shutdown writers"));
-        assert!(shutdown_err.contains("offline-disks=2/2"));
-        assert!(shutdown_err.contains("required=1"));
+        assert_eq!(
+            shutdown_err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let shutdown_err = StorageError::from(shutdown_err);
+        assert_eq!(shutdown_err, StorageError::ErasureWriteQuorum);
+        assert!(shutdown_err.is_quorum_error());
+        assert!(summary.contains("offline-disks=2/2"));
+        assert!(summary.contains("required=1"));
     }
 
     #[tokio::test]
     async fn multi_writer_reports_quorum_failure_when_quorum_exceeds_writer_count() {
         let committed = Arc::new(Mutex::new(Vec::new()));
-        let mut writers = vec![Some(bitrot_writer(DeferredCommitWriter::new(committed), 16))];
+        let mut writers = vec![Some(bitrot_writer(DeferredCommitWriter::new(committed), 32))];
         let mut writer = MultiWriter::new(&mut writers, 2);
 
         let err = writer
             .write(vec![Bytes::from_static(b"quorum impossible")])
             .await
             .expect_err("write quorum above writer count must fail");
-        let err = err.to_string();
-        assert!(err.contains("Failed to write data"));
-        assert!(err.contains("required=2"));
-        assert!(err.contains("erasure write quorum"));
+        assert_eq!(
+            err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let err = StorageError::from(err);
+        assert_eq!(err, StorageError::ErasureWriteQuorum);
+        assert!(err.is_quorum_error());
+        let summary = build_write_quorum_failure_summary(&writer.errs, OBJECT_OP_IGNORED_ERRS, writer.write_quorum);
+        let summary = format_write_quorum_failure(&summary);
+        assert!(summary.contains("required=2"));
+        assert!(summary.contains("erasure write quorum"));
 
         let shutdown_err = writer
             .shutdown()
             .await
             .expect_err("shutdown quorum above writer count must fail");
-        let shutdown_err = shutdown_err.to_string();
-        assert!(shutdown_err.contains("Failed to shutdown writers"));
-        assert!(shutdown_err.contains("required=2"));
-        assert!(shutdown_err.contains("erasure write quorum"));
+        assert_eq!(
+            shutdown_err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let shutdown_err = StorageError::from(shutdown_err);
+        assert_eq!(shutdown_err, StorageError::ErasureWriteQuorum);
+        assert!(shutdown_err.is_quorum_error());
+        let summary = build_write_quorum_failure_summary(&writer.errs, OBJECT_OP_IGNORED_ERRS, writer.write_quorum);
+        let summary = format_write_quorum_failure(&summary);
+        assert!(summary.contains("required=2"));
+        assert!(summary.contains("erasure write quorum"));
     }
 
     // The production wiring (`MultiWriter::new`) must arm a real deadline by
@@ -1779,7 +2152,13 @@ mod tests {
             .write(four_shards())
             .await
             .expect_err("two stalled writers must fail the write quorum instead of hanging");
-        assert!(err.to_string().contains("Failed to write data"));
+        assert_eq!(
+            err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let err = StorageError::from(err);
+        assert_eq!(err, StorageError::ErasureWriteQuorum);
+        assert!(err.is_quorum_error());
     }
 
     // A small object whose bytes were fully buffered leaves `write` succeeding
@@ -1824,7 +2203,13 @@ mod tests {
             .shutdown()
             .await
             .expect_err("two shutdown stalls must fail the shutdown quorum instead of hanging");
-        assert!(err.to_string().contains("Failed to shutdown writers"));
+        assert_eq!(
+            err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let err = StorageError::from(err);
+        assert_eq!(err, StorageError::ErasureWriteQuorum);
+        assert!(err.is_quorum_error());
     }
 
     // A slow-but-honest writer that keeps completing shards (delay < stall
@@ -2016,7 +2401,7 @@ mod tests {
         let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
         let reader = tokio::io::BufReader::new(Cursor::new(payload.clone()));
         let (_reader, written) = erasure
-            .encode_with_ingest_mode(reader, &mut writers, DATA_SHARDS, true)
+            .encode_with_ingest_mode(reader, &mut writers, DATA_SHARDS, true, None)
             .await
             .expect("BytesMut ingest path should encode the streaming payload");
 
@@ -2045,7 +2430,7 @@ mod tests {
         let reader = tokio::io::BufReader::new(Cursor::new(vec![0x5a; block_size * 2]));
 
         rustfs_io_metrics::set_put_stage_metrics_enabled(true);
-        let result = erasure.encode_with_ingest_mode(reader, &mut writers, 1, true).await;
+        let result = erasure.encode_with_ingest_mode(reader, &mut writers, 1, true, None).await;
         rustfs_io_metrics::set_put_stage_metrics_enabled(false);
 
         let (_reader, written) = result.expect("bytesmut streaming encode should complete");
@@ -2106,7 +2491,13 @@ mod tests {
             .await
             .expect_err("streaming encode must fail when write quorum is unavailable");
 
-        assert!(err.to_string().contains("Failed to write data"));
+        assert_eq!(
+            err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let err = StorageError::from(err);
+        assert_eq!(err, StorageError::ErasureWriteQuorum);
+        assert!(err.is_quorum_error());
     }
 
     #[tokio::test]
@@ -2130,7 +2521,13 @@ mod tests {
             .await
             .expect_err("write quorum failure must fail the inline encode");
 
-        assert!(err.to_string().contains("Failed to write data"));
+        assert_eq!(
+            err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let err = StorageError::from(err);
+        assert_eq!(err, StorageError::ErasureWriteQuorum);
+        assert!(err.is_quorum_error());
         assert!(
             committed.lock().expect("committed buffer should be lockable").is_empty(),
             "successful writer must not be committed when write quorum fails before shutdown"
@@ -2158,7 +2555,13 @@ mod tests {
             .await
             .expect_err("shutdown quorum failure must fail the inline encode");
 
-        assert!(err.to_string().contains("Failed to shutdown writers"));
+        let err = StorageError::from(err);
+        assert!(matches!(
+            &err,
+            StorageError::Io(source)
+                if source.kind() == std::io::ErrorKind::Other && source.to_string() == "injected shutdown failure"
+        ));
+        assert!(!err.is_quorum_error());
         assert!(
             !committed.lock().expect("committed buffer should be lockable").is_empty(),
             "the successful writer should have committed before shutdown quorum failure was reported"
@@ -2380,7 +2783,13 @@ mod tests {
             .await
             .expect_err("batched encode must fail when write quorum is unavailable");
 
-        assert!(err.to_string().contains("Failed to write data"));
+        assert_eq!(
+            err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let err = StorageError::from(err);
+        assert_eq!(err, StorageError::ErasureWriteQuorum);
+        assert!(err.is_quorum_error());
     }
 
     #[tokio::test]
@@ -2639,10 +3048,14 @@ mod tests {
         let (_reader, total) = match pipeline {
             EncodePipeline::Vec => {
                 erasure
-                    .encode_with_ingest_mode(reader, &mut writers, DATA_SHARDS, false)
+                    .encode_with_ingest_mode(reader, &mut writers, DATA_SHARDS, false, None)
                     .await
             }
-            EncodePipeline::BytesMut => erasure.encode_with_ingest_mode(reader, &mut writers, DATA_SHARDS, true).await,
+            EncodePipeline::BytesMut => {
+                erasure
+                    .encode_with_ingest_mode(reader, &mut writers, DATA_SHARDS, true, None)
+                    .await
+            }
             EncodePipeline::Batched => erasure.encode_batched(reader, &mut writers, DATA_SHARDS).await,
         }
         .expect("encode should succeed");

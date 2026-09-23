@@ -13,12 +13,15 @@
 // limitations under the License.
 
 use super::*;
-use crate::core::pools::POOL_META_NAME;
+use crate::core::pools::{POOL_META_NAME, load_pool_meta_identity_observing};
+use crate::disk::{self, error::DiskError};
 use crate::services::rebalance::{REBAL_META_NAME, RebalStatus};
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::heal::HealOperations as _;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_lock::NamespaceLockGuard;
+use std::collections::BTreeSet;
 use tracing::trace;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -27,12 +30,85 @@ const EVENT_HEAL_ABANDONED_PARTS: &str = "heal_abandoned_parts";
 const EVENT_HEAL_FORMAT_COMPLETED: &str = "heal_format_completed";
 const EVENT_HEAL_OBJECT_STARTED: &str = "heal_object_started";
 
+/// An explicit bucket-heal admission owns one lifecycle generation through its write tail.
+pub(crate) struct BucketHealScope {
+    pub(crate) bucket: String,
+    pub(crate) incarnation: uuid::Uuid,
+    pub(crate) store: Arc<ECStore>,
+    fence: super::BucketIncarnationFenceGuard,
+}
+
+impl BucketHealScope {
+    pub(crate) fn check(&self) -> disk::error::Result<()> {
+        if self.fence.is_lock_lost() {
+            return Err(DiskError::other("bucket heal incarnation fence was lost"));
+        }
+        Ok(())
+    }
+}
+
+tokio::task_local! {
+    static BUCKET_HEAL_SCOPE: Arc<BucketHealScope>;
+}
+
+pub(crate) fn bucket_heal_scope(bucket: &str) -> Option<Arc<BucketHealScope>> {
+    BUCKET_HEAL_SCOPE
+        .try_with(|scope| (scope.bucket == bucket).then(|| scope.clone()))
+        .ok()
+        .flatten()
+}
+
+/// Resolve only the two canonical bucket records; other internal paths carry no bucket authority.
+pub(super) fn bucket_metadata_owner(object: &str) -> Option<&str> {
+    use crate::bucket::metadata::{BUCKET_INCARNATION_FILE, BUCKET_METADATA_FILE};
+    let (prefix, rest) = object.split_once('/')?;
+    let (bucket, file) = rest.split_once('/')?;
+    (prefix == disk::BUCKET_META_PREFIX
+        && matches!(file, BUCKET_METADATA_FILE | BUCKET_INCARNATION_FILE)
+        && check_valid_bucket_name_strict(bucket).is_ok())
+    .then_some(bucket)
+}
+
+pub(crate) fn bucket_heal_scope_for_object(bucket: &str, object: &str) -> Option<Arc<BucketHealScope>> {
+    let owner = if bucket == RUSTFS_META_BUCKET {
+        bucket_metadata_owner(object)?
+    } else {
+        bucket
+    };
+    bucket_heal_scope(owner)
+}
+
+/// Storage-owned proof for the exact version and every selected erasure location.
+/// This is an in-process result, never reconstructed from admin drive telemetry.
+#[derive(Debug)]
+pub struct HealObjectAbsenceProof {
+    pub bucket: String,
+    pub object: String,
+    pub version_id: String,
+    pub bucket_incarnation_id: Uuid,
+    pub pool_index: Option<usize>,
+    pub set_index: Option<usize>,
+    pub locations: Vec<(usize, usize)>,
+    pub removed: bool,
+}
+
+#[derive(Debug)]
+pub struct HealObjectStorageResult {
+    pub item: HealResultItem,
+    pub error: Option<Error>,
+    pub absence: Option<HealObjectAbsenceProof>,
+}
+
 fn invalid_heal_pool_index(pool_idx: usize, pool_count: usize) -> Error {
     StorageError::InvalidArgument(
         "heal".to_string(),
         "pool".to_string(),
         format!("invalid heal pool index {pool_idx} for {pool_count} pools"),
     )
+}
+
+fn is_pool_meta_object(bucket: &str, object: &str) -> bool {
+    bucket == RUSTFS_META_BUCKET && object == POOL_META_NAME
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -88,19 +164,200 @@ fn heal_format_fence_lost_error() -> Error {
 }
 
 impl ECStore {
+    pub async fn purge_delete_marker_with_proof(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        purge: &MrfDeleteMarkerPurge,
+        opts: &HealOpts,
+    ) -> Result<bool> {
+        if opts.dry_run || opts.no_lock || !purge.is_valid() {
+            return Err(StorageError::PreconditionFailed);
+        }
+        let version = Uuid::parse_str(version_id)
+            .ok()
+            .filter(|version| !version.is_nil())
+            .ok_or(StorageError::PreconditionFailed)?;
+        let (Some(pool_index), Some(set_index)) = (opts.pool, opts.set) else {
+            return Err(StorageError::PreconditionFailed);
+        };
+        let mut marker = rustfs_filemeta::MetaDeleteMarker::default();
+        let consumed = marker.unmarshal_msg(&purge.marker)?;
+        if usize::try_from(consumed).ok() != Some(purge.marker.len())
+            || marker.version_id != Some(version)
+            || marker.stable_identity() != purge.marker_identity
+        {
+            return Err(StorageError::PreconditionFailed);
+        }
+        let marker_info = marker.clone().into_fileinfo(bucket, object, false)?;
+        if !marker_info.is_canonical_delete_marker()
+            || marker_info.delete_marker_incarnation() != Some(purge.marker_incarnation_id)
+        {
+            return Err(StorageError::PreconditionFailed);
+        }
+
+        let current = self.bucket_incarnation_id_from_disk(bucket).await?;
+        if current.is_nil() {
+            return Err(StorageError::BucketNotFound(bucket.to_owned()));
+        }
+        let original = purge.bucket_incarnation_id;
+        let object = object.to_owned();
+        self.run_bucket_heal_at_incarnation(bucket, current, opts, move |store, bucket, _opts| async move {
+            let scope = bucket_heal_scope(&bucket).ok_or(StorageError::PreconditionFailed)?;
+            scope.check()?;
+            if original != current {
+                let retirement_store = crate::bucket::metadata_sys::object_store_if_initialized_in(&store.ctx)
+                    .await
+                    .ok_or(StorageError::PreconditionFailed)?;
+                if !crate::bucket::retirement::is_retired(retirement_store, &bucket, original).await? {
+                    return Err(StorageError::PreconditionFailed);
+                }
+            }
+            let pool = store
+                .pools
+                .get(pool_index)
+                .ok_or_else(|| invalid_heal_pool_index(pool_index, store.pools.len()))?;
+            let set = pool.disk_set.get(set_index).cloned().ok_or_else(|| {
+                StorageError::InvalidArgument(
+                    "heal".to_string(),
+                    "set".to_string(),
+                    format!("invalid heal set index {set_index} for pool {pool_index}"),
+                )
+            })?;
+            set.purge_delete_marker_exact(&bucket, &object, version, marker).await
+        })
+        .await
+    }
+
+    pub(super) async fn run_bucket_heal_at_incarnation<T, F, Fut>(
+        self: &Arc<Self>,
+        bucket: &str,
+        expected: uuid::Uuid,
+        opts: &HealOpts,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Self>, String, HealOpts) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+    {
+        if expected.is_nil() || self.ctx.lock_manager().is_disabled() {
+            return Err(Error::other(
+                "incarnation-bound bucket heal requires a valid identity and namespace locking",
+            ));
+        }
+        // Lock order: bucket lifecycle, then bucket/object and capacity locks used by healing.
+        let fence = self.acquire_bucket_incarnation_fence(bucket, expected).await?;
+        let scope = Arc::new(BucketHealScope {
+            bucket: bucket.to_owned(),
+            incarnation: expected,
+            store: self.clone(),
+            fence,
+        });
+        let store = self.clone();
+        let bucket = bucket.to_owned();
+        let opts = *opts;
+        // Dropping a caller's cancellation/timeout waiter must not release the lifecycle
+        // owner while a storage operation is still committing.
+        tokio::spawn(BUCKET_HEAL_SCOPE.scope(scope.clone(), async move {
+            scope.check().map_err(Error::from)?;
+            let result = operation(store, bucket, opts).await;
+            scope.check().map_err(Error::from)?;
+            result
+        }))
+        .await
+        .map_err(|error| Error::other_with_context("bucket heal owner task failed", error))?
+    }
+
+    pub async fn heal_bucket_at_incarnation(
+        self: &Arc<Self>,
+        bucket: &str,
+        expected: uuid::Uuid,
+        opts: &HealOpts,
+    ) -> Result<HealResultItem> {
+        self.run_bucket_heal_at_incarnation(bucket, expected, opts, |store, bucket, opts| async move {
+            store.heal_bucket(&bucket, &opts).await
+        })
+        .await
+    }
+
+    pub async fn heal_local_bucket_at_incarnation(
+        self: &Arc<Self>,
+        bucket: &str,
+        expected: uuid::Uuid,
+        opts: &HealOpts,
+        fenced_pools: Vec<usize>,
+        pools: Option<Vec<usize>>,
+    ) -> Result<HealResultItem> {
+        self.run_bucket_heal_at_incarnation(bucket, expected, opts, |store, bucket, opts| async move {
+            let peer =
+                crate::cluster::rpc::peer_s3_client::LocalPeerS3Client::new_with_instance_ctx(None, pools, store.ctx.clone());
+            crate::cluster::rpc::peer_s3_client::PeerS3Client::heal_bucket_with_fence(&peer, &bucket, &opts, &fenced_pools)
+                .await
+                .map_err(Error::from)
+        })
+        .await
+    }
+
+    pub async fn heal_object_at_incarnation(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        expected: uuid::Uuid,
+        opts: &HealOpts,
+    ) -> Result<HealObjectStorageResult> {
+        let object = object.to_owned();
+        let version_id = version_id.to_owned();
+        self.run_bucket_heal_at_incarnation(bucket, expected, opts, |store, bucket, opts| async move {
+            store.heal_object_with_proof(&bucket, &object, &version_id, &opts).await
+        })
+        .await
+    }
+
+    pub async fn heal_mrf_object_at_incarnation(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        expected: uuid::Uuid,
+        opts: &HealOpts,
+    ) -> Result<HealObjectStorageResult> {
+        let object = object.to_owned();
+        let version_id = version_id.to_owned();
+        self.run_bucket_heal_at_incarnation(bucket, expected, opts, |store, bucket, opts| async move {
+            store
+                .heal_object_with_authoritative_absence_proof(&bucket, &object, &version_id, &opts)
+                .await
+        })
+        .await
+    }
+
     async fn acquire_heal_format_fence(
         &self,
-    ) -> Result<(NamespaceLockGuard, NamespaceLockGuard, PoolMeta, Option<RebalanceMeta>)> {
+    ) -> Result<(
+        tokio::sync::MutexGuard<'_, PoolMetaWriteState>,
+        NamespaceLockGuard,
+        NamespaceLockGuard,
+        PoolMeta,
+        Option<RebalanceMeta>,
+    )> {
         let metadata_pool = self
             .pools
             .first()
             .cloned()
             .ok_or_else(|| Error::other("heal format requires at least one storage pool"))?;
+        let mut write_state = self.pool_meta_save_gate.lock().await;
+        write_state.ensure_write_safe("heal format fence failed")?;
 
         // Metadata fence order is part of the decommission/rebalance protocol:
-        // pool.bin must always be acquired before rebalance.bin.
+        // pool.bin must always be acquired before rebalance.bin. A read guard is
+        // sufficient to freeze the pool snapshot and lets replacement format
+        // recovery coexist with ordinary Heal's capacity fence. The rebalance
+        // write guard still serializes format repair and excludes transitions.
         let pool_lock = metadata_pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
-        let pool_guard = pool_lock.get_write_lock(get_lock_acquire_timeout()).await?;
+        let pool_guard = pool_lock.get_read_lock(get_lock_acquire_timeout()).await?;
         let rebalance_lock = metadata_pool.new_ns_lock(RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
         let rebalance_guard = rebalance_lock.get_write_lock(get_lock_acquire_timeout()).await?;
 
@@ -108,8 +365,14 @@ impl ECStore {
             return Err(heal_format_fence_lost_error());
         }
 
+        load_pool_meta_identity_observing(self.pools.clone(), &mut write_state).await?;
         let mut pool_meta = PoolMeta::default();
-        pool_meta.load_no_lock(metadata_pool.clone()).await?;
+        let replica_state = pool_meta
+            .load_no_lock_from_replicas_observing(self.pools.clone(), &mut write_state)
+            .await?;
+        write_state.observe_replicas(replica_state);
+        write_state.ensure_missing_metadata_can_initialize()?;
+        write_state.ensure_write_safe("heal format fence failed")?;
         if pool_meta.pools.len() != self.pools.len()
             || pool_meta.pools.iter().enumerate().any(|(pool_idx, pool)| {
                 pool.id != pool_idx || pool.cmd_line.is_empty() || pool.cmd_line != self.pools[pool_idx].endpoints.cmd_line
@@ -141,11 +404,12 @@ impl ECStore {
             return Err(heal_format_fence_lost_error());
         }
 
+        write_state.ensure_write_safe("heal format fence failed")?;
         if pool_guard.is_lock_lost() || rebalance_guard.is_lock_lost() {
             return Err(heal_format_fence_lost_error());
         }
 
-        Ok((pool_guard, rebalance_guard, pool_meta, rebalance_meta))
+        Ok((write_state, pool_guard, rebalance_guard, pool_meta, rebalance_meta))
     }
 
     fn get_pools_for_heal_object(&self, opts: &HealOpts) -> Result<Vec<Arc<Sets>>> {
@@ -160,6 +424,169 @@ impl ECStore {
         }
     }
 
+    /// Whether a replacement set owns this pool's `pool.bin` replica.
+    /// Placement is determined by the same hash as metadata writes, never by
+    /// whether a shard is currently readable on the replacement disk.
+    pub fn replacement_pool_metadata_required(&self, pool_index: usize, set_index: usize) -> Result<bool> {
+        let pool = self
+            .pools
+            .get(pool_index)
+            .ok_or_else(|| invalid_heal_pool_index(pool_index, self.pools.len()))?;
+        let target_set = pool.get_disks_for_heal_object(
+            POOL_META_NAME,
+            &HealOpts {
+                set: Some(set_index),
+                ..Default::default()
+            },
+        )?;
+        Ok(Arc::ptr_eq(&target_set, &pool.get_disks_by_key(POOL_META_NAME)))
+    }
+
+    /// Restore the bucket configuration and incarnation before retiring a replacement marker.
+    pub async fn heal_replacement_bucket_metadata(
+        self: &Arc<Self>,
+        bucket: &str,
+        opts: &HealOpts,
+        targets: &[String],
+    ) -> Result<()> {
+        use crate::bucket::metadata::{BUCKET_INCARNATION_FILE, BUCKET_METADATA_FILE};
+        use crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_read_lock_in;
+
+        let (Some(pool_index), Some(set_index)) = (opts.pool, opts.set) else {
+            return Err(Error::PreconditionFailed);
+        };
+        if targets.is_empty() || opts.dry_run || opts.no_lock || check_valid_bucket_name_strict(bucket).is_err() {
+            return Err(Error::PreconditionFailed);
+        }
+        let pool = self
+            .pools
+            .get(pool_index)
+            .ok_or_else(|| invalid_heal_pool_index(pool_index, self.pools.len()))?;
+        let target_set = pool.get_disks_for_heal_object(BUCKET_METADATA_FILE, opts)?;
+        if targets.iter().any(|target| {
+            target_set
+                .set_endpoints
+                .iter()
+                .filter(|endpoint| endpoint.to_string() == *target)
+                .count()
+                != 1
+        }) {
+            return Err(Error::PreconditionFailed);
+        }
+        let objects: Vec<_> = [BUCKET_METADATA_FILE, BUCKET_INCARNATION_FILE]
+            .into_iter()
+            .map(|file| format!("{}/{bucket}/{file}", disk::BUCKET_META_PREFIX))
+            .filter(|object| Arc::ptr_eq(&target_set, &pool.get_disks_by_key(object)))
+            .collect();
+        if objects.is_empty() {
+            return Ok(());
+        }
+
+        // Read the persisted identity without lazy migration: a replacement
+        // must never turn lost configuration into newly fabricated defaults.
+        let incarnation = self.bucket_incarnation_id_from_disk(bucket).await?;
+        let targets = targets.to_vec();
+        self.run_bucket_heal_at_incarnation(bucket, incarnation, opts, move |store, bucket, opts| async move {
+            // Match config writers: lifecycle, metadata transaction, object locks.
+            // Keep the transaction stable through target readback, including when
+            // the caller is cancelled and the storage owner finishes its write.
+            let transaction = acquire_bucket_metadata_transaction_read_lock_in(&store.ctx, &bucket).await?;
+            for object in objects {
+                let scope = bucket_heal_scope(&bucket).ok_or(Error::PreconditionFailed)?;
+                scope.check()?;
+                if transaction.is_lock_lost() {
+                    return Err(Error::PreconditionFailed);
+                }
+                // Config objects occupy one pool, unlike pool.bin. Require a
+                // successful all-pool lookup before accepting another pool's ownership.
+                if !store.single_pool() {
+                    let (owner, _) = store
+                        .get_pool_info_for_delete_marker(RUSTFS_META_BUCKET, &object, &ObjectOptions::default())
+                        .await?;
+                    if owner.index != pool_index {
+                        continue;
+                    }
+                }
+                let metadata_opts = HealOpts { remove: false, ..opts };
+                let (result, error) = store.heal_object(RUSTFS_META_BUCKET, &object, "", &metadata_opts).await?;
+                if let Some(error) = error {
+                    return Err(error);
+                }
+                for target in &targets {
+                    let mut drives = result.after.drives.iter().filter(|drive| &drive.endpoint == target);
+                    if !drives.next().is_some_and(|drive| drive.state == "ok") || drives.next().is_some() {
+                        return Err(Error::PreconditionFailed);
+                    }
+                }
+                if !store
+                    .replacement_targets_have_version(RUSTFS_META_BUCKET, &object, "", pool_index, set_index, &targets)
+                    .await?
+                {
+                    return Err(Error::PreconditionFailed);
+                }
+            }
+            if transaction.is_lock_lost() {
+                return Err(Error::PreconditionFailed);
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Return every live erasure set selected by an object-heal scope.
+    pub async fn heal_erasure_set_scopes(&self, opts: &HealOpts) -> Result<Vec<(usize, usize)>> {
+        let pools = self.get_pools_for_heal_object(opts)?;
+        let pool_meta = self.pool_meta.read().await;
+        let mut scopes = Vec::new();
+
+        for pool in pools {
+            let suspended_complete = pool_meta.is_suspended(pool.pool_idx).then(|| {
+                pool_meta
+                    .pools
+                    .get(pool.pool_idx)
+                    .and_then(|status| status.decommission.as_ref())
+                    .is_some_and(|decommission| decommission.complete)
+            });
+            if let Some(complete) = suspended_complete {
+                if opts.pool.is_some() {
+                    return Err(if complete {
+                        StorageError::InvalidArgument(
+                            "heal".to_string(),
+                            "pool".to_string(),
+                            format!("heal pool {} has completed decommission", pool.pool_idx),
+                        )
+                    } else {
+                        Error::SlowDown
+                    });
+                }
+                continue;
+            }
+
+            if let Some(set_idx) = opts.set {
+                if set_idx >= pool.disk_set.len() {
+                    return Err(StorageError::InvalidArgument(
+                        "heal".to_string(),
+                        "set".to_string(),
+                        format!(
+                            "invalid heal set index {set_idx} for pool {} with {} sets",
+                            pool.pool_idx,
+                            pool.disk_set.len()
+                        ),
+                    ));
+                }
+                scopes.push((pool.pool_idx, set_idx));
+            } else {
+                scopes.extend((0..pool.disk_set.len()).map(|set_idx| (pool.pool_idx, set_idx)));
+            }
+        }
+
+        if scopes.is_empty() {
+            return Err(Error::SlowDown);
+        }
+
+        Ok(scopes)
+    }
+
     #[instrument(skip(self))]
     pub(super) async fn handle_heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         let mut r = HealResultItem {
@@ -172,7 +599,8 @@ impl ECStore {
         let mut count_completed = 0;
         let mut first_error = None;
         for (pool_idx, pool) in self.pools.iter().enumerate() {
-            let (pool_guard, rebalance_guard, pool_meta, rebalance_meta) = self.acquire_heal_format_fence().await?;
+            let (mut write_state, pool_guard, rebalance_guard, pool_meta, rebalance_meta) =
+                self.acquire_heal_format_fence().await?;
             if pool_guard.is_lock_lost() || rebalance_guard.is_lock_lost() {
                 first_error.get_or_insert(heal_format_fence_lost_error());
                 break;
@@ -187,7 +615,15 @@ impl ECStore {
                 continue;
             }
 
-            let fence_lost = || pool_guard.is_lock_lost() || rebalance_guard.is_lock_lost();
+            let fence_lost = || {
+                let lost = pool_guard.is_lock_lost()
+                    || rebalance_guard.is_lock_lost()
+                    || write_state.ensure_write_safe("heal format write fence failed").is_err();
+                if lost {
+                    write_state.block_writes_after_fence_loss();
+                }
+                lost
+            };
             let (mut result, err) = pool.heal_format_with_fence(dry_run, fence_lost).await?;
             if let Some(err) = err {
                 match err {
@@ -206,7 +642,11 @@ impl ECStore {
 
             // A lease can be lost after the final write; fail closed before
             // reporting the pool as successfully healed.
-            if pool_guard.is_lock_lost() || rebalance_guard.is_lock_lost() {
+            let fence_lost = pool_guard.is_lock_lost()
+                || rebalance_guard.is_lock_lost()
+                || write_state.ensure_write_safe("heal format publication fence failed").is_err();
+            if fence_lost {
+                write_state.block_writes_after_fence_loss();
                 first_error.get_or_insert(heal_format_fence_lost_error());
                 break;
             }
@@ -259,7 +699,33 @@ impl ECStore {
             )
         })?;
 
-        set.heal_replacement_format(dry_run, targets).await
+        let (mut write_state, pool_guard, rebalance_guard, pool_meta, rebalance_meta) = self.acquire_heal_format_fence().await?;
+        if let Some(skip) = classify_heal_format_pool(pool_index, &pool.endpoints.cmd_line, &pool_meta, rebalance_meta.as_ref()) {
+            return Ok((HealResultItem::default(), Some(heal_format_pool_skip_error(skip))));
+        }
+
+        let fence_lost = || {
+            let lost = pool_guard.is_lock_lost()
+                || rebalance_guard.is_lock_lost()
+                || write_state
+                    .ensure_write_safe("replacement format write fence failed")
+                    .is_err();
+            if lost {
+                write_state.block_writes_after_fence_loss();
+            }
+            lost
+        };
+        let result = set.heal_replacement_format_with_fence(dry_run, targets, fence_lost).await?;
+        let fence_lost = pool_guard.is_lock_lost()
+            || rebalance_guard.is_lock_lost()
+            || write_state
+                .ensure_write_safe("replacement format publication fence failed")
+                .is_err();
+        if fence_lost {
+            write_state.block_writes_after_fence_loss();
+            return Ok((result.0, Some(heal_format_fence_lost_error())));
+        }
+        Ok(result)
     }
 
     #[instrument(skip(self, targets), fields(pool_index, set_index, target_count = targets.len()))]
@@ -291,7 +757,50 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
-        let res = self.peer_sys.heal_bucket(bucket, opts).await?;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.read().await;
+        let save_guard = self.pool_meta_save_gate.lock().await;
+        save_guard.ensure_write_safe("bucket heal cannot run while pool metadata requires recovery")?;
+        let mut fenced_pools = BTreeSet::new();
+        {
+            let pool_meta = self.pool_meta.read().await;
+            fenced_pools.extend((0..pool_meta.pools.len()).filter(|pool_idx| pool_meta.is_suspended(*pool_idx)));
+            if let Some(pool_idx) = opts.pool {
+                if pool_idx >= pool_meta.pools.len() {
+                    return Err(invalid_heal_pool_index(pool_idx, pool_meta.pools.len()));
+                }
+                if pool_meta.is_suspended(pool_idx) {
+                    let complete = pool_meta.pools[pool_idx]
+                        .decommission
+                        .as_ref()
+                        .is_some_and(|decommission| decommission.complete);
+                    return Err(if complete {
+                        StorageError::InvalidArgument(
+                            "heal".to_string(),
+                            "pool".to_string(),
+                            format!("heal pool {pool_idx} has completed decommission"),
+                        )
+                    } else {
+                        Error::SlowDown
+                    });
+                }
+            }
+        }
+
+        let dispatch_fenced_pools = fenced_pools.iter().copied().collect::<Vec<_>>();
+        drop(save_guard);
+        let mut res = self
+            .peer_sys
+            .heal_bucket_with_fence_from_movement_guarded_coordinator(bucket, opts, &dispatch_fenced_pools)
+            .await?;
+        {
+            let pool_meta = self.pool_meta.read().await;
+            fenced_pools.extend((0..pool_meta.pools.len()).filter(|pool_idx| pool_meta.is_suspended(*pool_idx)));
+        }
+        if !fenced_pools.is_empty() {
+            let pools = fenced_pools.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+            res.detail = format!("skipped: bucket-volume heal fenced on decommission-suspended pool(s): {pools}");
+        }
 
         Ok(res)
     }
@@ -303,6 +812,151 @@ impl ECStore {
         object: &str,
         version_id: &str,
         opts: &HealOpts,
+    ) -> Result<(HealResultItem, Option<Error>)> {
+        self.handle_heal_object_with_absence(
+            bucket,
+            object,
+            version_id,
+            opts,
+            &mut None,
+            crate::set_disk::AbsenceProofRequest {
+                retirement: None,
+                allow_unversioned: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn heal_object_with_proof(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+    ) -> Result<HealObjectStorageResult> {
+        self.heal_object_with_absence_proof(bucket, object, version_id, opts, false)
+            .await
+    }
+
+    async fn heal_object_with_authoritative_absence_proof(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+    ) -> Result<HealObjectStorageResult> {
+        self.heal_object_with_absence_proof(bucket, object, version_id, opts, true)
+            .await
+    }
+
+    async fn heal_object_with_absence_proof(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+        allow_unversioned_absence: bool,
+    ) -> Result<HealObjectStorageResult> {
+        if opts.dry_run
+            || opts.no_lock
+            || (!allow_unversioned_absence && version_id.is_empty())
+            || super::utils::is_reserved_or_invalid_bucket(bucket, false)
+        {
+            let (item, error) = self.handle_heal_object(bucket, object, version_id, opts).await?;
+            return Ok(HealObjectStorageResult {
+                item,
+                error,
+                absence: None,
+            });
+        }
+
+        // Match object publication: bucket lifecycle before capacity and object
+        // namespace locks. Keep the incarnation pinned through proof delivery.
+        // Reuse the admission's owner: reacquiring a read lock behind a queued
+        // lifecycle writer would deadlock with the read lock we already hold.
+        let scope = bucket_heal_scope(bucket).filter(|scope| std::ptr::eq(scope.store.as_ref(), self));
+        let guard = if let Some(scope) = &scope {
+            scope.check().map_err(Error::from)?;
+            None
+        } else {
+            Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
+        };
+        let fence_is_lost = || {
+            scope.as_ref().is_some_and(|scope| scope.fence.is_lock_lost())
+                || guard.as_ref().is_some_and(NamespaceLockGuard::is_lock_lost)
+        };
+        let lifecycle_guard = scope
+            .as_ref()
+            .and_then(|scope| scope.fence.namespace_lock_guard())
+            .or(guard.as_ref())
+            .ok_or_else(|| Error::other("bucket heal requires a held lifecycle guard"))?;
+        let retirement = crate::bucket::retirement::MarkerRetirementContext {
+            store: crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await,
+            current_incarnation: if let Some(scope) = &scope {
+                Some(scope.incarnation)
+            } else {
+                self.bucket_incarnation_id_from_disk(bucket)
+                    .await
+                    .ok()
+                    .filter(|id| !id.is_nil())
+            },
+            lifecycle_guard,
+        };
+        let mut proofs = None;
+        let (item, mut error) = self
+            .handle_heal_object_with_absence(
+                bucket,
+                object,
+                version_id,
+                opts,
+                &mut proofs,
+                crate::set_disk::AbsenceProofRequest {
+                    retirement: Some(&retirement),
+                    allow_unversioned: allow_unversioned_absence,
+                },
+            )
+            .await?;
+        // Read the authoritative incarnation only for an absence candidate.
+        // The lifecycle guard has pinned it throughout the storage operation.
+        let incarnation = if proofs.is_some() && !fence_is_lost() {
+            if let Some(scope) = &scope {
+                Some(scope.incarnation)
+            } else {
+                self.bucket_incarnation_id_from_disk(bucket)
+                    .await
+                    .ok()
+                    .filter(|id| !id.is_nil())
+            }
+        } else {
+            None
+        };
+        let absence = match (incarnation, proofs) {
+            (Some(incarnation), Some(proofs)) if !fence_is_lost() => Some(HealObjectAbsenceProof {
+                bucket: bucket.to_owned(),
+                object: object.to_owned(),
+                version_id: version_id.to_owned(),
+                bucket_incarnation_id: incarnation,
+                pool_index: opts.pool,
+                set_index: opts.set,
+                removed: proofs.iter().any(|proof| proof.removed),
+                locations: proofs.into_iter().map(|proof| (proof.pool_index, proof.set_index)).collect(),
+            }),
+            _ => None,
+        };
+        if absence.is_some() {
+            error = None;
+        }
+        Ok(HealObjectStorageResult { item, error, absence })
+    }
+
+    async fn handle_heal_object_with_absence(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+        absence: &mut Option<Vec<crate::set_disk::HealedObjectAbsence>>,
+        proof: crate::set_disk::AbsenceProofRequest<'_>,
     ) -> Result<(HealResultItem, Option<Error>)> {
         trace!(
             event = EVENT_HEAL_OBJECT_STARTED,
@@ -317,9 +971,32 @@ impl ECStore {
         );
         let object = encode_dir_object(object);
 
+        *absence = None;
         let pools = self.get_pools_for_heal_object(opts)?;
+        let requested_pool_count = pools.len();
+        if let Some(set_idx) = opts.set {
+            for pool in &pools {
+                if set_idx >= pool.disk_set.len() {
+                    let err = StorageError::InvalidArgument(
+                        "heal".to_string(),
+                        "set".to_string(),
+                        format!(
+                            "invalid heal set index {set_idx} for pool {} with {} sets",
+                            pool.pool_idx,
+                            pool.disk_set.len()
+                        ),
+                    );
+                    if opts.pool.is_some() {
+                        return Err(err);
+                    }
+                    return Ok((HealResultItem::default(), Some(err)));
+                }
+            }
+        }
+        #[cfg(test)]
+        let store_id = self.id;
 
-        let mut futures = Vec::with_capacity(pools.len());
+        let mut heal_pools = Vec::with_capacity(pools.len());
         for pool in pools.iter() {
             let suspended_complete = {
                 let pool_meta = self.pool_meta.read().await;
@@ -347,16 +1024,76 @@ impl ECStore {
                 }
                 continue;
             }
-            futures.push(pool.heal_object(bucket, &object, version_id, opts));
+            heal_pools.push(Arc::clone(pool));
         }
-        let results = join_all(futures).await;
+        let results = if is_pool_meta_object(bucket, &object) && !opts.no_lock && !heal_pools.is_empty() {
+            let target_pool_indices = heal_pools.iter().map(|pool| pool.pool_idx).collect::<Vec<_>>();
+            match self.acquire_pool_meta_object_heal_fence(&target_pool_indices).await {
+                Ok((pool_meta_guard, admissions)) => {
+                    let fixed_set = self.pools.first().and_then(|pool| pool.disk_set.first()).cloned();
+                    let futures = heal_pools.iter().zip(admissions).map(|(pool, admission)| {
+                        let pool = Arc::clone(pool);
+                        let pool_object = object.clone();
+                        let fixed_set = fixed_set.clone();
+                        let mut opts = *opts;
+                        async move {
+                            admission?;
+                            let fixed_set = fixed_set.ok_or_else(|| Error::other("pool metadata heal requires a fixed set"))?;
+                            let target_set = pool.get_disks_for_heal_object(&pool_object, &opts)?;
+                            opts.no_lock = fixed_set.shares_namespace_lock_domain(&target_set).await;
+                            #[cfg(test)]
+                            if !opts.no_lock {
+                                crate::core::pools::notify_decommission_external_heal_target_lock_attempted();
+                            }
+                            #[cfg(test)]
+                            crate::core::pools::notify_decommission_external_heal_operation_started(store_id);
+                            pool.heal_object_with_absence(bucket, &pool_object, version_id, &opts, proof)
+                                .await
+                        }
+                    });
+                    let results = join_all(futures).await;
+                    drop(pool_meta_guard);
+                    results
+                }
+                Err(err) => (0..heal_pools.len()).map(|_| Err(err.clone())).collect(),
+            }
+        } else {
+            let mut futures = Vec::with_capacity(heal_pools.len());
+            for pool in heal_pools {
+                let pool_idx = pool.pool_idx;
+                let pool_object = object.clone();
+                let opts = *opts;
+                futures.push(self.run_external_decommission_capacity_heal(
+                    pool_idx,
+                    bucket,
+                    &object,
+                    opts,
+                    move |opts| async move {
+                        #[cfg(test)]
+                        crate::core::pools::notify_decommission_external_heal_operation_started(store_id);
+                        pool.heal_object_with_absence(bucket, &pool_object, version_id, &opts, proof)
+                            .await
+                    },
+                ));
+            }
+            join_all(futures).await
+        };
 
+        let mut proofs = Vec::with_capacity(requested_pool_count);
         let mut errs = Vec::with_capacity(self.pools.len());
         let mut ress = Vec::with_capacity(self.pools.len());
 
         for res in results.into_iter() {
             match res {
-                Ok((result, err)) => {
+                Ok((result, err, proof)) => {
+                    if let Some(proof) = proof
+                        && (err.is_none()
+                            || err
+                                .as_ref()
+                                .is_some_and(|err| is_err_object_not_found(err) || is_err_version_not_found(err)))
+                    {
+                        proofs.push(proof);
+                    }
                     let mut result = result;
                     result.object = decode_dir_object(&result.object);
                     ress.push(result);
@@ -367,6 +1104,12 @@ impl ECStore {
                     ress.push(HealResultItem::default());
                 }
             }
+        }
+
+        // Absence in one pool cannot discharge a responsibility covering other
+        // pools, including skipped decommission sources or failed lookups.
+        if requested_pool_count > 0 && proofs.len() == requested_pool_count {
+            *absence = Some(proofs);
         }
 
         for (idx, err) in errs.iter().enumerate() {
@@ -439,16 +1182,121 @@ impl ECStore {
 mod tests {
     use super::*;
     use crate::bucket::metadata_sys;
-    use crate::core::pools::{PoolDecommissionInfo, PoolStatus};
-    use crate::disk::{DeleteOptions, DiskOption, format::FormatV3, new_disk};
+    use crate::cluster::rpc::PeerS3Client;
+    use crate::config::com::{delete_config, read_config_no_lock_preserve_empty_with_metadata, save_config};
+    use crate::core::pools::{
+        DecommissionCapacityAdmission, DecommissionCapacityLockOrderBarrier, DecommissionErasureLayout,
+        DecommissionPoolCapacityInfo, POOL_META_IDENTITY_NAME, PoolDecommissionInfo, PoolMetaReplicaState, PoolStatus,
+        initialized_pool_meta_identity_for_test, set_decommission_capacity_info_overrides_for_test,
+    };
+    use crate::core::sets::HealFormatAfterSaveBarrier;
+    use crate::disk::error::Result as DiskResult;
+    use crate::disk::{DeleteOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, format::FormatV3, new_disk};
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::runtime::instance::InstanceContext;
-    use crate::services::rebalance::{RebalanceInfo, RebalanceStats};
-    use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+    use crate::services::rebalance::{
+        RebalanceInfo, RebalanceStats, test_three_pool_stores_with_isolated_node_contexts, test_two_pool_stores,
+    };
+    use crate::storage_api_contracts::bucket::{
+        BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
+    };
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations};
     use crate::store::init_format::{load_format_erasure, save_format_file};
     use crate::store::init_local_disks_with_instance_ctx;
+    use rustfs_heal_contracts::heal_channel::DriveState;
     use tokio_util::sync::CancellationToken;
+
+    #[derive(Debug)]
+    struct BlockingHealPeer {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl PeerS3Client for BlockingHealPeer {
+        async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> DiskResult<HealResultItem> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(HealResultItem::default())
+        }
+
+        async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> DiskResult<()> {
+            Ok(())
+        }
+
+        async fn list_bucket(&self, _opts: &BucketOptions) -> DiskResult<Vec<BucketInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> DiskResult<()> {
+            Ok(())
+        }
+
+        async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> DiskResult<BucketInfo> {
+            Ok(BucketInfo::default())
+        }
+
+        fn get_pools(&self) -> Option<Vec<usize>> {
+            Some(vec![0, 1])
+        }
+    }
+
+    #[derive(Debug)]
+    struct WriterQueuedLocalHealPeer {
+        movement_gate: Arc<tokio::sync::RwLock<()>>,
+        writer_queued: Arc<tokio::sync::Notify>,
+        writer_acquired: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl PeerS3Client for WriterQueuedLocalHealPeer {
+        async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> DiskResult<HealResultItem> {
+            let _movement_guard = self
+                .movement_gate
+                .try_read()
+                .map_err(|_| crate::disk::error::DiskError::TooManyOpenFiles)?;
+            Ok(HealResultItem::default())
+        }
+
+        async fn heal_bucket_with_fence_from_movement_guarded_coordinator(
+            &self,
+            _bucket: &str,
+            _opts: &HealOpts,
+            _fenced_pools: &[usize],
+        ) -> DiskResult<HealResultItem> {
+            Ok(HealResultItem::default())
+        }
+
+        async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> DiskResult<()> {
+            Ok(())
+        }
+
+        async fn list_bucket(&self, _opts: &BucketOptions) -> DiskResult<Vec<BucketInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> DiskResult<()> {
+            Ok(())
+        }
+
+        async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> DiskResult<BucketInfo> {
+            let movement_gate = self.movement_gate.clone();
+            let writer_acquired = self.writer_acquired.clone();
+            tokio::spawn(async move {
+                let _movement_guard = movement_gate.write().await;
+                writer_acquired.notify_one();
+            });
+            while self.movement_gate.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+            self.writer_queued.notify_one();
+            Ok(BucketInfo::default())
+        }
+
+        fn get_pools(&self) -> Option<Vec<usize>> {
+            Some(vec![0, 1])
+        }
+    }
 
     async fn minimal_heal_pool(pool_idx: usize) -> Arc<Sets> {
         let format = FormatV3::new(1, 1);
@@ -476,6 +1324,266 @@ mod tests {
         .expect("minimal pool should build")
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bucket_incarnation_heal_preserves_successor_shards_and_allows_fresh_repair() {
+        let (_root, store, shutdown) = multi_pool_heal_store().await;
+        let bucket = format!("heal-incarnation-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("original bucket");
+        let old = store
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("original identity");
+        store
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("normal bucket deletion");
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("same-name successor");
+        let new = store
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("successor identity");
+        assert_ne!(old, new);
+        let object = "successor-version";
+        let version = Uuid::new_v4().to_string();
+        let set = store.pools[0].get_disks(0);
+        let mut reader = PutObjReader::from_vec(vec![17; 512 * 1024]);
+        set.put_object(
+            &bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                versioned: true,
+                version_id: Some(version.clone()),
+                // Drain every rename before the fixture removes a physical shard.
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write successor version");
+        let missing = set.disks.read().await[0].clone().expect("missing target");
+        let healthy = set.disks.read().await[1].clone().expect("healthy target");
+        missing
+            .delete(
+                &bucket,
+                object,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("remove one successor shard");
+        let baseline = healthy
+            .read_all(&bucket, &format!("{object}/xl.meta"))
+            .await
+            .expect("healthy baseline");
+        let opts = HealOpts {
+            pool: Some(0),
+            set: Some(0),
+            scan_mode: rustfs_heal_contracts::heal_channel::HealScanMode::Deep,
+            ..Default::default()
+        };
+        // Positive control for the original bug: name-only healing repairs the successor.
+        let (_, error) = store
+            .heal_object(&bucket, object, &version, &opts)
+            .await
+            .expect("unbound control");
+        assert!(error.is_none());
+        assert!(missing.read_xl(&bucket, object, false).await.is_ok());
+        missing
+            .delete(
+                &bucket,
+                object,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("restore the same missing-shard condition");
+        let fi = healthy
+            .read_version("", &bucket, object, &version, &Default::default())
+            .await
+            .expect("successor metadata");
+        let disk_ref = healthy.endpoint().to_string();
+        assert!(
+            store
+                .write_local_metadata_at_incarnation(&disk_ref, (&bucket, object), fi.clone(), old)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .delete_local_path_at_incarnation(
+                    &disk_ref,
+                    (&bucket, object),
+                    DeleteOptions {
+                        recursive: true,
+                        immediate: true,
+                        ..Default::default()
+                    },
+                    old
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .delete_local_version_at_incarnation(
+                    &disk_ref,
+                    (&bucket, object),
+                    fi.clone(),
+                    false,
+                    DeleteOptions::default(),
+                    old
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .rename_local_data_at_incarnation(&disk_ref, (&bucket, object), &fi, (&bucket, "stale-destination"), old)
+                .await
+                .is_err()
+        );
+        for file in [".metadata.bin", ".bucket-incarnation"] {
+            let metadata = format!("buckets/{bucket}/{file}");
+            assert!(
+                store
+                    .rename_local_data_at_incarnation(&disk_ref, (&bucket, object), &fi, (RUSTFS_META_BUCKET, &metadata), old)
+                    .await
+                    .is_err(),
+                "stale remote heal must not replace the successor's {file}"
+            );
+        }
+        assert!(store.heal_bucket_at_incarnation(&bucket, old, &opts).await.is_err());
+        assert!(
+            store
+                .heal_object_at_incarnation(&bucket, object, &version, old, &opts)
+                .await
+                .is_err()
+        );
+        assert!(
+            missing.read_xl(&bucket, object, false).await.is_err(),
+            "obsolete admission must not publish a shard"
+        );
+        assert_eq!(
+            healthy
+                .read_all(&bucket, &format!("{object}/xl.meta"))
+                .await
+                .expect("healthy after stale heal"),
+            baseline
+        );
+        store
+            .heal_bucket_at_incarnation(&bucket, new, &opts)
+            .await
+            .expect("fresh bucket metadata repair");
+        let result = store
+            .heal_object_at_incarnation(&bucket, object, &version, new, &opts)
+            .await
+            .expect("new admission repair");
+        assert!(result.error.is_none(), "new admission must repair independently: {:?}", result.error);
+        assert!(
+            missing.read_xl(&bucket, object, false).await.is_ok(),
+            "new admission publishes the missing shard"
+        );
+        store
+            .write_local_metadata_at_incarnation(&disk_ref, (&bucket, object), fi.clone(), new)
+            .await
+            .expect("fresh target metadata");
+        store
+            .delete_local_version_at_incarnation(&disk_ref, (&bucket, object), fi, false, DeleteOptions::default(), new)
+            .await
+            .expect("fresh target version cleanup");
+        healthy
+            .write_all(&bucket, "fresh-cleanup/data", bytes::Bytes::from_static(b"temporary"))
+            .await
+            .expect("cleanup fixture");
+        store
+            .delete_local_path_at_incarnation(
+                &disk_ref,
+                (&bucket, "fresh-cleanup"),
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+                new,
+            )
+            .await
+            .expect("fresh target path cleanup");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bucket_incarnation_heal_owner_survives_cancelled_waiter_and_queued_writer() {
+        let (_root, store, shutdown) = multi_pool_heal_store().await;
+        let bucket = format!("heal-owner-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket");
+        let identity = store.bucket_incarnation_id_from_disk(&bucket).await.expect("identity");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+        let worker_store = store.clone();
+        let worker_bucket = bucket.clone();
+        let waiter = tokio::spawn(async move {
+            worker_store
+                .run_bucket_heal_at_incarnation(
+                    &worker_bucket,
+                    identity,
+                    &HealOpts::default(),
+                    move |store, bucket, opts| async move {
+                        started_tx.send(()).expect("announce held generation");
+                        release_rx.await.expect("release commit");
+                        let result = store
+                            .heal_object_with_proof(&bucket, "history.txt", &Uuid::new_v4().to_string(), &opts)
+                            .await?;
+                        let proof = result.absence.expect("absence proof must reuse the held lifecycle owner");
+                        assert_eq!(proof.bucket_incarnation_id, identity);
+                        assert_eq!(proof.locations.len(), 2);
+                        drained_tx.send(()).expect("announce drain");
+                        Ok(())
+                    },
+                )
+                .await
+        });
+        started_rx.await.expect("operation acquired generation fence");
+        waiter.abort();
+        assert!(waiter.await.expect_err("waiter aborted").is_cancelled());
+        let writer_store = store.clone();
+        let writer_bucket = bucket.clone();
+        let mut writer = Box::pin(writer_store.acquire_bucket_lifecycle_write_lock(&writer_bucket));
+        assert!(
+            futures::poll!(&mut writer).is_pending(),
+            "cancellation must not release the live operation's generation"
+        );
+        release_tx.send(()).expect("finish operation");
+        tokio::time::timeout(std::time::Duration::from_secs(10), drained_rx)
+            .await
+            .expect("proof must not reacquire a lifecycle read lock behind the queued writer")
+            .expect("physical operation drains");
+        let guard = tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+            .await
+            .expect("writer resumes after drain")
+            .expect("lifecycle writer");
+        drop(guard);
+        shutdown.cancel();
+    }
+
     async fn minimal_heal_store() -> ECStore {
         ECStore {
             id: Uuid::new_v4(),
@@ -489,10 +1597,68 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         }
+    }
+
+    async fn remove_pool_meta_shard(store: &ECStore, pool_idx: usize) -> DiskStore {
+        let target_set = store.pools[pool_idx].get_disks_by_key(POOL_META_NAME);
+        let missing_disk = target_set.disks.read().await[0]
+            .clone()
+            .expect("pool metadata fixture disk should be online");
+        missing_disk
+            .delete(
+                RUSTFS_META_BUCKET,
+                POOL_META_NAME,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("one pool metadata shard should be removable");
+        assert!(
+            missing_disk.read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false).await.is_err(),
+            "pool metadata fixture must start with one missing shard"
+        );
+        missing_disk
+    }
+
+    #[tokio::test]
+    async fn heal_erasure_set_scopes_follow_requested_pool_and_set() {
+        let store = minimal_heal_store().await;
+
+        assert_eq!(
+            store
+                .heal_erasure_set_scopes(&HealOpts::default())
+                .await
+                .expect("unscoped heal should enumerate every live set"),
+            vec![(0, 0), (1, 0)]
+        );
+        assert_eq!(
+            store
+                .heal_erasure_set_scopes(&HealOpts {
+                    pool: Some(1),
+                    set: Some(0),
+                    ..Default::default()
+                })
+                .await
+                .expect("scoped heal should enumerate only its requested set"),
+            vec![(1, 0)]
+        );
+
+        let err = store
+            .heal_erasure_set_scopes(&HealOpts {
+                pool: Some(0),
+                set: Some(1),
+                ..Default::default()
+            })
+            .await
+            .expect_err("an invalid set scope must fail closed");
+        assert!(matches!(err, Error::InvalidArgument(..)));
     }
 
     fn pool_meta_with_decommission(info: PoolDecommissionInfo) -> PoolMeta {
@@ -698,6 +1864,504 @@ mod tests {
         (temp_dir, store, shutdown)
     }
 
+    #[test]
+    fn bucket_metadata_heal_owner_rejects_path_aliases_and_unrelated_records() {
+        for file in [".metadata.bin", ".bucket-incarnation"] {
+            assert_eq!(bucket_metadata_owner(&format!("buckets/example/{file}")), Some("example"));
+        }
+        for path in [
+            "/buckets/example/.metadata.bin",
+            "buckets/../.metadata.bin",
+            "buckets/example/../.metadata.bin",
+            "buckets/example/.metadata.bin/extra",
+            "buckets/example//.metadata.bin",
+            "buckets/example/.metadata.bin.old",
+            "config/iam/example/.metadata.bin",
+            "buckets/example/usage.json",
+        ] {
+            assert_eq!(bucket_metadata_owner(path), None, "unexpected bucket authority for {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_bucket_metadata_respects_pool_ownership_and_required_records() {
+        let (root, store, shutdown) = multi_pool_heal_store().await;
+        let bucket = "replacement-bucket-metadata";
+        for invalid_bucket in ["MixedCase", "../example", RUSTFS_META_BUCKET] {
+            assert!(matches!(
+                store
+                    .heal_replacement_bucket_metadata(
+                        invalid_bucket,
+                        &HealOpts {
+                            pool: Some(0),
+                            set: Some(0),
+                            ..Default::default()
+                        },
+                        &[root.path().join("pool0-disk0").to_string_lossy().into_owned()],
+                    )
+                    .await,
+                Err(Error::PreconditionFailed)
+            ));
+        }
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket and its persisted records");
+        let mut owned = 0;
+        for pool in 0..2 {
+            let target = root.path().join(format!("pool{pool}-disk0"));
+            let records: Vec<_> = [".metadata.bin", ".bucket-incarnation"]
+                .into_iter()
+                .map(|file| {
+                    let path = target.join(RUSTFS_META_BUCKET).join("buckets").join(bucket).join(file);
+                    let exists = path.join("xl.meta").exists();
+                    if exists {
+                        std::fs::remove_dir_all(&path).expect("remove replacement metadata shard");
+                        owned += 1;
+                    }
+                    (path, exists)
+                })
+                .collect();
+            store
+                .heal_replacement_bucket_metadata(
+                    bucket,
+                    &HealOpts {
+                        pool: Some(pool),
+                        set: Some(0),
+                        recreate: true,
+                        ..Default::default()
+                    },
+                    &[target.to_string_lossy().into_owned()],
+                )
+                .await
+                .expect("repair owned records and accept authoritative ownership in the other pool");
+            for (path, existed) in records {
+                assert_eq!(path.join("xl.meta").exists(), existed, "wrong placement for {}", path.display());
+            }
+        }
+        assert_eq!(owned, 2, "each required record must have exactly one owning pool");
+        let object = format!("buckets/{bucket}/.metadata.bin");
+        let owner = store
+            .get_pool_idx_existing_with_opts(RUSTFS_META_BUCKET, &object, &ObjectOptions::default())
+            .await
+            .expect("persisted metadata owner");
+        let disk = store.pools[owner].disk_set[0].disks.read().await[0]
+            .clone()
+            .expect("metadata target disk");
+        let fi = disk
+            .read_version(
+                "",
+                RUSTFS_META_BUCKET,
+                &object,
+                "",
+                &disk::ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("inline metadata to repair through target-side admission");
+        assert!(fi.data.is_some(), "fixture must contain an inline metadata shard");
+        let target_path = root.path().join(format!("pool{owner}-disk0"));
+        std::fs::remove_dir_all(target_path.join(RUSTFS_META_BUCKET).join(&object)).expect("remove remote target shard");
+        let incarnation = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("current incarnation");
+        store
+            .rename_local_data_at_incarnation(
+                &disk.endpoint().to_string(),
+                (disk::RUSTFS_META_TMP_BUCKET, "metadata-heal-control"),
+                &fi,
+                (RUSTFS_META_BUCKET, &object),
+                incarnation,
+            )
+            .await
+            .expect("the target-side RPC admission must accept current bucket metadata repair");
+        assert!(target_path.join(RUSTFS_META_BUCKET).join(&object).join("xl.meta").exists());
+        let (configuration, _) = read_config_no_lock_preserve_empty_with_metadata(store.clone(), &object)
+            .await
+            .expect("read the current bucket configuration");
+        save_config(store.clone(), &object, configuration)
+            .await
+            .expect("publish a newer config revision in the same bucket incarnation");
+        let committed =
+            std::fs::read(target_path.join(RUSTFS_META_BUCKET).join(&object).join("xl.meta")).expect("new target configuration");
+        assert!(
+            store
+                .rename_local_data_at_incarnation(
+                    &disk.endpoint().to_string(),
+                    (disk::RUSTFS_META_TMP_BUCKET, "delayed-metadata-heal"),
+                    &fi,
+                    (RUSTFS_META_BUCKET, &object),
+                    incarnation,
+                )
+                .await
+                .is_err(),
+            "a delayed repair must not overwrite a newer config in the same incarnation"
+        );
+        assert_eq!(
+            std::fs::read(target_path.join(RUSTFS_META_BUCKET).join(&object).join("xl.meta")).expect("retained configuration"),
+            committed,
+            "rejected repair must leave the newer configuration unchanged"
+        );
+        for pool in 0..2 {
+            for disk in 0..4 {
+                let path = root
+                    .path()
+                    .join(format!("pool{pool}-disk{disk}"))
+                    .join(RUSTFS_META_BUCKET)
+                    .join("buckets")
+                    .join(bucket)
+                    .join(".metadata.bin");
+                if path.exists() {
+                    std::fs::remove_dir_all(path).expect("remove every copy of required bucket configuration");
+                }
+            }
+        }
+        metadata_sys::remove_bucket_metadata_in(&store.ctx, bucket)
+            .await
+            .expect("remove the cached configuration so repair cannot rely on it");
+        assert!(
+            store
+                .heal_replacement_bucket_metadata(
+                    bucket,
+                    &HealOpts {
+                        pool: Some(0),
+                        set: Some(0),
+                        recreate: true,
+                        ..Default::default()
+                    },
+                    &[root.path().join("pool0-disk0").to_string_lossy().into_owned()],
+                )
+                .await
+                .is_err(),
+            "total metadata loss must not be accepted as ownership in another pool"
+        );
+        for pool in 0..2 {
+            assert!(
+                !root
+                    .path()
+                    .join(format!("pool{pool}-disk0"))
+                    .join(RUSTFS_META_BUCKET)
+                    .join(&object)
+                    .exists(),
+                "missing required configuration must not be recreated with defaults"
+            );
+        }
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn absence_proof_requires_every_selected_pool() {
+        let (_temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        let bucket = format!("absence-scope-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket in both pools");
+        let version = Uuid::new_v4().to_string();
+        let result = store
+            .heal_object_with_proof(&bucket, "history.txt", &version, &HealOpts::default())
+            .await
+            .expect("exact absence lookup should complete across both pools");
+        assert!(result.error.is_none());
+        let proof = result.absence.expect("all selected pools proved the exact version absent");
+        assert_eq!(proof.locations, vec![(0, 0), (1, 0)]);
+        assert_eq!((proof.pool_index, proof.set_index), (None, None));
+        assert_eq!(proof.bucket, bucket);
+        assert_eq!(proof.version_id, version);
+        assert!(!proof.removed, "already absent versions do not count as another cleanup");
+
+        store.pool_meta.write().await.pools[1].decommission = Some(PoolDecommissionInfo {
+            start_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        });
+        let partial = store
+            .heal_object_with_proof(&bucket, "history.txt", &version, &HealOpts::default())
+            .await
+            .expect("unscoped heal should retain its legacy suspended-pool behavior");
+        assert!(partial.absence.is_none(), "an uninspected suspended pool prevents global absence proof");
+        shutdown.cancel();
+    }
+
+    fn heal_test_format_path(temp_dir: &tempfile::TempDir, pool_index: usize, disk_index: usize) -> std::path::PathBuf {
+        temp_dir
+            .path()
+            .join(format!("pool{pool_index}-disk{disk_index}"))
+            .join(crate::disk::RUSTFS_META_BUCKET)
+            .join(FORMAT_CONFIG_FILE)
+    }
+
+    async fn remove_heal_test_format(
+        temp_dir: &tempfile::TempDir,
+        store: &ECStore,
+        pool_index: usize,
+        disk_index: usize,
+    ) -> String {
+        let endpoint = store.pools[pool_index].endpoints.endpoints.as_ref()[disk_index].clone();
+        let target = endpoint.to_string();
+        let format_path = heal_test_format_path(temp_dir, pool_index, disk_index);
+        tokio::fs::remove_file(&format_path)
+            .await
+            .expect("replacement target format should be removable");
+        assert!(
+            !tokio::fs::try_exists(&format_path)
+                .await
+                .expect("replacement target format path should be inspectable")
+        );
+        let replacement = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("unformatted replacement disk should open");
+        let set = &store.pools[pool_index].disk_set[0];
+        let target_slot = set
+            .set_endpoints
+            .iter()
+            .position(|candidate| candidate == &endpoint)
+            .expect("replacement endpoint should belong to its set");
+        set.disks.write().await[target_slot] = Some(replacement);
+        target
+    }
+
+    async fn assert_heal_test_format_missing(temp_dir: &tempfile::TempDir, pool_index: usize, disk_index: usize) {
+        assert!(
+            !tokio::fs::try_exists(heal_test_format_path(temp_dir, pool_index, disk_index))
+                .await
+                .expect("replacement target format path should be inspectable"),
+            "format heal must not write the replacement target"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replacement_format_heal_coexists_with_capacity_read_fence() {
+        let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        let target = remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+        let capacity_guard = store
+            .acquire_external_decommission_capacity_fence(&[0], DecommissionCapacityAdmission::Heal)
+            .await
+            .expect("ordinary heal capacity fence should be acquired");
+
+        let (_, err) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), store.heal_replacement_format(false, 0, 0, &[target]))
+                .await
+                .expect("replacement format heal must not wait on an existing capacity read fence")
+                .expect("replacement format heal should complete");
+
+        assert!(err.is_none(), "replacement format heal should succeed: {err:?}");
+        assert!(
+            tokio::fs::try_exists(heal_test_format_path(&temp_dir, 0, 3))
+                .await
+                .expect("replacement target format path should be inspectable"),
+            "replacement format heal should restore the target while the capacity read fence is held"
+        );
+        drop(capacity_guard);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replacement_format_heal_remains_blocked_by_pool_metadata_writer() {
+        let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        let target = remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+        let pool_lock = store.pools[0]
+            .new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME)
+            .await
+            .expect("pool metadata lock should be created");
+        let pool_writer = pool_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .expect("pool metadata writer should be acquired");
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                store.heal_replacement_format(false, 0, 0, std::slice::from_ref(&target)),
+            )
+            .await
+            .is_err(),
+            "replacement format heal must wait for a pool metadata writer"
+        );
+        assert_heal_test_format_missing(&temp_dir, 0, 3).await;
+
+        drop(pool_writer);
+        let (_, err) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), store.heal_replacement_format(false, 0, 0, &[target]))
+                .await
+                .expect("replacement format heal should resume after the writer releases")
+                .expect("replacement format heal should complete after the writer releases");
+        assert!(err.is_none(), "replacement format heal should succeed: {err:?}");
+        assert!(
+            tokio::fs::try_exists(heal_test_format_path(&temp_dir, 0, 3))
+                .await
+                .expect("replacement target format path should be inspectable"),
+            "replacement format heal should restore the target after the writer releases"
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn full_format_heal_preblocked_pool_metadata_never_writes_format() {
+        let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+        store.pool_meta_save_gate.lock().await.observe_replicas(PoolMetaReplicaState {
+            needs_repair: true,
+            repair_write_safe: false,
+        });
+
+        let err = store
+            .handle_heal_format(false)
+            .await
+            .expect_err("a preblocked pool metadata state must reject full format heal");
+        assert!(
+            err.to_string()
+                .contains("restart after all replicas are readable and consistent")
+        );
+        assert_heal_test_format_missing(&temp_dir, 0, 3).await;
+        store
+            .ensure_pool_meta_side_effects_safe("preblocked format heal side effect")
+            .await
+            .expect_err("the preblocked state must remain sticky");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn full_format_heal_future_identity_never_writes_format_and_latches() {
+        let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+        let (mut future_identity, _) =
+            read_config_no_lock_preserve_empty_with_metadata(store.pools[1].clone(), POOL_META_IDENTITY_NAME)
+                .await
+                .expect("current identity should be readable");
+        let future_version = u16::from_le_bytes([future_identity[2], future_identity[3]])
+            .checked_add(1)
+            .expect("identity version should have a future value");
+        future_identity[2..4].copy_from_slice(&future_version.to_le_bytes());
+        save_config(store.pools[1].clone(), POOL_META_IDENTITY_NAME, future_identity)
+            .await
+            .expect("future identity should be persisted");
+
+        let err = store
+            .handle_heal_format(false)
+            .await
+            .expect_err("a future identity must reject full format heal");
+        assert!(err.to_string().contains("pool metadata incompatible"));
+        assert_heal_test_format_missing(&temp_dir, 0, 3).await;
+        store
+            .ensure_pool_meta_side_effects_safe("future identity format heal side effect")
+            .await
+            .expect_err("the future identity rejection must latch the write gate");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replacement_format_heal_epoch_conflict_never_writes_format_and_latches() {
+        let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        let target = remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+        let conflicting_identity =
+            initialized_pool_meta_identity_for_test(store.id, 2).expect("conflicting identity should encode");
+        save_config(store.pools[1].clone(), POOL_META_IDENTITY_NAME, conflicting_identity)
+            .await
+            .expect("conflicting identity should be persisted");
+
+        let err = store
+            .heal_replacement_format(false, 0, 0, &[target])
+            .await
+            .expect_err("an identity epoch conflict must reject replacement format heal");
+        assert!(
+            err.to_string()
+                .contains("identity replicas disagree on cluster identity or epoch")
+        );
+        assert_heal_test_format_missing(&temp_dir, 0, 3).await;
+        store
+            .ensure_pool_meta_side_effects_safe("epoch conflict replacement format side effect")
+            .await
+            .expect_err("the identity epoch conflict must latch the write gate");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replacement_format_heal_initialized_identity_without_pool_meta_never_writes_and_latches() {
+        let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        let target = remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+        for pool in &store.pools {
+            delete_config(pool.clone(), POOL_META_NAME)
+                .await
+                .expect("pool metadata replica should be removable");
+        }
+
+        let err = store
+            .heal_replacement_format(false, 0, 0, &[target])
+            .await
+            .expect_err("initialized identity without pool metadata must reject replacement format heal");
+        assert!(err.to_string().contains("initialized cluster identity exists"));
+        assert_heal_test_format_missing(&temp_dir, 0, 3).await;
+        store
+            .ensure_pool_meta_side_effects_safe("missing pool metadata replacement format side effect")
+            .await
+            .expect_err("missing initialized pool metadata must latch the write gate");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn full_format_heal_lost_after_last_save_does_not_publish_or_renew_and_latches() {
+        let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        let target = remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+        store.pools[0].disk_set[0].disks.write().await[3] = None;
+        let barrier = HealFormatAfterSaveBarrier::install(&store.pools[0], 3);
+        let recovery_latch = store.pool_meta_save_gate.lock().await.aborted_transaction_latch_for_test();
+        let mut heal = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { store.handle_heal_format(false).await }
+        });
+
+        barrier.wait_until_paused().await;
+        let saved = tokio::fs::read(heal_test_format_path(&temp_dir, 0, 3))
+            .await
+            .expect("the last replacement format must be durable before fence loss");
+        let saved = FormatV3::try_from(saved.as_slice()).expect("the durable replacement format should decode");
+        assert_eq!(saved.erasure.this, store.pools[0].format.erasure.sets[0][3]);
+        recovery_latch.store(true, std::sync::atomic::Ordering::SeqCst);
+        barrier.release();
+
+        let (result, err) = tokio::time::timeout(std::time::Duration::from_secs(30), &mut heal)
+            .await
+            .expect("format heal should stop after the lost fence")
+            .expect("format heal task should not panic")
+            .expect("format heal should return its fenced result");
+        assert!(matches!(err, Some(StorageError::SlowDown)));
+        assert!(
+            result
+                .after
+                .drives
+                .iter()
+                .any(|drive| drive.endpoint == target && drive.state == DriveState::Missing.to_string()),
+            "the lost fence must prevent the durable format from being published in the heal result"
+        );
+        assert!(
+            store.pools[0].disk_set[0].disks.read().await[3].is_none(),
+            "the lost fence must prevent renew_disk from attaching the replacement"
+        );
+        recovery_latch.store(false, std::sync::atomic::Ordering::SeqCst);
+        store
+            .ensure_pool_meta_side_effects_safe("post-save format fence loss side effect")
+            .await
+            .expect_err("post-save format fence loss must remain sticky");
+        shutdown.cancel();
+    }
+
     #[tokio::test]
     async fn heal_object_pool_scope_selects_only_requested_pool() {
         let store = minimal_heal_store().await;
@@ -727,6 +2391,473 @@ mod tests {
                 if field == "pool" && reason.contains("invalid heal pool index 2 for 2 pools")),
             "unexpected invalid pool error: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_read_repair_reuses_its_write_fence() {
+        let (_temp_dirs, store, _other_store) = test_two_pool_stores(None).await;
+        let missing_disk = remove_pool_meta_shard(&store, 0).await;
+
+        let (result, err) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            store.handle_heal_object(
+                RUSTFS_META_BUCKET,
+                POOL_META_NAME,
+                "",
+                &HealOpts {
+                    read_repair: true,
+                    pool: Some(0),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("pool metadata read repair must not wait on its own capacity fence")
+        .expect("pool metadata read repair should complete");
+
+        assert!(err.is_none(), "pool metadata read repair should succeed: {err:?}");
+        assert_eq!(result.object, POOL_META_NAME);
+        assert!(
+            missing_disk.read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false).await.is_ok(),
+            "pool metadata read repair should restore the missing shard"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_heal_preserves_typed_lock_timeout() {
+        let (_temp_dirs, store, _other_store) = test_two_pool_stores(None).await;
+        let lock = store.pools[0]
+            .new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME)
+            .await
+            .expect("pool metadata lock should be created");
+        let guard = lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .expect("pool metadata lock should be acquired");
+
+        let (_, err) = temp_env::async_with_vars(
+            [(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))],
+            store.handle_heal_object(
+                RUSTFS_META_BUCKET,
+                POOL_META_NAME,
+                "",
+                &HealOpts {
+                    pool: Some(0),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("pool metadata lock timeout should be mapped into the heal result");
+
+        assert!(
+            matches!(err, Some(Error::Lock(rustfs_lock::LockError::Timeout { .. }))),
+            "pool metadata heal must preserve the recoverable lock timeout: {err:?}"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_neighbor_keeps_ordinary_object_locking() {
+        let (_temp_dirs, store, _other_store) = test_two_pool_stores(None).await;
+        let object = "pool.bin.backup";
+        save_config(store.pools[0].clone(), object, b"neighbor metadata".to_vec())
+            .await
+            .expect("neighbor metadata fixture should be written");
+
+        let target_set = store.pools[0].get_disks_by_key(object);
+        let lock = target_set
+            .new_ns_lock(RUSTFS_META_BUCKET, object)
+            .await
+            .expect("neighbor metadata lock should be created");
+        let guard = lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .expect("neighbor metadata lock should be acquired");
+        let barrier = DecommissionCapacityLockOrderBarrier::install(store.id, store.id);
+        let heal_store = Arc::clone(&store);
+        let mut heal = tokio::spawn(async move {
+            heal_store
+                .handle_heal_object(
+                    RUSTFS_META_BUCKET,
+                    object,
+                    "",
+                    &HealOpts {
+                        pool: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        barrier.wait_until_external_heal_target_lock_attempted().await;
+        tokio::task::yield_now().await;
+        assert!(!heal.is_finished(), "neighbor metadata heal must retain ordinary object locking");
+        drop(guard);
+
+        let (result, err) = tokio::time::timeout(std::time::Duration::from_secs(30), &mut heal)
+            .await
+            .expect("neighbor metadata heal should finish after the object lock is released")
+            .expect("neighbor metadata heal task should not panic")
+            .expect("neighbor metadata heal should complete");
+        assert!(err.is_none(), "neighbor metadata heal should succeed: {err:?}");
+        assert_eq!(result.object, object);
+        drop(barrier);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn targeted_heal_is_blocked_by_exact_fit_decommission_reservation() {
+        let (_temp_dirs, store, _other_store) = test_two_pool_stores(None).await;
+        let bucket = format!("heal-capacity-{}", Uuid::new_v4().simple());
+        let object = "targeted-heal.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("heal capacity bucket should be created");
+
+        let target_set = store.pools[1].get_disks(0);
+        let mut reader = PutObjReader::from_vec(b"targeted heal body".to_vec());
+        target_set
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("targeted heal fixture should be written");
+        let missing_disk = target_set.disks.read().await[0]
+            .clone()
+            .expect("targeted heal fixture disk should be online");
+        missing_disk
+            .delete(
+                &bucket,
+                object,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("targeted heal fixture shard should be removed");
+        assert!(
+            missing_disk.read_xl(&bucket, object, false).await.is_err(),
+            "targeted heal fixture must start with one missing metadata copy"
+        );
+
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 30, 30),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 60, 60, 0),
+            ]],
+        );
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("the exact-fit decommission reservation should activate");
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let reservation = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("the active decommission reservation should be durable");
+            assert_eq!(reservation.targets.len(), 1);
+            assert_eq!(reservation.targets[0].pool_index, 1);
+            assert_eq!(reservation.targets[0].reserved_physical_bytes, 60);
+        }
+
+        let (_, err) = store
+            .handle_heal_object(
+                &bucket,
+                object,
+                "",
+                &HealOpts {
+                    pool: Some(1),
+                    set: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("targeted heal should return a mapped capacity result");
+        assert!(matches!(err, Some(Error::SlowDown)), "targeted heal must be capacity-blocked: {err:?}");
+        assert!(
+            missing_disk.read_xl(&bucket, object, false).await.is_err(),
+            "capacity-blocked targeted heal must not rewrite the missing shard"
+        );
+
+        let (_, err) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            store.handle_heal_object(
+                RUSTFS_META_BUCKET,
+                POOL_META_NAME,
+                "",
+                &HealOpts {
+                    pool: Some(1),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("pool metadata admission should not recurse on its namespace lock")
+        .expect("pool metadata capacity rejection should be mapped");
+        assert!(
+            matches!(err, Some(Error::SlowDown)),
+            "pool metadata heal must preserve target reservation admission: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_heal_keeps_per_target_capacity_admission() {
+        let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 30, 30),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 60, 60, 0),
+                DecommissionPoolCapacityInfo::for_test(2, layout, 60, 60, 0),
+            ]],
+        );
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("pool metadata reservation should activate");
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let reservation = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("pool metadata reservation should be durable");
+            assert_eq!(reservation.targets.len(), 1);
+            assert_eq!(reservation.targets[0].pool_index, 1);
+        }
+
+        let missing_disk = remove_pool_meta_shard(&store, 2).await;
+
+        let (result, err) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            store.handle_heal_object(RUSTFS_META_BUCKET, POOL_META_NAME, "", &HealOpts::default()),
+        )
+        .await
+        .expect("unscoped pool metadata heal should complete")
+        .expect("unscoped pool metadata heal should return a mapped result");
+
+        assert!(err.is_none(), "an admitted target should let unscoped metadata heal succeed: {err:?}");
+        assert_eq!(result.object, POOL_META_NAME);
+        assert!(
+            missing_disk.read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false).await.is_ok(),
+            "unscoped metadata heal should repair the admitted target while another target is reserved"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn targeted_heal_keeps_target_lock_for_different_lock_domain() {
+        let (_temp_dirs, store, other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = format!("heal-lock-domain-{}", Uuid::new_v4().simple());
+        let object = "different-domain-heal.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("heal lock-domain bucket should be created");
+
+        let target_set = other_store.pools[1].get_disks(0);
+        let mut reader = PutObjReader::from_vec(b"different lock domain body".to_vec());
+        target_set
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("heal lock-domain fixture should be written");
+        let missing_disk = target_set.disks.read().await[0]
+            .clone()
+            .expect("heal lock-domain fixture disk should be online");
+        missing_disk
+            .delete(
+                &bucket,
+                object,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("heal lock-domain fixture shard should be removed");
+        assert!(
+            missing_disk.read_xl(&bucket, object, false).await.is_err(),
+            "heal lock-domain fixture must start with one missing metadata copy"
+        );
+
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 30, 30),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 0, 100, 100),
+                DecommissionPoolCapacityInfo::for_test(2, layout, 60, 60, 0),
+            ]],
+        );
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("heal lock-domain reservation should activate");
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let reservation = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("heal lock-domain reservation should be durable");
+            assert_eq!(reservation.targets.len(), 1);
+            assert_eq!(reservation.targets[0].pool_index, 2);
+        }
+        let pool_meta = store.pool_meta.read().await.clone();
+        *other_store.pool_meta.write().await = pool_meta;
+
+        let fixed_set = other_store.pools[0].disk_set[0].clone();
+        assert!(
+            !fixed_set.shares_namespace_lock_domain(&target_set).await,
+            "heal fixture must use different fixed and target lock domains"
+        );
+        let barrier = DecommissionCapacityLockOrderBarrier::install(store.id, other_store.id);
+        let heal_store = Arc::clone(&other_store);
+        let heal_bucket = bucket.clone();
+        let heal_object = object.to_string();
+        let mut heal = tokio::spawn(async move {
+            heal_store
+                .handle_heal_object(
+                    &heal_bucket,
+                    &heal_object,
+                    "",
+                    &HealOpts {
+                        pool: Some(1),
+                        set: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        barrier.wait_until_external_capacity_released().await;
+        barrier.wait_until_external_heal_target_lock_attempted().await;
+
+        let (_, err) = tokio::time::timeout(std::time::Duration::from_secs(30), &mut heal)
+            .await
+            .expect("targeted heal should finish after target lock release")
+            .expect("targeted heal task should not panic")
+            .expect("targeted heal should complete");
+        assert!(err.is_none(), "targeted heal should repair after target lock release: {err:?}");
+        assert!(
+            missing_disk.read_xl(&bucket, object, false).await.is_ok(),
+            "targeted heal should rewrite the missing shard after the target lock is released"
+        );
+        drop(barrier);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn targeted_heal_reuses_shared_target_lock_without_reentrant_lock() {
+        let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = format!("heal-shared-lock-domain-{}", Uuid::new_v4().simple());
+        let object = "shared-domain-heal.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("shared heal lock-domain bucket should be created");
+
+        let target_set = store.pools[0].get_disks(0);
+        let mut reader = PutObjReader::from_vec(b"shared lock domain body".to_vec());
+        target_set
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("shared heal lock-domain fixture should be written");
+        let missing_disk = target_set.disks.read().await[0]
+            .clone()
+            .expect("shared heal lock-domain fixture disk should be online");
+        missing_disk
+            .delete(
+                &bucket,
+                object,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("shared heal lock-domain fixture shard should be removed");
+        assert!(
+            missing_disk.read_xl(&bucket, object, false).await.is_err(),
+            "shared heal lock-domain fixture must start with one missing metadata copy"
+        );
+
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 100, 100),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 60, 60, 0),
+                DecommissionPoolCapacityInfo::for_test(2, layout, 0, 30, 30),
+            ]],
+        );
+        store
+            .save_current_pool_meta_for_decommission_start(&[2], Vec::new())
+            .await
+            .expect("shared heal lock-domain reservation should activate");
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let reservation = pool_meta.pools[2]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("shared heal lock-domain reservation should be durable");
+            assert_eq!(reservation.targets.len(), 1);
+            assert_eq!(reservation.targets[0].pool_index, 1);
+            assert_eq!(reservation.targets[0].reserved_physical_bytes, 60);
+        }
+
+        let fixed_set = store.pools[0].disk_set[0].clone();
+        assert!(
+            fixed_set.shares_namespace_lock_domain(&target_set).await,
+            "shared heal fixture must use one fixed and target lock domain"
+        );
+
+        let barrier = DecommissionCapacityLockOrderBarrier::install(store.id, store.id);
+        let heal_store = Arc::clone(&store);
+        let heal_bucket = bucket.clone();
+        let heal_object = object.to_string();
+        let mut heal = tokio::spawn(async move {
+            heal_store
+                .handle_heal_object(
+                    &heal_bucket,
+                    &heal_object,
+                    "",
+                    &HealOpts {
+                        pool: Some(0),
+                        set: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        barrier.wait_until_external_capacity_released().await;
+        barrier.wait_until_external_heal_operation_started().await;
+        let (_, err) = tokio::time::timeout(std::time::Duration::from_secs(5), &mut heal)
+            .await
+            .expect("shared-domain heal must not reenter the fixed namespace lock")
+            .expect("shared-domain heal task should not panic")
+            .expect("shared-domain heal should complete");
+        assert!(err.is_none(), "shared-domain heal should repair after admission: {err:?}");
+        assert!(
+            missing_disk.read_xl(&bucket, object, false).await.is_ok(),
+            "shared-domain heal should rewrite the missing shard"
+        );
+        drop(barrier);
     }
 
     #[tokio::test]
@@ -858,6 +2989,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_heal_bucket_blocks_before_dispatch_when_pool_is_suspended() {
+        let mut store = minimal_heal_store().await;
+        store.pool_meta = RwLock::new(PoolMeta {
+            pools: vec![
+                PoolStatus {
+                    id: 0,
+                    cmd_line: "pool-0".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: None,
+                },
+                PoolStatus {
+                    id: 1,
+                    cmd_line: "pool-1".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: Some(PoolDecommissionInfo {
+                        start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                        ..Default::default()
+                    }),
+                },
+            ],
+            ..Default::default()
+        });
+
+        let err = store
+            .handle_heal_bucket(
+                "bucket",
+                &HealOpts {
+                    pool: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("suspended pool must be blocked before bucket-heal fan-out");
+        assert_eq!(err, Error::SlowDown);
+
+        store.pool_meta.write().await.pools[1]
+            .decommission
+            .as_mut()
+            .expect("decommission state should exist")
+            .complete = true;
+        let err = store
+            .handle_heal_bucket(
+                "bucket",
+                &HealOpts {
+                    pool: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("completed pool must remain fenced from bucket heal");
+        assert!(
+            matches!(err, StorageError::InvalidArgument(_, ref field, ref reason)
+                if field == "pool" && reason.contains("completed decommission")),
+            "unexpected completed-pool error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_heal_blocks_before_dispatch_after_unreadable_pool_meta_replica() {
+        let store = minimal_heal_store().await;
+        store.pool_meta_save_gate.lock().await.observe_replicas(PoolMetaReplicaState {
+            needs_repair: true,
+            repair_write_safe: false,
+        });
+
+        let err = store
+            .handle_heal_bucket("bucket", &HealOpts::default())
+            .await
+            .expect_err("bucket heal must stay blocked until restart after an unreadable replica");
+
+        assert!(
+            err.to_string()
+                .contains("restart after all replicas are readable and consistent")
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_heal_releases_save_gate_before_peer_dispatch_and_holds_movement_snapshot() {
+        let mut store = minimal_heal_store().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let peer: Box<dyn PeerS3Client> = Box::new(BlockingHealPeer {
+            started: started.clone(),
+            release: release.clone(),
+        });
+        store.peer_sys.clients = vec![Arc::new(peer)];
+        let store = Arc::new(store);
+        let movement_gate = store.ctx.data_movement_operation_gate();
+        let mut heal = tokio::spawn({
+            let store = store.clone();
+            async move { store.handle_heal_bucket("bucket", &HealOpts::default()).await }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .expect("peer dispatch should start");
+        assert!(
+            store.pool_meta_save_gate.try_lock().is_ok(),
+            "coordinator must release its local save gate before waiting for peers"
+        );
+        assert!(
+            movement_gate.try_write().is_err(),
+            "bucket heal must hold the movement snapshot through peer dispatch"
+        );
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut heal)
+            .await
+            .expect("bucket heal should finish after peer release")
+            .expect("bucket heal task should not panic")
+            .expect("bucket heal should succeed");
+    }
+
+    #[tokio::test]
+    async fn bucket_heal_local_fanout_does_not_reenter_movement_read_behind_queued_writer() {
+        let mut store = minimal_heal_store().await;
+        let movement_gate = store.ctx.data_movement_operation_gate();
+        let writer_queued = Arc::new(tokio::sync::Notify::new());
+        let writer_acquired = Arc::new(tokio::sync::Notify::new());
+        let peer: Box<dyn PeerS3Client> = Box::new(WriterQueuedLocalHealPeer {
+            movement_gate: movement_gate.clone(),
+            writer_queued: writer_queued.clone(),
+            writer_acquired: writer_acquired.clone(),
+        });
+        store.peer_sys.clients = vec![Arc::new(peer)];
+        let store = Arc::new(store);
+        let mut heal = tokio::spawn({
+            let store = store.clone();
+            async move { store.handle_heal_bucket("bucket", &HealOpts::default()).await }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), writer_queued.notified())
+            .await
+            .expect("movement writer should queue during local peer lookup");
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut heal)
+            .await
+            .expect("local fan-out must not reenter movement read behind the queued writer")
+            .expect("bucket heal task should not panic")
+            .expect("bucket heal should succeed");
+        tokio::time::timeout(std::time::Duration::from_secs(1), writer_acquired.notified())
+            .await
+            .expect("queued movement writer should proceed after bucket heal releases its read guard");
+    }
+
+    #[tokio::test]
     #[serial_test::serial]
     async fn unscoped_heal_object_suspended_owner_semantics() {
         let (_temp_dir, store, shutdown) = multi_pool_heal_store().await;
@@ -874,7 +3150,16 @@ mod tests {
 
         let mut active_reader = PutObjReader::from_vec(b"active owner".to_vec());
         store.pools[0]
-            .put_object(&bucket, active_object, &mut active_reader, &ObjectOptions::default())
+            .put_object(
+                &bucket,
+                active_object,
+                &mut active_reader,
+                &ObjectOptions {
+                    // Drain the rename tail before removing a physical shard.
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
             .await
             .expect("active owner object should be written");
         let active_disks = store.pools[0].disk_set[0].disks.read().await.clone();
@@ -910,6 +3195,7 @@ mod tests {
                     &mut duplicate_reader,
                     &ObjectOptions {
                         mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(mod_time)),
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
                         ..Default::default()
                     },
                 )
@@ -1073,9 +3359,22 @@ mod tests {
             .await
             .expect("quorum boundary heal should return a mapped result");
         *store.pools[0].disk_set[0].disks.write().await = original_quorum_disks;
+        let quorum_err = quorum_err
+            .as_ref()
+            .expect("heal must fail closed when capacity admission cannot verify pool metadata");
+        let quorum_failure = quorum_err
+            .pool_metadata_failure()
+            .expect("capacity admission failure should preserve typed pool metadata context");
+        assert_eq!(
+            quorum_failure.kind,
+            crate::error::PoolMetadataFailure::ReadUnavailable,
+            "read-only capacity admission failure must remain retryable"
+        );
+        assert_eq!(quorum_failure.operation, "target capacity admission failed");
+        assert_eq!(quorum_failure.phase, "pool_read");
         assert!(
-            matches!(quorum_err, Some(Error::ErasureReadQuorum)),
-            "quorum-boundary heal must preserve quorum error, got {quorum_err:?}"
+            store.pool_meta_writes_ready().await,
+            "read-only capacity admission failure must not latch the pool metadata writer"
         );
         shutdown.cancel();
     }
@@ -1184,7 +3483,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         };
@@ -1193,13 +3492,18 @@ mod tests {
             .handle_heal_format(false)
             .await
             .expect_err("missing pool metadata must fail closed before format writes");
-        assert!(matches!(err, StorageError::SlowDown));
+        assert!(err.to_string().contains("no durable bootstrap identity or pool.bin replica"));
+        store
+            .ensure_pool_meta_side_effects_safe("missing format-heal metadata side effect")
+            .await
+            .expect_err("missing metadata must latch the format-heal write gate");
 
         let pool_meta = PoolMeta::new(&store.pools, &PoolMeta::default());
         pool_meta
-            .save(store.pools.clone())
+            .save_for_startup(store.pools.clone())
             .await
             .expect("pool metadata should be persisted before format heal");
+        *store.pool_meta_save_gate.lock().await = PoolMetaWriteState::default();
 
         let (result, err) = store
             .handle_heal_format(false)

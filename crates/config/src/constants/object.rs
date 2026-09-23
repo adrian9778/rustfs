@@ -116,6 +116,30 @@ pub const ENV_OBJECT_GET_SKIP_BITROT_VERIFY: &str = "RUSTFS_OBJECT_GET_SKIP_BITR
 /// Default: bitrot verification is enabled on GetObject reads (do not skip).
 pub const DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY: bool = false;
 
+/// Create independent shard commitments for new writes after the fleet is upgraded.
+/// Existing protected objects and multipart uploads retain their protection.
+pub const ENV_SHARD_INTEGRITY_WRITE: &str = "RUSTFS_SHARD_INTEGRITY_WRITE";
+pub const DEFAULT_SHARD_INTEGRITY_WRITE: bool = false;
+
+/// Operator confirmation that every reader, writer and background coordinator
+/// understands independent shard commitments. This is not capability discovery
+/// or a fence against an old binary rejoining the fleet.
+pub const ENV_SHARD_INTEGRITY_FLEET_CONFIRMED: &str = "RUSTFS_SHARD_INTEGRITY_FLEET_CONFIRMED";
+pub const DEFAULT_SHARD_INTEGRITY_FLEET_CONFIRMED: bool = false;
+
+const _: () = assert!(!DEFAULT_SHARD_INTEGRITY_WRITE);
+const _: () = assert!(!DEFAULT_SHARD_INTEGRITY_FLEET_CONFIRMED);
+
+/// How object writes treat a bucket whose stored versioning configuration
+/// cannot be parsed: `permissive` writes as if unversioned (the historical
+/// behavior, recorded by metrics and an error log) and `strict` refuses the
+/// write with 503. Paths that already refuse an unreadable configuration do
+/// so in both modes. Any other value fails startup.
+pub const ENV_BUCKET_CONFIG_PARSE_MODE: &str = "RUSTFS_BUCKET_CONFIG_PARSE_MODE";
+
+/// Default bucket config parse mode.
+pub const DEFAULT_BUCKET_CONFIG_PARSE_MODE: &str = "permissive";
+
 /// Request writing the complete remote-tier version state into object metadata.
 ///
 /// This remains ineffective until
@@ -136,6 +160,28 @@ pub const DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED: bool = false;
 
 const _: () = assert!(!DEFAULT_TIER_REMOTE_VERSION_STATE_WRITE);
 const _: () = assert!(!DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED);
+
+/// Environment variable for remote tier TCP connect timeout in seconds.
+pub const ENV_TIER_REMOTE_CONNECT_TIMEOUT_SECS: &str = "RUSTFS_TIER_REMOTE_CONNECT_TIMEOUT_SECS";
+/// Default remote tier TCP connect timeout in seconds.
+pub const DEFAULT_TIER_REMOTE_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Environment variable for the remote tier request timeout in seconds.
+///
+/// This bounds upload/download request progress through response headers. The
+/// default is intentionally large so multi-TiB transition uploads keep their
+/// previous production budget while black-hole remotes no longer wait forever.
+pub const ENV_TIER_REMOTE_REQUEST_TIMEOUT_SECS: &str = "RUSTFS_TIER_REMOTE_REQUEST_TIMEOUT_SECS";
+/// Default remote tier request timeout in seconds.
+pub const DEFAULT_TIER_REMOTE_REQUEST_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+/// Environment variable for remote tier response-body idle timeout in seconds.
+///
+/// The timer is re-armed on every non-empty response-body chunk, so slow but
+/// progressing remotes can continue while silent response bodies are cancelled.
+pub const ENV_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS: &str = "RUSTFS_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS";
+/// Default remote tier response-body idle timeout in seconds.
+pub const DEFAULT_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS: u64 = 60;
 
 /// Request the object-transaction fencing contract used by storage-owned
 /// cleanup receipts and lock-window optimizations.
@@ -167,6 +213,56 @@ pub const DEFAULT_DATA_MOVEMENT_PART_CHECKSUMS_FLEET_CONFIRMED: bool = false;
 
 const _: () = assert!(!DEFAULT_DATA_MOVEMENT_PART_CHECKSUMS_WRITE);
 const _: () = assert!(!DEFAULT_DATA_MOVEMENT_PART_CHECKSUMS_FLEET_CONFIRMED);
+
+/// Request writing pool metadata version 2.
+///
+/// This remains ineffective until [`ENV_POOL_META_V2_FLEET_CONFIRMED`] is also enabled.
+pub const ENV_POOL_META_V2_WRITE: &str = "RUSTFS_POOL_META_V2_WRITE";
+pub const DEFAULT_POOL_META_V2_WRITE: bool = false;
+
+/// Operator-attested confirmation that every pool metadata reader and writer understands version 2.
+pub const ENV_POOL_META_V2_FLEET_CONFIRMED: &str = "RUSTFS_POOL_META_V2_FLEET_CONFIRMED";
+pub const DEFAULT_POOL_META_V2_FLEET_CONFIRMED: bool = false;
+
+const _: () = assert!(!DEFAULT_POOL_META_V2_WRITE);
+const _: () = assert!(!DEFAULT_POOL_META_V2_FLEET_CONFIRMED);
+
+/// Request writing pool metadata version 3 with durable generations.
+///
+/// Existing deployments remain on their observed version until
+/// [`ENV_POOL_META_V3_FLEET_CONFIRMED`] is also enabled. Fresh deployments may
+/// initialize directly at version 3 because they have no legacy readers.
+pub const ENV_POOL_META_V3_WRITE: &str = "RUSTFS_POOL_META_V3_WRITE";
+pub const DEFAULT_POOL_META_V3_WRITE: bool = false;
+
+/// Operator-attested confirmation that every pool metadata reader and writer
+/// understands the version 3 generation and recovery protocol.
+pub const ENV_POOL_META_V3_FLEET_CONFIRMED: &str = "RUSTFS_POOL_META_V3_FLEET_CONFIRMED";
+pub const DEFAULT_POOL_META_V3_FLEET_CONFIRMED: bool = false;
+
+const _: () = assert!(!DEFAULT_POOL_META_V3_WRITE);
+const _: () = assert!(!DEFAULT_POOL_META_V3_FLEET_CONFIRMED);
+
+/// Maximum unpacked size accepted for one Snowball archive member.
+///
+/// The value is expressed in bytes. Invalid values use the default, while
+/// valid values are clamped to [`MAX_SNOWBALL_ENTRY_BYTES`].
+pub const ENV_SNOWBALL_MAX_ENTRY_BYTES: &str = "RUSTFS_SNOWBALL_MAX_ENTRY_BYTES";
+pub const DEFAULT_SNOWBALL_MAX_ENTRY_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MAX_SNOWBALL_ENTRY_BYTES: u64 = 1024 * DEFAULT_SNOWBALL_MAX_ENTRY_BYTES;
+
+/// Maximum cumulative unpacked object bytes accepted from one Snowball
+/// archive request.
+///
+/// This does not include tar headers or bounded PAX metadata. The value is
+/// expressed in bytes and is clamped to
+/// [`MAX_SNOWBALL_UNPACKED_BYTES`].
+pub const ENV_SNOWBALL_MAX_UNPACKED_BYTES: &str = "RUSTFS_SNOWBALL_MAX_UNPACKED_BYTES";
+pub const DEFAULT_SNOWBALL_MAX_UNPACKED_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+pub const MAX_SNOWBALL_UNPACKED_BYTES: u64 = 10 * 1024 * DEFAULT_SNOWBALL_MAX_ENTRY_BYTES;
+
+const _: () = assert!(DEFAULT_SNOWBALL_MAX_ENTRY_BYTES <= MAX_SNOWBALL_ENTRY_BYTES);
+const _: () = assert!(DEFAULT_SNOWBALL_MAX_UNPACKED_BYTES <= MAX_SNOWBALL_UNPACKED_BYTES);
 
 // =============================================================================
 // Concurrent Request Fix - Timeout and Backpressure Configuration
@@ -258,6 +354,90 @@ pub const ENV_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: &str = "RUSTFS_PUT_FOREG
 pub const DEFAULT_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 0;
 
 const _: () = assert!(!DEFAULT_PUT_FOREGROUND_ADMISSION_ENABLE);
+
+/// Enable automatic foreground admission for large or unknown-size PutObject requests.
+///
+/// Unlike the strict experimental gate above, this default-on path only applies
+/// to requests that are large enough to create sustained erasure/RPC pressure.
+/// Small PUTs continue on the legacy path unless the strict gate is explicitly
+/// enabled.
+pub const ENV_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE: &str = "RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE";
+pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE: bool = true;
+
+/// Maximum automatic foreground write requests admitted concurrently per process.
+///
+/// `0` derives a conservative default from the local disk-read scheduler cap,
+/// currently clamped to protect the commit path without making ordinary high
+/// throughput uploads single-file.
+pub const ENV_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT: &str = "RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT";
+pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT: usize = 0;
+
+/// Minimum direct PutObject size that enters automatic foreground write admission.
+///
+/// Requests with an unknown size are treated as large because the write pressure
+/// cannot be bounded from headers.
+pub const ENV_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: &str = "RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES";
+pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Minimum UploadPart size that enters automatic foreground write admission.
+///
+/// Multipart pressure is often many moderate-sized parts rather than one very
+/// large request. The default gates every multipart part through the same permit
+/// pool as large/unknown-size PutObject while keeping small direct PUTs on the
+/// legacy path.
+pub const ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: &str =
+    "RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES";
+pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: usize = 0;
+
+/// Time in milliseconds an automatic foreground direct PutObject waits for a permit.
+///
+/// A short wait smooths transient bursts while still returning S3
+/// `SlowDown`/503 before body ingest when the node is already saturated.
+pub const ENV_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: &str = "RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS";
+pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 250;
+
+/// Time in milliseconds a multipart UploadPart waits for a foreground write permit.
+///
+/// SDK-default multipart clients send every part of an upload concurrently, so
+/// a single node routinely sees several times more parts in flight than the
+/// permit pool allows. A queued part waits before body ingest, so the pool
+/// still bounds the number of parts being written, but the wait is not free:
+/// RustFS does not read the request body while the part is queued (hyper only
+/// sends `100 Continue` once the body is first polled, and the AWS SDKs send
+/// the body after a 1-3 s `Expect: 100-continue` grace anyway), so the
+/// client's socket write stalls once the kernel buffers fill, and whatever
+/// timeout the client or an intermediary has configured decides the outcome.
+/// botocore applies its `connect_timeout` (60 s) to the body write, the AWS
+/// SDK for Java v2 has a 30 s socket write timeout, and MinIO bounds the same
+/// wait with a 10 s request deadline. The wait must leave margin under the
+/// shortest of those, not merely fall below an SDK default, so the part
+/// receives S3 `SlowDown`/503 for the client to retry instead of losing its
+/// connection (issue #7385). `0` rejects immediately when the pool is full.
+pub const ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: &str =
+    "RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS";
+pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 10_000;
+
+// A queued part holds the client's body write open for the whole wait. The
+// shortest write timeout among mainstream S3 SDKs is the AWS SDK for Java v2's
+// 30 s socket write timeout; keep the compiled default at no more than a third
+// of it. This locks only the default; the environment variable may still raise
+// the wait past any client timeout.
+const _: () = assert!(DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS * 3 <= 30_000);
+
+/// Maximum multipart UploadPart requests waiting for a foreground write permit per process.
+///
+/// Parts beyond this queue depth are rejected with S3 `SlowDown`/503 without
+/// waiting, so a genuinely saturated node still fails fast instead of holding
+/// an unbounded set of connections open for the whole wait timeout. Each
+/// queued HTTP/1 part also holds whatever unread body the client already
+/// pushed into that connection's kernel receive buffer, and a queued HTTP/2
+/// part holds up to its flow-control window in process memory, so the depth
+/// bounds socket and window memory as well as connections.
+/// `0` derives the depth from the permit limit.
+pub const ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING: &str = "RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING";
+pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING: usize = 0;
+
+const _: () = assert!(DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE);
 
 /// Environment variable for minimum GetObject timeout in seconds.
 ///
@@ -452,6 +632,45 @@ pub const ENV_OBJECT_LOCK_RPC_TIMEOUT_MS: &str = "RUSTFS_OBJECT_LOCK_RPC_TIMEOUT
 
 /// Default remote lock RPC transport timeout: 3000 milliseconds.
 pub const DEFAULT_OBJECT_LOCK_RPC_TIMEOUT_MS: u64 = 3000;
+
+/// Environment variable for the minimum interval between evictions of the
+/// cached lock RPC channel to one peer, in milliseconds.
+///
+/// A lock RPC that fails on transport, or that times out while the peer has
+/// not completed any lock RPC for two deadlines, evicts the shared HTTP/2
+/// channel so the next request re-dials. Evictions are rate limited per peer
+/// so one slow lock endpoint cannot drive a reset/GOAWAY/reconnect loop
+/// (issue #7363). `0` disables the cooldown.
+///
+/// Default: 5000 milliseconds.
+pub const ENV_OBJECT_LOCK_RPC_EVICTION_COOLDOWN_MS: &str = "RUSTFS_OBJECT_LOCK_RPC_EVICTION_COOLDOWN_MS";
+
+/// Default minimum interval between lock RPC channel evictions per peer: 5000 milliseconds.
+pub const DEFAULT_OBJECT_LOCK_RPC_EVICTION_COOLDOWN_MS: u64 = 5000;
+
+/// Environment variable for how many timed-out lock RPCs per peer may keep
+/// running in the background instead of being cancelled.
+///
+/// Cancelling a timed-out stream sends `RST_STREAM`; enough of them make the
+/// peer answer `GOAWAY too_many_resets` and drop every stream on the
+/// connection. A detached RPC ends on its own within the internode RPC
+/// timeout, and a lock it acquires after its caller gave up is released
+/// immediately. Beyond this budget timed-out RPCs are cancelled as before.
+///
+/// Default: 256.
+pub const ENV_OBJECT_LOCK_RPC_DETACHED_LIMIT: &str = "RUSTFS_OBJECT_LOCK_RPC_DETACHED_LIMIT";
+
+/// Default per-peer budget of detached (timed-out but still running) lock RPCs: 256.
+pub const DEFAULT_OBJECT_LOCK_RPC_DETACHED_LIMIT: usize = 256;
+
+/// Environment variable for the maximum number of in-flight lock acquisition
+/// RPCs admitted to one peer. Requests beyond this bound fail fast as
+/// retryable contention so a slow endpoint cannot accumulate an unbounded
+/// queue while its channel remains healthy.
+pub const ENV_OBJECT_LOCK_RPC_REQUEST_LIMIT: &str = "RUSTFS_OBJECT_LOCK_RPC_REQUEST_LIMIT";
+
+/// Default per-peer in-flight lock acquisition RPC admission limit.
+pub const DEFAULT_OBJECT_LOCK_RPC_REQUEST_LIMIT: usize = 128;
 
 /// Environment variable to enable object namespace lock diagnostics.
 ///
@@ -720,6 +939,16 @@ mod remote_version_state_tests {
     }
 
     #[test]
+    fn remote_tier_timeout_env_names_are_stable() {
+        assert_eq!(super::ENV_TIER_REMOTE_CONNECT_TIMEOUT_SECS, "RUSTFS_TIER_REMOTE_CONNECT_TIMEOUT_SECS");
+        assert_eq!(super::ENV_TIER_REMOTE_REQUEST_TIMEOUT_SECS, "RUSTFS_TIER_REMOTE_REQUEST_TIMEOUT_SECS");
+        assert_eq!(
+            super::ENV_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS,
+            "RUSTFS_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS"
+        );
+    }
+
+    #[test]
     fn data_movement_part_checksum_gate_uses_stable_environment_names() {
         assert_eq!(super::ENV_DATA_MOVEMENT_PART_CHECKSUMS_WRITE, "RUSTFS_DATA_MOVEMENT_PART_CHECKSUMS_WRITE");
         assert_eq!(
@@ -735,5 +964,23 @@ mod remote_version_state_tests {
             super::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED,
             "RUSTFS_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED"
         );
+    }
+
+    #[test]
+    fn pool_meta_v2_gate_uses_stable_environment_names() {
+        assert_eq!(super::ENV_POOL_META_V2_WRITE, "RUSTFS_POOL_META_V2_WRITE");
+        assert_eq!(super::ENV_POOL_META_V2_FLEET_CONFIRMED, "RUSTFS_POOL_META_V2_FLEET_CONFIRMED");
+    }
+
+    #[test]
+    fn pool_meta_v3_gate_uses_stable_environment_names() {
+        assert_eq!(super::ENV_POOL_META_V3_WRITE, "RUSTFS_POOL_META_V3_WRITE");
+        assert_eq!(super::ENV_POOL_META_V3_FLEET_CONFIRMED, "RUSTFS_POOL_META_V3_FLEET_CONFIRMED");
+    }
+
+    #[test]
+    fn snowball_limit_environment_names_are_stable() {
+        assert_eq!(super::ENV_SNOWBALL_MAX_ENTRY_BYTES, "RUSTFS_SNOWBALL_MAX_ENTRY_BYTES");
+        assert_eq!(super::ENV_SNOWBALL_MAX_UNPACKED_BYTES, "RUSTFS_SNOWBALL_MAX_UNPACKED_BYTES");
     }
 }

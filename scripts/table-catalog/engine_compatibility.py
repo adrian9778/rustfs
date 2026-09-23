@@ -17,7 +17,7 @@ DEFAULT_SPARK_VERSION = "3.5.4"
 DEFAULT_ICEBERG_VERSION = "1.7.1"
 DEFAULT_SCALA_VERSION = "2.12"
 DEFAULT_TRINO_VERSION = "477"
-DEFAULT_DUCKDB_VERSION = "1.3.2"
+DEFAULT_DUCKDB_VERSION = "1.5.5"
 DEFAULT_SNOWFLAKE_CLIENT_VERSION = "operator-recorded"
 DEFAULT_DATABEND_VERSION = "operator-recorded"
 DEFAULT_TRINO_SERVER = "http://127.0.0.1:8080"
@@ -53,7 +53,7 @@ LIVE_EVIDENCE_ALLOWED_CLAIMS = OrderedDict(
         ("PyIceberg", ["automated-smoke"]),
         ("Spark Iceberg REST catalog", ["manual-live-verified"]),
         ("Trino Iceberg REST catalog", ["manual-live-read-verified"]),
-        ("DuckDB Iceberg", ["manual-live-read-verified"]),
+        ("DuckDB Iceberg", ["manual-live-read-verified", "automated-rest-catalog-smoke"]),
         ("Databend", ["manual-live-s3-stage-verified"]),
         ("Snowflake Open Catalog / Iceberg integrations", ["reference-only"]),
     ]
@@ -136,8 +136,8 @@ def engine_compatibility_matrix() -> list[dict[str, Any]]:
             "entrypoint": "scripts/table-catalog/engine_compatibility.py --print-live-conformance",
             "scenarios": [
                 scenario("create-namespace", "manual-live-harness", "CREATE NAMESPACE IF NOT EXISTS"),
-                scenario("create-table", "manual-live-harness", "CREATE TABLE USING iceberg"),
-                scenario("append", "manual-live-harness", "INSERT INTO"),
+                scenario("create-table", "manual-live-harness", "CREATE TABLE USING iceberg AS SELECT"),
+                scenario("staged-create", "manual-live-harness", "atomic CTAS through the REST staged-create flow"),
                 scenario("reload-table", "manual-live-harness", "REFRESH TABLE and SELECT COUNT"),
                 scenario("drop-table", "manual-live-harness", "DROP TABLE and optional DROP NAMESPACE"),
                 scenario("commit-conflict", "manual-validation-required", "requires a two-writer Spark or REST conflict harness"),
@@ -155,12 +155,15 @@ def engine_compatibility_matrix() -> list[dict[str, Any]]:
         },
         {
             "client": "DuckDB Iceberg",
-            "status": "manual-live-read-probe",
-            "entrypoint": "scripts/table-catalog/engine_compatibility.py --print-live-conformance",
+            "status": "automated-smoke",
+            "entrypoint": "scripts/table-catalog/duckdb_smoke.py",
             "scenarios": [
-                scenario("metadata-read", "manual-live-probe", "read a supplied Iceberg metadata location through DuckDB iceberg_scan"),
-                scenario("read-table", "manual-live-probe", "read-path verification only"),
-                scenario("write-table", "not-claimed", "DuckDB write/commit compatibility is not claimed"),
+                scenario("metadata-read", "automated", "read the final metadata location through DuckDB iceberg_scan"),
+                scenario("catalog-attach", "automated", "attach `/iceberg` with s3 signing and `/_iceberg` with s3tables signing"),
+                scenario("read-table", "automated", "read a PyIceberg-created table through the attached catalog"),
+                scenario("write-table", "automated", "exercise single-table DDL, DML, schema evolution, snapshots, and PyIceberg cross-read"),
+                scenario("unsupported-boundaries", "automated", "verify purge and format v3 fail closed"),
+                scenario("multi-table-mode", "automated", "verify DuckDB can avoid the multi-table commit endpoint without claiming cross-table atomicity"),
             ],
         },
         {
@@ -360,8 +363,8 @@ def spark_sql_smoke(
     statements = [
         f"CREATE NAMESPACE IF NOT EXISTS {namespace_identifier};",
         f"DROP TABLE IF EXISTS {table_identifier};",
-        f"CREATE TABLE {table_identifier} (id BIGINT, payload STRING) USING iceberg;",
-        f"INSERT INTO {table_identifier} VALUES (1, 'alpha'), (2, 'beta');",
+        f"CREATE TABLE {table_identifier} USING iceberg AS "
+        "SELECT * FROM VALUES (1L, 'alpha'), (2L, 'beta') AS source(id, payload);",
         f"REFRESH TABLE {table_identifier};",
         f"SELECT COUNT(*) AS row_count FROM {table_identifier};",
     ]
@@ -489,8 +492,66 @@ def duckdb_sql_probe(
     return "\n".join(statements) + "\n"
 
 
-def duckdb_command() -> str:
-    return shell_join(["duckdb", "-c", ".read /tmp/rustfs-s3tables-duckdb-read.sql"])
+def duckdb_rest_catalog_sql(
+    *,
+    endpoint: str,
+    warehouse: str,
+    access_key: str,
+    secret_key: str,
+    region: str,
+    catalog_name: str,
+    namespace: str,
+    table: str,
+    rest_path: str,
+    rest_signing_name: str,
+) -> str:
+    parsed = re.match(r"^(https?)://(.+)$", normalized_endpoint(endpoint))
+    if not parsed:
+        raise ValueError("DuckDB REST catalog endpoint must include http:// or https://")
+    scheme, endpoint_without_scheme = parsed.groups()
+    rest_path = normalized_rest_path(rest_path)
+    catalog_identifier = quote_double_identifier(catalog_name)
+    table_identifier = ".".join(
+        [catalog_identifier, quote_double_identifier(namespace), quote_double_identifier(table)]
+    )
+    statements = [
+        "INSTALL httpfs;",
+        "LOAD httpfs;",
+        "INSTALL iceberg;",
+        "LOAD iceberg;",
+        "CREATE OR REPLACE SECRET rustfs_s3 (",
+        "  TYPE s3,",
+        "  PROVIDER config,",
+        f"  KEY_ID {sql_string(access_key)},",
+        f"  SECRET {sql_string(secret_key)},",
+        f"  REGION {sql_string(region)},",
+        f"  ENDPOINT {sql_string(endpoint_without_scheme)},",
+        "  URL_STYLE 'path',",
+        f"  USE_SSL {'true' if scheme == 'https' else 'false'},",
+        f"  SCOPE {sql_string(f's3://{warehouse}')}",
+        ");",
+        f"ATTACH {sql_string(warehouse)} AS {catalog_identifier} (",
+        "  TYPE iceberg,",
+        f"  ENDPOINT {sql_string(f'{normalized_endpoint(endpoint)}{rest_path}')},",
+        "  AUTHORIZATION_TYPE 'sigv4',",
+        "  SECRET 'rustfs_s3',",
+        f"  SIGV4_REGION {sql_string(region)},",
+        f"  SIGV4_SERVICE {sql_string(rest_signing_name)},",
+        "  ACCESS_DELEGATION_MODE 'none',",
+        "  STAGE_CREATE_TABLES false,",
+        "  SKIP_CREATE_TABLE_METADATA_UPDATES true,",
+        "  DISABLE_MULTI_TABLE_COMMIT true,",
+        "  REMOVE_FILES_ON_DELETE false,",
+        "  PURGE_REQUESTED false,",
+        "  SUPPORT_NESTED_NAMESPACES false",
+        ");",
+        f"SELECT COUNT(*) AS row_count FROM {table_identifier};",
+    ]
+    return "\n".join(statements) + "\n"
+
+
+def duckdb_command(*, sql_file: str = "/tmp/rustfs-s3tables-duckdb-read.sql") -> str:
+    return shell_join(["duckdb", "-c", f".read {sql_file}"])
 
 
 def snowflake_sql_template(*, endpoint: str, warehouse: str, rest_path: str, namespace: str, table: str) -> str:
@@ -604,7 +665,7 @@ def live_conformance_evidence(
                     OrderedDict(
                         [
                             ("client", "Spark Iceberg REST catalog"),
-                            ("scenario", "create-namespace-create-table-append-refresh-count-cleanup"),
+                            ("scenario", "create-namespace-staged-ctas-refresh-count-cleanup"),
                             ("expected_status", "pass"),
                             ("expected_row_count", 2),
                             ("claim_after_pass", "manual-live-verified"),
@@ -623,11 +684,11 @@ def live_conformance_evidence(
                     OrderedDict(
                         [
                             ("client", "DuckDB Iceberg"),
-                            ("scenario", "iceberg-scan-current-metadata-location"),
+                            ("scenario", "rest-catalog-single-table-read-write-cross-engine-negative-boundaries"),
                             ("expected_status", "pass"),
                             ("expected_row_count", 2),
-                            ("claim_after_pass", "manual-live-read-verified"),
-                            ("write_claim_after_pass", "not-claimed"),
+                            ("claim_after_pass", "automated-rest-catalog-smoke"),
+                            ("write_claim_after_pass", "single-table-automated-smoke"),
                         ]
                     ),
                     OrderedDict(
@@ -653,9 +714,9 @@ def live_conformance_evidence(
             (
                 "promotion_rules",
                 [
-                    "Keep PyIceberg as the only automated claim unless the run is executed by CI or a repeatable operator job.",
+                    "Keep PyIceberg and DuckDB automated claims tied to their repeatable smoke entrypoints and recorded client versions.",
                     "Promote Spark only to manual-live-verified when the exact RustFS build, Spark version, Iceberg version, SQL output, and row_count are recorded.",
-                    "Do not promote Trino or DuckDB write compatibility from read probes; write compatibility remains not-claimed.",
+                    "Keep Trino write compatibility not-claimed after its read probe and do not broaden DuckDB beyond the automated single-table scenarios.",
                     "Do not promote Snowflake or vendor catalog interoperability from a generated template without a repeatable live run.",
                     "Treat manual-live failures as compatibility findings and keep the previous public claim boundary.",
                 ],
@@ -1425,6 +1486,18 @@ def live_conformance_harness(
         region=region,
         metadata_location=metadata_location,
     )
+    duckdb_rest_sql = duckdb_rest_catalog_sql(
+        endpoint=endpoint,
+        warehouse=warehouse,
+        access_key=access_key,
+        secret_key=secret_key,
+        region=region,
+        catalog_name=catalog_name,
+        namespace=namespace,
+        table=table,
+        rest_path=rest_path,
+        rest_signing_name=rest_signing_name,
+    )
     snowflake_sql = snowflake_sql_template(
         endpoint=endpoint,
         warehouse=warehouse,
@@ -1553,14 +1626,25 @@ def live_conformance_harness(
                     OrderedDict(
                         [
                             ("name", "DuckDB Iceberg"),
-                            ("status", "manual-live-read-probe"),
+                            ("status", "automated-smoke"),
                             ("version", duckdb_version),
                             ("metadata_location", metadata_location),
                             ("sql_file", "/tmp/rustfs-s3tables-duckdb-read.sql"),
                             ("sql", duckdb_sql),
                             ("command", duckdb_command()),
                             ("expected", "iceberg_scan returns row_count=2 when metadata_location points at the current Iceberg metadata JSON"),
-                            ("write_compatibility", "not-claimed"),
+                            ("rest_catalog_sql_file", "/tmp/rustfs-s3tables-duckdb-rest.sql"),
+                            ("rest_catalog_sql", duckdb_rest_sql),
+                            (
+                                "rest_catalog_command",
+                                duckdb_command(sql_file="/tmp/rustfs-s3tables-duckdb-rest.sql"),
+                            ),
+                            (
+                                "rest_catalog_expected",
+                                "generic Iceberg REST ATTACH returns row_count=2 for an existing RustFS table",
+                            ),
+                            ("rest_catalog_write_compatibility", "single-table-automated-smoke"),
+                            ("write_compatibility", "single-table-automated-smoke"),
                         ]
                     ),
                     OrderedDict(
@@ -1627,6 +1711,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--print-operations-guide", action="store_true")
     parser.add_argument("--print-spark-config", action="store_true")
     parser.add_argument("--print-spark-sql", action="store_true")
+    parser.add_argument("--print-duckdb-rest-sql", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -1728,6 +1813,24 @@ def run(args: argparse.Namespace, output: StringIO | None = None) -> None:
             namespace=args.namespace,
             table=args.table,
             cleanup=args.cleanup,
+        )
+        if output is None:
+            print(sql, end="")
+        else:
+            output.write(sql)
+        printed = True
+    if args.print_duckdb_rest_sql:
+        sql = duckdb_rest_catalog_sql(
+            endpoint=args.endpoint,
+            warehouse=args.warehouse,
+            access_key=args.access_key,
+            secret_key=args.secret_key,
+            region=args.region,
+            catalog_name=args.catalog_name,
+            namespace=args.namespace,
+            table=args.table,
+            rest_path=args.rest_path or "/iceberg",
+            rest_signing_name=args.rest_signing_name or "s3",
         )
         if output is None:
             print(sql, end="")

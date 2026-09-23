@@ -14,6 +14,7 @@
 
 use crate::cluster::rpc::client::is_network_like_disk_error;
 use crate::config::storageclass;
+use crate::core::pools::PoolMetaBootstrapAuthority;
 use crate::disk::error_reduce::{count_errs, reduce_write_quorum_errs};
 use crate::disk::{self, DiskAPI};
 use crate::error::{Error, Result};
@@ -77,7 +78,14 @@ pub async fn connect_load_init_formats(
     deployment_id: Option<Uuid>,
 ) -> Result<FormatV3> {
     let instance_ctx = crate::runtime::global::current_ctx();
-    connect_load_init_formats_with_instance_ctx(&instance_ctx, first_disk, disks, set_count, set_drive_count, deployment_id).await
+    connect_load_init_formats_with_instance_ctx(&instance_ctx, first_disk, disks, set_count, set_drive_count, deployment_id)
+        .await
+        .map(|loaded| loaded.format)
+}
+
+pub(crate) struct LoadedFormat {
+    pub(crate) format: FormatV3,
+    pub(crate) pool_meta_bootstrap_authority: PoolMetaBootstrapAuthority,
 }
 
 pub(crate) async fn connect_load_init_formats_with_instance_ctx(
@@ -87,19 +95,35 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
     set_count: usize,
     set_drive_count: usize,
     deployment_id: Option<Uuid>,
-) -> Result<FormatV3> {
+) -> Result<LoadedFormat> {
     let (formats, errs) = load_format_erasure_all(disks, false).await;
 
     check_disk_fatal_errs(&errs)?;
 
-    // Treat transient network errors (connection refused, timeout, etc.) as
-    // equivalent to UnformattedDisk for the bootstrap decision. During
-    // fresh-cluster startup a remote peer that cannot be reached is
-    // indistinguishable from an unformatted disk — the peer may simply not
-    // have started its gRPC server yet.
+    // Transient network errors still follow the first-node wait path so peers
+    // can come online, but they are never fresh-cluster authority below.
     let all_unformatted = errs.iter().all(is_unformatted_or_transient_network);
+    // Fresh-cluster authority requires a response from every configured disk.
+    // A transiently unreachable peer may belong to an existing cluster and
+    // must never be treated as proof that the topology is new.
+    let fresh_bootstrap_proven = should_init_erasure_disks(&errs);
     let formats_present = formats.iter().flatten().count();
     let mut format_quorum = (formats_present > 0).then(|| select_format_erasure_in_quorum(&formats, 0));
+    // A resized pool may never reach quorum under its new endpoint count.
+    // Diagnose a valid, unambiguous stored layout before migration or waiting.
+    // A healthy quorum still takes precedence over foreign minority formats;
+    // conflicting or malformed observations retain their existing error path.
+    if format_quorum.as_ref().is_some_and(Result::is_err)
+        && let Some(reference) = formats.iter().flatten().next()
+        && formats.iter().flatten().all(|format| {
+            format.shared_identity() == reference.shared_identity()
+                && reference.erasure.sets.iter().flatten().any(|id| *id == format.erasure.this)
+        })
+        && let Err(err @ (Error::UnsupportedSnsdExpansion { .. } | Error::PoolTopologyMismatch { .. })) =
+            check_format_erasure_value_for_topology(reference, formats.len(), set_drive_count)
+    {
+        return Err(err);
+    }
     if format_quorum.as_ref().is_none_or(Result::is_err)
         && errs.iter().any(|error| {
             matches!(
@@ -123,7 +147,10 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
             Ok(LegacyFormatOutcome::Migrated { format, quorum_members }) => {
                 info!("Migrated format from MinIO config");
                 retain_format_quorum_members(instance_ctx, disks, &format, &quorum_members, set_drive_count).await?;
-                return Ok(*format);
+                return Ok(LoadedFormat {
+                    format: *format,
+                    pool_meta_bootstrap_authority: PoolMetaBootstrapAuthority::LegacyAdoption,
+                });
             }
             Ok(LegacyFormatOutcome::Incompatible) => {
                 error!(
@@ -138,9 +165,12 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
             Ok(LegacyFormatOutcome::None) => {}
             Err(e) => return Err(e),
         }
-        if all_unformatted {
+        if fresh_bootstrap_proven {
             let fm = init_format_erasure(instance_ctx, disks, set_count, set_drive_count, deployment_id).await?;
-            return Ok(fm);
+            return Ok(LoadedFormat {
+                format: fm,
+                pool_meta_bootstrap_authority: PoolMetaBootstrapAuthority::Fresh,
+            });
         }
     }
 
@@ -166,7 +196,29 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
     check_format_erasure_value_for_topology(&fm, formats.len(), set_drive_count)?;
     retain_format_quorum_members(instance_ctx, disks, &fm, &quorum_members, set_drive_count).await?;
 
-    Ok(fm)
+    Ok(LoadedFormat {
+        format: fm,
+        pool_meta_bootstrap_authority: verified_legacy_adoption_source(disks, &formats, set_count, set_drive_count).await?,
+    })
+}
+
+async fn verified_legacy_adoption_source(
+    disks: &[Option<DiskStore>],
+    rustfs_formats: &[Option<FormatV3>],
+    set_count: usize,
+    set_drive_count: usize,
+) -> Result<PoolMetaBootstrapAuthority> {
+    match try_migrate_format(disks, rustfs_formats, set_count, set_drive_count).await {
+        Ok(LegacyFormatOutcome::Migrated { .. }) => Ok(PoolMetaBootstrapAuthority::LegacyAdoption),
+        Ok(LegacyFormatOutcome::None | LegacyFormatOutcome::Incompatible) => Ok(PoolMetaBootstrapAuthority::None),
+        Err(err) => {
+            debug!(
+                error = %err,
+                "legacy adoption proof skipped because legacy format verification failed"
+            );
+            Ok(PoolMetaBootstrapAuthority::None)
+        }
+    }
 }
 
 async fn retain_format_quorum_members(
@@ -258,11 +310,8 @@ pub fn should_init_erasure_disks(errs: &[Option<DiskError>]) -> bool {
     count_errs(errs, &DiskError::UnformattedDisk) == errs.len()
 }
 
-/// Returns `true` if the error represents a disk that is either unformatted
-/// or unreachable due to a transient network failure. During fresh-cluster
-/// bootstrap a remote peer that cannot be reached is indistinguishable from
-/// an unformatted disk — the peer may simply not have started its gRPC
-/// server yet.
+/// Returns `true` for errors that stay on the first-node wait path. This is not
+/// fresh-cluster proof; only [`should_init_erasure_disks`] grants that.
 fn is_unformatted_or_transient_network(err: &Option<DiskError>) -> bool {
     matches!(err, Some(DiskError::UnformattedDisk)) || err.as_ref().is_some_and(is_network_like_disk_error)
 }
@@ -627,15 +676,18 @@ fn check_format_erasure_value_for_topology(format: &FormatV3, format_count: usiz
         .len()
         .checked_mul(set_drive_count_in_format)
         .ok_or_else(|| Error::other("erasure set drive count overflow"))?;
-    if format_count != format_drive_count {
-        return Err(Error::other(format!(
-            "formats length for erasure.sets does not match: got {format_count}, expected {format_drive_count}"
-        )));
+    if format_drive_count == 1 && format_count > 1 {
+        return Err(Error::UnsupportedSnsdExpansion {
+            configured_drives: format_count,
+        });
     }
-    if set_drive_count_in_format != set_drive_count {
-        return Err(Error::other(format!(
-            "erasure set length for set_drive_count does not match: got {set_drive_count_in_format}, expected {set_drive_count}"
-        )));
+    if format_count != format_drive_count || set_drive_count_in_format != set_drive_count {
+        return Err(Error::PoolTopologyMismatch {
+            stored_drives: format_drive_count,
+            stored_set_drive_count: set_drive_count_in_format,
+            configured_drives: format_count,
+            configured_set_drive_count: set_drive_count,
+        });
     }
     Ok(())
 }
@@ -843,6 +895,10 @@ mod tests {
     use serial_test::serial;
 
     async fn local_disks(count: usize) -> (tempfile::TempDir, Vec<Option<DiskStore>>) {
+        local_disks_with_set_width(count, count).await
+    }
+
+    async fn local_disks_with_set_width(count: usize, set_width: usize) -> (tempfile::TempDir, Vec<Option<DiskStore>>) {
         let temp_dir = tempfile::tempdir().expect("temporary disk root should be created");
         let mut endpoints = Vec::with_capacity(count);
         for disk_index in 0..count {
@@ -853,8 +909,8 @@ mod tests {
             let mut endpoint =
                 Endpoint::try_from(path.to_str().expect("temporary disk path should be UTF-8")).expect("endpoint should parse");
             endpoint.set_pool_index(0);
-            endpoint.set_set_index(0);
-            endpoint.set_disk_index(disk_index);
+            endpoint.set_set_index(disk_index / set_width);
+            endpoint.set_disk_index(disk_index % set_width);
             endpoints.push(endpoint);
         }
 
@@ -876,6 +932,21 @@ mod tests {
         disks.push(None);
 
         (temp_dir, disks)
+    }
+
+    async fn format_bytes(disks: &[Option<DiskStore>]) -> Vec<Option<Vec<u8>>> {
+        let mut snapshots = Vec::with_capacity(disks.len());
+        for disk in disks {
+            let disk = disk.as_ref().expect("snapshot disk should exist");
+            // Inspect bytes even when the disk wrapper rejects a format whose
+            // stored slot differs from the attempted new endpoint geometry.
+            match tokio::fs::read(disk.path().join(RUSTFS_META_BUCKET).join(FORMAT_CONFIG_FILE)).await {
+                Ok(data) => snapshots.push(Some(data)),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => snapshots.push(None),
+                Err(err) => panic!("format snapshot failed: {err}"),
+            }
+        }
+        snapshots
     }
 
     async fn write_legacy_format(disk: &Option<DiskStore>, format: &FormatV3) {
@@ -1080,6 +1151,212 @@ mod tests {
                 .expect("two existing formats should satisfy the production load path"),
             expected
         );
+    }
+
+    #[tokio::test]
+    async fn single_drive_format_rejects_in_place_expansion_without_writes() {
+        for configured_drives in [2, 4] {
+            for first_disk in [false, true] {
+                let (_temp_dir, mut disks) = local_disks(configured_drives).await;
+                let mut original = FormatV3::new(1, 1);
+                original.erasure.this = original.erasure.sets[0][0];
+                save_format_file(&disks[0], &Some(original))
+                    .await
+                    .expect("SNSD format should be written");
+                let before = format_bytes(&disks).await;
+
+                let err = connect_load_init_formats(first_disk, &mut disks, 1, configured_drives, None)
+                    .await
+                    .expect_err("an existing SNSD deployment cannot expand in place");
+                let message = err.to_string();
+                assert!(message.contains("SNSD"), "expected a single-drive expansion error: {message}");
+                assert!(message.contains("migrate data through S3"), "expected actionable guidance: {message}");
+                assert_eq!(format_bytes(&disks).await, before, "neither old nor new formats may be written");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_pool_rejects_drive_count_or_set_width_changes_without_writes() {
+        for (stored_sets, stored_width, configured_sets, configured_width) in
+            [(1, 4, 1, 6), (1, 4, 1, 8), (1, 4, 1, 2), (1, 4, 2, 2), (2, 2, 1, 4)]
+        {
+            for first_disk in [false, true] {
+                let (_temp_dir, mut disks) =
+                    local_disks_with_set_width(configured_sets * configured_width, configured_width).await;
+                let original = FormatV3::new(stored_sets, stored_width);
+                for (disk, disk_id) in disks.iter().zip(original.erasure.sets.iter().flatten()) {
+                    let mut format = original.clone();
+                    format.erasure.this = *disk_id;
+                    save_format_file(disk, &Some(format))
+                        .await
+                        .expect("existing format should be written");
+                }
+                let before = format_bytes(&disks).await;
+
+                let err = connect_load_init_formats(first_disk, &mut disks, configured_sets, configured_width, None)
+                    .await
+                    .expect_err("an existing pool's geometry is immutable");
+                let message = err.to_string();
+                assert!(message.contains("pool topology mismatch"), "expected a topology error: {message}");
+                assert!(
+                    message.contains(&format!("stored 4 drives with {stored_width} drives per erasure set")),
+                    "expected stored geometry: {message}"
+                );
+                assert!(message.contains("append a new pool"), "expected expansion guidance: {message}");
+                assert_eq!(format_bytes(&disks).await, before, "rejection must not rewrite any format");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn subquorum_existing_layout_with_missing_drives_is_not_expansion() {
+        let (_temp_dir, mut disks) = local_disks(1).await;
+        let mut original = FormatV3::new(1, 4);
+        original.erasure.this = original.erasure.sets[0][0];
+        save_format_file(&disks[0], &Some(original))
+            .await
+            .expect("existing format should be written");
+        disks.extend([None, None, None]);
+
+        for first_disk in [false, true] {
+            assert!(matches!(
+                connect_load_init_formats(first_disk, &mut disks, 1, 4, None).await,
+                Err(Error::ErasureReadQuorum)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn conflicting_layouts_without_quorum_are_not_expansion_proof() {
+        let (_temp_dir, mut disks) = local_disks(2).await;
+        for (index, (disk, width)) in disks.iter().zip([4, 2]).enumerate() {
+            let mut format = FormatV3::new(1, width);
+            format.erasure.this = format.erasure.sets[0][index];
+            save_format_file(disk, &Some(format))
+                .await
+                .expect("existing format should be written");
+        }
+        disks.extend([None, None]);
+
+        let result = connect_load_init_formats(true, &mut disks, 1, 4, None).await;
+        assert!(matches!(result, Err(Error::ErasureReadQuorum)), "conflicting layout result: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn existing_format_quorum_ignores_single_drive_outlier() {
+        let (_temp_dir, mut disks) = local_disks(3).await;
+        let majority = FormatV3::new(1, 3);
+        for (index, disk) in disks.iter().enumerate() {
+            // Slot zero lets the SNSD outlier pass the disk wrapper's own
+            // slot check, so quorum selection must exclude the parsed format.
+            let mut format = if index == 0 { FormatV3::new(1, 1) } else { majority.clone() };
+            format.erasure.this = format.erasure.sets[0][index];
+            save_format_file(disk, &Some(format))
+                .await
+                .expect("existing format should be written");
+        }
+
+        let loaded = connect_load_init_formats(true, &mut disks, 1, 3, None)
+            .await
+            .expect("a foreign SNSD outlier must not block a healthy majority");
+        assert_eq!(loaded.shared_identity(), majority.shared_identity());
+        assert!(disks[0].is_none(), "the foreign single-drive format must be quarantined");
+    }
+
+    #[tokio::test]
+    async fn multi_drive_pool_expansion_preserves_existing_format() {
+        let (_original_dir, mut disks) = local_disks(4).await;
+        let (_new_dir, mut new_disks) = local_disks(4).await;
+        let original = connect_load_init_formats(true, &mut disks, 1, 4, None)
+            .await
+            .expect("original multi-drive pool should initialize");
+        let before = format_bytes(&disks).await;
+
+        let added = connect_load_init_formats(true, &mut new_disks, 1, 4, Some(original.id))
+            .await
+            .expect("a new multi-drive pool should initialize with the existing deployment ID");
+        assert_eq!(added.id, original.id);
+        assert_ne!(added.erasure.sets, original.erasure.sets);
+        assert_eq!(format_bytes(&disks).await, before);
+        assert_eq!(
+            connect_load_init_formats(true, &mut disks, 1, 4, Some(original.id))
+                .await
+                .expect("the original pool should restart with unchanged geometry"),
+            original
+        );
+        assert_eq!(
+            connect_load_init_formats(true, &mut new_disks, 1, 4, Some(original.id))
+                .await
+                .expect("the new pool should restart with its own format"),
+            added
+        );
+    }
+
+    #[tokio::test]
+    async fn store_startup_rejects_pool_resize_before_retry_loop() {
+        use crate::layout::endpoints::{EndpointServerPools, PoolEndpoints};
+        use tokio_util::sync::CancellationToken;
+
+        for (stored_width, configured_width) in [(1, 4), (4, 8)] {
+            let (_temp_dir, disks) = local_disks(configured_width).await;
+            let original = FormatV3::new(1, stored_width);
+            for (disk, disk_id) in disks.iter().zip(&original.erasure.sets[0]) {
+                let mut format = original.clone();
+                format.erasure.this = *disk_id;
+                save_format_file(disk, &Some(format))
+                    .await
+                    .expect("old format should be written");
+            }
+            let before = format_bytes(&disks).await;
+            let endpoints = disks.iter().flatten().map(|disk| disk.endpoint()).collect::<Vec<_>>();
+            let pools = EndpointServerPools::from(vec![PoolEndpoints {
+                legacy: true,
+                set_count: 1,
+                drives_per_set: configured_width,
+                endpoints: Endpoints::from(endpoints),
+                cmd_line: "test-pool".to_string(),
+                platform: String::new(),
+            }]);
+            let shutdown = CancellationToken::new();
+            let result = temp_env::async_with_vars(
+                [
+                    (storageclass::STANDARD_ENV, None::<&str>),
+                    (storageclass::RRS_ENV, None::<&str>),
+                    (storageclass::OPTIMIZE_ENV, None::<&str>),
+                    (storageclass::INLINE_BLOCK_ENV, None::<&str>),
+                ],
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    crate::store::ECStore::new_with_instance_ctx(
+                        "127.0.0.1:0".parse().expect("test address"),
+                        pools,
+                        shutdown.clone(),
+                        Arc::new(InstanceContext::new()),
+                    ),
+                ),
+            )
+            .await;
+            shutdown.cancel();
+            let err = result
+                .expect("invalid topology must abort without the format retry backoff")
+                .expect_err("resize must fail");
+            match stored_width {
+                1 => assert!(matches!(err, Error::UnsupportedSnsdExpansion { configured_drives: 4 }), "{err}"),
+                _ => assert!(
+                    matches!(
+                        err,
+                        Error::PoolTopologyMismatch {
+                            stored_drives: 4,
+                            configured_drives: 8,
+                            ..
+                        }
+                    ),
+                    "{err}"
+                ),
+            }
+            assert_eq!(format_bytes(&disks).await, before, "failed store startup must not write formats");
+        }
     }
 
     #[tokio::test]
@@ -1294,9 +1571,11 @@ mod tests {
     async fn fresh_format_load_initializes_all_disks() {
         let (_temp_dir, mut disks) = local_disks(3).await;
 
-        let format = connect_load_init_formats(true, &mut disks, 1, 3, None)
+        let loaded = connect_load_init_formats_with_instance_ctx(&current_ctx(), true, &mut disks, 1, 3, None)
             .await
             .expect("fresh disks should receive a storage format");
+        assert_eq!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::Fresh);
+        let format = loaded.format;
 
         let (formats, errors) = load_format_erasure_all(&disks, false).await;
         assert!(errors.iter().all(Option::is_none), "every disk should load its fresh format: {errors:?}");
@@ -1339,12 +1618,11 @@ mod tests {
 
         let mut expected = legacy;
         expected.erasure.this = Uuid::nil();
-        assert_eq!(
-            connect_load_init_formats(true, &mut disks, 1, 3, None)
-                .await
-                .expect("compatible legacy format should migrate"),
-            expected
-        );
+        let loaded = connect_load_init_formats_with_instance_ctx(&current_ctx(), true, &mut disks, 1, 3, None)
+            .await
+            .expect("compatible legacy format should migrate");
+        assert_eq!(loaded.format, expected);
+        assert_eq!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::LegacyAdoption);
         let (formats, errors) = load_format_erasure_all(&disks, false).await;
         assert!(
             errors.iter().all(Option::is_none),
@@ -1357,6 +1635,51 @@ mod tests {
                 "the migrated format must preserve each disk's physical slot"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn compatible_single_drive_legacy_format_marks_adoption_proof() {
+        let (_temp_dir, mut disks) = local_disks(1).await;
+        let legacy = FormatV3::new(1, 1);
+        write_legacy_majority(&disks, &legacy).await;
+
+        let loaded = connect_load_init_formats_with_instance_ctx(&current_ctx(), true, &mut disks, 1, 1, None)
+            .await
+            .expect("single-drive MinIO format should migrate");
+
+        assert_eq!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::LegacyAdoption);
+    }
+
+    #[tokio::test]
+    async fn existing_migrated_format_keeps_legacy_adoption_proof() {
+        let (_temp_dir, mut disks) = local_disks(1).await;
+        let legacy = FormatV3::new(1, 1);
+        write_legacy_majority(&disks, &legacy).await;
+
+        connect_load_init_formats_with_instance_ctx(&current_ctx(), true, &mut disks, 1, 1, None)
+            .await
+            .expect("first run should migrate the MinIO format");
+        let loaded = connect_load_init_formats_with_instance_ctx(&current_ctx(), true, &mut disks, 1, 1, None)
+            .await
+            .expect("retry after a partial adoption should reload the migrated RustFS format");
+
+        assert_eq!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::LegacyAdoption);
+    }
+
+    #[tokio::test]
+    async fn existing_rustfs_format_without_legacy_source_is_not_legacy_adoption() {
+        let (_temp_dir, mut disks) = local_disks(1).await;
+        let mut format = FormatV3::new(1, 1);
+        format.erasure.this = format.erasure.sets[0][0];
+        save_format_file(&disks[0], &Some(format))
+            .await
+            .expect("existing RustFS format should be written");
+
+        let loaded = connect_load_init_formats_with_instance_ctx(&current_ctx(), true, &mut disks, 1, 1, None)
+            .await
+            .expect("existing RustFS format should load");
+
+        assert_eq!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::None);
     }
 
     #[tokio::test]
@@ -1640,6 +1963,14 @@ mod tests {
         assert!(!is_unformatted_or_transient_network(&Some(DiskError::FileNotFound)));
         assert!(!is_unformatted_or_transient_network(&Some(DiskError::CorruptedFormat)));
         assert!(!is_unformatted_or_transient_network(&Some(DiskError::DiskFull)));
+        assert!(should_init_erasure_disks(&[
+            Some(DiskError::UnformattedDisk),
+            Some(DiskError::UnformattedDisk),
+        ]));
+        assert!(
+            !should_init_erasure_disks(&[Some(DiskError::UnformattedDisk), Some(DiskError::Timeout)]),
+            "an unreachable peer is not fresh-topology proof"
+        );
     }
 }
 

@@ -15,7 +15,7 @@
 use super::*;
 #[cfg(test)]
 use rustfs_filemeta::MetadataResolutionParams;
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 
 /// Cached folder information for scanning
 #[derive(Clone, Debug)]
@@ -251,7 +251,7 @@ fn resolve_sizes(object_infos: &[ObjectInfo]) -> Vec<SizeResolution> {
 }
 
 fn lifecycle_rule_has_size_filter(lifecycle: &BucketLifecycleConfiguration, rule_id: &str) -> bool {
-    let filter_has_size = |filter: &s3s::dto::LifecycleRuleFilter| {
+    let filter_has_size = |filter: &LifecycleRuleFilter| {
         filter.object_size_greater_than.is_some()
             || filter.object_size_less_than.is_some()
             || filter
@@ -325,7 +325,7 @@ pub(super) fn build_bucket_heal_request(bucket: String, priority: HealChannelPri
         priority,
         recreate_missing: Some(false),
         source: HealRequestSource::Scanner,
-        ..Default::default()
+        ..HealChannelRequest::new()
     }
 }
 
@@ -345,7 +345,7 @@ pub(super) fn build_object_heal_request(
         remove_corrupted: Some(HEAL_DELETE_DANGLING),
         recreate_missing: Some(false),
         source: HealRequestSource::Scanner,
-        ..Default::default()
+        ..HealChannelRequest::new()
     }
 }
 
@@ -566,11 +566,62 @@ impl ScannerItem {
         item.object_path()
     }
 
+    fn effective_tier(oi: &ObjectInfo) -> &str {
+        if oi.transitioned_object.status == crate::TRANSITION_COMPLETE {
+            oi.transitioned_object.tier.as_str()
+        } else {
+            oi.storage_class.as_deref().unwrap_or(crate::storageclass::STANDARD)
+        }
+    }
+
+    fn tier_name_is_known(tier: &str, tier_names: &[String]) -> bool {
+        !tier.is_empty()
+            && tier != crate::data_usage_define::UNKNOWN_TIER
+            && (tier == crate::storageclass::STANDARD
+                || tier == crate::storageclass::RRS
+                || tier_names.iter().any(|name| name == tier))
+    }
+
+    pub(crate) fn tier_is_known(oi: &ObjectInfo, tier_names: &[String]) -> bool {
+        Self::tier_name_is_known(Self::effective_tier(oi), tier_names)
+    }
+
+    fn action_requires_known_tier(action: IlmAction) -> bool {
+        matches!(
+            action,
+            IlmAction::TransitionAction
+                | IlmAction::TransitionVersionAction
+                | IlmAction::DeleteAction
+                | IlmAction::DeleteVersionAction
+                | IlmAction::DeleteRestoredAction
+                | IlmAction::DeleteRestoredVersionAction
+                | IlmAction::DeleteAllVersionsAction
+                | IlmAction::DelMarkerDeleteAllVersionsAction
+        )
+    }
+
+    fn action_blocked_by_unknown_tier(
+        action: IlmAction,
+        oi: &ObjectInfo,
+        all_versions_known: bool,
+        tier_names: &[String],
+        target: &str,
+    ) -> bool {
+        if !Self::action_requires_known_tier(action) {
+            return false;
+        }
+        !Self::tier_is_known(oi, tier_names)
+            || (action.delete_all() && !all_versions_known)
+            || (matches!(action, IlmAction::TransitionAction | IlmAction::TransitionVersionAction)
+                && !Self::tier_name_is_known(target, tier_names))
+    }
+
     pub async fn apply_actions(
         &mut self,
         object_infos: Vec<ObjectInfo>,
         lock_retention: Option<Arc<ObjectLockConfiguration>>,
         versioning_config: VersioningConfiguration,
+        tier_names: &[String],
         size_summary: &mut SizeSummary,
     ) {
         let object_path = self.object_path();
@@ -694,6 +745,9 @@ impl ScannerItem {
         let mut noncurrent_unknown: Vec<&ObjectInfo> = Vec::new();
         let mut cumulative_size = 0;
         let mut remaining_versions = object_infos.len();
+        let all_versions_known = object_infos
+            .iter()
+            .all(|candidate| Self::tier_is_known(candidate, tier_names));
         'eventLoop: {
             for (i, event) in events.iter().enumerate() {
                 let oi = &object_infos[i];
@@ -765,14 +819,15 @@ impl ScannerItem {
                                 }
                             }
                             IlmAction::DeleteVersionAction => {
-                                if let Some(opt) = object_opts.get(i) {
-                                    to_delete_objs.push(ObjectToDelete {
-                                        object_name: opt.name.clone(),
-                                        version_id: opt.version_id,
-                                        ..Default::default()
-                                    });
+                                if let Some(target) = ecstore_lifecycle_version_delete_target(oi) {
+                                    to_delete_objs.push(target);
                                     noncurrent_events.push(event.clone());
                                     noncurrent_unknown.push(oi);
+                                } else {
+                                    if let SizeResolution::Unknown { physical, .. } = &resolved_sizes[i] {
+                                        self.heal_actions(oi, *physical, size_summary).await;
+                                    }
+                                    size_summary.actions_accounting_unknown(oi);
                                 }
                             }
                             IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
@@ -798,6 +853,18 @@ impl ScannerItem {
 
                 let mut size = actual_size;
                 let mut account_now = true;
+
+                // A retired/unknown source tier may point at a remote object
+                // that cannot be safely deleted or transitioned. Lifecycle
+                // evaluation is still useful for accounting, but all
+                // side-effecting tier actions fail closed until the registry
+                // recognizes the source again.
+                if Self::action_blocked_by_unknown_tier(event.action, oi, all_versions_known, tier_names, &event.storage_class) {
+                    size = self.heal_actions(oi, actual_size, size_summary).await;
+                    size_summary.actions_accounting(oi, size, actual_size);
+                    cumulative_size += size;
+                    continue;
+                }
 
                 match event.action {
                     IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => {
@@ -867,12 +934,8 @@ impl ScannerItem {
                         }
                     }
                     IlmAction::DeleteVersionAction => {
-                        if let Some(opt) = object_opts.get(i) {
-                            to_delete_objs.push(ObjectToDelete {
-                                object_name: opt.name.clone(),
-                                version_id: opt.version_id,
-                                ..Default::default()
-                            });
+                        if let Some(target) = ecstore_lifecycle_version_delete_target(oi) {
+                            to_delete_objs.push(target);
                             if let Some(actual_size) = known_size {
                                 noncurrent_accounting.push(PendingScannerAccounting {
                                     object: oi,
@@ -881,8 +944,8 @@ impl ScannerItem {
                                 });
                             }
                             account_now = false;
+                            noncurrent_events.push(event.clone());
                         }
-                        noncurrent_events.push(event.clone());
                     }
                     IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
                         debug!(
@@ -973,12 +1036,19 @@ impl ScannerItem {
             return;
         }
 
-        let Some(replication) = self.replication.clone() else {
-            return;
+        let replication = match self.replication.clone() {
+            Some(replication) => (*replication).clone(),
+            // No active rules or targets, but a purge the bucket still owes
+            // must reach the heal path: the delete worker settles it against
+            // the current configuration (abandoned when the target is gone,
+            // rustfs/backlog#2340) so the hidden version stops blocking
+            // DeleteBucket.
+            None if !oi.version_purge_status.is_empty() => ReplicationConfig::new(None, None),
+            None => return,
         };
 
         let done_replication = Metrics::time(Metric::CheckReplication);
-        let replication_result = queue_replication_heal(&oi.bucket, oi.clone(), (*replication).clone(), 0).await;
+        let replication_result = queue_replication_heal(&oi.bucket, oi.clone(), replication, 0).await;
         done_replication();
         let roi = replication_result.object_info;
         record_scanner_replication_admission(global_metrics(), &roi, replication_result.admission);
@@ -1304,6 +1374,51 @@ mod tests {
     }
 
     #[test]
+    fn unknown_tier_never_triggers_transition() {
+        let object = ObjectInfo {
+            storage_class: Some("retired-tier".to_string()),
+            ..Default::default()
+        };
+        let tier_names = ["WARM".to_string()];
+        assert!(!ScannerItem::tier_is_known(&object, &tier_names));
+        assert!(ScannerItem::action_requires_known_tier(IlmAction::TransitionAction));
+        assert!(ScannerItem::action_requires_known_tier(IlmAction::DeleteVersionAction));
+        assert!(ScannerItem::action_blocked_by_unknown_tier(
+            IlmAction::TransitionAction,
+            &object,
+            false,
+            &tier_names,
+            "WARM"
+        ));
+        assert!(!ScannerItem::action_blocked_by_unknown_tier(
+            IlmAction::NoneAction,
+            &object,
+            false,
+            &tier_names,
+            "WARM"
+        ));
+
+        let known = ObjectInfo {
+            storage_class: Some(crate::storageclass::STANDARD.to_string()),
+            ..Default::default()
+        };
+        assert!(ScannerItem::action_blocked_by_unknown_tier(
+            IlmAction::DeleteAllVersionsAction,
+            &known,
+            false,
+            &tier_names,
+            "WARM"
+        ));
+        assert!(!ScannerItem::action_blocked_by_unknown_tier(
+            IlmAction::TransitionAction,
+            &known,
+            true,
+            &tier_names,
+            crate::storageclass::STANDARD
+        ));
+    }
+
+    #[test]
     fn size_resolution_rejects_negative_overflow_and_unknown_compression() {
         let compressed = |actual_size: i64, declared: Option<&str>| {
             let mut user_defined = HashMap::new();
@@ -1526,13 +1641,13 @@ mod tests {
     #[test]
     fn malformed_size_blocks_size_dependent_transition_but_allows_time_only_expiry() {
         let size_filtered = BucketLifecycleConfiguration {
-            rules: vec![s3s::dto::LifecycleRule {
-                status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 id: Some("size".to_string()),
-                filter: Some(s3s::dto::LifecycleRuleFilter {
+                filter: Some(LifecycleRuleFilter {
                     object_size_greater_than: Some(1),
                     ..Default::default()
                 }),
@@ -1565,8 +1680,8 @@ mod tests {
         let mixed_filters = BucketLifecycleConfiguration {
             rules: vec![
                 size_filtered.rules[0].clone(),
-                s3s::dto::LifecycleRule {
-                    status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+                LifecycleRule {
+                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
                     expiration: None,
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
@@ -1622,13 +1737,13 @@ mod tests {
         ));
         assert!(lifecycle_rule_has_size_filter(
             &BucketLifecycleConfiguration {
-                rules: vec![s3s::dto::LifecycleRule {
-                    status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+                rules: vec![LifecycleRule {
+                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
                     expiration: None,
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
                     id: None,
-                    filter: Some(s3s::dto::LifecycleRuleFilter {
+                    filter: Some(LifecycleRuleFilter {
                         object_size_greater_than: Some(1),
                         ..Default::default()
                     }),
@@ -1681,7 +1796,7 @@ mod tests {
             ..Default::default()
         };
         let mut summary = SizeSummary::default();
-        item.apply_actions(vec![object], None, VersioningConfiguration::default(), &mut summary)
+        item.apply_actions(vec![object], None, VersioningConfiguration::default(), &[], &mut summary)
             .await;
 
         let bounded_bucket = bounded_reconciliation_field(&item.bucket);

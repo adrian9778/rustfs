@@ -24,8 +24,14 @@ on:
       - '.github/actions/**'
       - '.github/workflows/**'
       - 'scripts/release/create_or_update_release.sh'
+      - 'scripts/release/package_service_scripts.sh'
+      - 'scripts/release/package_versions.sh'
+      - 'scripts/test_package_service_scripts.sh'
+      - 'scripts/test_package_versions.sh'
+      - 'scripts/test_docker_workflow.py'
       - 'scripts/security/check_performance_ab_workflow.sh'
       - 'scripts/security/check_preview_release_workflow.sh'
+      - 'scripts/security/check_tier_artifact_workflow.sh'
       - 'scripts/security/check_workflow_pins.sh'
   pull_request:
     types: [ opened, synchronize, reopened, closed ]
@@ -37,8 +43,14 @@ on:
       - '.github/actions/**'
       - '.github/workflows/**'
       - 'scripts/release/create_or_update_release.sh'
+      - 'scripts/release/package_service_scripts.sh'
+      - 'scripts/release/package_versions.sh'
+      - 'scripts/test_package_service_scripts.sh'
+      - 'scripts/test_package_versions.sh'
+      - 'scripts/test_docker_workflow.py'
       - 'scripts/security/check_performance_ab_workflow.sh'
       - 'scripts/security/check_preview_release_workflow.sh'
+      - 'scripts/security/check_tier_artifact_workflow.sh'
       - 'scripts/security/check_workflow_pins.sh'
   schedule:
     # Daily, not weekly. This schedule exists to catch RustSec advisories
@@ -146,6 +158,15 @@ jobs:
       - name: Check performance A/B workflow trust boundary
         run: ./scripts/security/check_performance_ab_workflow.sh
 
+      - name: Check tier evidence workflow isolation
+        run: ./scripts/security/check_tier_artifact_workflow.sh
+
+      - name: Check package version contract
+        run: ./scripts/test_package_versions.sh
+
+      - name: Check package service lifecycle contract
+        run: ./scripts/test_package_service_scripts.sh
+
   dependency-review:
     name: Dependency Review
     runs-on: ubuntu-latest
@@ -195,4 +216,4 @@ jobs:
       - name: Open or update failure-tracking issue
         uses: ./.github/actions/schedule-failure-issue
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}

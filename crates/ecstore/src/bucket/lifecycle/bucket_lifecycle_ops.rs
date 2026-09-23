@@ -32,6 +32,7 @@ use crate::bucket::lifecycle::manual_transition_job::{
     record_manual_transition_worker_result_with_reason, renew_manual_transition_job_lease_if_owned,
     save_manual_transition_job_record_if_current, save_manual_transition_task_if_absent, update_manual_transition_job_record,
 };
+use crate::bucket::lifecycle::recovery_disposition_runtime::run_recovery_disposition_maintenance_loop;
 use crate::bucket::lifecycle::replication_sink;
 use crate::bucket::lifecycle::replication_sink::{
     DeleteReplicationConfigSnapshot, ReplicationObjectBridge, ReplicationStatusType, replication_state_to_filemeta,
@@ -41,7 +42,7 @@ use crate::bucket::lifecycle::tier_free_version_recovery::{
     DEFAULT_FREE_VERSION_RECOVERY_LIMIT, FreeVersionRecoveryStats, recover_tier_free_versions_with_cancel,
 };
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
-use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent_with_manager_and_identity};
+use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_with_lease_idempotent};
 use crate::bucket::lifecycle::transition_transaction::run_transition_transaction_recovery_loop;
 use crate::bucket::object_lock::ObjectLockApi;
 use crate::bucket::versioning::VersioningApi as _;
@@ -50,7 +51,10 @@ use crate::disk::error::DiskError;
 use crate::disk::{DeleteOptions, Disk, DiskAPI, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, STORAGE_FORMAT_FILE};
 use crate::error::Error;
 use crate::error::StorageError;
-use crate::error::{is_err_object_not_found, is_err_read_quorum, is_err_version_not_found, is_network_or_host_down};
+use crate::error::{
+    is_err_object_not_found, is_err_read_quorum, is_err_strict_volume_not_found, is_err_version_not_found,
+    is_network_or_host_down,
+};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::object_api::{ObjectEncryptionResolver, ReadPlan};
 use crate::services::tier::{
@@ -72,28 +76,22 @@ use crate::store::ECStore;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use http::HeaderMap;
 use rand::RngExt as _;
-use rustfs_common::metrics::{
-    IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
-};
 use rustfs_config::{
     DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
     DEFAULT_TRANSITION_WORKERS_CAP, ENV_MAX_EXPIRY_WORKERS, ENV_TRANSITION_QUEUE_CAPACITY, ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS,
     ENV_TRANSITION_WORKERS, ENV_TRANSITION_WORKERS_ABSOLUTE_MAX,
 };
 use rustfs_data_usage::TierStats;
+use rustfs_filemeta::metadata_keys;
 use rustfs_filemeta::{
-    FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatusOps, TRANSITION_COMPLETE, get_file_info, is_restored_object_on_disk,
+    FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatus, RestoreStatusOps, TRANSITION_COMPLETE, get_file_info,
+    is_restored_object_on_disk,
 };
-use rustfs_utils::{
-    get_env_i64, get_env_usize,
-    path::encode_dir_object,
-    string::{parse_bool, strings_has_prefix_fold},
+use rustfs_scanner_metrics::metrics::{
+    IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
 };
-use s3s::dto::{
-    BucketLifecycleConfiguration, ExpirationStatus, ObjectLockConfiguration, RestoreRequest, RestoreRequestType, RestoreStatus,
-    Timestamp,
-};
-use s3s::header::{X_AMZ_RESTORE, X_AMZ_SERVER_SIDE_ENCRYPTION};
+use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::parse_bool};
+use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, ObjectLockConfiguration, RestoreRequest, RestoreRequestType};
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -150,6 +148,19 @@ pub type ExpiryOpType = Box<dyn ExpiryOp + Send + Sync + 'static>;
 static XXHASH_SEED: u64 = 0;
 static TIER_FREE_VERSION_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
 static MANUAL_TRANSITION_JOB_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
+static RECOVERY_DISPOSITION_MAINTENANCE_STARTED: OnceLock<()> = OnceLock::new();
+
+#[cfg(test)]
+#[derive(Default)]
+struct FreeVersionPostRemoteDeleteTestBarrier {
+    arrived: Notify,
+    release: Notify,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static FREE_VERSION_POST_REMOTE_DELETE_TEST_BARRIER: Arc<FreeVersionPostRemoteDeleteTestBarrier>;
+}
 
 pub const AMZ_OBJECT_TAGGING: &str = "X-Amz-Tagging";
 #[allow(
@@ -162,7 +173,6 @@ pub const AMZ_TAG_COUNT: &str = "x-amz-tagging-count";
     reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
 )]
 pub const AMZ_TAG_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
-pub const AMZ_ENCRYPTION_AES: &str = "AES256";
 #[allow(
     dead_code,
     reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
@@ -490,7 +500,7 @@ impl ExpiryStats {
     }
 
     fn add_nonnegative(counter: &AtomicI64, delta: i64) {
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_add(delta).max(0)));
+        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_add(delta).max(0)));
     }
 
     fn increment_missed_expiry_tasks(&self) {
@@ -505,20 +515,26 @@ impl ExpiryStats {
         Self::add_nonnegative(&self.missed_tier_journal_tasks, 1);
     }
 
+    // The pending and active gauges are balanced by design: every increment
+    // has exactly one matching decrement. They must not saturate at zero on
+    // update, because a worker can dequeue (and decrement) before the
+    // enqueuing side has recorded its increment. Clamping that transient -1
+    // to 0 turns the later +1 into a phantom task that never drains
+    // (rustfs#7921). Readers clamp negative snapshots instead.
     fn increment_pending_tasks(&self) {
-        Self::add_nonnegative(&self.pending_tasks, 1);
+        self.pending_tasks.fetch_add(1, Ordering::AcqRel);
     }
 
     fn decrement_pending_tasks(&self) {
-        Self::add_nonnegative(&self.pending_tasks, -1);
+        self.pending_tasks.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn increment_active_tasks(&self) {
-        Self::add_nonnegative(&self.active_tasks, 1);
+        self.active_tasks.fetch_add(1, Ordering::AcqRel);
     }
 
     fn decrement_active_tasks(&self) {
-        Self::add_nonnegative(&self.active_tasks, -1);
+        self.active_tasks.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn increment_workers(&self) {
@@ -586,23 +602,389 @@ impl ExpiryOp for FreeVersionTask {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransitionDeleteVersionPlan {
+    Direct { version_id_exact: bool },
+    ProbeLegacyUnknown,
+}
+
+fn legacy_transition_version_state_missing(oi: &ObjectInfo) -> Result<bool, std::io::Error> {
+    use rustfs_utils::http::metadata_compat::{
+        SUFFIX_TRANSITIONED_VERSION_ID, SUFFIX_TRANSITIONED_VERSION_STATE, contains_key_str, get_consistent_str,
+    };
+
+    if !contains_key_str(&oi.user_defined, SUFFIX_TRANSITIONED_VERSION_STATE) {
+        let version_key_present = contains_key_str(&oi.user_defined, SUFFIX_TRANSITIONED_VERSION_ID);
+        if version_key_present {
+            if oi.transitioned_object.version_id.is_empty() {
+                let has_non_empty_version = oi.user_defined.iter().any(|(key, value)| {
+                    rustfs_utils::http::metadata_compat::strip_internal_prefix_preserving_case(key)
+                        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(SUFFIX_TRANSITIONED_VERSION_ID))
+                        && !value.is_empty()
+                });
+                if !has_non_empty_version {
+                    // MinIO writes the transitioned-versionID key with an empty value
+                    // for unversioned tier objects. The backend probe remains the proof.
+                    return Ok(true);
+                }
+            } else if get_consistent_str(&oi.user_defined, SUFFIX_TRANSITIONED_VERSION_ID)
+                == Some(oi.transitioned_object.version_id.as_str())
+            {
+                return Ok(true);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "legacy remote tier version metadata is conflicting or malformed",
+            ));
+        }
+        if !oi.transitioned_object.version_id.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "legacy remote tier version metadata is missing or inconsistent",
+            ));
+        }
+        return Ok(true);
+    }
+    let persisted = get_consistent_str(&oi.user_defined, SUFFIX_TRANSITIONED_VERSION_STATE).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote tier object has conflicting transition version state metadata",
+        )
+    })?;
+    if persisted != oi.transition_version_state.as_str() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote tier object transition version state metadata changed during decoding",
+        ));
+    }
+    Ok(false)
+}
+
+fn transition_remote_version_delete_plan(oi: &ObjectInfo) -> Result<TransitionDeleteVersionPlan, std::io::Error> {
+    match oi.transition_version_state {
+        rustfs_filemeta::TransitionVersionState::Unknown => {
+            if legacy_transition_version_state_missing(oi)? {
+                Ok(TransitionDeleteVersionPlan::ProbeLegacyUnknown)
+            } else {
+                validate_transition_remote_version(oi)
+                    .map(|version_id_exact| TransitionDeleteVersionPlan::Direct { version_id_exact })
+            }
+        }
+        _ => validate_transition_remote_version(oi)
+            .map(|version_id_exact| TransitionDeleteVersionPlan::Direct { version_id_exact }),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResolvedTransitionDeleteVersion {
+    version_id_exact: bool,
+    remote_already_missing: bool,
+}
+
+async fn acquire_free_version_tier_lease(
+    oi: &ObjectInfo,
+    tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
+) -> Result<(TierOperationLease, TransitionDeleteVersionPlan), std::io::Error> {
+    let delete_plan = transition_remote_version_delete_plan(oi)?;
+    let identity = tier_destination_id_from_metadata(&oi.user_defined)?
+        .ok_or_else(|| std::io::Error::other("tier free-version has no durable backend identity"))?;
+    let lease =
+        TierConfigMgr::acquire_operation_lease_for_backend_identity(tier_config_mgr, &oi.transitioned_object.tier, identity)
+            .await
+            .map_err(std::io::Error::other)?;
+    Ok((lease, delete_plan))
+}
+
+async fn resolve_transition_delete_version_plan(
+    oi: &ObjectInfo,
+    lease: &TierOperationLease,
+    delete_plan: TransitionDeleteVersionPlan,
+) -> Result<ResolvedTransitionDeleteVersion, std::io::Error> {
+    match delete_plan {
+        TransitionDeleteVersionPlan::Direct { version_id_exact } => Ok(ResolvedTransitionDeleteVersion {
+            version_id_exact,
+            remote_already_missing: false,
+        }),
+        TransitionDeleteVersionPlan::ProbeLegacyUnknown => {
+            let expected_version = oi.transitioned_object.version_id.as_str();
+            if expected_version.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "remote tier cannot safely delete a legacy object without an exact version ID",
+                ));
+            }
+            let probe = lease
+                .probe_transition_version(&oi.transitioned_object.name, expected_version)
+                .await?;
+            match (expected_version, probe) {
+                (expected, crate::services::tier::warm_backend::TransitionCandidateProbe::VersionedPresent(actual))
+                    if expected == actual =>
+                {
+                    lease.validate_remote_version_id(expected)?;
+                    Ok(ResolvedTransitionDeleteVersion {
+                        version_id_exact: true,
+                        remote_already_missing: false,
+                    })
+                }
+                (_, crate::services::tier::warm_backend::TransitionCandidateProbe::Missing) => {
+                    Ok(ResolvedTransitionDeleteVersion {
+                        version_id_exact: false,
+                        remote_already_missing: true,
+                    })
+                }
+                (_, crate::services::tier::warm_backend::TransitionCandidateProbe::Unsupported) => Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "remote tier cannot prove legacy transition delete state",
+                )),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "remote tier object version state is unknown",
+                )),
+            }
+        }
+    }
+}
+
+async fn execute_resolved_transition_delete(
+    oi: &ObjectInfo,
+    lease: &TierOperationLease,
+    resolved: ResolvedTransitionDeleteVersion,
+) -> Result<(), std::io::Error> {
+    if !resolved.remote_already_missing {
+        delete_object_from_remote_tier_with_lease_idempotent(
+            &oi.transitioned_object.name,
+            &oi.transitioned_object.version_id,
+            lease,
+            resolved.version_id_exact,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn delete_free_version_remote_object_with_lease(
+    oi: &ObjectInfo,
+    lease: &TierOperationLease,
+    delete_plan: TransitionDeleteVersionPlan,
+) -> Result<(), std::io::Error> {
+    let resolved = resolve_transition_delete_version_plan(oi, lease, delete_plan).await?;
+    execute_resolved_transition_delete(oi, lease, resolved).await
+}
+
+fn free_version_physical_topology_generation(api: &ECStore) -> String {
+    let mut hasher = Sha256::new();
+    for pool in &api.pools {
+        hasher.update(pool.pool_idx.to_be_bytes());
+        hasher.update(pool.disk_set.len().to_be_bytes());
+        for set in &pool.disk_set {
+            hasher.update(set.set_index.to_be_bytes());
+        }
+    }
+    rustfs_utils::crypto::hex(hasher.finalize().as_slice())
+}
+
+pub(crate) fn free_version_remote_tuple_matches(candidate: &ObjectInfo, expected: &ObjectInfo) -> std::io::Result<bool> {
+    if candidate.transitioned_object.tier != expected.transitioned_object.tier
+        || candidate.transitioned_object.name != expected.transitioned_object.name
+    {
+        return Ok(false);
+    }
+    let candidate_identity = tier_destination_id_from_metadata(&candidate.user_defined)?
+        .ok_or_else(|| std::io::Error::other("tier free-version is missing its backend identity"))?;
+    let expected_identity = tier_destination_id_from_metadata(&expected.user_defined)?
+        .ok_or_else(|| std::io::Error::other("tier free-version task is missing its backend identity"))?;
+    if candidate_identity != expected_identity {
+        return Ok(false);
+    }
+    if candidate.transition_version_state == rustfs_filemeta::TransitionVersionState::Unknown
+        || expected.transition_version_state == rustfs_filemeta::TransitionVersionState::Unknown
+    {
+        let candidate_legacy_missing = legacy_transition_version_state_missing(candidate)?;
+        let expected_legacy_missing = legacy_transition_version_state_missing(expected)?;
+        if candidate.transition_version_state == rustfs_filemeta::TransitionVersionState::Unknown
+            && expected.transition_version_state == rustfs_filemeta::TransitionVersionState::Unknown
+            && candidate_legacy_missing
+            && expected_legacy_missing
+            && candidate.transitioned_object.version_id == expected.transitioned_object.version_id
+        {
+            return Ok(true);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "tier free-version remote version state is unknown",
+        ));
+    }
+    Ok(candidate.transition_version_state == expected.transition_version_state
+        && candidate.transitioned_object.version_id == expected.transitioned_object.version_id)
+}
+
+async fn scan_exact_free_version_targets(
+    api: &ECStore,
+    oi: &ObjectInfo,
+    local_object: &str,
+) -> std::io::Result<Vec<(Arc<SetDisks>, FileInfo)>> {
+    let mut targets = Vec::new();
+    for pool in &api.pools {
+        for set in &pool.disk_set {
+            let versions = match set.load_file_info_versions_for_tier_cleanup(&oi.bucket, &oi.name).await {
+                Ok(Some(versions)) => versions,
+                Ok(None) => continue,
+                Err(err) if is_err_strict_volume_not_found(&err) => continue,
+                Err(err) => return Err(std::io::Error::other(err)),
+            };
+            for version in versions.versions.iter().chain(versions.free_versions.iter()) {
+                let candidate = ObjectInfo::from_file_info(version, &oi.bucket, &oi.name, true);
+                if free_version_remote_tuple_matches(&candidate, oi)? {
+                    if candidate.transitioned_object.free_version {
+                        // Data movement can leave the same remote tuple in
+                        // several physical pools. Ordinary deletion assigns a
+                        // fresh local free-version UUID to each copy, but all
+                        // of those markers own the same idempotent remote
+                        // DELETE. Consume them together while holding every
+                        // physical object lock; treating their local UUIDs as
+                        // conflicting would strand cleanup forever.
+                        let mut actual = version.clone();
+                        actual.name = local_object.to_string();
+                        targets.push((Arc::clone(set), actual));
+                    } else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "a live transitioned source still references the free-version remote tuple",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(targets)
+}
+
+fn free_version_cleanup_fences_current(
+    topology_generation: &str,
+    api: &ECStore,
+    bucket_guard: &rustfs_lock::NamespaceLockGuard,
+    object_guards: &[crate::store::ObjectLockDiagGuard],
+    lease: &TierOperationLease,
+    cancel: &CancellationToken,
+    deadline: tokio::time::Instant,
+) -> bool {
+    !cancel.is_cancelled()
+        && tokio::time::Instant::now() < deadline
+        && !bucket_guard.is_lock_lost()
+        && object_guards.iter().all(|guard| !guard.is_lock_lost())
+        && lease.is_current_generation()
+        && free_version_physical_topology_generation(api) == topology_generation
+}
+
+async fn cleanup_free_version_exact(api: Arc<ECStore>, oi: &ObjectInfo, cancel: &CancellationToken) -> std::io::Result<bool> {
+    const FREE_VERSION_REMOTE_DEADLINE: StdDuration = StdDuration::from_secs(30);
+
+    let topology_generation = free_version_physical_topology_generation(&api);
+    let bucket_guard = api
+        .acquire_bucket_lifecycle_read_lock(&oi.bucket)
+        .await
+        .map_err(std::io::Error::other)?;
+    let (lease, delete_plan) = acquire_free_version_tier_lease(oi, &api.tier_config_mgr()).await?;
+    let local_object = encode_dir_object(&oi.name);
+    let object_guards = api
+        .acquire_all_physical_object_write_locks("tier_free_version_cleanup", &oi.bucket, &local_object)
+        .await
+        .map_err(std::io::Error::other)?;
+    let targets = scan_exact_free_version_targets(&api, oi, &local_object).await?;
+    if targets.is_empty() {
+        return Ok(false);
+    }
+
+    let deadline = tokio::time::Instant::now() + FREE_VERSION_REMOTE_DEADLINE;
+    if !free_version_cleanup_fences_current(&topology_generation, &api, &bucket_guard, &object_guards, &lease, cancel, deadline) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "tier free-version cleanup fence is invalid before remote delete",
+        ));
+    }
+    let resolved = tokio::select! {
+        _ = cancel.cancelled() => {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "tier free-version cleanup was cancelled"));
+        }
+        result = tokio::time::timeout_at(deadline, resolve_transition_delete_version_plan(oi, &lease, delete_plan)) => {
+            result.map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "tier free-version remote probe timed out")
+            })??
+        }
+    };
+    if !free_version_cleanup_fences_current(&topology_generation, &api, &bucket_guard, &object_guards, &lease, cancel, deadline) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "tier free-version cleanup fence changed after remote probe",
+        ));
+    }
+    tokio::select! {
+        _ = cancel.cancelled() => {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "tier free-version cleanup was cancelled"));
+        }
+        result = tokio::time::timeout_at(deadline, execute_resolved_transition_delete(oi, &lease, resolved)) => {
+            result.map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "tier free-version remote delete timed out")
+            })??;
+        }
+    }
+    #[cfg(test)]
+    if let Ok(barrier) = FREE_VERSION_POST_REMOTE_DELETE_TEST_BARRIER.try_with(Arc::clone) {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+    if !free_version_cleanup_fences_current(&topology_generation, &api, &bucket_guard, &object_guards, &lease, cancel, deadline) {
+        // Remote DELETE is idempotent, but a changed fence makes the local
+        // outcome ambiguous. Keep every marker for a fully fenced retry.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "tier free-version cleanup fence changed after remote delete",
+        ));
+    }
+
+    let mut first_error = None;
+    for (set, actual) in &targets {
+        let mut delete_request = FileInfo {
+            name: local_object.clone(),
+            version_id: actual.version_id,
+            ..Default::default()
+        };
+        delete_request.set_tier_free_version();
+        if let Err(err) = set
+            .delete_object_version(&oi.bucket, &local_object, &delete_request, false)
+            .await
+            && first_error.is_none()
+        {
+            first_error = Some(std::io::Error::other(err));
+        }
+    }
+    let remaining = scan_exact_free_version_targets(&api, oi, &local_object).await?;
+    if !remaining.is_empty() {
+        return Err(first_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "tier free-version cleanup remained on at least one physical set",
+            )
+        }));
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    runtime_sources::notify_scanner_dirty_usage_mutation(
+        &oi.bucket,
+        &oi.name,
+        runtime_sources::ScannerDirtyUsageMutationSource::TierExpiration,
+    );
+    Ok(true)
+}
+
+#[cfg(all(test, feature = "test-util"))]
 async fn delete_free_version_remote_object(
     oi: &ObjectInfo,
     tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
 ) -> Result<(), std::io::Error> {
-    let version_id_exact = validate_transition_remote_version(oi)?;
-    let identity = tier_destination_id_from_metadata(&oi.user_defined)?
-        .ok_or_else(|| std::io::Error::other("tier free-version has no durable backend identity"))?;
-    delete_object_from_remote_tier_idempotent_with_manager_and_identity(
-        &oi.transitioned_object.name,
-        &oi.transitioned_object.version_id,
-        &oi.transitioned_object.tier,
-        identity,
-        tier_config_mgr,
-        version_id_exact,
-    )
-    .await?;
-    Ok(())
+    let (lease, delete_plan) = acquire_free_version_tier_lease(oi, tier_config_mgr).await?;
+    delete_free_version_remote_object_with_lease(oi, &lease, delete_plan).await
 }
 
 #[allow(
@@ -618,8 +1000,11 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    delete_free_version_remote_object(oi, tier_config_mgr).await?;
-    Ok(delete_local().await)
+    let (lease, delete_plan) = acquire_free_version_tier_lease(oi, tier_config_mgr).await?;
+    delete_free_version_remote_object_with_lease(oi, &lease, delete_plan).await?;
+    let result = delete_local().await;
+    drop(lease);
+    Ok(result)
 }
 
 struct NewerNoncurrentTask {
@@ -690,10 +1075,18 @@ impl ExpiryState {
         usize::try_from(self.stats.pending_tasks().max(0)).unwrap_or(usize::MAX)
     }
 
+    pub fn active_tasks(&self) -> usize {
+        usize::try_from(self.stats.active_tasks().max(0)).unwrap_or(usize::MAX)
+    }
+
     fn send_expiry_task(&self, wrkr: Sender<Option<ExpiryOpType>>, task: ExpiryOpType) -> bool {
+        // Account for the task before a worker can observe it. The worker
+        // decrements on dequeue, so incrementing after `try_send` would let a
+        // fast dequeue run the gauge through zero first.
+        self.stats.increment_pending_tasks();
         let queued = wrkr.try_send(Some(task)).is_ok();
-        if queued {
-            self.stats.increment_pending_tasks();
+        if !queued {
+            self.stats.decrement_pending_tasks();
         }
         queued
     }
@@ -719,7 +1112,7 @@ impl ExpiryState {
         Ok(())
     }
 
-    pub fn enqueue_free_version(&mut self, oi: ObjectInfo) -> bool {
+    pub fn enqueue_free_version(&self, oi: ObjectInfo) -> bool {
         let task = FreeVersionTask(oi);
         let wrkr = self.get_worker_ch(task.op_hash());
         if wrkr.is_none() {
@@ -826,7 +1219,7 @@ impl ExpiryState {
     }
 
     pub async fn resize_workers(n: usize, api: Arc<ECStore>) {
-        let expiry_state = runtime_sources::expiry_state_handle();
+        let expiry_state = api.ctx.expiry_state();
         if n == expiry_state.read().await.tasks_tx.len() || n < 1 {
             return;
         }
@@ -835,7 +1228,7 @@ impl ExpiryState {
 
         while state.tasks_tx.len() < n {
             let (tx, rx) = mpsc::channel(EXPIRY_WORKER_QUEUE_CAPACITY);
-            let api = api.clone();
+            let api = Arc::downgrade(&api);
             let rx = Arc::new(tokio::sync::Mutex::new(rx));
             let stats = Arc::clone(&state.stats);
             let recovery_notify = Arc::clone(&state.recovery_notify);
@@ -863,14 +1256,18 @@ impl ExpiryState {
 
     async fn worker(
         rx: &mut Receiver<Option<ExpiryOpType>>,
-        api: Arc<ECStore>,
+        api: Weak<ECStore>,
         stats: Arc<ExpiryStats>,
         recovery_notify: Arc<Notify>,
     ) {
-        let cancel_token = runtime_sources::background_services_cancel_token().unwrap_or_else(|| {
+        let Some(initial_api) = api.upgrade() else {
+            return;
+        };
+        let cancel_token = initial_api.ctx.background_cancel_token().unwrap_or_else(|| {
             static FALLBACK: std::sync::OnceLock<tokio_util::sync::CancellationToken> = std::sync::OnceLock::new();
             FALLBACK.get_or_init(tokio_util::sync::CancellationToken::new).clone()
         });
+        drop(initial_api);
 
         loop {
             select! {
@@ -899,6 +1296,9 @@ impl ExpiryState {
                     let v = v.expect("received None after None check");
                     stats.decrement_pending_tasks();
                     let _active_task = ExpiryActiveTask::begin(Arc::clone(&stats));
+                    let Some(api) = api.upgrade() else {
+                        return;
+                    };
                     if v.as_any().is::<ExpiryTask>() {
                         let v = v.as_any().downcast_ref::<ExpiryTask>().expect("ExpiryTask downcast failed");
                         //debug!("lifecycle expiry worker received task: {:?}", v.obj_info);
@@ -939,7 +1339,7 @@ impl ExpiryState {
                         let version_count = u64::try_from(v.versions.len()).unwrap_or(u64::MAX);
                         let trace = LifecycleExpiryTrace::for_batch(&v.bucket, &v.event, &v.src, version_count);
                         trace.emit(EVENT_LIFECYCLE_DELETE_DISPATCHED, "delete_dispatched", None);
-                        crate::client::object_handlers_common::delete_object_versions(
+                        let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
                             &api,
                             &v.bucket,
                             &v.versions,
@@ -947,7 +1347,19 @@ impl ExpiryState {
                             v.bucket_incarnation_id,
                         )
                         .await;
-                        trace.emit(EVENT_LIFECYCLE_DELETE_COMPLETED, "delete_completed", None);
+                        if failed == 0 {
+                            trace.emit(EVENT_LIFECYCLE_DELETE_COMPLETED, "delete_completed", None);
+                        } else {
+                            record_scanner_lifecycle_expiry_delete_failed(
+                                &v.src,
+                                u64::try_from(failed).unwrap_or(u64::MAX),
+                            );
+                            trace.emit(
+                                EVENT_LIFECYCLE_DELETE_FAILED,
+                                "delete_failed",
+                                Some("delete_operation_failed"),
+                            );
+                        }
                     }
                     else if v.as_any().is::<Jentry>() {
                         let v = v.as_any().downcast_ref::<Jentry>().expect("Jentry downcast failed");
@@ -968,119 +1380,33 @@ impl ExpiryState {
                     else if v.as_any().is::<FreeVersionTask>() {
                         let v = v.as_any().downcast_ref::<FreeVersionTask>().expect("FreeVersionTask downcast failed");
                         let oi = v.0.clone();
-                        if let Err(err) = delete_free_version_remote_object(&oi, &api.tier_config_mgr()).await {
-                            recovery_notify.notify_one();
-                            debug!(
-                                bucket = %oi.bucket,
-                                object = %oi.name,
-                                remote_object = %oi.transitioned_object.name,
-                                remote_version_id = %oi.transitioned_object.version_id,
-                                tier = %oi.transitioned_object.tier,
-                                error = ?err,
-                                event = EVENT_LIFECYCLE_WORKER_STATE,
-                                component = LOG_COMPONENT_ECSTORE,
-                                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                                reason = "remote_tier_delete_failed",
-                                "Lifecycle worker skipped remote tier delete"
-                            );
-                            continue;
-                        }
-
-                        let local_object = encode_dir_object(&oi.name);
-                        let mut fi = FileInfo {
-                            name: local_object.clone(),
-                            version_id: oi.version_id,
-                            ..Default::default()
-                        };
-                        // This removes an existing internal cleanup marker. Keeping
-                        // `deleted` false makes duplicate tasks return not-found
-                        // instead of creating an ordinary delete marker.
-                        fi.set_tier_free_version();
-
-                        let mut deleted_locally = false;
-                        for pool in &api.pools {
-                            let set = pool.get_disks_by_key(&local_object);
-                            let ns_lock = match set.new_ns_lock(&oi.bucket, &local_object).await {
-                                Ok(lock) => lock,
-                                Err(err) => {
-                                    recovery_notify.notify_one();
-                                    debug!(
-                                        event = EVENT_LIFECYCLE_WORKER_STATE,
-                                        component = LOG_COMPONENT_ECSTORE,
-                                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                                        bucket = %oi.bucket,
-                                        object = %oi.name,
-                                        pool_index = pool.pool_idx,
-                                        set_index = set.set_index,
-                                        error = ?err,
-                                        reason = "local_free_version_lock_failed",
-                                        "Lifecycle worker failed to create local free-version cleanup lock"
-                                    );
-                                    continue;
-                                }
-                            };
-                            let _object_lock_guard =
-                                match ns_lock.get_write_lock_quiet(get_lock_acquire_timeout()).await {
-                                    Ok(guard) => guard,
-                                    Err(err) => {
-                                        recovery_notify.notify_one();
-                                        debug!(
-                                            event = EVENT_LIFECYCLE_WORKER_STATE,
-                                            component = LOG_COMPONENT_ECSTORE,
-                                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                                            bucket = %oi.bucket,
-                                            object = %oi.name,
-                                            pool_index = pool.pool_idx,
-                                            set_index = set.set_index,
-                                            error = ?err,
-                                            reason = "local_free_version_lock_failed",
-                                            "Lifecycle worker failed to acquire local free-version cleanup lock"
-                                        );
-                                        continue;
-                                    }
-                                };
-                            match set
-                                .delete_object_version(&oi.bucket, &local_object, &fi, false)
-                                .await
-                            {
-                                Ok(()) => {
-                                    deleted_locally = true;
-                                    break;
-                                }
-                                Err(err) if is_err_version_not_found(&err) || is_err_object_not_found(&err) => continue,
-                                Err(err) => {
-                                    recovery_notify.notify_one();
-                                    debug!(
-                                        event = EVENT_LIFECYCLE_WORKER_STATE,
-                                        component = LOG_COMPONENT_ECSTORE,
-                                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                                        bucket = %oi.bucket,
-                                        object = %oi.name,
-                                        remote_object = %oi.transitioned_object.name,
-                                        remote_version_id = %oi.transitioned_object.version_id,
-                                        tier = %oi.transitioned_object.tier,
-                                        error = ?err,
-                                        reason = "local_free_version_delete_failed",
-                                        "Lifecycle worker failed local free-version cleanup"
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-
-                        if !deleted_locally {
-                            debug!(
+                        match cleanup_free_version_exact(api.clone(), &oi, &cancel_token).await {
+                            Ok(true) => {}
+                            Ok(false) => debug!(
                                 event = EVENT_LIFECYCLE_WORKER_STATE,
                                 component = LOG_COMPONENT_ECSTORE,
                                 subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                                 bucket = %oi.bucket,
                                 object = %oi.name,
-                                remote_object = %oi.transitioned_object.name,
-                                remote_version_id = %oi.transitioned_object.version_id,
-                                tier = %oi.transitioned_object.tier,
                                 reason = "local_free_version_missing",
-                                "Lifecycle worker could not find transitioned free version locally"
-                            );
+                                "Lifecycle worker found that the exact free-version was already absent"
+                            ),
+                            Err(err) => {
+                                recovery_notify.notify_one();
+                                debug!(
+                                    event = EVENT_LIFECYCLE_WORKER_STATE,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                                    bucket = %oi.bucket,
+                                    object = %oi.name,
+                                    remote_object = %oi.transitioned_object.name,
+                                    remote_version_id = %oi.transitioned_object.version_id,
+                                    tier = %oi.transitioned_object.tier,
+                                    error = ?err,
+                                    reason = "free_version_exact_cleanup_deferred",
+                                    "Lifecycle worker retained the exact free-version for a fenced retry"
+                                );
+                            }
                         }
                     }
                     else {
@@ -1099,6 +1425,22 @@ impl ExpiryState {
     }
 }
 
+pub(crate) async fn enqueue_committed_free_versions(api: &ECStore, free_versions: Vec<ObjectInfo>) -> usize {
+    if free_versions.is_empty() {
+        return 0;
+    }
+
+    let expiry_state = api.ctx.expiry_state();
+    let state = expiry_state.read().await;
+    let mut queued = 0;
+    for free_version in free_versions {
+        if state.enqueue_free_version(free_version) {
+            queued += 1;
+        }
+    }
+    queued
+}
+
 async fn enqueue_recovered_free_version_with_state(state: &Arc<RwLock<ExpiryState>>, oi: ObjectInfo) -> bool {
     let task = FreeVersionTask(oi);
     let hash = task.op_hash();
@@ -1112,11 +1454,14 @@ async fn enqueue_recovered_free_version_with_state(state: &Arc<RwLock<ExpiryStat
         return false;
     };
 
+    // Same ordering rule as `ExpiryState::send_expiry_task`: count first, so
+    // a worker that dequeues immediately cannot decrement before this
+    // increment lands.
+    stats.increment_pending_tasks();
     let queued = wrkr.try_send(Some(Box::new(task))).is_ok();
     if !queued {
+        stats.decrement_pending_tasks();
         stats.increment_missed_freevers_tasks();
-    } else {
-        stats.increment_pending_tasks();
     }
     stats.record_scanner_expiry_state();
     queued
@@ -1152,8 +1497,8 @@ fn set_recovered_free_version_enqueue_observer(
     RecoveredFreeVersionEnqueueObserverGuard
 }
 
-pub async fn enqueue_recovered_free_version(oi: ObjectInfo) -> bool {
-    let expiry_state = runtime_sources::expiry_state_handle();
+pub async fn enqueue_recovered_free_version(api: &ECStore, oi: ObjectInfo) -> bool {
+    let expiry_state = api.ctx.expiry_state();
     let queued = enqueue_recovered_free_version_with_state(&expiry_state, oi).await;
 
     #[cfg(test)]
@@ -2078,7 +2423,18 @@ pub async fn init_background_expiry(api: Arc<ECStore>) {
     let _ = spawn_tier_free_version_recovery_once(api.clone(), &TIER_FREE_VERSION_RECOVERY_STARTED);
     spawn_tier_delete_journal_recovery_once(api.clone());
     spawn_transition_transaction_recovery_once(api.clone());
+    spawn_recovery_disposition_maintenance_once(api.clone());
     spawn_manual_transition_job_recovery_once(api);
+}
+
+fn spawn_recovery_disposition_maintenance_once(api: Arc<ECStore>) -> Option<JoinHandle<()>> {
+    let cancel_token = api.ctx.background_cancel_token()?;
+    if RECOVERY_DISPOSITION_MAINTENANCE_STARTED.set(()).is_err() {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        run_recovery_disposition_maintenance_loop(api, cancel_token).await;
+    }))
 }
 
 fn spawn_manual_transition_job_recovery_once(api: Arc<ECStore>) -> Option<JoinHandle<()>> {
@@ -2580,8 +2936,8 @@ fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>, started: &OnceLock<(
     }
 
     Some(tokio::spawn(async move {
-        let cancel_token = runtime_sources::background_services_cancel_token().unwrap_or_default();
-        let expiry_state = runtime_sources::expiry_state_handle();
+        let cancel_token = api.ctx.background_cancel_token().unwrap_or_default();
+        let expiry_state = api.ctx.expiry_state();
         run_tier_free_version_recovery_loop(
             cancel_token,
             expiry_state,
@@ -2633,7 +2989,8 @@ async fn run_tier_free_version_recovery_loop<F, Fut>(
         match recovery_result {
             Ok(stats) => {
                 let elapsed = started_at.elapsed();
-                schedule.record_success(&stats, elapsed);
+                schedule.record_success(&stats);
+                rustfs_io_metrics::record_stage_duration("lifecycle_free_version_recovery", elapsed.as_secs_f64() * 1000.0);
                 let (pending_tasks, active_tasks) = {
                     let state = expiry_state.read().await;
                     (state.pending_tasks(), state.stats.active_tasks())
@@ -2662,7 +3019,7 @@ async fn run_tier_free_version_recovery_loop<F, Fut>(
             }
             Err(err) => {
                 let elapsed = started_at.elapsed();
-                schedule.record_failure(elapsed);
+                schedule.record_failure();
                 rustfs_io_metrics::record_stage_duration(
                     "lifecycle_free_version_recovery_failed",
                     elapsed.as_secs_f64() * 1000.0,
@@ -2694,10 +3051,10 @@ async fn wait_for_tier_free_version_recovery(
     } else {
         schedule.next_delay
     };
-    let sleep_delay = next_delay.saturating_sub(schedule.previous_run_duration);
-    schedule.previous_run_duration = StdDuration::ZERO;
+    // Recovery delays are completion-relative. Discounting the previous run
+    // would let a page that took at least one interval restart with no cooldown.
     schedule.jitter_next_delay = false;
-    let sleep = tokio::time::sleep(sleep_delay);
+    let sleep = tokio::time::sleep(next_delay);
     tokio::pin!(sleep);
     let mut recovery_request_consumed = false;
 
@@ -2747,7 +3104,6 @@ struct TierFreeVersionRecoverySchedule {
     next_delay: StdDuration,
     idle_interval: StdDuration,
     failure_interval: StdDuration,
-    previous_run_duration: StdDuration,
     jitter_next_delay: bool,
     bucket_marker: Option<String>,
     object_marker: Option<String>,
@@ -2760,7 +3116,6 @@ impl Default for TierFreeVersionRecoverySchedule {
             next_delay: StdDuration::ZERO,
             idle_interval: TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL,
             failure_interval: TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL,
-            previous_run_duration: StdDuration::ZERO,
             jitter_next_delay: false,
             bucket_marker: None,
             object_marker: None,
@@ -2773,7 +3128,6 @@ impl TierFreeVersionRecoverySchedule {
     fn reset_idle_interval(&mut self) {
         self.idle_interval = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
         self.next_delay = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
-        self.previous_run_duration = StdDuration::ZERO;
         self.jitter_next_delay = false;
     }
 
@@ -2784,18 +3138,15 @@ impl TierFreeVersionRecoverySchedule {
         self.reset_idle_interval();
     }
 
-    fn record_failure(&mut self, _run_duration: StdDuration) {
+    fn record_failure(&mut self) {
         self.idle_interval = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
         self.next_delay = self.failure_interval;
         self.failure_interval =
             std::cmp::min(self.failure_interval.saturating_mul(2), TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL);
-        // Keep the full backoff even after a long failed run, so a run whose
-        // duration exceeds the interval cannot restart immediately.
-        self.previous_run_duration = StdDuration::ZERO;
         self.jitter_next_delay = false;
     }
 
-    fn record_success(&mut self, stats: &FreeVersionRecoveryStats, run_duration: StdDuration) {
+    fn record_success(&mut self, stats: &FreeVersionRecoveryStats) {
         self.failure_interval = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
         if stats.enqueued > 0 || stats.failed > 0 {
             self.follow_up_sweep = true;
@@ -2805,7 +3156,6 @@ impl TierFreeVersionRecoverySchedule {
         self.object_marker = stats.next_object_marker.clone();
         if stats.truncated {
             self.next_delay = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
-            self.previous_run_duration = run_duration;
             self.jitter_next_delay = false;
             return;
         }
@@ -2816,13 +3166,11 @@ impl TierFreeVersionRecoverySchedule {
             self.follow_up_sweep = false;
             self.idle_interval = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
             self.next_delay = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
-            self.previous_run_duration = run_duration;
             self.jitter_next_delay = false;
             return;
         }
 
         self.next_delay = self.idle_interval;
-        self.previous_run_duration = run_duration;
         self.jitter_next_delay = true;
         self.idle_interval = std::cmp::min(self.idle_interval.saturating_mul(2), TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL);
     }
@@ -3422,11 +3770,8 @@ pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
     }
 }
 
-pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
-    let Some(api) = runtime_sources::object_store_handle() else {
-        return;
-    };
-    let configs = match metadata_boundary::get_expiry_configs(&api, &oi.bucket).await {
+pub(crate) async fn enqueue_immediate_expiry(api: Arc<ECStore>, oi: &ObjectInfo, src: LcEventSrc, opts: &ObjectOptions) {
+    let configs = match metadata_boundary::get_expiry_configs_for_options(&api, &oi.bucket, opts).await {
         Ok(configs) => configs,
         Err(err) => {
             observe_lifecycle_observability_event(EVENT_LIFECYCLE_EVALUATION_FAILED, "failed", Some("metadata_unavailable"));
@@ -3548,13 +3893,11 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
                 enqueue_expiry_rule_with_incarnation(event, &src, object, configs.bucket_incarnation_id).await;
             }
             IlmAction::DeleteVersionAction => {
-                to_delete_objs.push(ObjectToDelete {
-                    object_name: object.name.clone(),
-                    version_id: object.version_id,
-                    ..Default::default()
-                });
-                if noncurrent_event.is_none() {
-                    noncurrent_event = Some(event.clone());
+                if let Some(target) = lifecycle_version_delete_target(object) {
+                    to_delete_objs.push(target);
+                    if noncurrent_event.is_none() {
+                        noncurrent_event = Some(event.clone());
+                    }
                 }
             }
             _ => {}
@@ -3711,6 +4054,10 @@ impl ManualTransitionRunReport {
             || self.skipped_queue_full > 0
             || self.skipped_queue_closed > 0
             || self.skipped_queue_timeout > 0
+    }
+
+    fn has_enqueue_backpressure(&self) -> bool {
+        self.skipped_queue_full > 0 || self.skipped_queue_closed > 0 || self.skipped_queue_timeout > 0
     }
 
     pub fn was_truncated(&self) -> bool {
@@ -3928,7 +4275,7 @@ pub async fn enqueue_transition_for_existing_objects_scoped(
             }
             report.scanned = report.scanned.saturating_add(1);
             enqueue_transition_with_lifecycle_report(Some(api.clone()), object, &lc, &src, &options, &mut report).await;
-            if report.has_partial_enqueue() {
+            if report.has_enqueue_backpressure() {
                 report.next_marker.clone_from(&previous_marker);
                 report.next_version_idmarker.clone_from(&previous_version_marker);
                 report.continuation_token =
@@ -4082,13 +4429,11 @@ async fn enqueue_expiry_for_existing_object_group(
                     }
 
                     if event.action == IlmAction::DeleteVersionAction {
-                        to_delete_objs.push(ObjectToDelete {
-                            object_name: object.name.clone(),
-                            version_id: object.version_id,
-                            ..Default::default()
-                        });
-                        if noncurrent_event.is_none() {
-                            noncurrent_event = Some(event.clone());
+                        if let Some(target) = lifecycle_version_delete_target(object) {
+                            to_delete_objs.push(target);
+                            if noncurrent_event.is_none() {
+                                noncurrent_event = Some(event.clone());
+                            }
                         }
                     } else {
                         let blocked_by_replication = match lifecycle_delete_all_versions_blocked_by_replication(
@@ -4320,16 +4665,15 @@ fn transitioned_object_delete_opts(
     version_suspended: bool,
     bucket_incarnation_id: Uuid,
 ) -> crate::error::Result<ObjectOptions> {
+    let version_id = lifecycle_expiry_target_version_id(oi, action, versioned, version_suspended)?;
     let mut opts = ObjectOptions {
+        version_id,
         versioned,
         version_suspended,
         expiration: ExpirationOptions { expire: true },
         expected_bucket_incarnation_id: Some(bucket_incarnation_id),
         ..Default::default()
     };
-    if action.delete_versioned() {
-        opts.version_id = oi.version_id.map(|id| id.to_string());
-    }
     if action.delete_restored() {
         let etag = oi
             .etag
@@ -4359,12 +4703,50 @@ fn transitioned_object_delete_opts(
     Ok(opts)
 }
 
+fn lifecycle_expiry_target_version_id(
+    oi: &ObjectInfo,
+    action: IlmAction,
+    versioned: bool,
+    version_suspended: bool,
+) -> crate::error::Result<Option<String>> {
+    // Delete-all revalidates the authoritative current trigger under the
+    // object write lock; queued snapshots do not always carry `is_latest`.
+    if !action.delete_all()
+        && !lifecycle::expiration_action_has_valid_target(action, oi.version_id, oi.is_latest, oi.delete_marker)
+    {
+        return Err(Error::other("lifecycle expiry action does not match the evaluated object identity"));
+    }
+    if matches!(action, IlmAction::DeleteAction | IlmAction::DeleteRestoredAction)
+        && (versioned || version_suspended)
+        && oi.version_id.is_none()
+    {
+        return Err(Error::other("current-version lifecycle expiry is missing its version identity"));
+    }
+    if action.delete_versioned() {
+        return oi
+            .version_id
+            .ok_or_else(|| Error::other("exact-version lifecycle expiry is missing its version identity"))
+            .map(|version_id| Some(version_id.to_string()));
+    }
+    Ok(None)
+}
+
 pub async fn expire_transitioned_object(
     api: Arc<ECStore>,
     oi: &ObjectInfo,
     lc_event: &lifecycle::Event,
     _src: &LcEventSrc,
     bucket_incarnation_id: Uuid,
+) -> Result<ObjectInfo, std::io::Error> {
+    expire_transitioned_object_with_lock_lost_signal(api, oi, lc_event, bucket_incarnation_id, None).await
+}
+
+async fn expire_transitioned_object_with_lock_lost_signal(
+    api: Arc<ECStore>,
+    oi: &ObjectInfo,
+    lc_event: &lifecycle::Event,
+    bucket_incarnation_id: Uuid,
+    lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
 ) -> Result<ObjectInfo, std::io::Error> {
     let publication_guard = lifecycle_expiry_publication_guard(&api, oi, bucket_incarnation_id)
         .await
@@ -4376,6 +4758,9 @@ pub async fn expire_transitioned_object(
     let mut opts = transitioned_object_delete_opts(oi, lc_event.action, versioned, version_suspended, bucket_incarnation_id)
         .map_err(std::io::Error::other)?;
     opts.add_namespace_lock_guard(&publication_guard);
+    if let Some(signal) = lock_lost_signal {
+        opts.add_namespace_lock_lost_signal(signal);
+    }
     opts.delete_replication_config_snapshot = Some(Arc::new(snapshot));
     //let tags = LcAuditEvent::new(src, lcEvent).Tags();
     if lc_event.action.delete_restored() {
@@ -4384,6 +4769,11 @@ pub async fn expire_transitioned_object(
                 // Drop any cached restored-copy body so it does not sit resident
                 // until TTL after the copy is expired (ODC-26).
                 crate::object_api::notify_object_mutation(&oi.bucket, &oi.name).await;
+                runtime_sources::notify_scanner_dirty_usage_mutation(
+                    &oi.bucket,
+                    &oi.name,
+                    runtime_sources::ScannerDirtyUsageMutationSource::TierExpiration,
+                );
                 //audit_log_lifecycle(*oi, ILMExpiry, tags, traceFn);
                 Ok(dobj)
             }
@@ -4419,6 +4809,11 @@ pub async fn expire_transitioned_object(
     // The transitioned version is gone; evict any cached body for this object
     // so it does not linger until TTL (ODC-26).
     crate::object_api::notify_object_mutation(&oi.bucket, &oi.name).await;
+    runtime_sources::notify_scanner_dirty_usage_mutation(
+        &oi.bucket,
+        &oi.name,
+        runtime_sources::ScannerDirtyUsageMutationSource::TierExpiration,
+    );
 
     //audit_log_lifecycle(oi, ILMExpiry, tags);
 
@@ -4521,6 +4916,39 @@ fn validate_transition_remote_version(oi: &ObjectInfo) -> Result<bool, std::io::
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransitionReadVersionPlan {
+    Direct,
+    ProbeLegacyUnversioned,
+}
+
+const LEGACY_TRANSITION_READ_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+
+fn transition_remote_version_read_plan(oi: &ObjectInfo) -> Result<TransitionReadVersionPlan, std::io::Error> {
+    let version = oi.transitioned_object.version_id.as_str();
+    match oi.transition_version_state {
+        rustfs_filemeta::TransitionVersionState::Unknown => {
+            if !legacy_transition_version_state_missing(oi)? {
+                return validate_transition_remote_version(oi).map(|_| TransitionReadVersionPlan::Direct);
+            }
+            if version.is_empty() {
+                Ok(TransitionReadVersionPlan::ProbeLegacyUnversioned)
+            } else {
+                Ok(TransitionReadVersionPlan::Direct)
+            }
+        }
+        rustfs_filemeta::TransitionVersionState::KnownDisabled if version.is_empty() => Ok(TransitionReadVersionPlan::Direct),
+        rustfs_filemeta::TransitionVersionState::SuspendedNull if version == "null" => Ok(TransitionReadVersionPlan::Direct),
+        rustfs_filemeta::TransitionVersionState::Exact if !version.is_empty() && version != "null" => {
+            Ok(TransitionReadVersionPlan::Direct)
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote tier object version state conflicts with its version ID",
+        )),
+    }
+}
+
 // The resolver joins the tier manager as the second injected port this read
 // needs; grouping the request half into a struct would churn every call site of
 // a bug fix.
@@ -4535,7 +4963,12 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
     tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
     resolver: Option<&dyn ObjectEncryptionResolver>,
 ) -> Result<GetObjectReader, std::io::Error> {
-    validate_transition_remote_version(oi)?;
+    let read_plan = transition_remote_version_read_plan(oi)?;
+    // Reject invalid ranges and encryption requests before a compatibility
+    // probe can amplify them into remote listing work.
+    let plan = ReadPlan::build_for_request(rs.clone(), oi, opts, h, resolver)
+        .await
+        .map_err(|err| std::io::Error::other(format!("building the read plan for {bucket}/{object} failed: {err}")))?;
     let expected_identity = tier_destination_id_from_metadata(&oi.user_defined)?;
     let lease = match expected_identity {
         Some(identity) => {
@@ -4549,7 +4982,36 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
         Err(err) => return Err(std::io::Error::other(err)),
     };
 
-    tgt_client.validate_remote_version_id(&oi.transitioned_object.version_id)?;
+    match read_plan {
+        TransitionReadVersionPlan::Direct => {
+            tgt_client.validate_remote_version_id(&oi.transitioned_object.version_id)?;
+        }
+        TransitionReadVersionPlan::ProbeLegacyUnversioned => {
+            // RUSTFS_COMPAT_TODO(backlog#2203): remove operation-time probing
+            // after an admin reconcile can persist every proven legacy state.
+            let probe = tokio::time::timeout(
+                LEGACY_TRANSITION_READ_PROBE_TIMEOUT,
+                tgt_client.probe_transition_candidate(&oi.transitioned_object.name),
+            )
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "legacy remote tier version probe timed out"))??;
+            match probe {
+                crate::services::tier::warm_backend::TransitionCandidateProbe::UnversionedPresent => {}
+                crate::services::tier::warm_backend::TransitionCandidateProbe::Unsupported => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "remote tier cannot prove legacy unversioned transition state",
+                    ));
+                }
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "remote tier object version state is unknown",
+                    ));
+                }
+            }
+        }
+    }
 
     // The same read plan the local path uses, so the tier fetch is positioned in
     // the object's *stored* coordinate system and the stream is handed the same
@@ -4557,9 +5019,6 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
     // through a plaintext-coordinate range and skipping the transform is how a
     // transitioned SSE object used to come back as silently corrupt bytes of the
     // right length (rustfs/rustfs#6025).
-    let plan = ReadPlan::build_for_request(rs.clone(), oi, opts, h, resolver)
-        .await
-        .map_err(|err| std::io::Error::other(format!("building the read plan for {bucket}/{object} failed: {err}")))?;
     let (off, length) = (plan.storage_offset() as i64, plan.storage_length());
     let mut gopts = WarmBackendGetOpts::default();
 
@@ -4630,24 +5089,24 @@ fn attach_tier_operation_lease(mut reader: GetObjectReader, lease: TierOperation
     reader
 }
 
-pub async fn post_restore_opts(version_id: &str, bucket: &str, object: &str) -> Result<ObjectOptions, std::io::Error> {
+/// Resolve the RestoreObject request options.
+///
+/// Returns the typed [`StorageError`]: flattening these into an opaque
+/// `io::Error` string erased the identity the S3 layer needs to answer
+/// InvalidArgument instead of a generic 500 (backlog#2205).
+pub async fn post_restore_opts(version_id: &str, bucket: &str, object: &str) -> Result<ObjectOptions, Error> {
     let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
     let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
     let vid = version_id.trim();
     if !vid.is_empty() && vid != NULL_VERSION_ID {
         if let Err(_err) = Uuid::parse_str(vid) {
-            return Err(std::io::Error::other(
-                StorageError::InvalidVersionID(bucket.to_string(), object.to_string(), vid.to_string()).to_string(),
-            ));
+            return Err(StorageError::InvalidVersionID(bucket.to_string(), object.to_string(), vid.to_string()));
         }
         if !versioned && !version_suspended {
-            return Err(std::io::Error::other(
-                StorageError::InvalidArgument(
-                    bucket.to_string(),
-                    object.to_string(),
-                    format!("version-id specified {} but versioning is not enabled on {}", vid, bucket),
-                )
-                .to_string(),
+            return Err(StorageError::InvalidArgument(
+                bucket.to_string(),
+                object.to_string(),
+                format!("version-id specified {vid} but versioning is not enabled on {bucket}"),
             ));
         }
     }
@@ -4700,57 +5159,33 @@ pub async fn put_restore_opts(
     }
     meta.insert(X_AMZ_STORAGE_CLASS.as_str().to_lowercase(), sc);*/
 
-    if let Some(type_) = &rreq.type_
-        && type_.as_str() == RestoreRequestType::SELECT
+    // A SELECT restore must never reach the restore writer: the caller writes
+    // the retrieved bytes back to the source bucket/object, so building
+    // SELECT output options here produced a source overwrite carrying only
+    // the OutputLocation metadata instead of a write to `OutputLocation.S3`
+    // (backlog#1341). RestoreObject rejects SELECT at the API boundary; this
+    // is the fail-closed backstop for any other caller.
+    if rreq
+        .type_
+        .as_ref()
+        .is_some_and(|type_| type_.as_str() == RestoreRequestType::SELECT)
     {
-        let Some(s3) = select_restore_s3_location(rreq)? else {
-            return Err(std::io::Error::other("OutputLocation.S3 required for SELECT requests"));
-        };
-        if let Some(user_metadata) = s3.user_metadata.as_ref() {
-            for metadata in user_metadata {
-                let name = metadata
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| std::io::Error::other("SELECT restore metadata name is required"))?;
-                let value = metadata.value.clone().unwrap_or_default();
-                if strings_has_prefix_fold(name, "x-amz-meta") {
-                    meta.insert(name.to_string(), value);
-                } else {
-                    meta.insert(format!("x-amz-meta-{name}"), value);
-                }
-            }
-        }
-        if let Some(tags) = &s3.tagging {
-            meta.insert(
-                AMZ_OBJECT_TAGGING.to_string(),
-                serde_urlencoded::to_string(tags.tag_set.clone()).unwrap_or_else(|_| "".to_string()),
-            );
-        }
-        if let Some(encryption) = &s3.encryption
-            && encryption.encryption_type.as_str() != ""
-        {
-            meta.insert(X_AMZ_SERVER_SIDE_ENCRYPTION.as_str().to_string(), AMZ_ENCRYPTION_AES.to_string());
-        }
-        return Ok(ObjectOptions {
-            versioned: BucketVersioningSys::prefix_enabled(bucket, object).await,
-            version_suspended: BucketVersioningSys::prefix_suspended(bucket, object).await,
-            user_defined: meta,
-            ..Default::default()
-        });
+        return Err(std::io::Error::other("SELECT restore requests are not supported"));
     }
     for (k, v) in oi.user_defined.iter() {
         meta.insert(k.to_string(), v.clone());
     }
     rustfs_utils::http::metadata_compat::remove_str(&mut meta, rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID);
+    rustfs_utils::http::metadata_compat::remove_str(&mut meta, rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_WORKER_LOCK);
     if !oi.user_tags.is_empty() {
         meta.insert(AMZ_OBJECT_TAGGING.to_string(), (*oi.user_tags).clone());
     }
     let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), rreq.days.unwrap_or(1));
     meta.insert(
-        X_AMZ_RESTORE.as_str().to_string(),
+        metadata_keys::RESTORE.to_string(),
         RestoreStatus {
             is_restore_in_progress: Some(false),
-            restore_expiry_date: Some(Timestamp::from(restore_expiry)),
+            restore_expiry_date: Some(restore_expiry),
         }
         .to_string(),
     );
@@ -4760,6 +5195,10 @@ pub async fn put_restore_opts(
         user_defined: meta,
         version_id: oi.version_id.map(|e| e.to_string()),
         mod_time: oi.mod_time,
+        // Restore writes stored (possibly encrypted) bytes, so the writer's
+        // computed MD5 is not the object's public plaintext ETag.
+        preserve_etag: oi.etag.clone(),
+        shard_integrity_write_mode: Some(oi.shard_integrity_write_mode()),
         //expires:           oi.expires,
         ..Default::default()
     })
@@ -4825,12 +5264,37 @@ impl RestoreRequestOps for RestoreRequest {
 
 const _MAX_RESTORE_OBJECT_REQUEST_SIZE: i64 = 2 << 20;
 
+/// Builds an exact-version lifecycle delete target with the concrete
+/// generation observed by the evaluator. The null S3 version ID is reusable,
+/// so null data versions additionally require a write-unique data directory.
+pub fn lifecycle_version_delete_target(oi: &ObjectInfo) -> Option<ObjectToDelete> {
+    let version_id = oi.version_id?;
+    if version_id.is_nil()
+        && ((!oi.delete_marker && oi.data_dir.is_none_or(|data_dir| data_dir.is_nil()))
+            || (oi.delete_marker && oi.mod_time.is_none_or(|mod_time| mod_time == OffsetDateTime::UNIX_EPOCH)))
+    {
+        return None;
+    }
+
+    let target = ObjectToDelete {
+        object_name: oi.name.clone(),
+        version_id: Some(version_id),
+        ..Default::default()
+    };
+    Some(if version_id.is_nil() {
+        target.with_expected_identity(oi.data_dir, oi.mod_time, oi.delete_marker)
+    } else {
+        target
+    })
+}
+
 pub async fn eval_action_from_lifecycle(
     lc: &BucketLifecycleConfiguration,
     lock_config: Option<&ObjectLockConfiguration>,
     oi: &ObjectInfo,
 ) -> lifecycle::Event {
-    let event = lc.eval(&oi.to_lifecycle_opts()).await;
+    let lifecycle_opts = oi.to_lifecycle_opts();
+    let event = lc.eval(&lifecycle_opts).await;
     debug!(
         event = EVENT_LIFECYCLE_SCAN_SKIPPED,
         component = LOG_COMPONENT_ECSTORE,
@@ -4839,6 +5303,15 @@ pub async fn eval_action_from_lifecycle(
         state = "evaluated",
         "Evaluated lifecycle action during secondary scan"
     );
+
+    if !lifecycle::expiration_action_has_valid_target(
+        event.action,
+        lifecycle_opts.version_id,
+        lifecycle_opts.is_latest,
+        lifecycle_opts.delete_marker,
+    ) {
+        return lifecycle::Event::default();
+    }
 
     let lock_enabled = lock_config.is_some_and(ObjectLockApi::enabled);
     let object_locked = object_lock_boundary::is_object_locked_by_metadata(&oi.user_defined, oi.delete_marker);
@@ -4850,44 +5323,38 @@ pub async fn eval_action_from_lifecycle(
         IlmAction::DeleteAction
         | IlmAction::DeleteRestoredAction
         | IlmAction::DeleteVersionAction
-        | IlmAction::DeleteRestoredVersionAction => {
-            if matches!(event.action, IlmAction::DeleteVersionAction | IlmAction::DeleteRestoredVersionAction)
-                && oi.version_id.is_none()
-            {
-                return lifecycle::Event::default();
-            }
-            // Destructive expiry never bypasses retention. Restore expiry only
-            // removes the local copy; the retained logical version remains.
+        | IlmAction::DeleteRestoredVersionAction
             if !event.action.delete_restored()
                 && (object_locked
                     || !matches!(
                         object_lock_boundary::check_object_lock_for_deletion_with_config(lock_config, oi, false),
                         Ok(None)
-                    ))
-            {
-                //if serverDebugLog {
-                if oi.version_id.is_some() {
-                    debug!(
-                        event = EVENT_LIFECYCLE_SCAN_SKIPPED,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                        object = %oi.name,
-                        version_id = %oi.version_id.map(|v| v.to_string()).unwrap_or_default(),
-                        reason = "object_locked",
-                        "Skipped lifecycle delete because object version is locked"
-                    );
-                } else {
-                    debug!(
-                        event = EVENT_LIFECYCLE_SCAN_SKIPPED,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                        object = %oi.name,
-                        reason = "object_locked",
-                        "Skipped lifecycle delete because object is locked"
-                    );
-                }
-                return lifecycle::Event::default();
+                    )) =>
+        {
+            // Destructive expiry never bypasses retention. Restore expiry only
+            // removes the local copy; the retained logical version remains.
+            //if serverDebugLog {
+            if oi.version_id.is_some() {
+                debug!(
+                    event = EVENT_LIFECYCLE_SCAN_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    object = %oi.name,
+                    version_id = %oi.version_id.map(|v| v.to_string()).unwrap_or_default(),
+                    reason = "object_locked",
+                    "Skipped lifecycle delete because object version is locked"
+                );
+            } else {
+                debug!(
+                    event = EVENT_LIFECYCLE_SCAN_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    object = %oi.name,
+                    reason = "object_locked",
+                    "Skipped lifecycle delete because object is locked"
+                );
             }
+            return lifecycle::Event::default();
         }
         _ => (),
     }
@@ -5035,11 +5502,31 @@ pub async fn apply_expiry_on_transitioned_object(
     src: &LcEventSrc,
     bucket_incarnation_id: Uuid,
 ) -> bool {
+    apply_expiry_on_transitioned_object_with_lock_lost_signal(api, oi, lc_event, src, bucket_incarnation_id, None).await
+}
+
+async fn apply_expiry_on_transitioned_object_with_lock_lost_signal(
+    api: Arc<ECStore>,
+    oi: &ObjectInfo,
+    lc_event: &lifecycle::Event,
+    _src: &LcEventSrc,
+    bucket_incarnation_id: Uuid,
+    lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+) -> bool {
     if lc_event.action.delete_all() {
-        return apply_expiry_on_non_transitioned_objects(api, oi, lc_event, src, bucket_incarnation_id).await;
+        return apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
+            api,
+            oi,
+            lc_event,
+            bucket_incarnation_id,
+            lock_lost_signal,
+        )
+        .await;
     }
     let time_ilm = Metrics::time_ilm(lc_event.action);
-    if let Err(_err) = expire_transitioned_object(api, oi, lc_event, src, bucket_incarnation_id).await {
+    if let Err(_err) =
+        expire_transitioned_object_with_lock_lost_signal(api, oi, lc_event, bucket_incarnation_id, lock_lost_signal).await
+    {
         return false;
     }
     time_ilm(1)();
@@ -5053,6 +5540,16 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     lc_event: &lifecycle::Event,
     _src: &LcEventSrc,
     bucket_incarnation_id: Uuid,
+) -> bool {
+    apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(api, oi, lc_event, bucket_incarnation_id, None).await
+}
+
+async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
+    api: Arc<ECStore>,
+    oi: &ObjectInfo,
+    lc_event: &lifecycle::Event,
+    bucket_incarnation_id: Uuid,
+    lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
 ) -> bool {
     let Some(publication_guard) = lifecycle_expiry_publication_guard(&api, oi, bucket_incarnation_id).await else {
         return false;
@@ -5074,7 +5571,12 @@ pub async fn apply_expiry_on_non_transitioned_objects(
         }
     };
     let (versioned, version_suspended) = snapshot.versioning_config().delete_state(&oi.name);
+    let version_id = match lifecycle_expiry_target_version_id(oi, lc_event.action, versioned, version_suspended) {
+        Ok(version_id) => version_id,
+        Err(_) => return false,
+    };
     let mut opts = ObjectOptions {
+        version_id,
         versioned,
         version_suspended,
         expiration: ExpirationOptions { expire: true },
@@ -5083,9 +5585,8 @@ pub async fn apply_expiry_on_non_transitioned_objects(
         ..Default::default()
     };
     opts.add_namespace_lock_guard(&publication_guard);
-
-    if lc_event.action.delete_versioned() {
-        opts.version_id = oi.version_id.map(|v| v.to_string());
+    if let Some(signal) = lock_lost_signal {
+        opts.add_namespace_lock_lost_signal(signal);
     }
 
     if lc_event.action.delete_all() {
@@ -5164,6 +5665,61 @@ async fn enqueue_expiry_rule_with_incarnation(
     expiry_state.enqueue_by_days(oi, event, src, bucket_incarnation_id)
 }
 
+fn lifecycle_expiry_object_matches(current: &ObjectInfo, expected: &ObjectInfo) -> bool {
+    current.version_id == expected.version_id
+        && current.data_dir == expected.data_dir
+        && current.mod_time == expected.mod_time
+        && current.etag == expected.etag
+        && current.delete_marker == expected.delete_marker
+        && current.transitioned_object.name == expected.transitioned_object.name
+        && current.transitioned_object.version_id == expected.transitioned_object.version_id
+        && current.transitioned_object.tier == expected.transitioned_object.tier
+        && current.transitioned_object.status == expected.transitioned_object.status
+        && current.restore_expires == expected.restore_expires
+}
+
+pub(crate) async fn apply_expiry_rule_for_data_movement(
+    api: Arc<ECStore>,
+    event: &lifecycle::Event,
+    src: &LcEventSrc,
+    oi: &ObjectInfo,
+    lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+) -> bool {
+    let Ok(_lifecycle_guard) = api.acquire_bucket_lifecycle_read_lock(&oi.bucket).await else {
+        return false;
+    };
+    let Ok(bucket_incarnation_id) = api.bucket_incarnation_id_from_disk(&oi.bucket).await else {
+        return false;
+    };
+    let current = match api
+        .get_object_info(
+            &oi.bucket,
+            &oi.name,
+            &ObjectOptions {
+                version_id: oi.version_id.map(|version_id| version_id.to_string()),
+                versioned: oi.version_id.is_some(),
+                expected_bucket_incarnation_id: Some(bucket_incarnation_id),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(current) => current,
+        Err(_) => return false,
+    };
+    if !lifecycle_expiry_object_matches(&current, oi) {
+        return false;
+    }
+
+    if oi.transitioned_object.status.is_empty() {
+        apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(api, oi, event, bucket_incarnation_id, lock_lost_signal)
+            .await
+    } else {
+        apply_expiry_on_transitioned_object_with_lock_lost_signal(api, oi, event, src, bucket_incarnation_id, lock_lost_signal)
+            .await
+    }
+}
+
 pub(crate) async fn apply_expiry_rule_in(api: Arc<ECStore>, event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
     let Ok(_lifecycle_guard) = api.acquire_bucket_lifecycle_read_lock(&oi.bucket).await else {
         return false;
@@ -5187,17 +5743,7 @@ pub(crate) async fn apply_expiry_rule_in(api: Arc<ECStore>, event: &lifecycle::E
         Ok(current) => current,
         Err(_) => return false,
     };
-    if current.version_id != oi.version_id
-        || current.data_dir != oi.data_dir
-        || current.mod_time != oi.mod_time
-        || current.etag != oi.etag
-        || current.delete_marker != oi.delete_marker
-        || current.transitioned_object.name != oi.transitioned_object.name
-        || current.transitioned_object.version_id != oi.transitioned_object.version_id
-        || current.transitioned_object.tier != oi.transitioned_object.tier
-        || current.transitioned_object.status != oi.transitioned_object.status
-        || current.restore_expires != oi.restore_expires
-    {
+    if !lifecycle_expiry_object_matches(&current, oi) {
         return false;
     }
     enqueue_expiry_rule_with_incarnation(event, src, oi, bucket_incarnation_id).await
@@ -5297,14 +5843,14 @@ mod tests {
         enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report, eval_action_from_lifecycle,
         get_lock_acquire_timeout, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
-        lifecycle_rule_has_date_expiration, manual_transition_duration_elapsed, manual_transition_has_more_after_limit,
-        manual_transition_recovery_progress_sink, manual_transition_version_marker, manual_transition_worker_failure_reason,
-        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate,
-        persist_manual_transition_job_progress_if_owned, persist_manual_transition_page_checkpoint,
-        recover_manual_transition_job, recover_manual_transition_jobs, resolve_tier_free_version_recovery_enabled,
-        resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
-        resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop, select_restore_s3_location,
-        set_lifecycle_observability_observer, set_recovered_free_version_enqueue_observer,
+        lifecycle_rule_has_date_expiration, lifecycle_version_delete_target, manual_transition_duration_elapsed,
+        manual_transition_has_more_after_limit, manual_transition_recovery_progress_sink, manual_transition_version_marker,
+        manual_transition_worker_failure_reason, mark_delete_opts_skip_decommissioned_on_remote_success,
+        merge_stale_multipart_candidate, persist_manual_transition_job_progress_if_owned,
+        persist_manual_transition_page_checkpoint, recover_manual_transition_job, recover_manual_transition_jobs,
+        resolve_tier_free_version_recovery_enabled, resolve_transition_queue_capacity, resolve_transition_queue_send_timeout,
+        resolve_transition_worker_count, resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop,
+        select_restore_s3_location, set_lifecycle_observability_observer, set_recovered_free_version_enqueue_observer,
         should_defer_date_expiry_for_recent_config_update, transitioned_cleanup_tuple, transitioned_object_delete_opts,
         wait_for_tier_free_version_recovery,
     };
@@ -5315,6 +5861,8 @@ mod tests {
         decode_manual_transition_continuation_token, encode_manual_transition_continuation_token,
     };
     use crate::bucket::lifecycle::config_boundary;
+    use crate::bucket::lifecycle::evaluator::Evaluator;
+    use crate::bucket::lifecycle::lifecycle;
     use crate::bucket::lifecycle::manual_transition_job::{
         ManualTransitionJobCasBarrier, ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission,
         ManualTransitionScopeAdmissionClaim, ManualTransitionTaskRecord, ManualTransitionWorkerFailureReason,
@@ -5333,26 +5881,27 @@ mod tests {
     use crate::bucket::lifecycle::replication_sink::{ReplicationStatusType, VersionPurgeStatusType};
     use crate::bucket::lifecycle::runtime_boundary as runtime_sources;
     use crate::bucket::lifecycle::tier_free_version_recovery::{
-        FreeVersionRecoveryStats, RecoveryWalkTestAction, list_tier_free_versions, recover_tier_free_versions_with_cancel,
-        set_recovery_bucket_list_wait_hook, set_recovery_walk_test_hook,
+        FreeVersionRecoveryStats, RecoveryWalkTestAction, RecoveryWorkBudget, list_tier_free_versions,
+        list_tier_free_versions_with_budget, recover_tier_free_versions_with_cancel, set_recovery_bucket_list_wait_hook,
+        set_recovery_walk_test_hook,
     };
     use crate::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
     use crate::bucket::lifecycle::tier_sweeper::Jentry;
     use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG};
     use crate::bucket::metadata_sys;
-    #[cfg(feature = "test-util")]
-    use crate::client::transition_api::ReaderImpl;
     use crate::disk::endpoint::Endpoint;
     use crate::disk::{RUSTFS_META_MULTIPART_BUCKET, STORAGE_FORMAT_FILE};
     use crate::error::{Error, is_err_invalid_upload_id};
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::object_api::{ObjectInfo, ObjectOptions, PutObjReader};
     #[cfg(feature = "test-util")]
+    use crate::services::tier::test_util::MockWarmOp;
+    #[cfg(feature = "test-util")]
     use crate::services::tier::test_util::register_mock_tier;
     #[cfg(feature = "test-util")]
-    use crate::services::tier::tier::TierConfigMgr;
+    use crate::services::tier::tier::{TIER_DRIVER_TEST_FACTORY, TierConfigMgr, TierDriverTestFactory};
     #[cfg(feature = "test-util")]
-    use crate::services::tier::warm_backend::WarmBackend as _;
+    use crate::services::tier::warm_backend::{TransitionCandidateProbe, WarmBackend as _};
     use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause};
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
     use crate::storage_api_contracts::namespace::NamespaceLocking as _;
@@ -5361,7 +5910,7 @@ mod tests {
         lifecycle::ExpirationOptions,
         list::ListOperations as _,
         multipart::MultipartOperations as _,
-        object::{ObjectIO as _, ObjectOperations as _},
+        object::{ObjectIO as _, ObjectOperations as _, ObjectToDelete},
     };
     use crate::store::ECStore;
     #[cfg(feature = "test-util")]
@@ -5369,17 +5918,19 @@ mod tests {
     use futures::FutureExt;
     #[cfg(feature = "test-util")]
     use http::HeaderMap;
-    use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_MAX_EXPIRY_WORKERS;
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_data_usage::TierStats;
+    use rustfs_filemeta::metadata_keys;
     use rustfs_filemeta::{FileInfo, FileMeta};
+    #[cfg(feature = "test-util")]
+    use rustfs_s3_client::transition_api::ReaderImpl;
+    use rustfs_scanner_metrics::metrics::{IlmAction, global_metrics};
     use s3s::dto::{
         BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, LifecycleExpiration, LifecycleRule, MetadataEntry,
-        ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, OutputLocation, RestoreRequest,
-        RestoreRequestType, S3Location, Timestamp, Transition, TransitionStorageClass,
+        NoncurrentVersionExpiration, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule,
+        OutputLocation, RestoreRequest, RestoreRequestType, S3Location, Timestamp, Transition, TransitionStorageClass,
     };
-    use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -5422,7 +5973,7 @@ mod tests {
 
         assert_eq!(schedule.next_delay, StdDuration::ZERO);
         for expected in [60, 120, 240, 480, 600, 600, 600, 600] {
-            schedule.record_success(&idle, StdDuration::ZERO);
+            schedule.record_success(&idle);
             assert_eq!(schedule.next_delay, StdDuration::from_secs(expected));
         }
         assert_eq!(schedule.next_delay.as_secs() / TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL.as_secs(), 10);
@@ -5433,15 +5984,13 @@ mod tests {
         let mut schedule = TierFreeVersionRecoverySchedule::default();
 
         for expected in [60, 120, 240, 480, 600, 600] {
-            schedule.record_failure(StdDuration::from_secs(75));
+            schedule.record_failure();
             assert_eq!(schedule.next_delay, StdDuration::from_secs(expected));
-            assert_eq!(schedule.previous_run_duration, StdDuration::ZERO);
         }
 
-        schedule.record_success(&free_version_recovery_stats(0, 0, false), StdDuration::ZERO);
-        schedule.record_failure(StdDuration::from_secs(75));
+        schedule.record_success(&free_version_recovery_stats(0, 0, false));
+        schedule.record_failure();
         assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
-        assert_eq!(schedule.previous_run_duration, StdDuration::ZERO);
     }
 
     #[test]
@@ -5456,22 +6005,22 @@ mod tests {
     fn tier_free_version_recovery_pagination_preserves_full_sweep_backoff() {
         let idle = free_version_recovery_stats(0, 0, false);
         let mut schedule = TierFreeVersionRecoverySchedule::default();
-        schedule.record_success(&idle, StdDuration::ZERO);
-        schedule.record_success(&idle, StdDuration::ZERO);
+        schedule.record_success(&idle);
+        schedule.record_success(&idle);
         assert_eq!(schedule.next_delay, StdDuration::from_secs(120));
         assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
 
-        schedule.record_success(&free_version_recovery_stats(0, 0, true), StdDuration::ZERO);
+        schedule.record_success(&free_version_recovery_stats(0, 0, true));
         assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
         assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
         assert_eq!(schedule.bucket_marker.as_deref(), Some("bucket"));
         assert_eq!(schedule.object_marker.as_deref(), Some("object"));
 
-        schedule.record_success(&free_version_recovery_stats(0, 0, true), StdDuration::ZERO);
+        schedule.record_success(&free_version_recovery_stats(0, 0, true));
         assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
         assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
 
-        schedule.record_success(&idle, StdDuration::ZERO);
+        schedule.record_success(&idle);
         assert_eq!(schedule.next_delay, StdDuration::from_secs(240));
         assert_eq!(schedule.idle_interval, StdDuration::from_secs(480));
         assert!(schedule.bucket_marker.is_none());
@@ -5481,7 +6030,7 @@ mod tests {
     #[test]
     fn tier_free_version_recovery_wake_during_pagination_keeps_one_full_follow_up() {
         let mut schedule = TierFreeVersionRecoverySchedule::default();
-        schedule.record_success(&free_version_recovery_stats(0, 0, true), StdDuration::ZERO);
+        schedule.record_success(&free_version_recovery_stats(0, 0, true));
 
         schedule.request_retry();
         schedule.request_retry();
@@ -5489,7 +6038,7 @@ mod tests {
         assert_eq!(schedule.bucket_marker.as_deref(), Some("bucket"));
         assert_eq!(schedule.object_marker.as_deref(), Some("object"));
 
-        schedule.record_success(&free_version_recovery_stats(0, 0, false), StdDuration::ZERO);
+        schedule.record_success(&free_version_recovery_stats(0, 0, false));
         assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
         assert!(!schedule.follow_up_sweep);
         assert!(schedule.bucket_marker.is_none());
@@ -5504,22 +6053,22 @@ mod tests {
             free_version_recovery_stats(0, 1, true),
         ] {
             let mut schedule = TierFreeVersionRecoverySchedule::default();
-            schedule.record_success(&idle, StdDuration::ZERO);
-            schedule.record_success(&idle, StdDuration::ZERO);
+            schedule.record_success(&idle);
+            schedule.record_success(&idle);
             assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
 
-            schedule.record_success(&work, StdDuration::ZERO);
+            schedule.record_success(&work);
             assert!(schedule.follow_up_sweep);
             assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
             assert!(!schedule.jitter_next_delay);
 
-            schedule.record_success(&idle, StdDuration::ZERO);
+            schedule.record_success(&idle);
             assert!(!schedule.follow_up_sweep);
             assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
             assert_eq!(schedule.idle_interval, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
             assert!(!schedule.jitter_next_delay);
 
-            schedule.record_success(&idle, StdDuration::ZERO);
+            schedule.record_success(&idle);
             assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
             assert_eq!(schedule.idle_interval, StdDuration::from_secs(120));
         }
@@ -5533,17 +6082,17 @@ mod tests {
             free_version_recovery_stats(0, 1, false),
         ] {
             let mut schedule = TierFreeVersionRecoverySchedule::default();
-            schedule.record_success(&idle, StdDuration::ZERO);
-            schedule.record_success(&idle, StdDuration::ZERO);
+            schedule.record_success(&idle);
+            schedule.record_success(&idle);
             assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
 
-            schedule.record_success(&work, StdDuration::ZERO);
+            schedule.record_success(&work);
             assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
             assert_eq!(schedule.idle_interval, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
             assert!(!schedule.follow_up_sweep);
             assert!(!schedule.jitter_next_delay);
 
-            schedule.record_success(&idle, StdDuration::ZERO);
+            schedule.record_success(&idle);
             assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
             assert_eq!(schedule.idle_interval, StdDuration::from_secs(120));
         }
@@ -5682,7 +6231,7 @@ mod tests {
         );
     }
 
-    async fn tier_free_version_recovery_page_call_times(run_duration: StdDuration) -> Vec<StdDuration> {
+    async fn tier_free_version_recovery_page_call_times(run_durations: &[StdDuration]) -> Vec<StdDuration> {
         RECOVERY_JITTER_CALLS.store(0, Ordering::SeqCst);
         let cancel = CancellationToken::new();
         let state = ExpiryState::new();
@@ -5691,6 +6240,7 @@ mod tests {
         let recorded_call_times = Arc::clone(&call_times);
         let call_index = Arc::new(AtomicUsize::new(0));
         let recorded_call_index = Arc::clone(&call_index);
+        let recovery_run_durations = run_durations.to_vec();
         let loop_cancel = cancel.clone();
         let recovery_cancel = cancel.clone();
         let worker = tokio::spawn(async move {
@@ -5701,8 +6251,9 @@ mod tests {
                     .push(tokio::time::Instant::now().duration_since(started_at));
                 let index = recorded_call_index.fetch_add(1, Ordering::SeqCst);
                 let cancel = recovery_cancel.clone();
+                let run_duration = recovery_run_durations.get(index).copied();
                 async move {
-                    if index == 0 {
+                    if let Some(run_duration) = run_duration {
                         tokio::time::sleep(run_duration).await;
                         Ok(free_version_recovery_stats(0, 0, true))
                     } else {
@@ -5715,15 +6266,14 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
-        tokio::time::advance(run_duration).await;
-        tokio::task::yield_now().await;
-        if run_duration < TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL {
-            let remaining = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL - run_duration;
-            tokio::time::advance(remaining - StdDuration::from_secs(1)).await;
-            assert_eq!(call_index.load(Ordering::SeqCst), 1);
+        for (index, run_duration) in run_durations.iter().copied().enumerate() {
+            tokio::time::advance(run_duration).await;
+            tokio::task::yield_now().await;
+            tokio::time::advance(TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL - StdDuration::from_secs(1)).await;
+            assert_eq!(call_index.load(Ordering::SeqCst), index + 1);
             tokio::time::advance(StdDuration::from_secs(1)).await;
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
         worker.await.expect("recovery loop should stop after cancellation");
         assert_eq!(
             RECOVERY_JITTER_CALLS.load(Ordering::SeqCst),
@@ -5739,14 +6289,75 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     #[serial]
-    async fn tier_free_version_recovery_preserves_start_to_start_page_cadence() {
+    async fn tier_free_version_recovery_waits_after_each_page_completes() {
         assert_eq!(
-            tier_free_version_recovery_page_call_times(StdDuration::from_secs(45)).await,
-            vec![StdDuration::ZERO, StdDuration::from_secs(60)]
+            tier_free_version_recovery_page_call_times(&[StdDuration::from_secs(45)]).await,
+            vec![StdDuration::ZERO, StdDuration::from_secs(105)]
         );
         assert_eq!(
-            tier_free_version_recovery_page_call_times(StdDuration::from_secs(75)).await,
-            vec![StdDuration::ZERO, StdDuration::from_secs(75)]
+            tier_free_version_recovery_page_call_times(&[StdDuration::from_secs(60)]).await,
+            vec![StdDuration::ZERO, StdDuration::from_secs(120)]
+        );
+        assert_eq!(
+            tier_free_version_recovery_page_call_times(&[StdDuration::from_secs(75)]).await,
+            vec![StdDuration::ZERO, StdDuration::from_secs(135)]
+        );
+        assert_eq!(
+            tier_free_version_recovery_page_call_times(&[StdDuration::from_secs(75), StdDuration::from_secs(45)]).await,
+            vec![StdDuration::ZERO, StdDuration::from_secs(135), StdDuration::from_secs(240)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tier_free_version_recovery_notify_during_page_keeps_completion_cooldown() {
+        let cancel = CancellationToken::new();
+        let state = ExpiryState::new();
+        let recovery_notify = Arc::clone(&state.read().await.recovery_notify);
+        let started_at = tokio::time::Instant::now();
+        let call_times = Arc::new(StdMutex::new(Vec::new()));
+        let recorded_call_times = Arc::clone(&call_times);
+        let call_index = Arc::new(AtomicUsize::new(0));
+        let recorded_call_index = Arc::clone(&call_index);
+        let loop_cancel = cancel.clone();
+        let recovery_cancel = cancel.clone();
+        let worker = tokio::spawn(async move {
+            run_tier_free_version_recovery_loop(loop_cancel, state, std::convert::identity, move |_, _, _| {
+                recorded_call_times
+                    .lock()
+                    .expect("recovery call times lock should not be poisoned")
+                    .push(tokio::time::Instant::now().duration_since(started_at));
+                let index = recorded_call_index.fetch_add(1, Ordering::SeqCst);
+                let cancel = recovery_cancel.clone();
+                async move {
+                    if index == 0 {
+                        tokio::time::sleep(StdDuration::from_secs(75)).await;
+                        Ok(free_version_recovery_stats(0, 0, true))
+                    } else {
+                        cancel.cancel();
+                        Ok(free_version_recovery_stats(0, 0, false))
+                    }
+                }
+            })
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(StdDuration::from_secs(30)).await;
+        recovery_notify.notify_one();
+        tokio::time::advance(StdDuration::from_secs(45)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(StdDuration::from_secs(59)).await;
+        assert_eq!(call_index.load(Ordering::SeqCst), 1);
+        tokio::time::advance(StdDuration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        worker.await.expect("recovery loop should stop after cancellation");
+
+        assert_eq!(
+            call_times
+                .lock()
+                .expect("recovery call times lock should not be poisoned")
+                .as_slice(),
+            &[StdDuration::ZERO, StdDuration::from_secs(135)]
         );
     }
 
@@ -5986,7 +6597,75 @@ mod tests {
 
     #[cfg(feature = "test-util")]
     #[tokio::test]
-    async fn transitioned_get_rejects_unknown_version_state_before_backend_io() {
+    async fn transitioned_get_allows_legacy_unknown_exact_version_for_non_destructive_read() {
+        let manager = TierConfigMgr::new();
+        let tier = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&manager, &tier).await;
+        let remote_object = format!("remote/{}", Uuid::new_v4());
+        let body = Bytes::from_static(b"legacy transitioned object body");
+        let remote_version = backend
+            .put(
+                &remote_object,
+                ReaderImpl::Body(body.clone()),
+                i64::try_from(body.len()).expect("body length should fit"),
+            )
+            .await
+            .expect("mock remote object should be stored");
+        let mut user_defined = HashMap::new();
+        insert_legacy_transition_version_id(&mut user_defined, &remote_version);
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: i64::try_from(body.len()).expect("body length should fit"),
+            transitioned_object: TransitionedObject {
+                name: remote_object,
+                version_id: remote_version,
+                status: crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string(),
+                tier: tier.clone(),
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            user_defined: user_defined.into(),
+            ..Default::default()
+        };
+
+        let range = Some(crate::storage_api_contracts::range::HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 7,
+            end: 18,
+        });
+        let mut reader = get_transitioned_object_reader_with_tier_manager(
+            &object_info.bucket,
+            &object_info.name,
+            &range,
+            &HeaderMap::new(),
+            &object_info,
+            &ObjectOptions::default(),
+            &manager,
+            None,
+        )
+        .await
+        .expect("legacy unknown state should still allow a non-destructive read");
+        let mut got = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut got)
+            .await
+            .expect("transitioned reader should drain");
+
+        assert_eq!(got, &body.as_ref()[7..=18]);
+        assert_eq!(backend.get_count().await, 1);
+        assert_eq!(backend.remove_count().await, 0);
+        assert_eq!(
+            TierConfigMgr::active_operation_lease_count(&manager, &tier).await,
+            0,
+            "tier generation lease should release after EOF"
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn transitioned_get_rejects_explicit_unknown_version_state_before_backend_io() {
         let manager = TierConfigMgr::new();
         let tier = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&manager, &tier).await;
@@ -5996,6 +6675,181 @@ mod tests {
             size: 1,
             transitioned_object: TransitionedObject {
                 name: "remote/object".to_string(),
+                version_id: String::new(),
+                status: crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string(),
+                tier,
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            user_defined: user_defined_with_transition_version_state(rustfs_filemeta::TransitionVersionState::Unknown).into(),
+            ..Default::default()
+        };
+
+        let err = match get_transitioned_object_reader_with_tier_manager(
+            &object_info.bucket,
+            &object_info.name,
+            &None,
+            &HeaderMap::new(),
+            &object_info,
+            &ObjectOptions::default(),
+            &manager,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("explicit unknown remote version state must fail before backend IO"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(backend.op_log().await, Vec::<MockWarmOp>::new());
+        assert_eq!(backend.get_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn transitioned_get_rejects_present_but_invalid_legacy_version_metadata() {
+        let manager = TierConfigMgr::new();
+        let tier = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&manager, &tier).await;
+
+        for persisted_version in [
+            Uuid::nil().to_string(),
+            "\u{fffd}".to_string(),
+            "bad\u{0001}version".to_string(),
+        ] {
+            let mut user_defined = HashMap::new();
+            insert_legacy_transition_version_id(&mut user_defined, &persisted_version);
+            let object_info = ObjectInfo {
+                bucket: "bucket".to_string(),
+                name: "object".to_string(),
+                size: 1,
+                transitioned_object: TransitionedObject {
+                    name: "remote/object".to_string(),
+                    version_id: String::new(),
+                    status: crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string(),
+                    tier: tier.clone(),
+                    ..Default::default()
+                },
+                transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+                user_defined: user_defined.into(),
+                ..Default::default()
+            };
+
+            let err = match get_transitioned_object_reader_with_tier_manager(
+                &object_info.bucket,
+                &object_info.name,
+                &None,
+                &HeaderMap::new(),
+                &object_info,
+                &ObjectOptions::default(),
+                &manager,
+                None,
+            )
+            .await
+            {
+                Ok(_) => panic!("present but invalid legacy version metadata must fail before backend IO"),
+                Err(err) => err,
+            };
+
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        }
+
+        assert_eq!(backend.op_log().await, Vec::<MockWarmOp>::new());
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn transitioned_get_probes_legacy_empty_unknown_state_before_unversioned_read() {
+        let manager = TierConfigMgr::new();
+        let tier = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&manager, &tier).await;
+        backend.set_put_remote_version(Some(String::new())).await;
+        let remote_object = format!("remote/{}", Uuid::new_v4());
+        let body = Bytes::from_static(b"legacy unversioned transitioned object body");
+        let remote_version = backend
+            .put(
+                &remote_object,
+                ReaderImpl::Body(body.clone()),
+                i64::try_from(body.len()).expect("body length should fit"),
+            )
+            .await
+            .expect("mock remote object should be stored");
+        assert!(remote_version.is_empty());
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: i64::try_from(body.len()).expect("body length should fit"),
+            transitioned_object: TransitionedObject {
+                name: remote_object.clone(),
+                version_id: String::new(),
+                status: crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string(),
+                tier: tier.clone(),
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            user_defined: HashMap::from([("x-minio-internal-transitioned-versionID".to_string(), String::new())]).into(),
+            ..Default::default()
+        };
+
+        let mut reader = get_transitioned_object_reader_with_tier_manager(
+            &object_info.bucket,
+            &object_info.name,
+            &None,
+            &HeaderMap::new(),
+            &object_info,
+            &ObjectOptions::default(),
+            &manager,
+            None,
+        )
+        .await
+        .expect("probe-proven legacy unversioned state should allow a non-destructive read");
+        let mut got = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut got)
+            .await
+            .expect("transitioned reader should drain");
+
+        assert_eq!(got, body.as_ref());
+        assert_eq!(backend.remove_count().await, 0);
+        assert_eq!(
+            backend.op_log().await,
+            vec![
+                MockWarmOp::Put {
+                    object: remote_object.clone()
+                },
+                MockWarmOp::Probe {
+                    object: remote_object.clone()
+                },
+                MockWarmOp::Get { object: remote_object },
+            ]
+        );
+        assert_eq!(
+            TierConfigMgr::active_operation_lease_count(&manager, &tier).await,
+            0,
+            "tier generation lease should release after EOF"
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn transitioned_get_rejects_ambiguous_empty_unknown_state_without_backend_get() {
+        let manager = TierConfigMgr::new();
+        let tier = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&manager, &tier).await;
+        let remote_object = format!("remote/{}", Uuid::new_v4());
+        backend
+            .set_transition_candidate_probe_override(Some(TransitionCandidateProbe::VersionedPresent(
+                "versioned-candidate".to_string(),
+            )))
+            .await;
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: 1,
+            transitioned_object: TransitionedObject {
+                name: remote_object.clone(),
                 version_id: String::new(),
                 status: crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string(),
                 tier,
@@ -6017,19 +6871,28 @@ mod tests {
         )
         .await
         {
-            Ok(_) => panic!("unknown remote version state must fail before backend IO"),
+            Ok(_) => panic!("versioned legacy unknown state without stored version must fail before backend GET"),
             Err(err) => err,
         };
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(backend.op_log().await, vec![MockWarmOp::Probe { object: remote_object }]);
         assert_eq!(backend.get_count().await, 0);
+        assert_eq!(backend.remove_count().await, 0);
     }
 
     #[cfg(feature = "test-util")]
     #[tokio::test]
-    async fn free_version_delete_rejects_unknown_version_state_before_backend_io() {
+    async fn free_version_delete_rejects_explicit_unknown_before_backend_io() {
         let manager = TierConfigMgr::new();
         let backend = register_mock_tier(&manager, "WARM").await;
+        let identity = test_tier_destination_identity(&manager, "WARM").await;
+        let mut user_defined = user_defined_with_tier_destination_identity(identity);
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut user_defined,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_STATE,
+            rustfs_filemeta::TransitionVersionState::Unknown.as_str().to_string(),
+        );
         let object_info = ObjectInfo {
             transitioned_object: TransitionedObject {
                 name: "remote/object".to_string(),
@@ -6038,15 +6901,249 @@ mod tests {
                 ..Default::default()
             },
             transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            user_defined: user_defined.into(),
             ..Default::default()
         };
 
         let err = super::delete_free_version_remote_object(&object_info, &manager)
             .await
-            .expect_err("unknown remote version state must fail before backend IO");
+            .expect_err("explicit unknown cleanup must fail before backend IO");
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("version state is unknown"));
+        assert_eq!(backend.op_log().await, Vec::<MockWarmOp>::new());
         assert_eq!(backend.remove_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn test_tier_destination_identity(
+        manager: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
+        tier: &str,
+    ) -> crate::services::tier::tier::TierDestinationId {
+        TierConfigMgr::acquire_operation_lease(manager, tier)
+            .await
+            .expect("test tier lease should be available")
+            .backend_identity()
+    }
+
+    #[cfg(feature = "test-util")]
+    fn user_defined_with_tier_destination_identity(
+        identity: crate::services::tier::tier::TierDestinationId,
+    ) -> HashMap<String, String> {
+        let mut user_defined = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut user_defined,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(identity),
+        );
+        user_defined
+    }
+
+    #[cfg(feature = "test-util")]
+    fn user_defined_with_transition_version_state(state: rustfs_filemeta::TransitionVersionState) -> HashMap<String, String> {
+        let mut user_defined = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut user_defined,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_STATE,
+            state.as_str().to_string(),
+        );
+        user_defined
+    }
+
+    #[cfg(feature = "test-util")]
+    fn insert_legacy_transition_version_id(user_defined: &mut HashMap<String, String>, version_id: &str) {
+        rustfs_utils::http::metadata_compat::insert_str(
+            user_defined,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_ID,
+            version_id.to_string(),
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn free_version_tuple_rejects_mixed_legacy_missing_and_explicit_unknown() {
+        let manager = TierConfigMgr::new();
+        register_mock_tier(&manager, "WARM").await;
+        let identity = test_tier_destination_identity(&manager, "WARM").await;
+        let mut legacy_metadata = user_defined_with_tier_destination_identity(identity);
+        insert_legacy_transition_version_id(&mut legacy_metadata, "legacy-version");
+        let mut explicit_metadata = legacy_metadata.clone();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut explicit_metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_STATE,
+            rustfs_filemeta::TransitionVersionState::Unknown.as_str().to_string(),
+        );
+        let make_info = |user_defined: HashMap<String, String>| ObjectInfo {
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: "legacy-version".to_string(),
+                tier: "WARM".to_string(),
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            user_defined: user_defined.into(),
+            ..Default::default()
+        };
+
+        let err = super::free_version_remote_tuple_matches(&make_info(legacy_metadata), &make_info(explicit_metadata))
+            .expect_err("mixed legacy-missing and explicit unknown provenance must fail closed");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn free_version_delete_probes_exact_version_hidden_by_current_delete_marker() {
+        let manager = TierConfigMgr::new();
+        let tier = "WARM";
+        let backend = register_mock_tier(&manager, tier).await;
+        let identity = test_tier_destination_identity(&manager, tier).await;
+        let remote_object = format!("remote/{}", Uuid::new_v4());
+        let body = Bytes::from_static(b"legacy exact cleanup body");
+        let remote_version = backend
+            .put(
+                &remote_object,
+                ReaderImpl::Body(body),
+                i64::try_from(b"legacy exact cleanup body".len()).expect("body length should fit"),
+            )
+            .await
+            .expect("mock remote object should be stored");
+        let mut user_defined = user_defined_with_tier_destination_identity(identity);
+        insert_legacy_transition_version_id(&mut user_defined, &remote_version);
+        backend
+            .set_transition_candidate_probe_override(Some(TransitionCandidateProbe::Missing))
+            .await;
+        assert_eq!(
+            backend
+                .probe_transition_candidate_state(&remote_object)
+                .await
+                .expect("current remote view should be readable"),
+            TransitionCandidateProbe::Missing,
+            "a current delete marker must hide the historical data version from an unversioned probe"
+        );
+        backend.clear_op_log().await;
+        let object_info = ObjectInfo {
+            transitioned_object: TransitionedObject {
+                name: remote_object.clone(),
+                version_id: remote_version,
+                tier: tier.to_string(),
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            user_defined: user_defined.into(),
+            ..Default::default()
+        };
+
+        super::delete_free_version_remote_object(&object_info, &manager)
+            .await
+            .expect("probe-proven legacy exact cleanup should delete the remote version");
+        super::delete_free_version_remote_object(&object_info, &manager)
+            .await
+            .expect("a retry after the exact remote version is already missing should be idempotent");
+
+        assert_eq!(
+            backend.op_log().await,
+            vec![
+                MockWarmOp::Get {
+                    object: remote_object.clone()
+                },
+                MockWarmOp::Remove {
+                    object: remote_object.clone()
+                },
+                MockWarmOp::Get {
+                    object: remote_object.clone()
+                },
+            ]
+        );
+        assert_eq!(
+            backend.remove_versions().await,
+            vec![(remote_object, object_info.transitioned_object.version_id)]
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn free_version_delete_retains_legacy_unknown_unversioned_object() {
+        let manager = TierConfigMgr::new();
+        let tier = "WARM";
+        let backend = register_mock_tier(&manager, tier).await;
+        backend.set_put_remote_version(Some(String::new())).await;
+        let identity = test_tier_destination_identity(&manager, tier).await;
+        let remote_object = format!("remote/{}", Uuid::new_v4());
+        let body = Bytes::from_static(b"legacy unversioned cleanup body");
+        let remote_version = backend
+            .put(
+                &remote_object,
+                ReaderImpl::Body(body),
+                i64::try_from(b"legacy unversioned cleanup body".len()).expect("body length should fit"),
+            )
+            .await
+            .expect("mock remote object should be stored");
+        assert!(remote_version.is_empty());
+        backend.clear_op_log().await;
+        let mut user_defined = user_defined_with_tier_destination_identity(identity);
+        user_defined.insert("x-minio-internal-transitioned-versionID".to_string(), String::new());
+        let object_info = ObjectInfo {
+            transitioned_object: TransitionedObject {
+                name: remote_object.clone(),
+                version_id: String::new(),
+                tier: tier.to_string(),
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            user_defined: user_defined.into(),
+            ..Default::default()
+        };
+
+        let err = super::delete_free_version_remote_object(&object_info, &manager)
+            .await
+            .expect_err("legacy unversioned cleanup cannot exclude a versioning-state race");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(backend.op_log().await.is_empty());
+        assert_eq!(backend.remove_count().await, 0);
+        assert!(backend.remove_versions().await.is_empty());
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn free_version_delete_does_not_remove_a_different_remote_version() {
+        let manager = TierConfigMgr::new();
+        let tier = "WARM";
+        let backend = register_mock_tier(&manager, tier).await;
+        let identity = test_tier_destination_identity(&manager, tier).await;
+        let remote_object = format!("remote/{}", Uuid::new_v4());
+        backend.set_put_remote_version(Some("different-version".to_string())).await;
+        backend
+            .put(
+                &remote_object,
+                ReaderImpl::Body(Bytes::from_static(b"different remote version")),
+                i64::try_from(b"different remote version".len()).expect("body length should fit"),
+            )
+            .await
+            .expect("different remote version should be stored");
+        backend.clear_op_log().await;
+        let mut user_defined = user_defined_with_tier_destination_identity(identity);
+        insert_legacy_transition_version_id(&mut user_defined, "legacy-version");
+        let object_info = ObjectInfo {
+            transitioned_object: TransitionedObject {
+                name: remote_object.clone(),
+                version_id: "legacy-version".to_string(),
+                tier: tier.to_string(),
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            user_defined: user_defined.into(),
+            ..Default::default()
+        };
+
+        super::delete_free_version_remote_object(&object_info, &manager)
+            .await
+            .expect("a missing exact legacy version should be an idempotent cleanup success");
+
+        assert_eq!(backend.op_log().await, vec![MockWarmOp::Get { object: remote_object }]);
+        assert_eq!(backend.remove_count().await, 0);
+        assert!(backend.remove_versions().await.is_empty());
     }
 
     #[cfg(feature = "test-util")]
@@ -6138,9 +7235,18 @@ mod tests {
             rustfs_utils::crypto::hex(old_identity),
         );
         oi.user_defined = Arc::new(metadata.clone());
+        let lease_observed_during_local_delete = Arc::new(std::sync::atomic::AtomicBool::new(false));
         delete_free_version_remote_object_then(&oi, &manager, {
             let local_delete_calls = Arc::clone(&local_delete_calls);
+            let lease_observed_during_local_delete = Arc::clone(&lease_observed_during_local_delete);
+            let manager = manager.clone();
             move || async move {
+                assert_eq!(
+                    crate::services::tier::tier::TierConfigMgr::active_operation_lease_count(&manager, "WARM").await,
+                    1,
+                    "the identity-bound tier lease must span the exact local marker delete"
+                );
+                lease_observed_during_local_delete.store(true, Ordering::Relaxed);
                 local_delete_calls.fetch_add(1, Ordering::Relaxed);
             }
         })
@@ -6148,6 +7254,12 @@ mod tests {
         .expect("matching destination identity should allow idempotent remote cleanup");
         assert_eq!(old_backend.remove_count().await, 1);
         assert_eq!(local_delete_calls.load(Ordering::Relaxed), 1);
+        assert!(lease_observed_during_local_delete.load(Ordering::Relaxed));
+        assert_eq!(
+            crate::services::tier::tier::TierConfigMgr::active_operation_lease_count(&manager, "WARM").await,
+            0,
+            "the tier lease should be released after the local marker delete completes"
+        );
 
         let mut single_prefix_metadata = HashMap::new();
         single_prefix_metadata.insert(
@@ -6261,7 +7373,7 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         let admin_err = err
             .get_ref()
-            .and_then(|source| source.downcast_ref::<crate::client::admin_handler_utils::AdminError>())
+            .and_then(|source| source.downcast_ref::<rustfs_s3_client::admin_handler_utils::AdminError>())
             .expect("identity mismatch should retain the typed tier error");
         assert_eq!(admin_err.code, crate::services::tier::tier::ERR_TIER_INVALID_CONFIG.code);
         assert_eq!(new_backend.get_count().await, 0);
@@ -6298,6 +7410,7 @@ mod tests {
             bucket: "bucket".to_string(),
             name: "object".to_string(),
             version_id: Some(vid),
+            is_latest: true,
             data_dir: Some(Uuid::new_v4()),
             etag: Some("etag".to_string()),
             restore_expires: Some(OffsetDateTime::now_utc() - StdDuration::from_secs(1)),
@@ -6309,10 +7422,14 @@ mod tests {
             },
             ..Default::default()
         };
+        let noncurrent = ObjectInfo {
+            is_latest: false,
+            ..oi.clone()
+        };
 
         // Plain version expiry: exact version, real delete.
         let incarnation = Uuid::new_v4();
-        let opts = transitioned_object_delete_opts(&oi, IlmAction::DeleteVersionAction, true, false, incarnation)
+        let opts = transitioned_object_delete_opts(&noncurrent, IlmAction::DeleteVersionAction, true, false, incarnation)
             .expect("build version expiry options");
         assert_eq!(opts.version_id.as_deref(), Some(vid_str.as_str()));
         assert_eq!(opts.expected_bucket_incarnation_id, Some(incarnation));
@@ -6328,7 +7445,7 @@ mod tests {
         // Restore-expiry of a noncurrent version: restored-copy cleanup of the
         // exact version. Routing this through the full transitioned-object
         // delete instead would remove the remote tier data.
-        let opts = transitioned_object_delete_opts(&oi, IlmAction::DeleteRestoredVersionAction, true, false, incarnation)
+        let opts = transitioned_object_delete_opts(&noncurrent, IlmAction::DeleteRestoredVersionAction, true, false, incarnation)
             .expect("build restored-version expiry options");
         assert_eq!(opts.version_id.as_deref(), Some(vid_str.as_str()));
         assert!(opts.transition.expire_restored);
@@ -6338,6 +7455,45 @@ mod tests {
             .expect("build object expiry options");
         assert!(opts.version_id.is_none());
         assert!(!opts.transition.expire_restored);
+
+        let historical_null = ObjectInfo {
+            version_id: Some(Uuid::nil()),
+            ..noncurrent
+        };
+        let opts = transitioned_object_delete_opts(&historical_null, IlmAction::DeleteVersionAction, true, false, incarnation)
+            .expect("an explicit null version should remain an exact delete target");
+        let null_version_id = Uuid::nil().to_string();
+        assert_eq!(opts.version_id.as_deref(), Some(null_version_id.as_str()));
+        assert!(
+            transitioned_object_delete_opts(&historical_null, IlmAction::DeleteAction, true, false, incarnation).is_err(),
+            "a historical null version must never be routed as a current-object delete"
+        );
+
+        let versioned_current_without_identity = ObjectInfo {
+            version_id: None,
+            is_latest: true,
+            ..oi
+        };
+        assert!(
+            transitioned_object_delete_opts(
+                &versioned_current_without_identity,
+                IlmAction::DeleteAction,
+                true,
+                false,
+                incarnation,
+            )
+            .is_err(),
+            "a versioned current object without an identity is ambiguous"
+        );
+        let opts = transitioned_object_delete_opts(
+            &versioned_current_without_identity,
+            IlmAction::DeleteAction,
+            false,
+            false,
+            incarnation,
+        )
+        .expect("a truly unversioned current object should remain deletable");
+        assert!(opts.version_id.is_none());
     }
 
     #[tokio::test]
@@ -6381,6 +7537,7 @@ mod tests {
         let state = ExpiryState::new();
         let mut state = state.write().await;
         let je = Jentry {
+            persisted_version: 0,
             obj_name: "remote/object".to_string(),
             version_id: "remote-version".to_string(),
             tier_name: "WARM".to_string(),
@@ -6389,6 +7546,7 @@ mod tests {
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
             state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
             source: None,
+            dispatch: None,
         };
 
         let err = state
@@ -6403,7 +7561,7 @@ mod tests {
     async fn enqueue_free_version_reports_false_without_worker_channel() {
         let state = ExpiryState::new();
         let recovery_notify = Arc::clone(&state.read().await.recovery_notify);
-        let mut state = state.write().await;
+        let state = state.write().await;
         let oi = ObjectInfo {
             bucket: "bucket".to_string(),
             name: "object".to_string(),
@@ -6422,6 +7580,65 @@ mod tests {
         assert!(!queued);
         assert_eq!(state.stats.missed_free_vers_tasks(), 1);
         assert!(recovery_notify.notified().now_or_never().is_some());
+    }
+
+    #[tokio::test]
+    async fn expiry_pending_gauge_survives_dequeue_landing_before_enqueue_accounting() {
+        // A worker may dequeue and decrement before the enqueuing side records
+        // its increment. The gauge must return to zero afterwards instead of
+        // clamping the transient -1 away and reporting a phantom pending task
+        // that no idle check can ever drain (rustfs#7921).
+        let state = ExpiryState::new();
+        let stats = Arc::clone(&state.read().await.stats);
+
+        stats.decrement_pending_tasks();
+        stats.increment_pending_tasks();
+        assert_eq!(stats.pending_tasks(), 0);
+        assert_eq!(state.read().await.pending_tasks(), 0);
+
+        stats.decrement_active_tasks();
+        stats.increment_active_tasks();
+        assert_eq!(stats.active_tasks(), 0);
+        assert_eq!(state.read().await.active_tasks(), 0);
+    }
+
+    #[tokio::test]
+    async fn free_version_enqueue_rolls_back_pending_when_queue_full() {
+        // Single-threaded, so this cannot observe the count-before-publish
+        // ordering itself; it pins the rollback that ordering requires: a
+        // rejected send must not leave its speculative increment behind.
+        let state = ExpiryState::new_with_unconsumed_worker_channel(1);
+        let oi = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: "remote-version".to_string(),
+                tier: "WARM".to_string(),
+                free_version: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(state.read().await.enqueue_free_version(oi.clone()));
+        assert_eq!(state.read().await.stats.pending_tasks(), 1);
+
+        // The single-slot queue is full for both enqueue paths.
+        assert!(!enqueue_recovered_free_version_with_state(&state, oi.clone()).await);
+        assert_eq!(state.read().await.stats.pending_tasks(), 1);
+        assert_eq!(state.read().await.stats.missed_free_vers_tasks(), 1);
+
+        assert!(!state.read().await.enqueue_free_version(oi));
+        assert_eq!(state.read().await.stats.pending_tasks(), 1);
+        assert_eq!(state.read().await.stats.missed_free_vers_tasks(), 2);
+
+        // Draining the one real task returns the gauge to zero.
+        let receiver = state.read().await.tasks_rx[0].clone();
+        let task = receiver.lock().await.recv().await.expect("queued task");
+        assert!(task.is_some());
+        state.read().await.stats.decrement_pending_tasks();
+        assert_eq!(state.read().await.pending_tasks(), 0);
     }
 
     #[tokio::test]
@@ -6529,6 +7746,7 @@ mod tests {
         let state = ExpiryState::new_with_unconsumed_worker_channel(1);
         let mut state = state.write().await;
         let je = Jentry {
+            persisted_version: 0,
             obj_name: "remote/object".to_string(),
             version_id: "remote-version".to_string(),
             tier_name: "WARM".to_string(),
@@ -6537,6 +7755,7 @@ mod tests {
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
             state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
             source: None,
+            dispatch: None,
         };
 
         state
@@ -6593,7 +7812,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut state = state.write().await;
+        let state = state.write().await;
 
         assert!(state.enqueue_free_version(oi.clone()));
         assert!(recovery_notify.notified().now_or_never().is_none());
@@ -6615,8 +7834,9 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let worker_stats = Arc::clone(&stats);
         let worker_notify = Arc::clone(&recovery_notify);
+        let worker_store = Arc::downgrade(&ecstore);
         let worker = tokio::spawn(async move {
-            ExpiryState::worker(&mut rx, ecstore, worker_stats, worker_notify).await;
+            ExpiryState::worker(&mut rx, worker_store, worker_stats, worker_notify).await;
         });
         let oi = ObjectInfo {
             bucket: "bucket".to_string(),
@@ -6668,7 +7888,7 @@ mod tests {
         };
 
         assert!(
-            super::enqueue_recovered_free_version(oi).await,
+            super::enqueue_recovered_free_version(&ecstore, oi).await,
             "the resized production worker queue should accept the task"
         );
         stop_tx.send(None).await.expect("worker stop signal should be delivered");
@@ -6717,8 +7937,9 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let worker_stats = Arc::clone(&stats);
         let worker_notify = Arc::clone(&recovery_notify);
+        let worker_store = Arc::downgrade(&ecstore);
         let worker = tokio::spawn(async move {
-            ExpiryState::worker(&mut rx, ecstore, worker_stats, worker_notify).await;
+            ExpiryState::worker(&mut rx, worker_store, worker_stats, worker_notify).await;
         });
 
         stats.increment_pending_tasks();
@@ -6736,6 +7957,119 @@ mod tests {
                     .expect("free-version path existence check should succeed")
             );
         }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn tier_remove_waits_for_inflight_free_version_local_commit() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("tier-remove-free-version-{}", Uuid::new_v4());
+        let object = "free-version";
+        create_test_bucket(&ecstore, &bucket).await;
+        let (backend, identity_hex) = register_recovery_mock_tier(&ecstore).await;
+        let tier_manager = ecstore.tier_config_mgr();
+        {
+            let manager = tier_manager.read().await;
+            manager
+                .save_tiering_config(Arc::clone(&ecstore))
+                .await
+                .expect("mock tier configuration should persist before removal");
+        }
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, Some(identity_hex)).await;
+        let page = list_tier_free_versions(Arc::clone(&ecstore), 1, None, None, CancellationToken::new())
+            .await
+            .expect("seeded free version should be listed");
+        let oi = page
+            .items
+            .into_iter()
+            .next()
+            .expect("seeded free version should be recoverable");
+
+        backend
+            .set_put_remote_version(Some(oi.transitioned_object.version_id.clone()))
+            .await;
+        let seed_lease = TierConfigMgr::acquire_operation_lease(&tier_manager, "WARM")
+            .await
+            .expect("mock tier lease should be available");
+        seed_lease
+            .put(&oi.transitioned_object.name, ReaderImpl::Body(Bytes::from_static(b"body")), 4)
+            .await
+            .expect("remote free-version tuple should be seeded");
+        drop(seed_lease);
+
+        let barrier = Arc::new(super::FreeVersionPostRemoteDeleteTestBarrier::default());
+        let cleanup_barrier = Arc::clone(&barrier);
+        let cleanup_store = Arc::clone(&ecstore);
+        let cleanup_oi = oi.clone();
+        let cleanup = tokio::spawn(async move {
+            super::FREE_VERSION_POST_REMOTE_DELETE_TEST_BARRIER
+                .scope(cleanup_barrier, async move {
+                    super::cleanup_free_version_exact(cleanup_store, &cleanup_oi, &CancellationToken::new()).await
+                })
+                .await
+        });
+        tokio::time::timeout(StdDuration::from_secs(30), barrier.arrived.notified())
+            .await
+            .expect("free-version cleanup should pause after the remote delete");
+        assert!(!backend.contains(&oi.transitioned_object.name).await);
+
+        let remove_manager = Arc::clone(&tier_manager);
+        let remove_store = Arc::clone(&ecstore);
+        let remove_backend = backend.clone();
+        let remove_driver_factory: TierDriverTestFactory = Arc::new(move |_| Ok(Box::new(remove_backend.clone())));
+        let mut remove = tokio::spawn(async move {
+            TIER_DRIVER_TEST_FACTORY
+                .scope(
+                    remove_driver_factory,
+                    TierConfigMgr::remove_and_save(&remove_manager, remove_store, "WARM", true),
+                )
+                .await
+        });
+        let prepared = tokio::time::timeout(StdDuration::from_secs(30), async {
+            loop {
+                match TierConfigMgr::acquire_operation_lease(&tier_manager, "WARM").await {
+                    Ok(lease) => drop(lease),
+                    Err(err) if TierConfigMgr::operation_lease_blocked_by_mutation(&err) => break,
+                    Err(err) => panic!("tier remove should only block new operations while cleanup is paused: {err}"),
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::select! {
+            prepared = prepared => {
+                prepared.expect("tier remove should install its prepared admission fence");
+            }
+            result = &mut remove => {
+                panic!("tier remove finished before installing its prepared admission fence: {result:?}");
+            }
+        }
+        assert!(!remove.is_finished(), "tier remove must wait for the leased local cleanup commit");
+
+        barrier.release.notify_one();
+        tokio::time::timeout(StdDuration::from_secs(30), cleanup)
+            .await
+            .expect("free-version cleanup should finish after release")
+            .expect("free-version cleanup task should join")
+            .expect("free-version cleanup should keep its generation current");
+        tokio::time::timeout(StdDuration::from_secs(30), remove)
+            .await
+            .expect("tier remove should finish after local cleanup")
+            .expect("tier remove task should join")
+            .expect("tier remove should pass its fresh authoritative proof");
+
+        assert!(!tier_manager.read().await.is_tier_valid("WARM"));
+        for disk_path in &disk_paths {
+            assert!(
+                !fs::try_exists(disk_path.join(&bucket).join(object))
+                    .await
+                    .expect("post-removal free-version path check should succeed")
+            );
+        }
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("empty free-version test bucket should be removed");
     }
 
     #[cfg(feature = "test-util")]
@@ -6774,7 +8108,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let worker_stats = Arc::clone(&stats);
         let worker_notify = Arc::clone(&recovery_notify);
-        let worker_store = Arc::clone(&ecstore);
+        let worker_store = Arc::downgrade(&ecstore);
         let worker = tokio::spawn(async move {
             ExpiryState::worker(&mut rx, worker_store, worker_stats, worker_notify).await;
         });
@@ -6784,12 +8118,12 @@ mod tests {
             .await
             .expect("free-version task should reach the worker");
         tokio::time::timeout(StdDuration::from_secs(30), async {
-            while remote_backend.remove_count().await == 0 {
+            while stats.active_tasks() == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("worker should complete remote cleanup before taking the local lock");
+        .expect("worker should mark the cleanup task active before the lock assertion");
         let completed_while_locked = tokio::time::timeout(StdDuration::from_millis(100), async {
             while stats.active_tasks() != 0 {
                 tokio::task::yield_now().await;
@@ -6798,7 +8132,12 @@ mod tests {
         .await;
         assert!(
             completed_while_locked.is_err(),
-            "local cleanup must wait while a competing object writer owns the namespace lock"
+            "the cleanup task must wait while a competing object writer owns the namespace lock"
+        );
+        assert_eq!(
+            remote_backend.remove_count().await,
+            0,
+            "the remote tuple must not be deleted before the all-physical namespace fence is acquired"
         );
         for disk_path in &disk_paths {
             assert!(
@@ -6809,6 +8148,13 @@ mod tests {
         }
 
         drop(object_lock_guard);
+        tokio::time::timeout(StdDuration::from_secs(30), async {
+            while remote_backend.remove_count().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker should delete the remote tuple after acquiring the released namespace fence");
         tx.send(None).await.expect("worker stop signal should be delivered");
         worker.await.expect("free-version worker should stop cleanly");
 
@@ -6820,6 +8166,75 @@ mod tests {
                     .expect("free-version path existence check should succeed")
             );
         }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn tier_overwrite_cleanup_retains_a_minority_live_remote_reference() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("overwrite-minority-{}", Uuid::new_v4());
+        let object = "still-referenced";
+        create_test_bucket(&ecstore, &bucket).await;
+        let (backend, identity) = register_recovery_mock_tier(&ecstore).await;
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, Some(identity.clone())).await;
+        let page = list_tier_free_versions(Arc::clone(&ecstore), 100, None, None, CancellationToken::new())
+            .await
+            .expect("list persisted cleanup owner");
+        let owner = page.items.into_iter().find(|oi| oi.bucket == bucket).expect("seeded owner");
+        backend
+            .set_put_remote_version(Some(owner.transitioned_object.version_id.clone()))
+            .await;
+        let lease = TierConfigMgr::acquire_operation_lease(&ecstore.tier_config_mgr(), "WARM")
+            .await
+            .expect("remote fixture lease");
+        lease
+            .put(
+                &owner.transitioned_object.name,
+                rustfs_s3_client::transition_api::ReaderImpl::Body(bytes::Bytes::from_static(b"old")),
+                3,
+            )
+            .await
+            .expect("seed referenced remote bytes");
+        drop(lease);
+        let path = disk_paths[0].join(&bucket).join(object).join(STORAGE_FORMAT_FILE);
+        let cleanup_metadata = fs::read(&path).await.expect("save completed replica");
+        let mut live = FileInfo::new(object, 2, 2);
+        live.volume = bucket.clone();
+        live.erasure.index = 1;
+        live.data_dir = Some(Uuid::new_v4());
+        live.mod_time = Some(OffsetDateTime::now_utc());
+        live.size = 3;
+        live.add_object_part(1, "149603e6c03516362a8da23f624db945".to_string(), 3, live.mod_time, 3, None, None);
+        live.transition_status = TRANSITION_COMPLETE.to_string();
+        live.transition_tier = "WARM".to_string();
+        live.transitioned_objname = owner.transitioned_object.name.clone();
+        live.transition_version = Some(owner.transitioned_object.version_id.clone());
+        live.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
+        rustfs_utils::http::insert_str(&mut live.metadata, rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID, identity);
+        let mut old_metadata = FileMeta::new();
+        old_metadata.add_version(live).expect("prepare minority live source");
+        fs::write(&path, old_metadata.marshal_msg().expect("encode live source"))
+            .await
+            .expect("model one replica retained by an interrupted overwrite");
+
+        let err = super::cleanup_free_version_exact(Arc::clone(&ecstore), &owner, &CancellationToken::new())
+            .await
+            .expect_err("quorum free versions cannot erase a minority live reference");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(backend.remove_count().await, 0);
+        assert!(backend.contains(&owner.transitioned_object.name).await);
+
+        fs::write(&path, cleanup_metadata)
+            .await
+            .expect("complete replica convergence");
+        assert!(
+            super::cleanup_free_version_exact(Arc::clone(&ecstore), &owner, &CancellationToken::new())
+                .await
+                .expect("converged cleanup can delete the exact remote owner")
+        );
+        assert_eq!(backend.remove_count().await, 1);
+        assert!(!backend.contains(&owner.transitioned_object.name).await);
     }
 
     #[cfg(feature = "test-util")]
@@ -6849,7 +8264,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let worker_stats = Arc::clone(&stats);
         let worker_notify = Arc::clone(&recovery_notify);
-        let worker_store = Arc::clone(&ecstore);
+        let worker_store = Arc::downgrade(&ecstore);
         let worker = tokio::spawn(async move {
             ExpiryState::worker(&mut rx, worker_store, worker_stats, worker_notify).await;
         });
@@ -6904,6 +8319,7 @@ mod tests {
             .next()
             .expect("seeded free version should be recoverable");
         let stale_version_id = oi.version_id.expect("free version should have a concrete UUID");
+        let ordinary_marker_mod_time = OffsetDateTime::now_utc();
 
         for disk_path in &disk_paths {
             let metadata_path = disk_path.join(&bucket).join(object).join(STORAGE_FORMAT_FILE);
@@ -6911,13 +8327,22 @@ mod tests {
                 .await
                 .expect("free-version metadata should remain readable");
             let mut metadata = FileMeta::load(&encoded).expect("free-version metadata should decode");
+            let mut free_version_delete = FileInfo {
+                version_id: Some(stale_version_id),
+                deleted: true,
+                ..Default::default()
+            };
+            free_version_delete.set_tier_free_version();
+            metadata
+                .delete_version(&free_version_delete)
+                .expect("stale free version should be consumed before its ID is reused");
             metadata
                 .add_version(FileInfo {
                     volume: bucket.clone(),
                     name: object.to_string(),
                     version_id: Some(stale_version_id),
                     deleted: true,
-                    mod_time: Some(OffsetDateTime::now_utc()),
+                    mod_time: Some(ordinary_marker_mod_time),
                     ..Default::default()
                 })
                 .expect("same-ID ordinary marker should replace the stale free version");
@@ -6931,6 +8356,13 @@ mod tests {
             .expect("same-ID ordinary marker metadata should be written");
         }
 
+        assert!(
+            !super::cleanup_free_version_exact(Arc::clone(&ecstore), &oi, &CancellationToken::new())
+                .await
+                .expect("a stale task whose local UUID now names an ordinary marker should be an idempotent no-op"),
+            "the stale free-version task must not report local cleanup"
+        );
+
         let state = ExpiryState::new();
         let (stats, recovery_notify) = {
             let state = state.read().await;
@@ -6939,7 +8371,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let worker_stats = Arc::clone(&stats);
         let worker_notify = Arc::clone(&recovery_notify);
-        let worker_store = Arc::clone(&ecstore);
+        let worker_store = Arc::downgrade(&ecstore);
         let worker = tokio::spawn(async move {
             ExpiryState::worker(&mut rx, worker_store, worker_stats, worker_notify).await;
         });
@@ -6993,8 +8425,9 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let worker_stats = Arc::clone(&stats);
         let worker_notify = Arc::clone(&recovery_notify);
+        let worker_store = Arc::downgrade(&ecstore);
         let worker = tokio::spawn(async move {
-            ExpiryState::worker(&mut rx, ecstore, worker_stats, worker_notify).await;
+            ExpiryState::worker(&mut rx, worker_store, worker_stats, worker_notify).await;
         });
         let oi = ObjectInfo {
             bucket: format!("missing-bucket-{}", Uuid::new_v4()),
@@ -8295,6 +9728,30 @@ mod tests {
         }
     }
 
+    fn current_and_noncurrent_expiration_lifecycle() -> BucketLifecycleConfiguration {
+        BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("expire-current-and-noncurrent".to_string()),
+                noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                }),
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        }
+    }
+
     fn all_versions_expiration_lifecycle() -> BucketLifecycleConfiguration {
         BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -8662,6 +10119,18 @@ mod tests {
         assert_eq!(report.skipped_queue_closed, 0);
         assert_eq!(report.skipped_queue_timeout, 0);
         assert!(report.has_partial_enqueue());
+        assert!(report.has_enqueue_backpressure());
+    }
+
+    #[test]
+    fn manual_transition_in_flight_skip_does_not_stop_the_scan() {
+        let options = ManualTransitionRunOptions::default();
+        let mut report = ManualTransitionRunReport::new("bucket", &options);
+
+        report.record_enqueue_outcome(TransitionEnqueueOutcome::AlreadyInFlight);
+
+        assert!(report.has_partial_enqueue());
+        assert!(!report.has_enqueue_backpressure());
     }
 
     #[test]
@@ -10803,6 +12272,429 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_evaluators_agree_on_null_version_identity_and_guards() {
+        let lifecycle = current_and_noncurrent_expiration_lifecycle();
+        let now = OffsetDateTime::now_utc();
+        let historical_null = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "logs/object".to_string(),
+            mod_time: Some(now - time::Duration::days(40)),
+            successor_mod_time: Some(now - time::Duration::days(3)),
+            version_id: Some(Uuid::nil()),
+            is_latest: false,
+            num_versions: 1,
+            replication_status: ReplicationStatusType::Completed,
+            ..Default::default()
+        };
+        let cases = [
+            ("explicit historical null", historical_null.clone(), None, IlmAction::DeleteVersionAction),
+            (
+                "missing historical identity",
+                ObjectInfo {
+                    version_id: None,
+                    ..historical_null.clone()
+                },
+                None,
+                IlmAction::NoneAction,
+            ),
+            (
+                "pending null replication",
+                ObjectInfo {
+                    replication_status: ReplicationStatusType::Pending,
+                    ..historical_null.clone()
+                },
+                None,
+                IlmAction::NoneAction,
+            ),
+            (
+                "locked historical null",
+                ObjectInfo {
+                    user_defined: Arc::new(HashMap::from([(
+                        metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(),
+                        "ON".to_string(),
+                    )])),
+                    ..historical_null.clone()
+                },
+                Some(lock_enabled_without_default_retention()),
+                IlmAction::NoneAction,
+            ),
+            (
+                "unversioned current",
+                ObjectInfo {
+                    version_id: None,
+                    is_latest: true,
+                    successor_mod_time: None,
+                    ..historical_null
+                },
+                None,
+                IlmAction::DeleteAction,
+            ),
+        ];
+
+        for (name, object, lock_config, expected) in cases {
+            let object_opts = lifecycle::object_opts_from_object_info(&object);
+            let batch_event = Evaluator::new(Arc::new(lifecycle.clone()))
+                .with_lock_retention(lock_config.clone().map(Arc::new))
+                .eval(&[object_opts])
+                .await
+                .expect("batch lifecycle evaluation should succeed")
+                .remove(0);
+            let secondary_event = eval_action_from_lifecycle(&lifecycle, lock_config.as_ref(), &object).await;
+
+            assert_eq!(batch_event.action, expected, "batch evaluator mismatch for {name}");
+            assert_eq!(secondary_event.action, expected, "secondary evaluator mismatch for {name}");
+        }
+    }
+
+    /// backlog#2202: the batch `NewerNoncurrentVersions` path used to delete
+    /// noncurrent versions without telling notification subscribers anything,
+    /// while the current-version path emitted a lifecycle expiration event.
+    /// Only versions this batch actually removed may produce an event.
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_noncurrent_batch_expiry_emits_events_only_for_committed_deletes() {
+        use crate::services::event_notification::test_recorder;
+        use rustfs_s3_types::EventName;
+
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("lifecycle-noncurrent-events-{}", Uuid::new_v4().simple());
+        let object = "logs/object";
+        create_test_bucket(&ecstore, &bucket).await;
+
+        metadata_sys::update_in(
+            &ecstore.ctx,
+            &bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be enabled");
+
+        let now = OffsetDateTime::now_utc();
+        let mut noncurrent_reader = PutObjReader::from_vec(b"noncurrent".to_vec());
+        let noncurrent = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut noncurrent_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    mod_time: Some(now - time::Duration::days(40)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the noncurrent version should be created");
+        let noncurrent_version_id = noncurrent.version_id.expect("a versioned PUT has an exact identity");
+        let mut current_reader = PutObjReader::from_vec(b"current".to_vec());
+        let current = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut current_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    mod_time: Some(now - time::Duration::days(2)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the current version should be created");
+        let current_version_id = current.version_id.expect("a versioned PUT has an exact identity");
+
+        let incarnation = ecstore
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("bucket incarnation should be available");
+
+        test_recorder::install();
+
+        // One version that exists and one that never did: `delete_objects`
+        // suppresses the not-found error, so only the committed delete may be
+        // announced.
+        let missing_version_id = Uuid::new_v4();
+        let targets = vec![
+            ObjectToDelete {
+                object_name: object.to_string(),
+                version_id: Some(noncurrent_version_id),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: object.to_string(),
+                version_id: Some(missing_version_id),
+                ..Default::default()
+            },
+        ];
+        let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
+            &ecstore,
+            &bucket,
+            &targets,
+            lifecycle::Event::default(),
+            incarnation,
+        )
+        .await;
+        assert_eq!(failed, 0, "a missing version is not a batch failure");
+
+        let events = test_recorder::recorded_for_bucket(&bucket);
+        let announced = events.iter().map(|event| event.version_id).collect::<Vec<_>>();
+        assert_eq!(
+            announced,
+            vec![Some(noncurrent_version_id)],
+            "only the committed noncurrent delete should be announced \
+             (noncurrent={noncurrent_version_id}, current={current_version_id}, missing={missing_version_id}), got {events:?}"
+        );
+        assert_eq!(events[0].event_name, EventName::LifecycleExpirationDelete.to_string());
+        assert_eq!(events[0].object, object);
+        assert!(!events[0].delete_marker);
+
+        let remaining = ecstore
+            .clone()
+            .list_object_versions(&bucket, object, None, None, None, 10)
+            .await
+            .expect("remaining versions should be listable")
+            .objects
+            .into_iter()
+            .filter(|candidate| candidate.name == object)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].version_id, Some(current_version_id));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_deletes_only_the_historical_null_version_after_versioning_is_reenabled() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("lifecycle-null-history-{}", Uuid::new_v4().simple());
+        let object = "logs/object";
+        create_test_bucket(&ecstore, &bucket).await;
+
+        metadata_sys::update_in(
+            &ecstore.ctx,
+            &bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should first be enabled");
+        metadata_sys::update_in(
+            &ecstore.ctx,
+            &bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be suspended");
+
+        let now = OffsetDateTime::now_utc();
+        let mut null_reader = PutObjReader::from_vec(b"historical-null".to_vec());
+        let null_version = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut null_reader,
+                &ObjectOptions {
+                    version_suspended: true,
+                    mod_time: Some(now - time::Duration::days(40)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("suspended PUT should create a null version");
+        assert_eq!(null_version.version_id, Some(Uuid::nil()));
+
+        metadata_sys::update_in(
+            &ecstore.ctx,
+            &bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be re-enabled");
+        let active_bytes = b"active-version".to_vec();
+        let active_mod_time = now - time::Duration::days(2);
+        let mut active_reader = PutObjReader::from_vec(active_bytes.clone());
+        let active = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut active_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    mod_time: Some(active_mod_time),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("re-enabled PUT should create the active version");
+        let active_version_id = active.version_id.expect("active version should have an exact identity");
+        assert!(!active_version_id.is_nil());
+
+        let mut object_infos = ecstore
+            .clone()
+            .list_object_versions(&bucket, object, None, None, None, 10)
+            .await
+            .expect("version history should be listable")
+            .objects
+            .into_iter()
+            .filter(|candidate| candidate.name == object)
+            .collect::<Vec<_>>();
+        object_infos.sort_by_key(|candidate| !candidate.is_latest);
+        assert_eq!(object_infos.len(), 2);
+        let null_index = object_infos
+            .iter()
+            .position(|candidate| candidate.version_id == Some(Uuid::nil()))
+            .expect("history should expose an explicit null identity");
+        assert!(!object_infos[null_index].is_latest);
+
+        let lifecycle = current_and_noncurrent_expiration_lifecycle();
+        let object_opts = object_infos
+            .iter()
+            .map(lifecycle::object_opts_from_object_info)
+            .collect::<Vec<_>>();
+        let events = Evaluator::new(Arc::new(lifecycle.clone()))
+            .eval(&object_opts)
+            .await
+            .expect("version group should evaluate");
+        let current_index = object_infos
+            .iter()
+            .position(|candidate| candidate.is_latest)
+            .expect("version history should expose one current version");
+        assert_eq!(events[null_index].action, IlmAction::DeleteVersionAction);
+        assert_eq!(events[current_index].action, IlmAction::NoneAction);
+        let secondary_event = eval_action_from_lifecycle(&lifecycle, None, &object_infos[null_index]).await;
+        assert_eq!(secondary_event.action, events[null_index].action);
+        let null_target = lifecycle_version_delete_target(&object_infos[null_index])
+            .expect("the historical null generation should be an exact lifecycle target");
+        assert!(null_target.expected_identity.is_some());
+
+        let incarnation = ecstore
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("bucket incarnation should be available");
+        let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
+            &ecstore,
+            &bucket,
+            std::slice::from_ref(&null_target),
+            events[null_index].clone(),
+            incarnation,
+        )
+        .await;
+        assert_eq!(failed, 0, "the unchanged historical null generation should be deleted");
+
+        let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
+            &ecstore,
+            &bucket,
+            &[ObjectToDelete {
+                object_name: object.to_string(),
+                version_id: None,
+                ..Default::default()
+            }],
+            events[null_index].clone(),
+            incarnation,
+        )
+        .await;
+        assert_eq!(failed, 1, "a lifecycle batch target without a version identity must fail closed");
+
+        let remaining = ecstore
+            .clone()
+            .list_object_versions(&bucket, object, None, None, None, 10)
+            .await
+            .expect("remaining version should be listable")
+            .objects
+            .into_iter()
+            .filter(|candidate| candidate.name == object)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].version_id, Some(active_version_id));
+        assert!(remaining[0].is_latest);
+
+        let mut reader = ecstore
+            .get_object_reader(&bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("active version should remain readable");
+        let actual = reader.read_all().await.expect("active version bytes should be readable");
+        assert_eq!(actual, active_bytes);
+
+        metadata_sys::update_in(
+            &ecstore.ctx,
+            &bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be suspended again");
+        let replacement_bytes = b"replacement-null-version".to_vec();
+        let mut replacement_reader = PutObjReader::from_vec(replacement_bytes.clone());
+        let replacement = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut replacement_reader,
+                &ObjectOptions {
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a later suspended PUT should reuse the null version ID");
+        assert_eq!(replacement.version_id, Some(Uuid::nil()));
+        assert_ne!(
+            replacement.data_dir, object_infos[null_index].data_dir,
+            "the replacement must be a distinct persisted generation"
+        );
+
+        let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
+            &ecstore,
+            &bucket,
+            &[ObjectToDelete {
+                object_name: object.to_string(),
+                version_id: Some(Uuid::nil()),
+                ..Default::default()
+            }],
+            events[null_index].clone(),
+            incarnation,
+        )
+        .await;
+        assert_eq!(failed, 1, "a reusable null ID without its observed generation must fail closed");
+
+        let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
+            &ecstore,
+            &bucket,
+            &[null_target],
+            events[null_index].clone(),
+            incarnation,
+        )
+        .await;
+        assert_eq!(failed, 1, "a stale null-generation target must fail its write-lock CAS");
+
+        let remaining = ecstore
+            .clone()
+            .list_object_versions(&bucket, object, None, None, None, 10)
+            .await
+            .expect("replacement history should be listable")
+            .objects
+            .into_iter()
+            .filter(|candidate| candidate.name == object)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 2);
+        assert!(
+            remaining
+                .iter()
+                .any(|candidate| candidate.version_id == Some(active_version_id))
+        );
+        assert!(remaining.iter().any(|candidate| candidate.version_id == Some(Uuid::nil())));
+        let mut reader = ecstore
+            .get_object_reader(&bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the replacement null version should remain current and readable");
+        let actual = reader
+            .read_all()
+            .await
+            .expect("replacement null-version bytes should be readable");
+        assert_eq!(actual, replacement_bytes);
+    }
+
+    #[tokio::test]
     async fn existing_object_lifecycle_skips_current_expiration_for_bucket_default_retention() {
         let lc = latest_expiration_lifecycle();
         let mut object = current_object(ReplicationStatusType::Completed);
@@ -10866,9 +12758,8 @@ mod tests {
             .await
             .expect_err("malformed Object Lock metadata must reject lifecycle config resolution");
         assert!(
-            exact_error
-                .to_string()
-                .contains("persisted bucket Object Lock configuration is invalid")
+            crate::bucket::metadata::is_unreadable_config_error(&exact_error),
+            "malformed Object Lock metadata must surface as the typed unreadable-config refusal: {exact_error}"
         );
 
         let runtime_state = install_unconsumed_runtime_expiry_worker(&ecstore, 1).await;
@@ -10881,7 +12772,8 @@ mod tests {
                 .push((event, state, reason));
         });
 
-        super::enqueue_immediate_expiry(&object_info, LcEventSrc::S3PutObject).await;
+        super::enqueue_immediate_expiry(Arc::clone(&ecstore), &object_info, LcEventSrc::S3PutObject, &ObjectOptions::default())
+            .await;
 
         assert!(
             observed.lock().expect("observed events should not poison").contains(&(
@@ -11197,7 +13089,7 @@ mod tests {
         let lc = latest_expiration_lifecycle();
         let object = current_object_with_metadata(
             ReplicationStatusType::Completed,
-            HashMap::from([(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string())]),
+            HashMap::from([(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string())]),
         );
 
         let event = eval_action_from_lifecycle(&lc, None, &object).await;
@@ -11215,10 +13107,10 @@ mod tests {
             ReplicationStatusType::Completed,
             HashMap::from([
                 (
-                    X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                    metadata_keys::OBJECT_LOCK_MODE.to_string(),
                     s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
                 ),
-                (X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), retain_until),
+                (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until),
             ]),
         );
 
@@ -11240,10 +13132,10 @@ mod tests {
             ReplicationStatusType::Completed,
             HashMap::from([
                 (
-                    X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                    metadata_keys::OBJECT_LOCK_MODE.to_string(),
                     ObjectLockRetentionMode::COMPLIANCE.to_string(),
                 ),
-                (X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), retain_until),
+                (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until),
             ]),
         );
         object.transitioned_object.status = TRANSITION_COMPLETE.to_string();
@@ -11422,7 +13314,7 @@ mod tests {
 
     #[cfg(feature = "test-util")]
     #[tokio::test]
-    async fn journal_replay_rejects_unknown_version_state_before_backend_io() {
+    async fn journal_replay_quarantines_legacy_unknown_version_state_before_backend_io() {
         let (_disk_paths, ecstore) = setup_test_env().await;
         let (backend, _) = register_recovery_mock_tier(&ecstore).await;
         let identity = TierConfigMgr::acquire_operation_lease(&ecstore.tier_config_mgr(), "WARM")
@@ -11430,6 +13322,7 @@ mod tests {
             .expect("mock tier lease should be available")
             .backend_identity();
         let je = Jentry {
+            persisted_version: 0,
             obj_name: "remote/object".to_string(),
             version_id: "legacy-version".to_string(),
             tier_name: "WARM".to_string(),
@@ -11438,66 +13331,65 @@ mod tests {
             version_state: rustfs_filemeta::TransitionVersionState::Unknown,
             state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
             source: None,
+            dispatch: None,
         };
 
+        crate::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(ecstore.clone(), &je)
+            .await
+            .expect("legacy unknown journal should remain byte-compatible and persistable");
         let err = crate::bucket::lifecycle::tier_delete_journal::process_tier_delete_journal_entry(ecstore, &je)
             .await
-            .expect_err("unknown journal state must fail before backend IO");
+            .expect_err("legacy unknown journal must be quarantined before backend IO");
 
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
         assert_eq!(backend.remove_count().await, 0);
     }
 
     #[cfg(feature = "test-util")]
     #[tokio::test]
-    async fn journal_replay_deletes_confirmed_exact_provider_token() {
+    async fn rejected_upload_cleanup_retries_confirmed_exact_provider_token_without_legacy_journal() {
         let (_disk_paths, ecstore) = setup_test_env().await;
         let (backend, _) = register_recovery_mock_tier(&ecstore).await;
         let lease = TierConfigMgr::acquire_operation_lease(&ecstore.tier_config_mgr(), "WARM")
             .await
             .expect("mock tier lease should be available");
-        let identity = lease.backend_identity();
         backend
             .set_put_remote_version(Some("provider-version-token".to_string()))
             .await;
         lease
             .put(
                 "remote/object",
-                crate::client::transition_api::ReaderImpl::Body(bytes::Bytes::from_static(b"candidate")),
+                rustfs_s3_client::transition_api::ReaderImpl::Body(bytes::Bytes::from_static(b"candidate")),
                 9,
             )
             .await
             .expect("confirmed remote candidate should be seeded");
         backend.set_remove_failure(true);
         backend.set_reject_non_empty_remote_versions(true);
-        let je = Jentry {
-            obj_name: "remote/object".to_string(),
-            version_id: "provider-version-token".to_string(),
-            tier_name: "WARM".to_string(),
-            backend_identity: Some(identity),
-            version_id_exact: true,
-            version_state: rustfs_filemeta::TransitionVersionState::Exact,
-            state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
-            source: None,
-        };
-
-        crate::set_disk::cleanup_rejected_transition_upload_durably(
+        let err = crate::set_disk::cleanup_rejected_transition_upload_durably(
             &lease,
-            &je.obj_name,
-            &je.version_id,
+            "remote/object",
+            "provider-version-token",
             true,
             Some(ecstore.clone()),
         )
         .await
-        .expect("failed immediate cleanup should remain durable in the journal");
-        assert!(backend.contains(&je.obj_name).await);
+        .expect_err("a failed immediate cleanup must remain owned by the caller's transition transaction");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(backend.contains("remote/object").await);
 
         backend.set_remove_failure(false);
-        crate::bucket::lifecycle::tier_delete_journal::process_tier_delete_journal_entry(ecstore, &je)
-            .await
-            .expect("identity-bound exact journal must retry confirmed candidate cleanup");
+        crate::set_disk::cleanup_rejected_transition_upload_durably(
+            &lease,
+            "remote/object",
+            "provider-version-token",
+            true,
+            Some(ecstore),
+        )
+        .await
+        .expect("the transaction retry must delete the same confirmed candidate");
 
-        assert!(!backend.contains(&je.obj_name).await);
+        assert!(!backend.contains("remote/object").await);
         assert_eq!(backend.exact_remove_count(), 2);
         assert_eq!(
             backend.remove_versions().await,
@@ -11660,11 +13552,14 @@ mod tests {
         };
         let mut recovery_rx = recovery_rx.lock().await;
         assert!(
-            super::enqueue_recovered_free_version(ObjectInfo {
-                bucket: "prefill".to_string(),
-                name: "prefill".to_string(),
-                ..Default::default()
-            })
+            super::enqueue_recovered_free_version(
+                &ecstore,
+                ObjectInfo {
+                    bucket: "prefill".to_string(),
+                    name: "prefill".to_string(),
+                    ..Default::default()
+                },
+            )
             .await,
             "the production recovery queue should accept its first task"
         );
@@ -11837,6 +13732,181 @@ mod tests {
             .delete_bucket(&bucket, &DeleteBucketOptions::default())
             .await
             .expect("empty recovery test bucket should be removed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_object_budget_is_global_across_buckets() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        for budget in [
+            RecoveryWorkBudget {
+                max_objects: 0,
+                max_buckets: 1,
+            },
+            RecoveryWorkBudget {
+                max_objects: 1,
+                max_buckets: 0,
+            },
+        ] {
+            let err = list_tier_free_versions_with_budget(Arc::clone(&ecstore), 1, None, None, CancellationToken::new(), budget)
+                .await
+                .expect_err("a zero recovery work budget must fail before starting an unbounded walk");
+            assert!(matches!(err, Error::Io(_)));
+        }
+
+        let suffix = Uuid::new_v4().simple();
+        let buckets = [
+            format!("zzzz-recovery-budget-{suffix}-a"),
+            format!("zzzz-recovery-budget-{suffix}-b"),
+            format!("zzzz-recovery-budget-{suffix}-c"),
+        ];
+        for bucket in &buckets {
+            create_test_bucket(&ecstore, bucket).await;
+        }
+
+        let first_bucket = buckets[0].clone();
+        let first_bucket_for_hook = first_bucket.clone();
+        let _walk = set_recovery_walk_test_hook(move |bucket| {
+            (bucket == first_bucket_for_hook).then(|| {
+                RecoveryWalkTestAction::SendItems(
+                    ["ordinary-object-0", "ordinary-object-0", "ordinary-object-1"]
+                        .into_iter()
+                        .map(|name| ObjectInfo {
+                            bucket: first_bucket_for_hook.clone(),
+                            name: name.to_string(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                )
+            })
+        });
+        let page = list_tier_free_versions_with_budget(
+            Arc::clone(&ecstore),
+            1,
+            None,
+            None,
+            CancellationToken::new(),
+            RecoveryWorkBudget {
+                max_objects: 1,
+                max_buckets: 10,
+            },
+        )
+        .await
+        .expect("the decoded-object boundary should enforce the recovery budget");
+
+        assert!(page.items.is_empty());
+        assert_eq!(page.scanned_entries, 3);
+        assert_eq!(page.buckets_scanned, 1);
+        assert!(page.truncated);
+        assert_eq!(page.next_bucket_marker.as_deref(), Some(first_bucket.as_str()));
+        assert_eq!(page.next_object_marker.as_deref(), Some("ordinary-object-0"));
+        drop(_walk);
+
+        let walked = Arc::new(StdMutex::new(Vec::new()));
+        let walked_by_hook = Arc::clone(&walked);
+        let test_buckets = buckets.clone();
+        let _walk = set_recovery_walk_test_hook(move |bucket| {
+            test_buckets
+                .iter()
+                .find(|candidate| candidate.as_str() == bucket)
+                .map(|bucket| {
+                    walked_by_hook
+                        .lock()
+                        .expect("recovery walk log should not be poisoned")
+                        .push(bucket.clone());
+                    RecoveryWalkTestAction::SendItems(vec![ObjectInfo {
+                        bucket: bucket.clone(),
+                        name: "ordinary-object".to_string(),
+                        ..Default::default()
+                    }])
+                })
+        });
+
+        let page = list_tier_free_versions_with_budget(
+            Arc::clone(&ecstore),
+            1,
+            None,
+            None,
+            CancellationToken::new(),
+            RecoveryWorkBudget {
+                max_objects: 2,
+                max_buckets: 10,
+            },
+        )
+        .await
+        .expect("the bounded recovery page should be listed");
+
+        assert!(page.items.is_empty());
+        assert_eq!(page.scanned_entries, 2);
+        assert_eq!(page.buckets_scanned, 2);
+        assert!(page.truncated);
+        assert_eq!(page.next_bucket_marker.as_deref(), Some(buckets[1].as_str()));
+        assert_eq!(page.next_object_marker.as_deref(), Some("ordinary-object"));
+        assert_eq!(walked.lock().expect("recovery walk log should not be poisoned").as_slice(), &buckets[..2]);
+
+        for bucket in &buckets {
+            ecstore
+                .delete_bucket(bucket, &DeleteBucketOptions::default())
+                .await
+                .expect("empty recovery test bucket should be removed");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_bucket_budget_resumes_at_unscanned_bucket() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let suffix = Uuid::new_v4().simple();
+        let buckets = [
+            format!("zzzz-recovery-buckets-{suffix}-a"),
+            format!("zzzz-recovery-buckets-{suffix}-b"),
+        ];
+        for bucket in &buckets {
+            create_test_bucket(&ecstore, bucket).await;
+        }
+
+        let test_buckets = buckets.clone();
+        let _walk = set_recovery_walk_test_hook(move |bucket| {
+            test_buckets
+                .iter()
+                .any(|candidate| candidate.as_str() == bucket)
+                .then(|| RecoveryWalkTestAction::SendItems(Vec::new()))
+        });
+        let budget = RecoveryWorkBudget {
+            max_objects: 10,
+            max_buckets: 1,
+        };
+        let first = list_tier_free_versions_with_budget(Arc::clone(&ecstore), 1, None, None, CancellationToken::new(), budget)
+            .await
+            .expect("the first bucket-bounded page should be listed");
+
+        assert_eq!(first.buckets_scanned, 1);
+        assert!(first.truncated);
+        assert_eq!(first.next_bucket_marker.as_deref(), Some(buckets[1].as_str()));
+        assert!(first.next_object_marker.is_none());
+
+        let second = list_tier_free_versions_with_budget(
+            Arc::clone(&ecstore),
+            1,
+            first.next_bucket_marker,
+            first.next_object_marker,
+            CancellationToken::new(),
+            budget,
+        )
+        .await
+        .expect("the second bucket-bounded page should resume");
+
+        assert_eq!(second.buckets_scanned, 1);
+        assert!(!second.truncated);
+        assert!(second.next_bucket_marker.is_none());
+        assert!(second.next_object_marker.is_none());
+
+        for bucket in &buckets {
+            ecstore
+                .delete_bucket(bucket, &DeleteBucketOptions::default())
+                .await
+                .expect("empty recovery test bucket should be removed");
+        }
     }
 
     #[tokio::test]
@@ -12095,7 +14165,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn tier_free_version_recovery_continues_after_deleted_marker_bucket() {
-        let (_paths, ecstore) = setup_test_env().await;
+        let (disk_paths, ecstore) = setup_test_env().await;
         let suffix = Uuid::new_v4().simple();
         let earlier_bucket = format!("zzzz-recovery-{suffix}-a");
         let deleted_marker = format!("zzzz-recovery-{suffix}-m");
@@ -12103,11 +14173,7 @@ mod tests {
         let later_object = "a-before-stale-marker";
         create_test_bucket(&ecstore, &earlier_bucket).await;
         create_test_bucket(&ecstore, &later_bucket).await;
-        let mut reader = PutObjReader::from_vec(b"cursor reset probe".to_vec());
-        ecstore
-            .put_object(&later_bucket, later_object, &mut reader, &ObjectOptions::default())
-            .await
-            .expect("successor bucket object should be created");
+        seed_recoverable_free_version(&disk_paths, &later_bucket, later_object, None, None).await;
 
         let page = list_tier_free_versions(
             Arc::clone(&ecstore),
@@ -12120,14 +14186,10 @@ mod tests {
         .expect("recovery should resume at the first bucket after a deleted marker bucket");
 
         assert_eq!(page.buckets_scanned, 1, "the later bucket must not be skipped");
-        assert_eq!(
-            page.scanned_entries, 1,
-            "the deleted bucket's object marker must not skip objects in the successor bucket"
-        );
-        ecstore
-            .delete_object(&later_bucket, later_object, ObjectOptions::default())
-            .await
-            .expect("successor bucket object should be removed");
+        assert_eq!(page.items.len(), 1, "the successor bucket's recoverable object must be returned");
+        assert_eq!(page.items[0].bucket, later_bucket);
+        assert_eq!(page.items[0].name, later_object);
+        remove_seeded_free_version(&disk_paths, &later_bucket, later_object).await;
         for bucket in [&earlier_bucket, &later_bucket] {
             ecstore
                 .delete_bucket(bucket, &DeleteBucketOptions::default())

@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 mod error;
 pub mod heal;
 
 pub use error::{Error, Result};
 pub use heal::{
-    HealManager, HealOperationsSnapshot, HealOptions, HealPriority, HealPriorityCounts, HealRequest, HealSourceCounts, HealType,
+    HealAdmissionTelemetry, HealManager, HealOperationsSnapshot, HealOptions, HealPriority, HealPriorityCounts, HealRequest,
+    HealSourceCounts, HealType,
     channel::HealChannelProcessor,
     progress::{HealProgress, aggregate_heal_progress},
     resume::{ReplacementRecoveryRecord, ReplacementRecoveryState, ResumeUtils},
@@ -58,10 +61,14 @@ pub fn create_ahm_services_cancel_token() -> CancellationToken {
 }
 
 /// Shutdown all heal services gracefully
-pub fn shutdown_ahm_services() {
+pub async fn shutdown_ahm_services() -> Result<()> {
+    if let Some(manager) = get_heal_manager() {
+        manager.stop().await?;
+    }
     if let Some(cancel_token) = GLOBAL_AHM_SERVICES_CANCEL_TOKEN.get() {
         cancel_token.cancel();
     }
+    Ok(())
 }
 
 struct HealRuntime {
@@ -174,7 +181,7 @@ pub async fn init_heal_manager_with_workload_provider(
         let channel_receiver = if force_channel_failure {
             Err("forced heal channel initialization failure")
         } else {
-            rustfs_common::heal_channel::init_heal_channels()
+            rustfs_heal_contracts::heal_channel::init_heal_channels()
         };
         let (receiver, receipt_receiver) = match channel_receiver {
             Ok(receivers) => receivers,
@@ -329,6 +336,19 @@ pub async fn current_replacement_recovery_snapshot() -> ReplacementRecoverySnaps
         }
     }
 
+    for record in records.values_mut() {
+        if matches!(record.state, ReplacementRecoveryState::Running)
+            && !match get_heal_manager() {
+                Some(manager) => manager.replacement_generation_is_running(&record.task_id).await,
+                None => false,
+            }
+        {
+            record.state = ReplacementRecoveryState::Unknown;
+            record.reason = Some("durable rebuilding generation has no active replacement owner".to_string());
+            reason.get_or_insert_with(|| "replacement execution ownership is not established".to_string());
+        }
+    }
+
     ReplacementRecoverySnapshot {
         records: records.into_values().collect(),
         definitive: reason.is_none(),
@@ -356,7 +376,7 @@ mod tests {
         heal::storage::HealStorageAPI, init_heal_manager, run_owned_initialization,
     };
     use crate::heal::storage_api::status::BucketInfo;
-    use rustfs_common::heal_channel::HealOpts;
+    use rustfs_heal_contracts::heal_channel::HealOpts;
     use rustfs_madmin::heal_commands::HealResultItem;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};

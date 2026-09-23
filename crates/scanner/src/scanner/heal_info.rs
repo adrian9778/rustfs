@@ -28,7 +28,6 @@ pub struct BackgroundHealInfo {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum BackgroundHealInfoReadStatus {
-    ErasureSd,
     Loaded,
     Missing,
     Blocked,
@@ -62,16 +61,10 @@ pub async fn read_background_heal_info(storeapi: Arc<ECStore>) -> BackgroundHeal
 /// Read background healing information together with the movement epoch that
 /// fenced the read. The epoch must be reused by the matching cycle update so a
 /// missing-object default cannot be committed across a movement transition.
-pub(super) async fn read_background_heal_info_with_epoch(storeapi: Arc<ECStore>) -> BackgroundHealInfoRead {
-    // Skip for ErasureSD setup
-    if scanner_is_erasure_sd().await {
-        return BackgroundHealInfoRead {
-            info: BackgroundHealInfo::default(),
-            expected_epoch: None,
-            status: BackgroundHealInfoReadStatus::ErasureSd,
-        };
-    }
-
+pub(super) async fn read_background_heal_info_with_epoch<S>(storeapi: Arc<S>) -> BackgroundHealInfoRead
+where
+    S: ScannerStorage,
+{
     let expected_epoch = scanner_publication_epoch(storeapi.clone()).await;
     if expected_epoch.is_none() {
         return BackgroundHealInfoRead {
@@ -136,16 +129,13 @@ pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundH
     save_background_heal_info_for_epoch(storeapi, info, None).await;
 }
 
-pub(super) async fn save_background_heal_info_for_epoch(
-    storeapi: Arc<ECStore>,
+pub(super) async fn save_background_heal_info_for_epoch<S>(
+    storeapi: Arc<S>,
     info: BackgroundHealInfo,
     expected_epoch: Option<u64>,
-) {
-    // Skip for ErasureSD setup
-    if scanner_is_erasure_sd().await {
-        return;
-    }
-
+) where
+    S: ScannerStorage,
+{
     // Serialize to JSON
     let data = match serde_json::to_vec(&info) {
         Ok(data) => data,
