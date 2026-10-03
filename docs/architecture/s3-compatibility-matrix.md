@@ -27,6 +27,7 @@ Counts ignore blank lines and comments; compute them from the files. The lifecyc
 | CopyObject checksums (CRC32, CRC32C, CRC64NVME, SHA1, SHA256, MD5, SHA512, XXHASH3, XXHASH64, XXHASH128), including source preservation and explicit override | Supported | `crates/e2e_test/src/copy_object_checksum_test.rs` |
 | ListObjects/ListObjectsV2 prefix, delimiter, marker, max-keys | Supported | `implemented_tests.txt` |
 | Multipart upload create/upload/complete/abort and selected multipart copy/checksum/object-attribute behavior | Supported | `implemented_tests.txt` |
+| ListParts pagination: `NextPartNumberMarker` is omitted when `IsTruncated=false`, and sparse numeric markers resume at the first part above the marker | Supported | `rustfs/src/storage/s3_api/multipart.rs` (XML serialization tests), `crates/e2e_test/src/multipart_storage_class_test.rs` (real AWS SDK paginator) |
 | Bucket and object tagging | Supported | `implemented_tests.txt` |
 | Bucket policy put/get/delete | Supported | `implemented_tests.txt` |
 | Public access block put/get/delete | Supported | `implemented_tests.txt` |
