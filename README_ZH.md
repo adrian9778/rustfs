@@ -176,7 +176,7 @@ docker compose -f docker-compose-simple.yml up -d
 ./docker-buildx.sh --push
 
 # 构建指定版本
-./docker-buildx.sh --release v1.0.0 --push
+./docker-buildx.sh --release 1.0.1 --push
 
 # 构建并推送到自定义仓库
 ./docker-buildx.sh --registry your-registry.com --namespace yourname --push
@@ -193,7 +193,7 @@ docker compose -f docker-compose-simple.yml up -d
 ```bash
 make docker-buildx                    # 本地构建
 make docker-buildx-push               # 构建并推送
-make docker-buildx-version VERSION=v1.0.0  # 构建指定版本
+make docker-buildx-version VERSION=1.0.1  # 构建指定版本
 make help-docker                      # 显示所有 Docker 相关命令
 ```
 
